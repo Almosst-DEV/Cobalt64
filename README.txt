@@ -1,5 +1,5 @@
 Navi48-MacOS
-The first public unofficial MacOS driver.
+The first public unofficial MacOS GPU driver.
 
 What this repo contains
 -----------------------
