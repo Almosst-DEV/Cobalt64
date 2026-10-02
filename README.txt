@@ -1,12 +1,9 @@
 Navi48-MacOS
-============
 
-Experimental, proof-of-concept native macOS support for the AMD Radeon RX 9070 XT
-(Navi 48, gfx1201) on an x86_64 PC running macOS Tahoe. Not affiliated with AMD or
-Apple. Licence: MIT (see LICENSE; third-party notices in third-party/).
+Experimental, but functional MacOS support for the 9070 XT
 
-What is here
-------------
+What this repo contains
+-----------------------
   src/navi48-bringup   Bring-up kext (IOKit): PCIe/BAR setup, IP discovery, PSP/SMU/GMC/
                        GFX/SDMA/MES initialisation, display (DCN 4.1) mode-setting, a
                        user client ("N48N") exposing buffers, command submission and
@@ -30,37 +27,20 @@ Status
 Reached on one x86_64 test PC with an RX 9070 XT: a 60 fps
 GPU-composited macOS desktop on one DisplayPort display, macOS Tahoe 26.6.2, x86_64
 PC booted through OpenCore. The Metal compositor runs on this driver stack. A lot is
-still rough: only one display path has been exercised at length, performance and
+still rough. Only one display path has been exercised at length, performance and
 stability work is ongoing, and many pieces exist to work around one specific macOS
 build.
 
+Coming Soon
+-----------
+Multi-monitor support
+Multiple display paths
+Native GPU rendering for app content
+
 Can I install this?
 -------------------
-Honest answer: probably not, and you should not try on a machine you care about.
-
-  * It is experimental research code, with no installer and no support. It can panic
-    the machine, hang the GPU or the display, and corrupt a boot volume if you
-    misconfigure the EFI partition. Do not use it as a daily driver.
-  * It is pinned to one macOS build. Large parts hook Apple's own driver at fixed
-    offsets; another macOS build needs those offsets redone.
-  * It needs the same GPU family (RX 9070 / 9070 XT, Navi 48, gfx1201).
-  * You need an OpenCore-booted Hackintosh-style setup; this repository does not
-    include any OpenCore configuration, SMBIOS identity or EFI files.
-  * It builds on the RDNA4FB kext (display-only prior art) and its MacKernelSDK; clone
-    it separately (below) to src/RDNA4FB - the kext Makefile expects ../RDNA4FB/MacKernelSDK.
-  * Apple's kext approval flow and AMFI must be relaxed for the unsigned kexts and
-    the Metal bundle to load. That is a real reduction of macOS security.
-  * AMD firmware is not included. Get it yourself from linux-firmware
-    (tools/fetch-firmware.sh; src/navi48-bringup/firmware/README.txt).
-  * Mesa must be built with the patches in mesa-patches/ (x86_64 build for macOS).
-  * Several test fixtures, translation caches and shader-compiler outputs that came
-    from captures of Apple's driver are deliberately not included for copyright
-    reasons, so parts of the test suites (notably src/xlat12 and parts of
-    src/navi48-bringup/tests) will not build or pass here without regenerating them
-    yourself on your own machine. tools/native/navi48metal/build.sh also expects an
-    spvcache/ you generate with tools/native/autotranslate.
-  * The scripts in tools/ assume an ssh alias "navi48" for the test PC (override with
-    NAVI48_HOST) and a build host Mac.
+Not reliably. Wait for the first official public release
+for stability and usability. This is just the code.
 
 External projects and dependencies (not vendored; clone them yourself)
 ----------------------------------------------------------------------
