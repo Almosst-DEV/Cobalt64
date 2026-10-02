@@ -1,6 +1,5 @@
 Navi48-MacOS
-
-Experimental, but functional MacOS support for the 9070 XT
+The first public unofficial MacOS driver.
 
 What this repo contains
 -----------------------
