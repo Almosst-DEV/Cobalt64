@@ -1,0 +1,161 @@
+# Makefile — cross-compile Navi48Bringup.kext for x86_64 from any host.
+# Reuses RDNA4FB's MacKernelSDK. Targets macOS 11 ABI (loads on 11+, incl. Tahoe).
+#   make          build build/Navi48Bringup.kext
+#   make clean
+
+PRODUCT   := Navi48Bringup
+BUNDLE_ID := com.navi48.bringup
+ARCH      := x86_64
+DEPLOY    := 11.0
+SDK       := $(shell xcrun --sdk macosx --show-sdk-path)
+MKSDK     := ../RDNA4FB/MacKernelSDK
+
+BUILD := build
+KEXT  := $(BUILD)/$(PRODUCT).kext
+EXEC  := $(KEXT)/Contents/MacOS/$(PRODUCT)
+
+CXX := clang++
+CC  := clang
+
+CXX_SRCS := src/Navi48Bringup.cpp src/Navi48UserClient.cpp src/Navi48NativeClient.cpp src/Navi48MetalNub.cpp src/ipdiscovery.cpp src/psp.cpp $(wildcard src/amd/*.cpp) $(wildcard src/apple/*.cpp) $(wildcard src/dcn/*.cpp)
+# Firmware blobs (firmware/*.bin, tracked) are embedded as C arrays generated at build
+# time into src/fw/ (gitignored) by tools/embed-firmware.py: symbol fw_<blob>[] + fw_<blob>_size.
+FW_BINS  := $(wildcard firmware/*.bin)
+FW_SRCS  := $(patsubst firmware/%.bin,src/fw/fw_%.c,$(FW_BINS))
+# xlat12 (the gfx10.3->gfx12 render-state translator) is one source of truth in ../xlat12,
+# tested by `make -C src/xlat12`; compiled into the kext here with an explicit rule so it is not
+# duplicated. Plain C, no libc beyond stdint (MacKernelSDK provides <stdint.h>).
+XLAT12_DIR := ../xlat12
+# shadercache (the hash-keyed gfx1201 shader cache, milestone 3) is the same arrangement as
+# xlat12: one source of truth in ../shadercache, tested by `make -C src/shadercache test` and
+# `kextcheck`, compiled in here with an explicit rule rather than duplicated.
+SHADERCACHE_DIR := ../shadercache
+# dcn41 (the DCN 4.1 display register layer and its write allowlist) is the same arrangement
+# as xlat12 and shadercache: one source of truth in ../dcn41, tested on the host Mac by
+# `python3 tools/dcn41/build.py all` (unit + planted-defect control + C++17 + kextcheck),
+# compiled in here rather than duplicated. Plain C11, no libc beyond stdint/stdbool/stddef.
+DCN41_DIR := ../dcn41
+DCN41_SRCS := $(wildcard $(DCN41_DIR)/*.c)
+DCN41_OBJS := $(patsubst $(DCN41_DIR)/%.c,$(BUILD)/dcn41/%.o,$(DCN41_SRCS))
+#: a TEST BUILD with another shader-cache blob, e.g. run hp7's candidate carrying G:
+#   make BUILD=build-hp7g SHADERCACHE_BLOB=../../re/cache/m4c-attr-g/cache.bin
+# The default build is untouched (SHADERCACHE_BLOB empty: firmware/shadercache.bin, generated into src/fw/ as before). With the
+# option set, the blob is embedded from a C file generated INSIDE $(BUILD) (never src/fw/, which the default build reuses), and
+# BUILD must not be the default `build`, so a candidate can never land in build/Navi48Bringup.kext. The kext's own
+# `shadercache: blob opened - N entries ... <bytes> bytes` line tells the two apart on hardware (shipped 59520 B).
+SHADERCACHE_BLOB ?=
+ifneq ($(strip $(SHADERCACHE_BLOB)),)
+ifeq ($(BUILD),build)
+$(error SHADERCACHE_BLOB needs its own BUILD directory (e.g. BUILD=build-hp7g); the default build keeps the shipped blob)
+endif
+SC_ALT_C := $(BUILD)/fwalt/fw_shadercache.c
+FW_SRCS  := $(filter-out src/fw/fw_shadercache.c,$(FW_SRCS))
+$(SC_ALT_C): $(SHADERCACHE_BLOB) tools/embed-firmware.py FORCE
+	@mkdir -p $(dir $@)
+	python3 tools/embed-firmware.py $(SHADERCACHE_BLOB) $@ fw_shadercache
+	python3 tools/embed-firmware.py --verify $(SHADERCACHE_BLOB) $@
+$(BUILD)/fwalt/fw_shadercache.o: $(SC_ALT_C)
+	$(CC) $(CFLAGS) -c $< -o $@
+.PHONY: FORCE
+FORCE:
+endif
+C_SRCS   := src/kmod_info.c $(FW_SRCS)
+src/fw/fw_%.c: firmware/%.bin tools/embed-firmware.py
+	@mkdir -p src/fw
+	python3 tools/embed-firmware.py $< $@ fw_$*
+
+OBJS := $(patsubst %.cpp,$(BUILD)/%.o,$(CXX_SRCS)) $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS)) \
+        $(BUILD)/xlat12.o $(BUILD)/xlat12_ib.o $(BUILD)/xlat12_headless.o $(BUILD)/shadercache.o $(DCN41_OBJS) \
+        $(if $(strip $(SHADERCACHE_BLOB)),$(BUILD)/fwalt/fw_shadercache.o)
+
+COMMON := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) \
+  -I$(MKSDK)/Headers -Isrc -Isrc/amd -I$(XLAT12_DIR) -I$(SHADERCACHE_DIR) -I$(DCN41_DIR) -mmacosx-version-min=$(DEPLOY) \
+  -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT \
+  -D_FORTIFY_SOURCE=0 -nostdinc -fno-builtin -fno-common -fno-stack-protector \
+  -mkernel -fapple-kext -Wall -Os -g
+CXXFLAGS := $(COMMON) -std=c++17 -fno-exceptions -fno-rtti -fcheck-new -fno-c++-static-destructors
+CFLAGS   := $(COMMON)
+LDFLAGS  := -arch $(ARCH) -target $(ARCH)-apple-macos$(DEPLOY) -isysroot $(SDK) \
+  -nostdlib -Xlinker -kext -L$(MKSDK)/Library/x86_64 -lkmodc++ -lkmod -Wl,-no_deduplicate
+
+all: $(KEXT)
+
+# Header dependency tracking (-MMD): a struct change in a shared header (e.g. DeviceContext
+# in amdgpu_regs.h) must rebuild EVERY module, or the kext links objects with mismatched
+# layouts. That exact accident produced the 0.0.6/0.0.7 builds on an earlier run.
+$(BUILD)/%.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+$(BUILD)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+# xlat12 lives outside the tree; give it its own rule so it lands at $(BUILD)/xlat12.o. Reviewer item 6 (0.0.442,
+# review of 0.0.441, BUILD DEPENDENCIES): -MMD -MP plus an `-include` of the generated .d file, so an
+# incremental build after a rows-only header change (e.g. xlat12_readset.h regenerated by tools/gfx-readset.py) is
+# NOT silently skipped by a listed-headers set that happened to omit it - the .d file is the REAL dependency list, a
+# compiler fact, not a hand-maintained one. The explicit header list below is kept too, so the FIRST build (before
+# any .d file exists) is still correct.
+$(BUILD)/xlat12.o: $(XLAT12_DIR)/xlat12.c $(XLAT12_DIR)/xlat12.h $(XLAT12_DIR)/xlat12_tables.h $(XLAT12_DIR)/xlat12_repack.h \
+                 $(XLAT12_DIR)/xlat12_scissor.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+-include $(BUILD)/xlat12.d
+$(BUILD)/xlat12_ib.o: $(XLAT12_DIR)/xlat12_ib.c $(XLAT12_DIR)/xlat12_ib.h $(XLAT12_DIR)/xlat12.h \
+                    $(XLAT12_DIR)/xlat12_desc.h $(XLAT12_DIR)/xlat12_shader_ids.h $(XLAT12_DIR)/xlat12_shader_ids_candidates.h \
+                    $(XLAT12_DIR)/xlat12_abi_ptrs.h $(XLAT12_DIR)/xlat12_readset.h $(XLAT12_DIR)/xlat12_shader_desc.h \
+                    $(XLAT12_DIR)/xlat12_reused.h $(XLAT12_DIR)/xlat12_provenance.h $(XLAT12_DIR)/xlat12_scissor.h \
+                    $(XLAT12_DIR)/xlat12_dtable_rows.inc
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+-include $(BUILD)/xlat12_ib.d
+# xlat12_headless (the setup-half recogniser, notes 804): IN THE KEXT SINCE 0.0.369, behind gXdHeadless, which is OFF by
+# default (`accel gfxneuter 13 | 1 << 8` turns it on). It was offline-only through 0.0.368; the safety review that admitted it
+# is the project notes "SAFETY REVIEW - E1 / headless coverage / N1", Decision 2, and gfx_commit.h's N48_CM_KIND_*
+# paragraph is what the COMMIT gate demands of it. Same explicit-rule arrangement as xlat12_ib above.
+$(BUILD)/xlat12_headless.o: $(XLAT12_DIR)/xlat12_headless.c $(XLAT12_DIR)/xlat12_headless.h $(XLAT12_DIR)/xlat12_ib.h \
+                    $(XLAT12_DIR)/xlat12.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+-include $(BUILD)/xlat12_headless.d
+# shadercache, same arrangement as xlat12 above.
+$(BUILD)/shadercache.o: $(SHADERCACHE_DIR)/shadercache.c $(SHADERCACHE_DIR)/shadercache.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+# dcn41, same arrangement again. -MMD so a change to the generated allowlist table or to
+# dcn41_regs.h rebuilds every dcn41 object.
+$(BUILD)/dcn41/%.o: $(DCN41_DIR)/%.c
+	@mkdir -p $(BUILD)/dcn41
+	$(CC) $(CFLAGS) -std=c11 -MMD -MP -c $< -o $@
+-include $(OBJS:.o=.d)
+
+$(KEXT): $(OBJS) Info.plist
+	@mkdir -p $(KEXT)/Contents/MacOS
+	$(CXX) $(LDFLAGS) $(OBJS) -o $(EXEC)
+	@# A virtual declared in one of our own classes but defined nowhere links
+	@# fine here and then fails in the KERNEL linker, where the only symptom is
+	@# that the kext silently does not load — no message in dmesg, none in the
+	@# unified log, nothing on the ESP to see. 0.0.39 shipped that way because
+	@# ~AmdTtlServicesABI() had no body. Catch it at build time instead.
+	@bad=$$(nm -u -arch $(ARCH) $(EXEC) | c++filt | grep -E 'Navi48|AmdTtl|amdgpu::|n48::|n48dcn::|xlat12|_sc_|dcn41_' || true); \
+	if [ -n "$$bad" ]; then \
+	  echo "LINK ERROR: these symbols are OURS but undefined — the kext will not load:"; \
+	  echo "$$bad" | sed 's/^/    /'; \
+	  rm -f $(EXEC); exit 1; \
+	fi
+	cp Info.plist $(KEXT)/Contents/Info.plist
+	find $(KEXT) \( -name '.DS_Store' -o -name '._*' \) -delete
+	# xattr -cr does NOT remove com.apple.FinderInfo from the bundle ROOT, and
+	# codesign refuses any bundle carrying it ("resource fork, Finder information,
+	# or similar detritus not allowed"). It reappears here from Finder/fileprovider
+	# activity on the build directory, so the build failed intermittently and the
+	# || fallback could not rescue it -- the fallback re-ran the same ineffective
+	# xattr -cr. Strip it explicitly first; -d on a missing attribute is harmless.
+	-xattr -d com.apple.FinderInfo $(KEXT) 2>/dev/null
+	xattr -cr $(KEXT)
+	codesign --force --sign - $(KEXT) || { xattr -d com.apple.FinderInfo $(KEXT) 2>/dev/null; xattr -cr $(KEXT); codesign --force --sign - $(KEXT); }
+	@test -f $(KEXT)/Contents/_CodeSignature/CodeResources || { echo 'codesign produced no CodeResources'; exit 1; }
+	@echo "Built $(KEXT) for $(ARCH) (min macOS $(DEPLOY))"
+
+clean:
+	rm -rf $(BUILD)
+.PHONY: all clean

@@ -1,0 +1,4 @@
+# AIR function name = nominal threadgroup size (metal2vulkan --local NAME=X,Y,Z); kernels not listed use the 64,1,1 default.
+sum_rgba_columns=32,1,1
+sum_rgba_rows=32,1,1
+write_tex=8,8,1

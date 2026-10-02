@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>Navi48Accel</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.navi48.accelprobe</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Navi48Accel</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.3</string>
+	<key>CFBundleVersion</key>
+	<string>0.0.3</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>Navi48Accelerator</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.navi48.accelprobe</string>
+			<key>IOClass</key>
+			<string>Navi48Accelerator</string>
+			<key>IOMatchCategory</key>
+			<string>IOAccelerator</string>
+			<key>IOProbeScore</key>
+			<integer>1000</integer>
+			<key>IOProviderClass</key>
+			<string>Navi48MetalNub</string>
+			<key>MetalPluginClassName</key>
+			<string>Navi48Device</string>
+			<key>MetalPluginName</key>
+			<string>Navi48Metal</string>
+		</dict>
+	</dict>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.iokit.IOAcceleratorFamily2</key>
+		<string>2.0.0</string>
+		<key>com.apple.iokit.IOGraphicsFamily</key>
+		<string>1.0</string>
+		<key>com.apple.kpi.iokit</key>
+		<string>20.0.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>20.0.0</string>
+		<key>com.apple.kpi.mach</key>
+		<string>20.0.0</string>
+		<key>com.apple.kpi.unsupported</key>
+		<string>20.0.0</string>
+	</dict>
+</dict>
+</plist>

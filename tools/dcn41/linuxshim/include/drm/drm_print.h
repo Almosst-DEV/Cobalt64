@@ -1,0 +1,12 @@
+#include <linux/types.h>
+#define DRM_DEBUG_KMS(...) do {} while (0)
+#define DRM_DEBUG_DRIVER(...) do {} while (0)
+#define DRM_DEBUG(...) do {} while (0)
+#define DRM_INFO(...) do {} while (0)
+#define DRM_ERROR(...) do {} while (0)
+#define DRM_WARN(...) do {} while (0)
+#define DRM_DEBUG_ATOMIC(...) do {} while (0)
+#define drm_dbg(...) do {} while (0)
+#define drm_err(...) do {} while (0)
+#define drm_warn(...) do {} while (0)
+#define drm_info(...) do {} while (0)

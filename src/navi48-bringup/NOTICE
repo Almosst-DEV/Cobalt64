@@ -1,0 +1,19 @@
+Navi48Bringup — Phase 3 GPU bring-up kext for Navi 48 (gfx1201) on x86 macOS.
+
+This work reuses and adapts code from two upstream projects, with thanks:
+
+* RDNA4FB  (BSD 3-Clause, (c) 2026 Sunneva N. Mariu / somestupidgirl)
+  https://github.com/somestupidgirl/RDNA4FB
+  - src/ipdiscovery.{hpp,cpp} are used verbatim (their BSD-3 headers retained).
+  - The BAR5 register-mapping, indirect-VRAM (MM_INDEX/MM_DATA), on-die IP
+    discovery, and read-only PSP/SMU survey techniques are ported from it.
+
+* mac-amdgpu  (MIT, lemonade-sdk)
+  https://github.com/lemonade-sdk/mac-amdgpu
+  - The IP-block bring-up sequences (gfx/gmc/psp/smu/sdma/mes/ih v12/v14/v7)
+    that later writing stages will port are derived from this project, which
+    proved the full Navi 48 bring-up on macOS (Apple Silicon / DriverKit).
+
+Register semantics are cross-checked against the Linux amdgpu driver
+(drivers/gpu/drm/amd/amdgpu), GPL-2.0 — used as documentation/reference only,
+no GPL code is copied into this permissively-licensed kext.

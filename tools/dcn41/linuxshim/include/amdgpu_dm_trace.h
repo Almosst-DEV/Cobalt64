@@ -1,0 +1,12 @@
+/* linuxshim: tracepoints compiled out */
+#define trace_amdgpu_dc_rreg(...) do {} while (0)
+#define trace_amdgpu_dc_wreg(...) do {} while (0)
+#define trace_amdgpu_dc_performance(...) do {} while (0)
+#define trace_amdgpu_dm_dc_clocks_state(...) do {} while (0)
+#define trace_amdgpu_dm_dce_clocks_state(...) do {} while (0)
+#define trace_amdgpu_dm_dc_pipe_state(...) do {} while (0)
+#define trace_dcn_fpu(...) do {} while (0)
+#define trace_dcn_optc_lock_unlock_state(...) do {} while (0)
+#define trace_amdgpu_dmub_trace_high_irq(...) do {} while (0)
+#define trace_amdgpu_refresh_rate_track(...) do {} while (0)
+#define trace_dcn_otg_state(...) do {} while (0)

@@ -1,0 +1,20 @@
+# build outputs
+build/
+build-*/
+*.kext/
+*.o
+*.d
+*.dylib
+*.a
+*.app/
+*.dSYM/
+*.bin
+*.spv
+*.air
+*.metallib
+src/navi48-bringup/src/fw/
+src/navi48-bringup/firmware/
+# local run output
+runs/
+*.log
+.DS_Store

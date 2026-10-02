@@ -1,0 +1,3665 @@
+From 8bf48965aa71a9139541c14bb6a1850404ef9d56 Mon Sep 17 00:00:00 2001
+From: Navi48-MacOS contributors <noreply@example.invalid>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH 2/5] radv: Darwin native backend, Mesa half of the Navi48 kext
+ ABI (S1c)
+
+Replaces the S1a kernel stubs with the marshaller of NATIVE-S1C-ABI.md:
+IOServiceOpen(Navi48Bringup, 'N48N') + Hello, BoCreate/BoFree/CPU map,
+GemVa, Ctx, Submit (chunks classified in userspace, >64 IBs split, fence on
+the last), WaitSeq loops over the 2 s kernel wait, GEM_METADATA/GEM_OP and
+ctx pstate in Mesa, memory info and GB_ADDR_CONFIG from the kernel, the
+-errno mapping (Timeout -> -ETIME, Aborted -> -ECANCELED).  The syncobj
+provider now signals from kernel seqnos (WAIT_FOR_SUBMIT semantics, clone
+shares the handle space, DRM-style -1/errno).  RADV_DARWIN_MOCK=1 runs the
+contract's selectors in process for host-side end-to-end tests; the ABI
+header is the kext builder's, byte for byte.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ include/darwin/navi48_native_abi.h            | 183 +++++
+ src/amd/common/ac_linux_drm.c                 |   5 +
+ src/amd/common/darwin/ac_darwin_drm.c         | 684 +++++++++++++++---
+ src/amd/common/darwin/ac_darwin_drm.h         |  31 +-
+ src/amd/common/darwin/ac_darwin_iokit.c       | 112 +++
+ src/amd/common/darwin/ac_darwin_kext.c        | 542 ++++++++++++++
+ src/amd/common/darwin/ac_darwin_kext.h        | 163 +++++
+ src/amd/common/darwin/ac_darwin_mock.c        | 600 +++++++++++++++
+ src/amd/common/darwin/ac_darwin_sync.c        | 425 +++++++++--
+ src/amd/common/darwin/test/acd_kext_test.c    | 362 +++++++++
+ src/amd/common/meson.build                    |   4 +
+ src/amd/vulkan/meson.build                    |   2 +-
+ src/amd/vulkan/radv_physical_device.c         |  15 +-
+ src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c |   5 +
+ 14 files changed, 2946 insertions(+), 187 deletions(-)
+ create mode 100644 include/darwin/navi48_native_abi.h
+ create mode 100644 src/amd/common/darwin/ac_darwin_iokit.c
+ create mode 100644 src/amd/common/darwin/ac_darwin_kext.c
+ create mode 100644 src/amd/common/darwin/ac_darwin_kext.h
+ create mode 100644 src/amd/common/darwin/ac_darwin_mock.c
+ create mode 100644 src/amd/common/darwin/test/acd_kext_test.c
+
+diff --git a/include/darwin/navi48_native_abi.h b/include/darwin/navi48_native_abi.h
+new file mode 100644
+index 00000000000..9ffedc2253f
+--- /dev/null
++++ b/include/darwin/navi48_native_abi.h
+@@ -0,0 +1,183 @@
++/*
++ * Navi48NativeABI.h - the user-client ABI of the native stack (kext 0.0.601, native step S1c).
++ *
++ * ONE plain-C header shared by three consumers: the kext (Navi48NativeClient), the Mesa Darwin backend
++ * (copied byte for byte to mesa-mac/include/darwin/navi48_native_abi.h) and the PC test tools
++ * (tools/native/n48native.c, s1d_replay.c). The contract is notes/design/NATIVE-S1C-ABI.md: where this
++ * file and the contract disagree, the contract wins (and this file is the bug).
++ *
++ * Transport: IOServiceOpen(svc, task, N48N_UC_TYPE, &conn), then IOConnectCallMethod(conn, selector, ...).
++ * Scalars are uint64_t, at most 16 each way. Every struct input is at most 4096 bytes and arrives inline.
++ * Every reserved field must be 0. Little-endian, natural alignment, no packing.
++ * CPU map of a BO: IOConnectMapMemory64(conn, memoryType = BO handle, ...).
++ *
++ * Only stdint.h is needed; the same text compiles as C11 and as C++11.
++ */
++#ifndef NAVI48_NATIVE_ABI_H
++#define NAVI48_NATIVE_ABI_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++#define N48N_STATIC_ASSERT(c, m) static_assert(c, m)
++#else
++#define N48N_STATIC_ASSERT(c, m) _Static_assert(c, m)
++#endif
++
++#define N48N_UC_TYPE       0x4E34384Eu      /* 'N48N' */
++#define N48N_ABI_VERSION   1u
++#define N48N_MAX_IBS       64u
++#define N48N_MAX_BOS       4096u            /* handles 1..4095; 0 is never valid */
++#define N48N_MAX_CTX       64u              /* ids 1..64 */
++#define N48N_FENCE_SLOTS   16u
++#define N48N_WAIT_CAP_NS   2000000000ull
++#define N48N_SEQ_LAST      0xFFFFFFFFFFFFFFFFull   /* WaitSeq: "last emitted at entry" */
++
++/* ---- selectors of the native client (own numbering; type 0 is the legacy Navi48UserClient) ---------------- */
++enum {
++    N48N_SEL_HELLO     = 0,   /* in: [0] client ABI (=1) [1] flags (0)          out: [0] kernel ABI [1] kext build [2] max IBs [3] vmid */
++    N48N_SEL_QUERYINFO = 1,   /* struct out: n48n_info (192 B) */
++    N48N_SEL_READREGS  = 2,   /* in: [0] ABSOLUTE dword offset (RREG32) [1] count 1..16 [2] instance (0xFFFFFFFF)   struct out: uint32_t[count] */
++    N48N_SEL_BOCREATE  = 3,   /* struct in: n48n_gem_create_in (32 B)   out: [0] handle [1] size [2] placed domain [3] placement bits */
++    N48N_SEL_BOFREE    = 4,   /* in: [0] handle */
++    N48N_SEL_GEMVA     = 5,   /* struct in: n48n_gem_va (64 B) */
++    N48N_SEL_CTX       = 6,   /* struct in: n48n_ctx (16 B)   struct out: n48n_ctx (16 B) */
++    N48N_SEL_SUBMIT    = 7,   /* struct in: n48n_cs_in (32 + 32*n B)   out: [0] seqno */
++    N48N_SEL_WAITSEQ   = 8,   /* in: [0] seqno [1] timeout ns (relative) [2] ctx id (ignored)   out: [0] busy [1] retired [2] emitted */
++    N48N_SEL_COUNT     = 9
++};
++
++/* ---- the drm values the kernel interprets (identical to include/drm-uapi/amdgpu_drm.h) ----------------------- */
++#define N48N_GEM_DOMAIN_CPU        0x1u
++#define N48N_GEM_DOMAIN_GTT        0x2u
++#define N48N_GEM_DOMAIN_VRAM       0x4u
++#define N48N_GEM_DOMAIN_GDS        0x8u
++#define N48N_GEM_DOMAIN_GWS        0x10u
++#define N48N_GEM_DOMAIN_OA         0x20u
++#define N48N_GEM_DOMAIN_DOORBELL   0x40u
++
++#define N48N_GEM_CPU_ACCESS_REQUIRED (1ull << 0)
++#define N48N_GEM_NO_CPU_ACCESS       (1ull << 1)
++#define N48N_GEM_CPU_GTT_USWC        (1ull << 2)
++#define N48N_GEM_VRAM_CLEARED        (1ull << 3)
++#define N48N_GEM_VRAM_CONTIGUOUS     (1ull << 5)
++#define N48N_GEM_VM_ALWAYS_VALID     (1ull << 6)
++#define N48N_GEM_EXPLICIT_SYNC       (1ull << 7)
++#define N48N_GEM_CP_MQD_GFX9         (1ull << 8)    /* refused */
++#define N48N_GEM_ENCRYPTED           (1ull << 10)   /* refused */
++#define N48N_GEM_PREEMPTIBLE         (1ull << 11)   /* refused */
++#define N48N_GEM_DISCARDABLE         (1ull << 12)
++#define N48N_GEM_UNCACHED            (1ull << 14)   /* forces MTYPE UC in the PTE */
++#define N48N_GEM_GFX12_DCC           (1ull << 16)   /* ignored: no DCC PTE bit in S1c */
++#define N48N_GEM_VIRTIO_SHARED       (1ull << 31)   /* Mesa-internal flag, ignored */
++
++#define N48N_VA_OP_MAP        1u
++#define N48N_VA_OP_UNMAP      2u
++#define N48N_VA_OP_CLEAR      3u    /* Unsupported */
++#define N48N_VA_OP_REPLACE    4u    /* Unsupported */
++
++#define N48N_VM_DELAY_UPDATE  (1u << 0)
++#define N48N_VM_PAGE_READABLE (1u << 1)
++#define N48N_VM_PAGE_WRITEABLE (1u << 2)
++#define N48N_VM_PAGE_EXECUTABLE (1u << 3)
++#define N48N_VM_PAGE_PRT      (1u << 4)     /* Unsupported */
++#define N48N_VM_MTYPE_MASK    (0xfu << 5)
++#define N48N_VM_MTYPE_DEFAULT (0u << 5)
++#define N48N_VM_MTYPE_NC      (1u << 5)
++#define N48N_VM_MTYPE_WC      (2u << 5)
++#define N48N_VM_MTYPE_CC      (3u << 5)
++#define N48N_VM_MTYPE_UC      (4u << 5)
++#define N48N_VM_MTYPE_RW      (5u << 5)
++#define N48N_VM_PAGE_NOALLOC  (1u << 9)
++
++#define N48N_CTX_OP_ALLOC         1u
++#define N48N_CTX_OP_FREE          2u
++#define N48N_CTX_OP_QUERY_STATE2  4u
++#define N48N_CTX_QUERY2_RESET     (1ull << 0)
++#define N48N_CTX_QUERY2_GUILTY    (1ull << 2)
++
++#define N48N_HW_IP_GFX            0u
++#define N48N_IB_FLAG_CE                  (1u << 0)   /* Unsupported */
++#define N48N_IB_FLAG_PREAMBLE            (1u << 1)   /* accepted, ignored: a preamble is always executed */
++#define N48N_IB_FLAG_PREEMPT             (1u << 2)   /* accepted, ignored */
++#define N48N_IB_FLAG_TC_WB_NOT_INVALIDATE (1u << 3) /* accepted, ignored */
++#define N48N_IB_FLAG_RESET_GDS_MAX_WAVE_ID (1u << 4) /* Unsupported */
++#define N48N_IB_FLAG_SECURE              (1u << 5)   /* Unsupported */
++#define N48N_IB_FLAG_EMIT_MEM_SYNC       (1u << 6)   /* Unsupported */
++
++#define N48N_CS_HAS_FENCE  (1u << 0)
++
++/* ---- structs (every one layout-identical to its drm twin; sizes asserted below) ------------------------------ */
++
++/* == struct drm_amdgpu_gem_create_in, 32 B */
++struct n48n_gem_create_in { uint64_t bo_size, alignment, domains, domain_flags; };
++
++/* == struct drm_amdgpu_gem_va, 64 B. Timeline/syncobj fields must be 0 (Mesa consumes them). */
++struct n48n_gem_va {
++    uint32_t handle, _pad, operation, flags;                /* 0,4,8,12 */
++    uint64_t va_address, offset_in_bo, map_size;            /* 16,24,32 */
++    uint64_t vm_timeline_point;                             /* 40 */
++    uint32_t vm_timeline_syncobj_out, num_syncobj_handles;  /* 48,52 */
++    uint64_t input_fence_syncobj_handles;                   /* 56 */
++};
++
++/* == union drm_amdgpu_ctx, 16 B: in = {op, flags, ctx_id, priority}; out overlays it */
++struct n48n_ctx { uint32_t op, flags, ctx_id; int32_t priority; };
++/* out: ALLOC -> dword0 = ctx_id, dword1 = 0;  QUERY_STATE2 -> qword0 = N48N_CTX_QUERY2_*, dwords 2,3 = 0 */
++
++/* == struct drm_amdgpu_cs_chunk_ib, 32 B */
++struct n48n_cs_ib { uint32_t _pad, flags; uint64_t va_start; uint32_t ib_bytes, ip_type, ip_instance, ring; };
++
++/* Submit header, 32 B, followed by num_ibs x n48n_cs_ib. structureInputSize must be 32 + 32*num_ibs. */
++struct n48n_cs_in {
++    uint32_t abi;             /* 0: = N48N_ABI_VERSION */
++    uint32_t ctx_id;          /* 4: from Ctx ALLOC */
++    uint32_t num_ibs;         /* 8: 1..64, executed in array order */
++    uint32_t flags;           /* 12: bit0 N48N_CS_HAS_FENCE; other bits 0 */
++    uint32_t fence_handle;    /* 16: == drm_amdgpu_cs_chunk_fence.handle (BO handle) */
++    uint32_t fence_offset;    /* 20: == .offset, in BYTES (Mesa already multiplies by 8), 8-aligned */
++    uint64_t reserved;        /* 24: 0 */
++    /* struct n48n_cs_ib ibs[num_ibs]; at 32 */
++};
++
++struct n48n_info {                 /* 192 B */
++    uint32_t abi_version, kext_build, flags, vmid;              /* 0,4,8,12  flags: N48N_INFO_* */
++    uint32_t gb_addr_config, gc_version, ring_size_dw, max_ibs; /* 16..28: live GB_ADDR_CONFIG; (maj<<16)|(min<<8)|rev */
++    uint64_t vram_vis_total, vram_vis_free;                     /* 32,40: BAR0-visible pool */
++    uint64_t vram_hi_total, vram_hi_free;                       /* 48,56: pool above BAR0 */
++    uint64_t gtt_cap, gtt_used, gtt_max_bo;                     /* 64,72,80 */
++    uint64_t pt_cap, pt_used;                                   /* 88,96: page-table bytes, this client */
++    uint64_t seq_emitted, seq_retired;                          /* 104,112 */
++    uint64_t va_low_first, va_low_last;                         /* 120,128: 0x10000, 0x7FFFFFFFFFFF */
++    uint64_t va_high_first, va_high_last;                       /* 136,144: 0xFFFF800000000000, 0xFFFFFFFFFFFFFFFF */
++    uint32_t max_bos, fence_slots;                              /* 152,156 */
++    uint32_t reserved[8];                                       /* 160..191 */
++};
++#define N48N_INFO_HUNG          (1u << 0)
++#define N48N_INFO_S1B_POSITIVE  (1u << 1)
++#define N48N_INFO_NATIVE_BOOT   (1u << 2)
++/* BoCreate scalar out [3] */
++#define N48N_PLACED_CPU_MAPPABLE (1u << 0)
++#define N48N_PLACED_ZEROED       (1u << 1)
++#define N48N_PLACED_HI_POOL      (1u << 2)
++
++N48N_STATIC_ASSERT(sizeof(struct n48n_gem_create_in) == 32, "n48n_gem_create_in is 32 B");
++N48N_STATIC_ASSERT(sizeof(struct n48n_gem_va) == 64, "n48n_gem_va is 64 B");
++N48N_STATIC_ASSERT(sizeof(struct n48n_ctx) == 16, "n48n_ctx is 16 B");
++N48N_STATIC_ASSERT(sizeof(struct n48n_cs_ib) == 32, "n48n_cs_ib is 32 B");
++N48N_STATIC_ASSERT(sizeof(struct n48n_cs_in) == 32, "n48n_cs_in header is 32 B");
++N48N_STATIC_ASSERT(sizeof(struct n48n_info) == 192, "n48n_info is 192 B");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_gem_va, va_address) == 16, "gem_va.va_address at 16");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_gem_va, vm_timeline_point) == 40, "gem_va.vm_timeline_point at 40");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_gem_va, input_fence_syncobj_handles) == 56, "gem_va.input_fence_syncobj_handles at 56");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_cs_ib, va_start) == 8, "cs_ib.va_start at 8");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_cs_ib, ib_bytes) == 16, "cs_ib.ib_bytes at 16");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_cs_in, reserved) == 24, "cs_in.reserved at 24");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_info, vram_vis_total) == 32, "info.vram_vis_total at 32");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_info, gtt_cap) == 64, "info.gtt_cap at 64");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_info, seq_emitted) == 104, "info.seq_emitted at 104");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_info, va_low_first) == 120, "info.va_low_first at 120");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_info, max_bos) == 152, "info.max_bos at 152");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_info, reserved) == 160, "info.reserved at 160");
++
++#endif /* NAVI48_NATIVE_ABI_H */
+diff --git a/src/amd/common/ac_linux_drm.c b/src/amd/common/ac_linux_drm.c
+index 080976ab733..dbe4c8efc63 100644
+--- a/src/amd/common/ac_linux_drm.c
++++ b/src/amd/common/ac_linux_drm.c
+@@ -288,7 +288,12 @@ int ac_drm_bo_wait_for_idle(ac_drm_device *dev, ac_drm_bo bo, uint64_t timeout_n
+ int ac_drm_bo_va_op(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset, uint64_t size,
+                     uint64_t addr, uint64_t flags, uint32_t ops)
+ {
++#ifdef HAVE_AMDGPU_DARWIN
++   /* GPU VA granularity is 4 KiB; the CPU page size is 16 KiB on Apple Silicon (arm64 mock runs). */
++   size = align64(size, 4096);
++#else
+    size = align64(size, getpagesize());
++#endif
+ 
+    return ac_drm_bo_va_op_raw(
+       dev, bo_handle, offset, size, addr,
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+index 9815937af3e..7aeb3cece7d 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -5,8 +5,10 @@
+  */
+ 
+ #include "ac_darwin_drm.h"
++#include "ac_darwin_kext.h"
+ 
+ #include <errno.h>
++#include <pthread.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -16,6 +18,7 @@
+ #include "util/macros.h"
+ #include "util/u_math.h"
+ #include "util/u_sync_provider.h"
++#include "drm-uapi/drm.h"
+ 
+ /* Kernel-facing DRM version reported to RADV: the minimum the amdgpu winsys
+  * accepts (ac_query_gpu_info refuses anything older). */
+@@ -25,26 +28,55 @@
+ /* amdgpu.ids: 7550,C0 */
+ #define ACD_MARKETING_NAME "AMD Radeon RX 9070 XT"
+ 
+-/* S1a stand-in: with RADV_DARWIN_HOST_BO=1 a BO is anonymous host memory and
+- * GEM_VA / GEM_WAIT_IDLE succeed without touching a GPU, so vkCreateDevice can
+- * get past RADV's own BO allocations and reach the first real kernel stub (CS
+- * submit).  Without it every BO call is a kernel stub.  Nothing here is GPU
+- * visible; S1c replaces it with kext-backed BOs. */
++#define ACD_METADATA_MAX 256
++/* How long a submit blocks on a dependency that was never submitted (WAIT_FOR_SUBMIT). */
++#define ACD_CS_DEP_TIMEOUT_NS (60ull * 1000000000ull)
++
++/* A BO is a kext handle plus what only Mesa keeps: the create args, a cached CPU map
++ * and the metadata blob (GEM_METADATA never reaches the kernel).  In the HOST_BO
++ * stand-in the memory is anonymous host memory and there is no kext. */
+ struct amdgpu_bo {
+    uint64_t size;
+    uint32_t handle;
++   uint32_t placed_domain;
++   uint32_t placed_bits;
++   struct n48n_gem_create_in create;
+    void *cpu;
++   size_t cpu_size;
++   uint32_t cpu_refs;
++   bool host; /* HOST_BO stand-in memory */
++   uint64_t meta_flags, meta_tiling;
++   uint32_t meta_size;
++   uint8_t meta[ACD_METADATA_MAX];
++};
++
++/* Everything that belongs to the ONE native kext client of this process: the connection, the VA space
++ * (the kernel has one page-table tree per client), the BO table and the syncobj handle space.  Several
++ * acd_devices (RADV's throw-away device for the physical-device query, vulkaninfo's second VkDevice, ...)
++ * share one core, so the kext's one-client rule (contract D4) never trips inside a process.  The last
++ * device to go closes the connection. */
++struct acd_core {
++   int refcount;
++   bool shared; /* the process-wide core (false: the private HOST_BO stand-in core) */
++   struct acd_kext *kext; /* NULL in the HOST_BO stand-in */
++   struct amdgpu_va_manager *va_mgr;
++   struct util_sync_provider *sync; /* master; every device holds a clone */
++   pthread_mutex_t bo_lock;
++   struct amdgpu_bo *bos[N48N_MAX_BOS]; /* by kext handle */
+ };
+ 
+ struct acd_device {
+-   bool host_bo;
++   bool host_bo; /* S1a stand-in */
+    uint32_t next_bo_handle;
+    const struct amdgpu_device *canned;
+-   struct amdgpu_va_manager *va_mgr;
+-   struct util_sync_provider *sync;
++   struct acd_core *core;
++   struct util_sync_provider *sync; /* this device's clone of core->sync */
+    uint32_t next_ctx_id;
+ };
+ 
++static pthread_mutex_t g_core_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct acd_core *g_core;
++
+ #define ACD_KERNEL_STUB(what)                                                                     \
+    do {                                                                                           \
+       fprintf(stderr, "radv-darwin: kernel stub '%s' -> -ENODEV (no kernel driver, S1a)\n", what); \
+@@ -61,6 +93,147 @@ find_canned(const char *name)
+    return NULL;
+ }
+ 
++/* kext wait callback for the sync provider: -ETIME from the kernel means "hung". */
++static int
++acd_backend_wait_seq(void *ctx, uint64_t seq, uint64_t rel_ns, bool *busy, uint64_t *retired)
++{
++   struct acd_wait_status st = {0};
++   int r = acd_kext_wait_seq(ctx, seq, rel_ns, busy, &st);
++   if (!r)
++      *retired = st.retired;
++   return r;
++}
++
++static bool
++env_is_1(const char *name)
++{
++   const char *v = getenv(name);
++   return v && v[0] == '1';
++}
++
++/* Hello, live checks and the info snapshot; every failure is one clear stderr line. */
++static int
++acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned)
++{
++   struct acd_hello h;
++   int r = acd_kext_hello(kext, &h);
++   if (r) {
++      fprintf(stderr, "radv-darwin: native kext Hello failed (%d %s): the kext refused native mode "
++                      "(ABI mismatch, S1b gate not passed, device lost earlier, or not root)\n",
++              r, strerror(-r));
++      return r < 0 ? r : -ENODEV;
++   }
++   if (h.abi != N48N_ABI_VERSION) {
++      fprintf(stderr, "radv-darwin: kext ABI %u != Mesa ABI %u\n", h.abi, N48N_ABI_VERSION);
++      return -ENODEV;
++   }
++   if (h.max_ibs != N48N_MAX_IBS || h.vmid != 8)
++      fprintf(stderr, "radv-darwin: note: kext reports max_ibs %u vmid %u (contract: %u / 8)\n", h.max_ibs, h.vmid,
++              N48N_MAX_IBS);
++
++   struct n48n_info info;
++   r = acd_kext_query_info(kext, &info);
++   if (r) {
++      fprintf(stderr, "radv-darwin: QueryInfo failed: %d\n", r);
++      return r;
++   }
++
++   /* GB_ADDR_CONFIG: the tiling layout the canned info and S1d's image assume. */
++   uint32_t gb = 0;
++   r = acd_kext_read_regs(kext, ACD_GB_ADDR_CONFIG_REG, 1, &gb);
++   if (r) {
++      fprintf(stderr, "radv-darwin: ReadRegs(GB_ADDR_CONFIG) failed: %d\n", r);
++      return r;
++   }
++   if (gb != ACD_GB_ADDR_CONFIG_GFX1201 && !env_is_1("RADV_DARWIN_ALLOW_ADDRCFG")) {
++      fprintf(stderr, "radv-darwin: live GB_ADDR_CONFIG 0x%08x != canned gfx1201 0x%08x (set "
++                      "RADV_DARWIN_ALLOW_ADDRCFG=1 to override)\n",
++              gb, ACD_GB_ADDR_CONFIG_GFX1201);
++      return -ENODEV;
++   }
++
++   /* The canned VA ranges must lie inside the kernel's. */
++   const struct drm_amdgpu_info_device *di = &canned->dev;
++   if (di->virtual_address_offset < info.va_low_first || di->virtual_address_max - 1 > info.va_low_last ||
++       (di->high_va_offset &&
++        (di->high_va_offset < info.va_high_first || di->high_va_max - 1 > info.va_high_last))) {
++      fprintf(stderr, "radv-darwin: canned VA ranges [0x%llx,0x%llx) [0x%llx,0x%llx) are not inside the kernel's "
++                      "[0x%llx,0x%llx] [0x%llx,0x%llx]\n",
++              (unsigned long long)di->virtual_address_offset, (unsigned long long)di->virtual_address_max,
++              (unsigned long long)di->high_va_offset, (unsigned long long)di->high_va_max,
++              (unsigned long long)info.va_low_first, (unsigned long long)info.va_low_last,
++              (unsigned long long)info.va_high_first, (unsigned long long)info.va_high_last);
++      return -ENODEV;
++   }
++
++   static bool logged;
++   if (!logged) {
++      logged = true;
++      fprintf(stderr, "radv-darwin: native kext: ABI %u, build %u, VMID %u, max %u IBs/submit, GB_ADDR_CONFIG "
++                      "0x%08x, VRAM %llu MiB visible + %llu MiB hi, GTT cap %llu MiB\n",
++              h.abi, h.build, h.vmid, h.max_ibs, gb, (unsigned long long)(info.vram_vis_total >> 20),
++              (unsigned long long)(info.vram_hi_total >> 20), (unsigned long long)(info.gtt_cap >> 20));
++   }
++   return 0;
++}
++
++/* Builds the core: connection (unless the HOST_BO stand-in), handshake, VA manager, master provider. */
++static int
++acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_core **out)
++{
++   struct acd_core *c = calloc(1, sizeof(*c));
++   if (!c)
++      return -ENOMEM;
++   pthread_mutex_init(&c->bo_lock, NULL);
++   c->refcount = 1;
++
++   if (!host_bo) {
++      int r = acd_kext_open(&c->kext);
++      if (r == 0)
++         r = acd_native_handshake(c->kext, canned);
++      if (r) {
++         acd_kext_destroy(c->kext);
++         pthread_mutex_destroy(&c->bo_lock);
++         free(c);
++         return r;
++      }
++   }
++
++   const struct acd_sync_backend be = {.wait_seq = acd_backend_wait_seq, .ctx = c->kext};
++   c->sync = acd_sync_provider_create(c->kext ? &be : NULL);
++   c->va_mgr = amdgpu_va_manager_alloc();
++   if (!c->sync || !c->va_mgr) {
++      free(c->va_mgr);
++      if (c->sync)
++         c->sync->finalize(c->sync);
++      acd_kext_destroy(c->kext);
++      pthread_mutex_destroy(&c->bo_lock);
++      free(c);
++      return -ENOMEM;
++   }
++
++   const struct drm_amdgpu_info_device *di = &canned->dev;
++   /* gfx12: RADV needs half of the VA range reserved for PRT, as on Linux. */
++   amdgpu_va_manager_init2(c->va_mgr, di->virtual_address_offset, di->virtual_address_max, di->high_va_offset,
++                           di->high_va_max, di->virtual_address_alignment, AMDGPU_VA_MGR_RESERVE_HALF_VA_FOR_PRT);
++   *out = c;
++   return 0;
++}
++
++static void
++acd_core_destroy(struct acd_core *c)
++{
++   amdgpu_va_manager_deinit(c->va_mgr);
++   free(c->va_mgr);
++   /* BOs RADV leaked: the kext frees them at close; only the Mesa side is released here. */
++   for (uint32_t i = 0; i < N48N_MAX_BOS; i++)
++      free(c->bos[i]);
++   acd_kext_destroy(c->kext); /* IOServiceClose */
++   c->sync->finalize(c->sync); /* clones keep the syncobj state alive as long as they need it */
++   pthread_mutex_destroy(&c->bo_lock);
++   free(c);
++}
++
+ int
+ acd_device_initialize(uint32_t *drm_major, uint32_t *drm_minor, acd_device_handle *out)
+ {
+@@ -74,24 +247,37 @@ acd_device_initialize(uint32_t *drm_major, uint32_t *drm_minor, acd_device_handl
+       return -ENODEV;
+    }
+ 
+-   dev->sync = acd_sync_provider_create();
+-   dev->va_mgr = amdgpu_va_manager_alloc();
+-   if (!dev->sync || !dev->va_mgr) {
+-      free(dev->va_mgr);
+-      if (dev->sync)
+-         dev->sync->finalize(dev->sync);
++   const bool mock = env_is_1("RADV_DARWIN_MOCK");
++   dev->host_bo = env_is_1("RADV_DARWIN_HOST_BO") && !mock;
++
++   int r = 0;
++   if (dev->host_bo) {
++      r = acd_core_create(dev->canned, true, &dev->core); /* private, no kext */
++   } else {
++      pthread_mutex_lock(&g_core_lock);
++      if (g_core) {
++         g_core->refcount++;
++         dev->core = g_core;
++      } else {
++         r = acd_core_create(dev->canned, false, &g_core);
++         if (r == 0) {
++            g_core->shared = true;
++            dev->core = g_core;
++         }
++      }
++      pthread_mutex_unlock(&g_core_lock);
++   }
++   if (r) {
+       free(dev);
+-      return -ENOMEM;
++      return r;
+    }
+ 
+-   const struct drm_amdgpu_info_device *di = &dev->canned->dev;
+-   /* gfx12: RADV needs half of the VA range reserved for PRT, as on Linux. */
+-   amdgpu_va_manager_init2(dev->va_mgr, di->virtual_address_offset, di->virtual_address_max,
+-                           di->high_va_offset, di->high_va_max, di->virtual_address_alignment,
+-                           AMDGPU_VA_MGR_RESERVE_HALF_VA_FOR_PRT);
++   dev->sync = dev->core->sync->clone(dev->core->sync);
++   if (!dev->sync) {
++      acd_device_deinitialize(dev);
++      return -ENOMEM;
++   }
+ 
+-   const char *host_bo = getenv("RADV_DARWIN_HOST_BO");
+-   dev->host_bo = host_bo && host_bo[0] == '1';
+    dev->next_bo_handle = 1;
+    dev->next_ctx_id = 1;
+    *drm_major = ACD_DRM_MAJOR;
+@@ -103,9 +289,20 @@ acd_device_initialize(uint32_t *drm_major, uint32_t *drm_minor, acd_device_handl
+ void
+ acd_device_deinitialize(acd_device_handle dev)
+ {
+-   amdgpu_va_manager_deinit(dev->va_mgr);
+-   free(dev->va_mgr);
+-   /* dev->sync is finalized by ac_drm_device_deinitialize() */
++   /* dev->sync is finalized by ac_drm_device_deinitialize() (only reached here directly on the failure path) */
++   struct acd_core *c = dev->core;
++   bool last;
++   if (c->shared) {
++      pthread_mutex_lock(&g_core_lock);
++      last = --c->refcount == 0;
++      if (last)
++         g_core = NULL;
++      pthread_mutex_unlock(&g_core_lock);
++   } else {
++      last = true;
++   }
++   if (last)
++      acd_core_destroy(c);
+    free(dev);
+ }
+ 
+@@ -130,7 +327,7 @@ acd_query_sw_info(acd_device_handle dev, enum amdgpu_sw_info info, void *value)
+                                                              : dev->canned->dev.virtual_address_offset) >> 32;
+       return 0;
+    case amdgpu_sw_info_address_prt_wa_control_bit:
+-      return amdgpu_va_manager_query_sw_info(dev->va_mgr, amdgpu_va_manager_sw_info_address_prt_wa_control_bit,
++      return amdgpu_va_manager_query_sw_info(dev->core->va_mgr, amdgpu_va_manager_sw_info_address_prt_wa_control_bit,
+                                              value);
+    }
+    return -EINVAL;
+@@ -141,7 +338,7 @@ acd_va_range_alloc(acd_device_handle dev, enum amdgpu_gpu_va_range va_range_type
+                    uint64_t va_base_alignment, uint64_t va_base_required, uint64_t *va_base_allocated,
+                    amdgpu_va_handle *va_range_handle, uint64_t flags)
+ {
+-   return amdgpu_va_range_alloc2(dev->va_mgr, va_range_type, size, va_base_alignment, va_base_required,
++   return amdgpu_va_range_alloc2(dev->core->va_mgr, va_range_type, size, va_base_alignment, va_base_required,
+                                  va_base_allocated, va_range_handle, flags);
+ }
+ 
+@@ -179,6 +376,48 @@ info_read_mmr_reg(const struct amdgpu_device *d, uint32_t reg, uint32_t count, u
+    }
+ }
+ 
++/* AMDGPU_INFO_MEMORY and the usage queries come from the kernel (contract section 7). */
++static int
++acd_info_memory(struct acd_device *dev, const struct drm_amdgpu_info *info, void *out)
++{
++   struct n48n_info k;
++   int r = acd_kext_query_info(dev->core->kext, &k);
++   if (r)
++      return r;
++
++   const uint64_t vram_total = k.vram_vis_total + k.vram_hi_total;
++   const uint64_t vram_free = k.vram_vis_free + k.vram_hi_free;
++   switch (info->query) {
++   case AMDGPU_INFO_VRAM_USAGE:
++      *(uint64_t *)out = vram_total - vram_free;
++      return 0;
++   case AMDGPU_INFO_VIS_VRAM_USAGE:
++      *(uint64_t *)out = k.vram_vis_total - k.vram_vis_free;
++      return 0;
++   case AMDGPU_INFO_GTT_USAGE:
++      *(uint64_t *)out = k.gtt_used;
++      return 0;
++   default:
++      break;
++   }
++
++   struct drm_amdgpu_memory_info *m = out;
++   memset(m, 0, sizeof(*m));
++   m->vram.total_heap_size = vram_total;
++   m->vram.usable_heap_size = vram_total;
++   m->vram.heap_usage = vram_total - vram_free;
++   m->vram.max_allocation = k.vram_vis_total * 3 / 4;
++   m->cpu_accessible_vram.total_heap_size = k.vram_vis_total;
++   m->cpu_accessible_vram.usable_heap_size = k.vram_vis_total;
++   m->cpu_accessible_vram.heap_usage = k.vram_vis_total - k.vram_vis_free;
++   m->cpu_accessible_vram.max_allocation = k.vram_vis_total * 3 / 4;
++   m->gtt.total_heap_size = k.gtt_cap;
++   m->gtt.usable_heap_size = k.gtt_cap;
++   m->gtt.heap_usage = k.gtt_used;
++   m->gtt.max_allocation = k.gtt_max_bo;
++   return 0;
++}
++
+ static int
+ acd_info(struct acd_device *dev, const struct drm_amdgpu_info *info)
+ {
+@@ -213,21 +452,30 @@ acd_info(struct acd_device *dev, const struct drm_amdgpu_info *info)
+    case AMDGPU_INFO_DEV_INFO:
+       *(struct drm_amdgpu_info_device *)out = d->dev;
+       return 0;
+-   case AMDGPU_INFO_MEMORY: {
+-      struct drm_amdgpu_memory_info *m = out;
+-      *m = d->mem;
+-      /* as drm-shim: keep only total_heap_size, no usage */
+-      m->vram.usable_heap_size = m->vram.total_heap_size;
+-      m->vram.heap_usage = 0;
+-      m->vram.max_allocation = m->vram.total_heap_size * 3 / 4;
+-      m->cpu_accessible_vram.usable_heap_size = m->cpu_accessible_vram.total_heap_size;
+-      m->cpu_accessible_vram.heap_usage = 0;
+-      m->cpu_accessible_vram.max_allocation = m->cpu_accessible_vram.total_heap_size * 3 / 4;
+-      m->gtt.usable_heap_size = m->gtt.total_heap_size;
+-      m->gtt.heap_usage = 0;
+-      m->gtt.max_allocation = m->gtt.total_heap_size * 3 / 4;
+-      return 0;
+-   }
++   case AMDGPU_INFO_MEMORY:
++      if (dev->core->kext)
++         return acd_info_memory(dev, info, out);
++      {
++         struct drm_amdgpu_memory_info *m = out;
++         *m = d->mem;
++         /* as drm-shim: keep only total_heap_size, no usage */
++         m->vram.usable_heap_size = m->vram.total_heap_size;
++         m->vram.heap_usage = 0;
++         m->vram.max_allocation = m->vram.total_heap_size * 3 / 4;
++         m->cpu_accessible_vram.usable_heap_size = m->cpu_accessible_vram.total_heap_size;
++         m->cpu_accessible_vram.heap_usage = 0;
++         m->cpu_accessible_vram.max_allocation = m->cpu_accessible_vram.total_heap_size * 3 / 4;
++         m->gtt.usable_heap_size = m->gtt.total_heap_size;
++         m->gtt.heap_usage = 0;
++         m->gtt.max_allocation = m->gtt.total_heap_size * 3 / 4;
++         return 0;
++      }
++   case AMDGPU_INFO_VRAM_USAGE:
++   case AMDGPU_INFO_VIS_VRAM_USAGE:
++   case AMDGPU_INFO_GTT_USAGE:
++      if (dev->core->kext)
++         return acd_info_memory(dev, info, out);
++      return -EINVAL;
+    case AMDGPU_INFO_VIDEO_CAPS:
+       return 0;
+    default:
+@@ -236,8 +484,182 @@ acd_info(struct acd_device *dev, const struct drm_amdgpu_info *info)
+    }
+ }
+ 
++/* ---- BO table (handle -> Mesa-side state) ---- */
++
++static struct amdgpu_bo *
++bo_lookup(struct acd_device *dev, uint32_t handle)
++{
++   struct amdgpu_bo *b = NULL;
++   if (handle && handle < N48N_MAX_BOS) {
++      pthread_mutex_lock(&dev->core->bo_lock);
++      b = dev->core->bos[handle];
++      pthread_mutex_unlock(&dev->core->bo_lock);
++   }
++   return b;
++}
++
+ /* ---- DRM_AMDGPU_* command emulation ---- */
+ 
++static int
++acd_cmd_gem_va(struct acd_device *dev, struct drm_amdgpu_gem_va *va)
++{
++   /* Mesa consumes the syncobj fields (contract 7): the wait first, the signal after. */
++   if (va->num_syncobj_handles && va->input_fence_syncobj_handles) {
++      int r = dev->sync->wait(dev->sync, (uint32_t *)(uintptr_t)va->input_fence_syncobj_handles,
++                              va->num_syncobj_handles, INT64_MAX,
++                              DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
++      if (r)
++         return -errno; /* provider ops return -1 with errno set */
++   }
++   const uint32_t out_handle = va->vm_timeline_syncobj_out;
++   uint64_t point = va->vm_timeline_point;
++
++   int r = acd_kext_gem_va(dev->core->kext, va);
++   if (r)
++      return r;
++   /* MAP/UNMAP are synchronous in the kernel: the timeline point is already complete. */
++   if (out_handle && dev->sync->timeline_signal(dev->sync, &out_handle, &point, 1))
++      return -errno;
++   return 0;
++}
++
++static int
++acd_cmd_cs(struct acd_device *dev, union drm_amdgpu_cs *cs)
++{
++   const uint32_t ctx_id = cs->in.ctx_id, bo_list = cs->in.bo_list_handle, num_chunks = cs->in.num_chunks;
++   const uint64_t *chunks = (const uint64_t *)(uintptr_t)cs->in.chunks;
++
++   struct acd_cs_plan plan;
++   int r = acd_cs_plan_init(&plan, ctx_id, bo_list, num_chunks, chunks);
++   if (r)
++      return r;
++
++   /* SYNCOBJ_IN / TIMELINE_WAIT: a point backed by a seqno of this client is already ordered on
++    * the one ring; a CPU-signalled one is done; one not yet submitted is waited for on the CPU. */
++   for (uint32_t i = 0; i < plan.n_waits && !r; i++)
++      r = acd_sync_cs_wait_ready(dev->sync, plan.waits[i].handle, plan.waits[i].point, ACD_CS_DEP_TIMEOUT_NS);
++
++   uint64_t seq = 0;
++   if (!r)
++      r = acd_kext_submit(dev->core->kext, &plan, &seq);
++   /* SYNCOBJ_OUT / TIMELINE_SIGNAL: attach the returned seqno to each (handle, point). */
++   for (uint32_t i = 0; i < plan.n_signals && !r; i++)
++      r = acd_sync_cs_attach(dev->sync, plan.signals[i].handle, plan.signals[i].point, seq);
++
++   acd_cs_plan_fini(&plan);
++   if (r)
++      return r;
++   memset(&cs->out, 0, sizeof(cs->out));
++   cs->out.handle = seq;
++   return 0;
++}
++
++static int
++acd_cmd_ctx(struct acd_device *dev, union drm_amdgpu_ctx *args)
++{
++   switch (args->in.op) {
++   case AMDGPU_CTX_OP_GET_STABLE_PSTATE:
++   case AMDGPU_CTX_OP_SET_STABLE_PSTATE:
++      /* Mesa-only no-ops (contract 4.1): never reach the kernel. */
++      memset(&args->out, 0, sizeof(args->out));
++      return 0;
++   case AMDGPU_CTX_OP_ALLOC_CTX:
++   case AMDGPU_CTX_OP_FREE_CTX:
++   case AMDGPU_CTX_OP_QUERY_STATE2: {
++      struct n48n_ctx in, out;
++      memcpy(&in, &args->in, sizeof(in));
++      int r = acd_kext_ctx(dev->core->kext, &in, &out);
++      if (r)
++         return r;
++      memcpy(&args->out, &out, sizeof(out)); /* out overlays in, layouts identical (contract 2.1) */
++      return 0;
++   }
++   default:
++      return -EINVAL;
++   }
++}
++
++static int
++acd_cmd_wait_cs(struct acd_device *dev, union drm_amdgpu_wait_cs *args)
++{
++   /* in.handle: a seqno, 0 = nothing to wait for, ~0 = the newest; ip/ring/ctx are ignored. */
++   const uint64_t seq = args->in.handle, deadline = args->in.timeout;
++   bool busy = false;
++   int r = acd_kext_wait_deadline(dev->core->kext, seq, deadline, &busy);
++   if (r)
++      return r;
++   memset(&args->out, 0, sizeof(args->out));
++   args->out.status = busy;
++   return 0;
++}
++
++static int
++acd_cmd_gem_wait_idle(struct acd_device *dev, union drm_amdgpu_gem_wait_idle *args)
++{
++   /* has_vm_always_valid is always true: BO idle = whole ring idle. */
++   const uint32_t handle = args->in.handle;
++   const uint64_t deadline = args->in.timeout;
++   bool busy = false;
++   int r = acd_kext_wait_deadline(dev->core->kext, N48N_SEQ_LAST, deadline, &busy);
++   if (r)
++      return r;
++   struct amdgpu_bo *bo = bo_lookup(dev, handle);
++   memset(&args->out, 0, sizeof(args->out));
++   args->out.status = busy;
++   args->out.domain = bo ? bo->placed_domain : 0;
++   return 0;
++}
++
++static int
++acd_cmd_gem_metadata(struct acd_device *dev, struct drm_amdgpu_gem_metadata *m)
++{
++   /* Mesa-only (contract 7): SET stores <= 256 B per BO, GET returns it; always succeeds. */
++   struct amdgpu_bo *bo = bo_lookup(dev, m->handle);
++   if (!bo)
++      return -ENOENT;
++   if (m->op == AMDGPU_GEM_METADATA_OP_SET_METADATA) {
++      if (m->data.data_size_bytes > ACD_METADATA_MAX)
++         return -EINVAL;
++      bo->meta_flags = m->data.flags;
++      bo->meta_tiling = m->data.tiling_info;
++      bo->meta_size = m->data.data_size_bytes;
++      memcpy(bo->meta, m->data.data, bo->meta_size);
++      return 0;
++   }
++   if (m->op == AMDGPU_GEM_METADATA_OP_GET_METADATA) {
++      m->data.flags = bo->meta_flags;
++      m->data.tiling_info = bo->meta_tiling;
++      m->data.data_size_bytes = bo->meta_size;
++      memset(m->data.data, 0, sizeof(m->data.data));
++      memcpy(m->data.data, bo->meta, bo->meta_size);
++      return 0;
++   }
++   return -EINVAL;
++}
++
++static int
++acd_cmd_gem_op(struct acd_device *dev, struct drm_amdgpu_gem_op *op)
++{
++   struct amdgpu_bo *bo = bo_lookup(dev, op->handle);
++   if (!bo)
++      return -ENOENT;
++   switch (op->op) {
++   case AMDGPU_GEM_OP_GET_GEM_CREATE_INFO: {
++      /* from the stored create args and the placed size */
++      struct drm_amdgpu_gem_create_in *ci = (struct drm_amdgpu_gem_create_in *)(uintptr_t)op->value;
++      ci->bo_size = bo->size;
++      ci->alignment = bo->create.alignment;
++      ci->domains = bo->create.domains;
++      ci->domain_flags = bo->create.domain_flags;
++      return 0;
++   }
++   case AMDGPU_GEM_OP_SET_PLACEMENT:
++      return 0;
++   default:
++      return -EINVAL;
++   }
++}
++
+ int
+ acd_ioctl(acd_device_handle dev, unsigned cmd_index, void *data, unsigned size)
+ {
+@@ -245,52 +667,60 @@ acd_ioctl(acd_device_handle dev, unsigned cmd_index, void *data, unsigned size)
+    case DRM_AMDGPU_INFO:
+       return acd_info(dev, data);
+ 
+-   case DRM_AMDGPU_CTX: {
+-      /* Userspace-only: RADV's context is an id for the seqno space. */
+-      union drm_amdgpu_ctx *args = data;
+-      switch (args->in.op) {
+-      case AMDGPU_CTX_OP_ALLOC_CTX:
+-         memset(&args->out, 0, sizeof(args->out));
+-         args->out.alloc.ctx_id = dev->next_ctx_id++;
+-         return 0;
+-      case AMDGPU_CTX_OP_FREE_CTX:
+-         return 0;
+-      case AMDGPU_CTX_OP_QUERY_STATE2:
+-         memset(&args->out, 0, sizeof(args->out));
+-         return 0;
+-      case AMDGPU_CTX_OP_GET_STABLE_PSTATE:
+-      case AMDGPU_CTX_OP_SET_STABLE_PSTATE:
+-         memset(&args->out, 0, sizeof(args->out));
+-         return 0;
+-      default:
+-         return -EINVAL;
++   case DRM_AMDGPU_CTX:
++      if (!dev->core->kext) {
++         /* HOST_BO stand-in: RADV's context is an id for the seqno space. */
++         union drm_amdgpu_ctx *args = data;
++         switch (args->in.op) {
++         case AMDGPU_CTX_OP_ALLOC_CTX:
++            memset(&args->out, 0, sizeof(args->out));
++            args->out.alloc.ctx_id = dev->next_ctx_id++;
++            return 0;
++         case AMDGPU_CTX_OP_FREE_CTX:
++            return 0;
++         case AMDGPU_CTX_OP_QUERY_STATE2:
++         case AMDGPU_CTX_OP_GET_STABLE_PSTATE:
++         case AMDGPU_CTX_OP_SET_STABLE_PSTATE:
++            memset(&args->out, 0, sizeof(args->out));
++            return 0;
++         default:
++            return -EINVAL;
++         }
+       }
+-   }
++      return acd_cmd_ctx(dev, data);
+ 
+    case DRM_AMDGPU_VM:
+-      /* The VMID is static per client in the kext design. */
++      /* RESERVE/UNRESERVE_VMID: the VMID is static per client (contract 7). */
+       return 0;
+ 
+    case DRM_AMDGPU_GEM_VA:
+       if (dev->host_bo)
+          return 0;
+-      ACD_KERNEL_STUB("GEM_VA (BO map/unmap)");
++      return acd_cmd_gem_va(dev, data);
+    case DRM_AMDGPU_GEM_METADATA:
+-      ACD_KERNEL_STUB("GEM_METADATA");
++      if (dev->host_bo)
++         ACD_KERNEL_STUB("GEM_METADATA");
++      return acd_cmd_gem_metadata(dev, data);
+    case DRM_AMDGPU_GEM_OP:
+-      ACD_KERNEL_STUB("GEM_OP");
++      if (dev->host_bo)
++         ACD_KERNEL_STUB("GEM_OP");
++      return acd_cmd_gem_op(dev, data);
+    case DRM_AMDGPU_GEM_WAIT_IDLE:
+       if (dev->host_bo)
+          return 0; /* out.status stays 0: idle */
+-      ACD_KERNEL_STUB("GEM_WAIT_IDLE (bo_wait_for_idle)");
++      return acd_cmd_gem_wait_idle(dev, data);
+    case DRM_AMDGPU_CS:
+-      ACD_KERNEL_STUB("CS submit");
++      if (dev->host_bo)
++         ACD_KERNEL_STUB("CS submit");
++      return acd_cmd_cs(dev, data);
+    case DRM_AMDGPU_WAIT_CS:
+-      ACD_KERNEL_STUB("WAIT_CS (fence wait)");
++      if (dev->host_bo)
++         ACD_KERNEL_STUB("WAIT_CS (fence wait)");
++      return acd_cmd_wait_cs(dev, data);
+    case DRM_AMDGPU_USERQ:
+    case DRM_AMDGPU_USERQ_SIGNAL:
+    case DRM_AMDGPU_USERQ_WAIT:
+-      ACD_KERNEL_STUB("userqueue");
++      return -ENODEV; /* contract 7: USERQ* -ENODEV */
+    default:
+       fprintf(stderr, "radv-darwin: unhandled DRM_AMDGPU command %u -> -ENOSYS\n", cmd_index);
+       return -ENOSYS;
+@@ -300,21 +730,50 @@ acd_ioctl(acd_device_handle dev, unsigned cmd_index, void *data, unsigned size)
+ int
+ acd_bo_alloc(acd_device_handle dev, struct amdgpu_bo_alloc_request *req, amdgpu_bo_handle *bo)
+ {
+-   if (!dev->host_bo)
+-      ACD_KERNEL_STUB("BO alloc");
+-
+    struct amdgpu_bo *b = calloc(1, sizeof(*b));
+    if (!b)
+       return -ENOMEM;
+-   uint64_t align = req->phys_alignment > 4096 ? req->phys_alignment : 4096;
+-   uint64_t size = align64(req->alloc_size, 4096);
+-   if (posix_memalign(&b->cpu, align, size)) {
++   b->create = (struct n48n_gem_create_in){.bo_size = req->alloc_size,
++                                           .alignment = req->phys_alignment,
++                                           .domains = req->preferred_heap,
++                                           .domain_flags = req->flags};
++
++   if (dev->host_bo) {
++      uint64_t align = req->phys_alignment > 4096 ? req->phys_alignment : 4096;
++      uint64_t size = align64(req->alloc_size, 4096);
++      if (posix_memalign(&b->cpu, align, size)) {
++         free(b);
++         return -ENOMEM;
++      }
++      memset(b->cpu, 0, size);
++      b->size = size;
++      b->handle = dev->next_bo_handle++;
++      b->host = true;
++      *bo = b;
++      return 0;
++   }
++
++   struct acd_bo_created c;
++   int r = acd_kext_bo_create(dev->core->kext, &b->create, &c);
++   if (r) {
+       free(b);
+-      return -ENOMEM;
++      return r;
++   }
++   b->handle = c.handle;
++   b->size = c.size;
++   b->placed_domain = c.domain;
++   b->placed_bits = c.bits;
++
++   pthread_mutex_lock(&dev->core->bo_lock);
++   const bool dup = dev->core->bos[c.handle] != NULL;
++   if (!dup)
++      dev->core->bos[c.handle] = b;
++   pthread_mutex_unlock(&dev->core->bo_lock);
++   if (dup) {
++      fprintf(stderr, "radv-darwin: kext returned BO handle %u twice\n", c.handle);
++      free(b);
++      return -EIO;
+    }
+-   memset(b->cpu, 0, size);
+-   b->size = size;
+-   b->handle = dev->next_bo_handle++;
+    *bo = b;
+    return 0;
+ }
+@@ -323,49 +782,86 @@ int
+ acd_bo_export(acd_device_handle dev, amdgpu_bo_handle bo, enum amdgpu_bo_handle_type type,
+               uint32_t *shared_handle)
+ {
+-   if (dev->host_bo && (type == amdgpu_bo_handle_type_kms || type == amdgpu_bo_handle_type_kms_noimport)) {
++   /* Only the kms handle (the kext's own BO handle); dma-buf / flink are not available. */
++   if (type == amdgpu_bo_handle_type_kms || type == amdgpu_bo_handle_type_kms_noimport) {
+       *shared_handle = bo->handle;
+       return 0;
+    }
+-   ACD_KERNEL_STUB("BO export");
++   return -ENOSYS;
+ }
+ 
+ int
+ acd_bo_import(acd_device_handle dev, enum amdgpu_bo_handle_type type, uint32_t shared_handle,
+               struct amdgpu_bo_import_result *result)
+ {
+-   ACD_KERNEL_STUB("BO import");
++   return -ENOSYS;
+ }
+ 
+ int
+ acd_bo_free(acd_device_handle dev, amdgpu_bo_handle bo)
+ {
+-   if (!dev->host_bo)
+-      ACD_KERNEL_STUB("BO free");
+-   free(bo->cpu);
++   if (dev->host_bo) {
++      free(bo->cpu);
++      free(bo);
++      return 0;
++   }
++   int r = 0;
++   /* the CPU mapping goes first (contract 3.4); the kext then frees the BO */
++   if (bo->cpu) {
++      r = acd_kext_bo_unmap(dev->core->kext, bo->handle, bo->cpu);
++      bo->cpu = NULL;
++   }
++   int r2 = acd_kext_bo_free(dev->core->kext, bo->handle);
++   pthread_mutex_lock(&dev->core->bo_lock);
++   if (dev->core->bos[bo->handle] == bo)
++      dev->core->bos[bo->handle] = NULL;
++   pthread_mutex_unlock(&dev->core->bo_lock);
+    free(bo);
+-   return 0;
++   return r2 ? r2 : r;
+ }
+ 
+ int
+ acd_bo_cpu_map(acd_device_handle dev, amdgpu_bo_handle bo, void **cpu)
+ {
+-   if (!dev->host_bo)
+-      ACD_KERNEL_STUB("BO cpu map");
+-   *cpu = bo->cpu;
+-   return 0;
++   if (dev->host_bo) {
++      *cpu = bo->cpu;
++      return 0;
++   }
++   /* Map once per BO, cache pointer and size, reference-count map/unmap (contract 3.4). */
++   pthread_mutex_lock(&dev->core->bo_lock);
++   int r = 0;
++   if (!bo->cpu) {
++      void *addr = NULL;
++      size_t size = 0;
++      r = acd_kext_bo_map(dev->core->kext, bo->handle, &addr, &size);
++      if (!r) {
++         bo->cpu = addr;
++         bo->cpu_size = size;
++      }
++   }
++   if (!r) {
++      bo->cpu_refs++;
++      *cpu = bo->cpu;
++   }
++   pthread_mutex_unlock(&dev->core->bo_lock);
++   return r;
+ }
+ 
+ int
+ acd_bo_cpu_unmap(acd_device_handle dev, amdgpu_bo_handle bo)
+ {
+-   if (!dev->host_bo)
+-      ACD_KERNEL_STUB("BO cpu unmap");
++   if (dev->host_bo)
++      return 0;
++   /* The mapping stays cached until BoFree (acd_bo_free unmaps it first). */
++   pthread_mutex_lock(&dev->core->bo_lock);
++   if (bo->cpu_refs)
++      bo->cpu_refs--;
++   pthread_mutex_unlock(&dev->core->bo_lock);
+    return 0;
+ }
+ 
+ int
+ acd_create_bo_from_user_mem(acd_device_handle dev, void *cpu, uint64_t size, amdgpu_bo_handle *bo)
+ {
+-   ACD_KERNEL_STUB("BO from user memory");
++   return -ENOSYS; /* has_userptr is false */
+ }
+diff --git a/src/amd/common/darwin/ac_darwin_drm.h b/src/amd/common/darwin/ac_darwin_drm.h
+index 7da3aa411a2..129cdba5b4d 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.h
++++ b/src/amd/common/darwin/ac_darwin_drm.h
+@@ -3,11 +3,16 @@
+  *
+  * Darwin backend of the ac_drm_* layer (ac_linux_drm.c), for RADV on macOS.
+  *
+- * There is no DRM node and no libdrm on macOS.  S1a state: every device-info
+- * query is answered from the canned gfx1201 table (amd/common/amdgpu_devices.c,
+- * the table the Linux drm-shim serves), everything that only needs userspace
+- * (VA manager, contexts, syncobjs) works, and everything that would need the
+- * kernel driver returns -ENODEV with a log line ("kernel stub").
++ * There is no DRM node and no libdrm on macOS.  Device-info queries are answered
++ * from the canned gfx1201 table (amd/common/amdgpu_devices.c, the table the Linux
++ * drm-shim serves) except memory sizes; the VA manager and syncobjs live in
++ * userspace; BOs, VA mappings, contexts, submits and waits are marshalled to the
++ * kext's native client (ac_darwin_kext.c, contract NATIVE-S1C-ABI.md).
++ *
++ * Backends (acd_device_initialize):
++ *   default                  IOServiceOpen(Navi48Bringup, 'N48N'); fails cleanly if absent
++ *   RADV_DARWIN_MOCK=1       in-process mock of the kext (no GPU)
++ *   RADV_DARWIN_HOST_BO=1    S1a stand-in: host-memory BOs, no kext, kernel stubs
+  */
+ #ifndef AC_DARWIN_DRM_H
+ #define AC_DARWIN_DRM_H
+@@ -42,7 +47,7 @@ int acd_va_range_alloc(acd_device_handle dev, enum amdgpu_gpu_va_range va_range_
+ int acd_va_range_query(acd_device_handle dev, enum amdgpu_gpu_va_range type, uint64_t *start,
+                        uint64_t *end);
+ 
+-/* Kernel stubs (S1c). */
++/* BO calls (kext-backed; host memory in the HOST_BO stand-in). */
+ int acd_bo_alloc(acd_device_handle dev, struct amdgpu_bo_alloc_request *req, amdgpu_bo_handle *bo);
+ int acd_bo_export(acd_device_handle dev, amdgpu_bo_handle bo, enum amdgpu_bo_handle_type type,
+                   uint32_t *shared_handle);
+@@ -55,7 +60,19 @@ int acd_create_bo_from_user_mem(acd_device_handle dev, void *cpu, uint64_t size,
+                                 amdgpu_bo_handle *bo);
+ 
+ /* Userspace sync provider (ac_darwin_sync.c). */
+-struct util_sync_provider *acd_sync_provider_create(void);
++struct acd_sync_backend {
++   /* Waits for kernel seqno `seq` to retire, at most rel_ns; returns 0 with *busy 0/1 and the
++    * retired seqno, or -errno (device lost: -ETIME / -ECANCELED). */
++   int (*wait_seq)(void *ctx, uint64_t seq, uint64_t rel_ns, bool *busy, uint64_t *retired);
++   void *ctx;
++};
++struct util_sync_provider *acd_sync_provider_create(const struct acd_sync_backend *be);
++/* CS path: blocks until (handle, point) is CPU-signalled or attached to a seqno
++ * (WAIT_FOR_SUBMIT semantics); a point backed by a seqno of this client is already
++ * ordered before the next submit and needs no wait. */
++int acd_sync_cs_wait_ready(struct util_sync_provider *p, uint32_t handle, uint64_t point, uint64_t timeout_ns);
++/* CS path: attaches the returned seqno to (handle, point); point 0 = binary payload. */
++int acd_sync_cs_attach(struct util_sync_provider *p, uint32_t handle, uint64_t point, uint64_t seq);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/src/amd/common/darwin/ac_darwin_iokit.c b/src/amd/common/darwin/ac_darwin_iokit.c
+new file mode 100644
+index 00000000000..7e81081e530
+--- /dev/null
++++ b/src/amd/common/darwin/ac_darwin_iokit.c
+@@ -0,0 +1,112 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * IOKit transport of the native kext ABI: IOServiceOpen of class Navi48Bringup
++ * with user-client type 'N48N' (NATIVE-S1C-ABI.md section 1).
++ */
++
++#include "ac_darwin_kext.h"
++
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++
++#include <IOKit/IOKitLib.h>
++#include <mach/mach.h>
++
++struct iokit_ctx {
++   io_connect_t conn;
++};
++
++static int
++iokit_call(void *ctx, uint32_t sel, const uint64_t *sin, uint32_t nsin, const void *stin, size_t stinsz,
++           uint64_t *sout, uint32_t *nsout, void *stout, size_t *stoutsz)
++{
++   struct iokit_ctx *c = ctx;
++   uint32_t cnt = nsout ? *nsout : 0;
++   size_t osz = stoutsz ? *stoutsz : 0;
++   kern_return_t kr = IOConnectCallMethod(c->conn, sel, sin, nsin, stin, stinsz, sout, nsout ? &cnt : NULL,
++                                          stout, stoutsz ? &osz : NULL);
++   if (nsout)
++      *nsout = cnt;
++   if (stoutsz)
++      *stoutsz = osz;
++   return (int)kr;
++}
++
++static int
++iokit_map(void *ctx, uint32_t handle, void **addr, size_t *size)
++{
++   struct iokit_ctx *c = ctx;
++   mach_vm_address_t a = 0;
++   mach_vm_size_t s = 0;
++   kern_return_t kr = IOConnectMapMemory64(c->conn, handle, mach_task_self(), &a, &s, kIOMapAnywhere);
++   if (kr == kIOReturnSuccess) {
++      *addr = (void *)(uintptr_t)a;
++      *size = (size_t)s;
++   }
++   return (int)kr;
++}
++
++static int
++iokit_unmap(void *ctx, uint32_t handle, void *addr)
++{
++   struct iokit_ctx *c = ctx;
++   return (int)IOConnectUnmapMemory64(c->conn, handle, mach_task_self(), (mach_vm_address_t)(uintptr_t)addr);
++}
++
++static void
++iokit_close(void *ctx)
++{
++   struct iokit_ctx *c = ctx;
++   IOServiceClose(c->conn);
++   free(c);
++}
++
++int
++acd_kext_open_iokit(struct acd_kext **out)
++{
++   io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("Navi48Bringup"));
++   if (!svc) {
++      fprintf(stderr, "radv-darwin: IOServiceGetMatchingService(Navi48Bringup) found nothing: the Navi48 kext is "
++                      "not loaded (native backend unavailable)\n");
++      return -ENODEV;
++   }
++
++   io_connect_t conn = 0;
++   kern_return_t kr = KERN_FAILURE;
++   /* A previous client (e.g. RADV's throw-away device used for the physical-device query) may
++    * still be closing: retry ExclusiveAccess for up to 2 s. */
++   for (int tries = 0; tries < 200; tries++) {
++      kr = IOServiceOpen(svc, mach_task_self(), N48N_UC_TYPE, &conn);
++      if (kr != (kern_return_t)ACD_KR_EXCLUSIVE_ACCESS)
++         break;
++      usleep(10000);
++   }
++   IOObjectRelease(svc);
++   if (kr != KERN_SUCCESS) {
++      fprintf(stderr, "radv-darwin: IOServiceOpen(Navi48Bringup, type 'N48N') failed: IOReturn 0x%08x%s\n",
++              (unsigned)kr,
++              (unsigned)kr == ACD_KR_EXCLUSIVE_ACCESS ? " (another native client is open)"
++              : (unsigned)kr == ACD_KR_NOT_PRIVILEGED ? " (needs root)"
++              : (unsigned)kr == ACD_KR_NOT_READY      ? " (native mode not available this boot)"
++                                                      : "");
++      return acd_kr_to_errno(ACD_SEL_HELLO, (int)kr);
++   }
++
++   struct iokit_ctx *c = calloc(1, sizeof(*c));
++   if (!c) {
++      IOServiceClose(conn);
++      return -ENOMEM;
++   }
++   c->conn = conn;
++   const struct acd_kext_ops ops = {
++      .call = iokit_call,
++      .map = iokit_map,
++      .unmap = iokit_unmap,
++      .close = iokit_close,
++   };
++   *out = acd_kext_create(&ops, c);
++   return *out ? 0 : -ENOMEM;
++}
+diff --git a/src/amd/common/darwin/ac_darwin_kext.c b/src/amd/common/darwin/ac_darwin_kext.c
+new file mode 100644
+index 00000000000..e2373f4f910
+--- /dev/null
++++ b/src/amd/common/darwin/ac_darwin_kext.c
+@@ -0,0 +1,542 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Marshaller between the DRM_AMDGPU_* commands RADV issues and the selectors
++ * of the kext's Navi48NativeClient.  Contract: NATIVE-S1C-ABI.md (binding).
++ */
++
++#include "ac_darwin_kext.h"
++
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++/* ---- the mirrored structs must be layout-identical to their drm twins (D2) ---- */
++_Static_assert(sizeof(struct n48n_gem_create_in) == 32, "gem_create_in size");
++_Static_assert(sizeof(struct n48n_gem_create_in) == sizeof(struct drm_amdgpu_gem_create_in), "gem_create_in twin");
++_Static_assert(sizeof(struct n48n_gem_va) == 64, "gem_va size");
++_Static_assert(sizeof(struct n48n_gem_va) == sizeof(struct drm_amdgpu_gem_va), "gem_va twin");
++_Static_assert(offsetof(struct n48n_gem_va, handle) == offsetof(struct drm_amdgpu_gem_va, handle), "va.handle");
++_Static_assert(offsetof(struct n48n_gem_va, operation) == offsetof(struct drm_amdgpu_gem_va, operation), "va.op");
++_Static_assert(offsetof(struct n48n_gem_va, flags) == offsetof(struct drm_amdgpu_gem_va, flags), "va.flags");
++_Static_assert(offsetof(struct n48n_gem_va, va_address) == offsetof(struct drm_amdgpu_gem_va, va_address), "va.addr");
++_Static_assert(offsetof(struct n48n_gem_va, offset_in_bo) == offsetof(struct drm_amdgpu_gem_va, offset_in_bo), "va.off");
++_Static_assert(offsetof(struct n48n_gem_va, map_size) == offsetof(struct drm_amdgpu_gem_va, map_size), "va.size");
++_Static_assert(offsetof(struct n48n_gem_va, vm_timeline_point) == offsetof(struct drm_amdgpu_gem_va, vm_timeline_point), "va.tp");
++_Static_assert(offsetof(struct n48n_gem_va, vm_timeline_syncobj_out) ==
++                  offsetof(struct drm_amdgpu_gem_va, vm_timeline_syncobj_out), "va.tso");
++_Static_assert(offsetof(struct n48n_gem_va, num_syncobj_handles) ==
++                  offsetof(struct drm_amdgpu_gem_va, num_syncobj_handles), "va.nsh");
++_Static_assert(offsetof(struct n48n_gem_va, input_fence_syncobj_handles) ==
++                  offsetof(struct drm_amdgpu_gem_va, input_fence_syncobj_handles), "va.ifsh");
++_Static_assert(sizeof(struct n48n_ctx) == 16, "ctx size");
++_Static_assert(sizeof(struct n48n_ctx) == sizeof(union drm_amdgpu_ctx), "ctx twin");
++_Static_assert(sizeof(struct n48n_cs_ib) == 32, "cs_ib size");
++_Static_assert(sizeof(struct n48n_cs_ib) == sizeof(struct drm_amdgpu_cs_chunk_ib), "cs_ib twin");
++_Static_assert(offsetof(struct n48n_cs_ib, flags) == offsetof(struct drm_amdgpu_cs_chunk_ib, flags), "ib.flags");
++_Static_assert(offsetof(struct n48n_cs_ib, va_start) == offsetof(struct drm_amdgpu_cs_chunk_ib, va_start), "ib.va");
++_Static_assert(offsetof(struct n48n_cs_ib, ib_bytes) == offsetof(struct drm_amdgpu_cs_chunk_ib, ib_bytes), "ib.bytes");
++_Static_assert(offsetof(struct n48n_cs_ib, ip_type) == offsetof(struct drm_amdgpu_cs_chunk_ib, ip_type), "ib.ip");
++_Static_assert(offsetof(struct n48n_cs_ib, ring) == offsetof(struct drm_amdgpu_cs_chunk_ib, ring), "ib.ring");
++_Static_assert(sizeof(struct n48n_cs_in) == 32, "cs_in size");
++_Static_assert(sizeof(struct n48n_info) == 192, "info size");
++
++/* my selector enum must equal the header's */
++_Static_assert(ACD_SEL_HELLO == N48N_SEL_HELLO && ACD_SEL_QUERY_INFO == N48N_SEL_QUERYINFO &&
++               ACD_SEL_READ_REGS == N48N_SEL_READREGS && ACD_SEL_BO_CREATE == N48N_SEL_BOCREATE &&
++               ACD_SEL_BO_FREE == N48N_SEL_BOFREE && ACD_SEL_GEM_VA == N48N_SEL_GEMVA &&
++               ACD_SEL_CTX == N48N_SEL_CTX && ACD_SEL_SUBMIT == N48N_SEL_SUBMIT &&
++               ACD_SEL_WAIT_SEQ == N48N_SEL_WAITSEQ, "selector numbers");
++/* the drm values the kernel interprets equal amdgpu_drm.h's */
++_Static_assert(N48N_VA_OP_MAP == AMDGPU_VA_OP_MAP && N48N_VA_OP_UNMAP == AMDGPU_VA_OP_UNMAP &&
++               N48N_VM_PAGE_EXECUTABLE == AMDGPU_VM_PAGE_EXECUTABLE && N48N_VM_MTYPE_UC == AMDGPU_VM_MTYPE_UC &&
++               N48N_VM_PAGE_PRT == AMDGPU_VM_PAGE_PRT, "va values");
++_Static_assert(N48N_CTX_OP_ALLOC == AMDGPU_CTX_OP_ALLOC_CTX && N48N_CTX_OP_FREE == AMDGPU_CTX_OP_FREE_CTX &&
++               N48N_CTX_OP_QUERY_STATE2 == AMDGPU_CTX_OP_QUERY_STATE2, "ctx ops");
++_Static_assert(N48N_IB_FLAG_CE == AMDGPU_IB_FLAG_CE && N48N_IB_FLAG_PREAMBLE == AMDGPU_IB_FLAG_PREAMBLE &&
++               N48N_IB_FLAG_TC_WB_NOT_INVALIDATE == AMDGPU_IB_FLAG_TC_WB_NOT_INVALIDATE &&
++               N48N_IB_FLAG_EMIT_MEM_SYNC == AMDGPU_IB_FLAG_EMIT_MEM_SYNC &&
++               N48N_IB_FLAG_SECURE == AMDGPU_IB_FLAGS_SECURE, "ib flags");
++_Static_assert(N48N_GEM_DOMAIN_GTT == AMDGPU_GEM_DOMAIN_GTT && N48N_GEM_DOMAIN_VRAM == AMDGPU_GEM_DOMAIN_VRAM &&
++               N48N_GEM_NO_CPU_ACCESS == AMDGPU_GEM_CREATE_NO_CPU_ACCESS &&
++               N48N_GEM_CP_MQD_GFX9 == AMDGPU_GEM_CREATE_CP_MQD_GFX9 &&
++               N48N_GEM_ENCRYPTED == AMDGPU_GEM_CREATE_ENCRYPTED &&
++               N48N_GEM_PREEMPTIBLE == AMDGPU_GEM_CREATE_PREEMPTIBLE, "gem values");
++
++struct acd_kext {
++   struct acd_kext_ops ops;
++   void *ctx;
++};
++
++struct acd_kext *
++acd_kext_create(const struct acd_kext_ops *ops, void *ctx)
++{
++   struct acd_kext *k = calloc(1, sizeof(*k));
++   if (!k) {
++      if (ops->close)
++         ops->close(ctx);
++      return NULL;
++   }
++   k->ops = *ops;
++   k->ctx = ctx;
++   return k;
++}
++
++void
++acd_kext_destroy(struct acd_kext *k)
++{
++   if (!k)
++      return;
++   if (k->ops.close)
++      k->ops.close(k->ctx);
++   free(k);
++}
++
++int
++acd_kext_open(struct acd_kext **out)
++{
++   const char *mock = getenv("RADV_DARWIN_MOCK");
++   if (mock && mock[0] == '1')
++      return acd_mock_open(out);
++   return acd_kext_open_iokit(out);
++}
++
++uint64_t
++acd_kext_now_ns(struct acd_kext *k)
++{
++   if (k->ops.now_ns)
++      return k->ops.now_ns(k->ctx);
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++}
++
++/* Contract 1.1. */
++int
++acd_kr_to_errno(uint32_t sel, int kr_signed)
++{
++   const uint32_t kr = (uint32_t)kr_signed;
++   switch (kr) {
++   case ACD_KR_SUCCESS:
++      return 0;
++   case ACD_KR_BAD_ARGUMENT:
++      return -EINVAL;
++   case ACD_KR_NOT_FOUND:
++      return -ENOENT;
++   case ACD_KR_UNSUPPORTED:
++      return sel == ACD_SEL_HELLO ? -ENODEV : -EINVAL;
++   case ACD_KR_NO_MEMORY:
++   case ACD_KR_NO_RESOURCES:
++      return -ENOMEM;
++   case ACD_KR_NOT_READY:
++      return -ENODEV;
++   case ACD_KR_EXCLUSIVE_ACCESS:
++      return -EBUSY;
++   case ACD_KR_NOT_PRIVILEGED:
++   case ACD_KR_NOT_PERMITTED:
++      return -EACCES;
++   case ACD_KR_TIMEOUT:
++      return -ETIME; /* RADV: DEVICE_LOST (the call that detected the hang) */
++   case ACD_KR_ABORTED:
++      return -ECANCELED; /* RADV: DEVICE_LOST (every later GPU call) */
++   default:
++      break;
++   }
++   /* any mach/IPC error (kext gone): MACH_SEND_INVALID_DEST 0x10000003 and friends,
++    * MACH_SEND_* 0x1000xxxx, MACH_RCV_* 0x1000{4,5}xxx, MIG_SERVER_DIED -300 */
++   if ((kr & 0xffff0000u) == 0x10000000u || kr == 0xfffffed4u)
++      return -ENODEV;
++   fprintf(stderr, "radv-darwin: sel %u -> 0x%08x\n", sel, kr);
++   return -EIO;
++}
++
++static inline void
++acd_sfence(void)
++{
++#if defined(__x86_64__) || defined(__i386__)
++   __builtin_ia32_sfence();
++#else
++   __atomic_thread_fence(__ATOMIC_SEQ_CST);
++#endif
++}
++
++static bool
++trace_enabled(void)
++{
++   static int t = -1;
++   if (t < 0) {
++      const char *v = getenv("RADV_DARWIN_TRACE");
++      t = v && v[0] == '1';
++   }
++   return t;
++}
++
++static int
++kcall(struct acd_kext *k, uint32_t sel, const uint64_t *sin, uint32_t nsin, const void *stin,
++      size_t stinsz, uint64_t *sout, uint32_t *nsout, void *stout, size_t *stoutsz)
++{
++   int kr = k->ops.call(k->ctx, sel, sin, nsin, stin, stinsz, sout, nsout, stout, stoutsz);
++   const int r = acd_kr_to_errno(sel, kr);
++   if (trace_enabled())
++      fprintf(stderr, "radv-darwin: trace sel %u nsin %u stin %zu -> IOReturn 0x%08x errno %d\n", sel, nsin, stinsz,
++              (unsigned)kr, r);
++   return r;
++}
++
++/* ---- pure helpers ---- */
++
++uint32_t
++acd_canon_bits_ok(uint64_t va)
++{
++   uint64_t top = va >> 47; /* bits 63..47, 17 bits */
++   return top == 0 || top == 0x1ffffull;
++}
++
++bool
++acd_wait_expired(uint64_t abs_deadline_ns, uint64_t now_ns)
++{
++   return abs_deadline_ns != ACD_TIMEOUT_INFINITE && now_ns >= abs_deadline_ns;
++}
++
++/* Relative ns for the next WaitSeq call, clamped to [0, 2 s]. */
++uint64_t
++acd_wait_slice_ns(uint64_t abs_deadline_ns, uint64_t now_ns)
++{
++   if (abs_deadline_ns == ACD_TIMEOUT_INFINITE)
++      return N48N_WAIT_CAP_NS;
++   if (now_ns >= abs_deadline_ns)
++      return 0;
++   uint64_t rem = abs_deadline_ns - now_ns;
++   return rem > N48N_WAIT_CAP_NS ? N48N_WAIT_CAP_NS : rem;
++}
++
++uint32_t
++acd_cs_split_count(uint32_t n_ibs)
++{
++   return (n_ibs + N48N_MAX_IBS - 1) / N48N_MAX_IBS;
++}
++
++/* ---- selectors ---- */
++
++int
++acd_kext_hello(struct acd_kext *k, struct acd_hello *out)
++{
++   const uint64_t sin[2] = {N48N_ABI_VERSION, 0};
++   uint64_t sout[4] = {0};
++   uint32_t nout = 4;
++   int r = kcall(k, ACD_SEL_HELLO, sin, 2, NULL, 0, sout, &nout, NULL, NULL);
++   if (r)
++      return r;
++   if (nout != 4)
++      return -EIO;
++   out->abi = (uint32_t)sout[0];
++   out->build = (uint32_t)sout[1];
++   out->max_ibs = (uint32_t)sout[2];
++   out->vmid = (uint32_t)sout[3];
++   return 0;
++}
++
++int
++acd_kext_query_info(struct acd_kext *k, struct n48n_info *info)
++{
++   size_t sz = sizeof(*info);
++   memset(info, 0, sizeof(*info));
++   int r = kcall(k, ACD_SEL_QUERY_INFO, NULL, 0, NULL, 0, NULL, NULL, info, &sz);
++   if (r)
++      return r;
++   return sz == sizeof(*info) ? 0 : -EIO;
++}
++
++int
++acd_kext_read_regs(struct acd_kext *k, uint32_t dword_offset, uint32_t count, uint32_t *vals)
++{
++   if (count < 1 || count > 16)
++      return -EINVAL;
++   const uint64_t sin[3] = {dword_offset, count, 0xFFFFFFFFull};
++   size_t sz = count * sizeof(uint32_t);
++   int r = kcall(k, ACD_SEL_READ_REGS, sin, 3, NULL, 0, NULL, NULL, vals, &sz);
++   if (r)
++      return r;
++   return sz == count * sizeof(uint32_t) ? 0 : -EIO;
++}
++
++int
++acd_kext_bo_create(struct acd_kext *k, const struct n48n_gem_create_in *in, struct acd_bo_created *out)
++{
++   uint64_t sout[4] = {0};
++   uint32_t nout = 4;
++   int r = kcall(k, ACD_SEL_BO_CREATE, NULL, 0, in, sizeof(*in), sout, &nout, NULL, NULL);
++   if (r)
++      return r;
++   if (nout != 4 || sout[0] == 0 || sout[0] >= N48N_MAX_BOS)
++      return -EIO;
++   out->handle = (uint32_t)sout[0];
++   out->size = sout[1];
++   out->domain = (uint32_t)sout[2];
++   out->bits = (uint32_t)sout[3];
++   return 0;
++}
++
++int
++acd_kext_bo_free(struct acd_kext *k, uint32_t handle)
++{
++   const uint64_t sin[1] = {handle};
++   acd_sfence();
++   return kcall(k, ACD_SEL_BO_FREE, sin, 1, NULL, 0, NULL, NULL, NULL, NULL);
++}
++
++int
++acd_kext_bo_map(struct acd_kext *k, uint32_t handle, void **addr, size_t *size)
++{
++   int kr = k->ops.map(k->ctx, handle, addr, size);
++   /* the map path is not a selector: use sel 0xffffffff in the unknown-code log line */
++   return acd_kr_to_errno(0xffffffffu, kr);
++}
++
++int
++acd_kext_bo_unmap(struct acd_kext *k, uint32_t handle, void *addr)
++{
++   int kr = k->ops.unmap(k->ctx, handle, addr);
++   return acd_kr_to_errno(0xffffffffu, kr);
++}
++
++int
++acd_kext_gem_va(struct acd_kext *k, const struct drm_amdgpu_gem_va *va)
++{
++   struct n48n_gem_va w;
++   memset(&w, 0, sizeof(w));
++   w.handle = va->handle;
++   w.operation = va->operation;
++   w.flags = va->flags;
++   w.va_address = va->va_address;
++   w.offset_in_bo = va->offset_in_bo;
++   w.map_size = va->map_size;
++   /* vm_timeline_*, num_syncobj_handles and the input-fence pointer stay 0: Mesa
++    * consumes them (MAP is synchronous). */
++   acd_sfence();
++   return kcall(k, ACD_SEL_GEM_VA, NULL, 0, &w, sizeof(w), NULL, NULL, NULL, NULL);
++}
++
++int
++acd_kext_ctx(struct acd_kext *k, const struct n48n_ctx *in, struct n48n_ctx *out)
++{
++   size_t sz = sizeof(*out);
++   memset(out, 0, sizeof(*out));
++   int r = kcall(k, ACD_SEL_CTX, NULL, 0, in, sizeof(*in), NULL, NULL, out, &sz);
++   if (r)
++      return r;
++   return sz == sizeof(*out) ? 0 : -EIO;
++}
++
++/* ---- CS ---- */
++
++void
++acd_cs_plan_fini(struct acd_cs_plan *plan)
++{
++   free(plan->ibs);
++   free(plan->waits);
++   free(plan->signals);
++   memset(plan, 0, sizeof(*plan));
++}
++
++static int
++plan_add_sync(struct acd_cs_sync **arr, uint32_t *n, uint32_t extra, const struct acd_cs_sync *items)
++{
++   struct acd_cs_sync *t = realloc(*arr, (*n + extra) * sizeof(**arr));
++   if (!t)
++      return -ENOMEM;
++   *arr = t;
++   memcpy(t + *n, items, extra * sizeof(*items));
++   *n += extra;
++   return 0;
++}
++
++static int
++plan_parse_syncobj(struct acd_cs_sync **arr, uint32_t *n, const struct drm_amdgpu_cs_chunk *c, bool timeline)
++{
++   const size_t esz = timeline ? sizeof(struct drm_amdgpu_cs_chunk_syncobj) : sizeof(struct drm_amdgpu_cs_chunk_sem);
++   const size_t bytes = (size_t)c->length_dw * 4;
++   if (bytes % esz)
++      return -EINVAL;
++   const uint32_t count = (uint32_t)(bytes / esz);
++   for (uint32_t i = 0; i < count; i++) {
++      struct acd_cs_sync s;
++      if (timeline) {
++         const struct drm_amdgpu_cs_chunk_syncobj *e =
++            (const struct drm_amdgpu_cs_chunk_syncobj *)(uintptr_t)c->chunk_data + i;
++         s = (struct acd_cs_sync){.handle = e->handle, .point = e->point, .timeline = true};
++      } else {
++         const struct drm_amdgpu_cs_chunk_sem *e = (const struct drm_amdgpu_cs_chunk_sem *)(uintptr_t)c->chunk_data + i;
++         s = (struct acd_cs_sync){.handle = e->handle, .point = 0, .timeline = false};
++      }
++      int r = plan_add_sync(arr, n, 1, &s);
++      if (r)
++         return r;
++   }
++   return 0;
++}
++
++int
++acd_cs_plan_init(struct acd_cs_plan *plan, uint32_t ctx_id, uint32_t bo_list_handle, uint32_t num_chunks,
++                 const uint64_t *chunks)
++{
++   memset(plan, 0, sizeof(*plan));
++   plan->ctx_id = ctx_id;
++
++   /* bo_list_handle must be 0 (RADV passes 0; the BO_HANDLES chunk is ignored: always-valid) */
++   if (bo_list_handle != 0)
++      return -EINVAL;
++
++   uint32_t n_ib = 0;
++   for (uint32_t i = 0; i < num_chunks; i++) {
++      const struct drm_amdgpu_cs_chunk *c = (const struct drm_amdgpu_cs_chunk *)(uintptr_t)chunks[i];
++      if (c->chunk_id == AMDGPU_CHUNK_ID_IB)
++         n_ib++;
++   }
++   if (n_ib == 0)
++      return -EINVAL;
++   plan->ibs = calloc(n_ib, sizeof(*plan->ibs));
++   if (!plan->ibs)
++      return -ENOMEM;
++
++   int r = 0;
++   for (uint32_t i = 0; i < num_chunks && !r; i++) {
++      const struct drm_amdgpu_cs_chunk *c = (const struct drm_amdgpu_cs_chunk *)(uintptr_t)chunks[i];
++      switch (c->chunk_id) {
++      case AMDGPU_CHUNK_ID_IB: {
++         if (c->length_dw * 4 != sizeof(struct drm_amdgpu_cs_chunk_ib)) {
++            r = -EINVAL;
++            break;
++         }
++         const struct drm_amdgpu_cs_chunk_ib *ib = (const void *)(uintptr_t)c->chunk_data;
++         plan->ibs[plan->n_ibs++] = (struct n48n_cs_ib){
++            ._pad = 0,
++            .flags = ib->flags,
++            .va_start = ib->va_start,
++            .ib_bytes = ib->ib_bytes,
++            .ip_type = ib->ip_type,
++            .ip_instance = ib->ip_instance,
++            .ring = ib->ring,
++         };
++         break;
++      }
++      case AMDGPU_CHUNK_ID_FENCE: {
++         if (plan->has_fence || c->length_dw * 4 != sizeof(struct drm_amdgpu_cs_chunk_fence)) {
++            r = -EINVAL; /* at most one user fence per CS */
++            break;
++         }
++         const struct drm_amdgpu_cs_chunk_fence *f = (const void *)(uintptr_t)c->chunk_data;
++         plan->has_fence = true;
++         plan->fence_handle = f->handle;
++         plan->fence_offset = f->offset;
++         break;
++      }
++      case AMDGPU_CHUNK_ID_DEPENDENCIES:
++      case AMDGPU_CHUNK_ID_SCHEDULED_DEPENDENCIES:
++      case AMDGPU_CHUNK_ID_BO_HANDLES:
++         break; /* ignored: one ring, always-valid */
++      case AMDGPU_CHUNK_ID_SYNCOBJ_IN:
++         r = plan_parse_syncobj(&plan->waits, &plan->n_waits, c, false);
++         break;
++      case AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT:
++         r = plan_parse_syncobj(&plan->waits, &plan->n_waits, c, true);
++         break;
++      case AMDGPU_CHUNK_ID_SYNCOBJ_OUT:
++         r = plan_parse_syncobj(&plan->signals, &plan->n_signals, c, false);
++         break;
++      case AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL:
++         r = plan_parse_syncobj(&plan->signals, &plan->n_signals, c, true);
++         break;
++      case AMDGPU_CHUNK_ID_CP_GFX_SHADOW:
++      default:
++         r = -EINVAL;
++         break;
++      }
++   }
++   if (r)
++      acd_cs_plan_fini(plan);
++   return r;
++}
++
++int
++acd_kext_submit(struct acd_kext *k, const struct acd_cs_plan *plan, uint64_t *last_seqno)
++{
++   uint8_t buf[sizeof(struct n48n_cs_in) + N48N_MAX_IBS * sizeof(struct n48n_cs_ib)];
++   uint64_t seq = 0;
++
++   if (plan->n_ibs == 0)
++      return -EINVAL;
++
++   for (uint32_t off = 0; off < plan->n_ibs; off += N48N_MAX_IBS) {
++      uint32_t n = plan->n_ibs - off;
++      if (n > N48N_MAX_IBS)
++         n = N48N_MAX_IBS;
++      const bool last = off + n == plan->n_ibs;
++
++      struct n48n_cs_in hdr;
++      memset(&hdr, 0, sizeof(hdr));
++      hdr.abi = N48N_ABI_VERSION;
++      hdr.ctx_id = plan->ctx_id;
++      hdr.num_ibs = n;
++      if (last && plan->has_fence) {
++         hdr.flags = N48N_CS_HAS_FENCE;
++         hdr.fence_handle = plan->fence_handle;
++         hdr.fence_offset = plan->fence_offset;
++      }
++      memcpy(buf, &hdr, sizeof(hdr));
++      memcpy(buf + sizeof(hdr), plan->ibs + off, n * sizeof(struct n48n_cs_ib));
++
++      uint64_t sout[1] = {0};
++      uint32_t nout = 1;
++      acd_sfence();
++      int r = kcall(k, ACD_SEL_SUBMIT, NULL, 0, buf, sizeof(hdr) + n * sizeof(struct n48n_cs_ib), sout, &nout,
++                    NULL, NULL);
++      if (r)
++         return r;
++      if (nout != 1)
++         return -EIO;
++      seq = sout[0];
++   }
++   *last_seqno = seq;
++   return 0;
++}
++
++int
++acd_kext_wait_seq(struct acd_kext *k, uint64_t seq, uint64_t rel_ns, bool *busy, struct acd_wait_status *st)
++{
++   if (rel_ns > N48N_WAIT_CAP_NS)
++      rel_ns = N48N_WAIT_CAP_NS;
++   const uint64_t sin[3] = {seq, rel_ns, 0};
++   uint64_t sout[3] = {0};
++   uint32_t nout = 3;
++   int r = kcall(k, ACD_SEL_WAIT_SEQ, sin, 3, NULL, 0, sout, &nout, NULL, NULL);
++   if (r)
++      return r;
++   if (nout != 3)
++      return -EIO;
++   *busy = sout[0] != 0;
++   if (st) {
++      st->retired = sout[1];
++      st->emitted = sout[2];
++   }
++   return 0;
++}
++
++int
++acd_kext_wait_deadline(struct acd_kext *k, uint64_t seq, uint64_t abs_deadline_ns, bool *busy)
++{
++   for (;;) {
++      const uint64_t slice = acd_wait_slice_ns(abs_deadline_ns, acd_kext_now_ns(k));
++      int r = acd_kext_wait_seq(k, seq, slice, busy, NULL);
++      if (r)
++         return r;
++      if (!*busy)
++         return 0;
++      if (acd_wait_expired(abs_deadline_ns, acd_kext_now_ns(k))) {
++         *busy = true;
++         return 0;
++      }
++   }
++}
+diff --git a/src/amd/common/darwin/ac_darwin_kext.h b/src/amd/common/darwin/ac_darwin_kext.h
+new file mode 100644
+index 00000000000..cd8e60c65c6
+--- /dev/null
++++ b/src/amd/common/darwin/ac_darwin_kext.h
+@@ -0,0 +1,163 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Mesa side of the Navi48 native kext ABI (NATIVE-S1C-ABI.md): the marshaller
++ * from DRM_AMDGPU_* commands to the Navi48NativeClient selectors.
++ *
++ * The transport (IOKit, the in-process mock, or a test double) is a small
++ * ops table, so everything in ac_darwin_kext.c is plain C with no IOKit
++ * dependency and can be unit-tested against a fake IOConnectCallMethod.
++ */
++#ifndef AC_DARWIN_KEXT_H
++#define AC_DARWIN_KEXT_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include "drm-uapi/amdgpu_drm.h"
++#include "navi48_native_abi.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Selector numbers, contract section 2. */
++enum acd_sel {
++   ACD_SEL_HELLO = 0,
++   ACD_SEL_QUERY_INFO = 1,
++   ACD_SEL_READ_REGS = 2,
++   ACD_SEL_BO_CREATE = 3,
++   ACD_SEL_BO_FREE = 4,
++   ACD_SEL_GEM_VA = 5,
++   ACD_SEL_CTX = 6,
++   ACD_SEL_SUBMIT = 7,
++   ACD_SEL_WAIT_SEQ = 8,
++};
++
++/* IOReturn values, contract section 1.1 (numeric, so this file needs no IOKit). */
++#define ACD_KR_SUCCESS          0x00000000u
++#define ACD_KR_BAD_ARGUMENT     0xe00002c2u
++#define ACD_KR_NOT_FOUND        0xe00002f0u
++#define ACD_KR_UNSUPPORTED      0xe00002c7u
++#define ACD_KR_NO_MEMORY        0xe00002bdu
++#define ACD_KR_NO_RESOURCES     0xe00002beu
++#define ACD_KR_NOT_READY        0xe00002d8u
++#define ACD_KR_EXCLUSIVE_ACCESS 0xe00002c5u
++#define ACD_KR_NOT_PRIVILEGED   0xe00002c1u
++#define ACD_KR_NOT_PERMITTED    0xe00002e2u
++#define ACD_KR_TIMEOUT          0xe00002d6u
++#define ACD_KR_ABORTED          0xe00002ebu
++
++#define ACD_TIMEOUT_INFINITE    0xffffffffffffffffull /* == AMDGPU_TIMEOUT_INFINITE */
++#define ACD_GB_ADDR_CONFIG_GFX1201 0x08200545u
++#define ACD_GB_ADDR_CONFIG_REG     0x263eu
++
++struct acd_kext_ops {
++   /* IOConnectCallMethod; returns the kern_return_t / IOReturn. */
++   int (*call)(void *ctx, uint32_t sel, const uint64_t *scalar_in, uint32_t n_scalar_in,
++               const void *struct_in, size_t struct_in_size, uint64_t *scalar_out,
++               uint32_t *n_scalar_out, void *struct_out, size_t *struct_out_size);
++   /* IOConnectMapMemory64(conn, handle, ...) / IOConnectUnmapMemory64; kern_return_t. */
++   int (*map)(void *ctx, uint32_t handle, void **addr, size_t *size);
++   int (*unmap)(void *ctx, uint32_t handle, void *addr);
++   /* IOServiceClose. */
++   void (*close)(void *ctx);
++   /* CLOCK_MONOTONIC in ns; NULL = clock_gettime. */
++   uint64_t (*now_ns)(void *ctx);
++};
++
++struct acd_kext;
++
++/* Takes ownership of ctx (ops->close is called at destroy). */
++struct acd_kext *acd_kext_create(const struct acd_kext_ops *ops, void *ctx);
++void acd_kext_destroy(struct acd_kext *k);
++
++/* Backend selection: RADV_DARWIN_MOCK=1 gives the in-process mock, otherwise the
++ * IOKit transport (IOServiceOpen of Navi48Bringup, type 'N48N'). Logs one clear
++ * stderr line and returns -errno on failure. */
++int acd_kext_open(struct acd_kext **out);
++int acd_kext_open_iokit(struct acd_kext **out);      /* ac_darwin_iokit.c */
++int acd_mock_open(struct acd_kext **out);            /* ac_darwin_mock.c */
++
++/* Error mapping, contract section 1.1. Logs the "sel %u -> 0x%08x" line for unknown codes. */
++int acd_kr_to_errno(uint32_t sel, int kr);
++
++/* Pure helpers (unit-tested). */
++uint64_t acd_wait_slice_ns(uint64_t abs_deadline_ns, uint64_t now_ns);
++bool acd_wait_expired(uint64_t abs_deadline_ns, uint64_t now_ns);
++uint32_t acd_canon_bits_ok(uint64_t va); /* 1 if bits 63..47 are all equal */
++
++struct acd_hello {
++   uint32_t abi, build, max_ibs, vmid;
++};
++
++int acd_kext_hello(struct acd_kext *k, struct acd_hello *out);
++int acd_kext_query_info(struct acd_kext *k, struct n48n_info *info);
++int acd_kext_read_regs(struct acd_kext *k, uint32_t dword_offset, uint32_t count, uint32_t *vals);
++
++struct acd_bo_created {
++   uint32_t handle;
++   uint64_t size;
++   uint32_t domain; /* placed: 2 GTT / 4 VRAM */
++   uint32_t bits;   /* N48N_PLACED_* */
++};
++int acd_kext_bo_create(struct acd_kext *k, const struct n48n_gem_create_in *in, struct acd_bo_created *out);
++int acd_kext_bo_free(struct acd_kext *k, uint32_t handle);
++int acd_kext_bo_map(struct acd_kext *k, uint32_t handle, void **addr, size_t *size);
++int acd_kext_bo_unmap(struct acd_kext *k, uint32_t handle, void *addr);
++
++/* Marshals a drm_amdgpu_gem_va (timeline/syncobj fields are zeroed on the wire). */
++int acd_kext_gem_va(struct acd_kext *k, const struct drm_amdgpu_gem_va *va);
++int acd_kext_ctx(struct acd_kext *k, const struct n48n_ctx *in, struct n48n_ctx *out);
++
++/* ---- CS ---- */
++struct acd_cs_sync {
++   uint32_t handle;
++   uint64_t point;
++   bool timeline;
++};
++
++struct acd_cs_plan {
++   uint32_t ctx_id;
++   struct n48n_cs_ib *ibs; /* copied verbatim from the IB chunks, in order */
++   uint32_t n_ibs;
++   bool has_fence;
++   uint32_t fence_handle;
++   uint32_t fence_offset; /* bytes */
++   struct acd_cs_sync *waits;
++   uint32_t n_waits;
++   struct acd_cs_sync *signals;
++   uint32_t n_signals;
++};
++
++/* Classifies the chunks (contract 4.2). chunks is the array of pointers to
++ * struct drm_amdgpu_cs_chunk (drm_amdgpu_cs_in.chunks). Returns 0 or -EINVAL /
++ * -ENOMEM. The plan must be released with acd_cs_plan_fini(). */
++int acd_cs_plan_init(struct acd_cs_plan *plan, uint32_t ctx_id, uint32_t bo_list_handle,
++                     uint32_t num_chunks, const uint64_t *chunks);
++void acd_cs_plan_fini(struct acd_cs_plan *plan);
++
++/* Splits into Submits of <= N48N_MAX_IBS IBs (fence on the last only). Returns
++ * the last seqno. */
++int acd_kext_submit(struct acd_kext *k, const struct acd_cs_plan *plan, uint64_t *last_seqno);
++/* Number of Submit calls a plan of n IBs needs. */
++uint32_t acd_cs_split_count(uint32_t n_ibs);
++
++struct acd_wait_status {
++   uint64_t retired, emitted;
++};
++/* One WaitSeq call, relative ns (capped to 2 s here as in the kernel). *busy 0/1. */
++int acd_kext_wait_seq(struct acd_kext *k, uint64_t seq, uint64_t rel_ns, bool *busy,
++                      struct acd_wait_status *st);
++/* Loops WaitSeq in <= 2 s slices to an absolute CLOCK_MONOTONIC deadline
++ * (or ACD_TIMEOUT_INFINITE). *busy = 1 when the deadline passed first. */
++int acd_kext_wait_deadline(struct acd_kext *k, uint64_t seq, uint64_t abs_deadline_ns, bool *busy);
++
++uint64_t acd_kext_now_ns(struct acd_kext *k);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/amd/common/darwin/ac_darwin_mock.c b/src/amd/common/darwin/ac_darwin_mock.c
+new file mode 100644
+index 00000000000..87d297a8d53
+--- /dev/null
++++ b/src/amd/common/darwin/ac_darwin_mock.c
+@@ -0,0 +1,600 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * In-process mock of the kext's Navi48NativeClient (RADV_DARWIN_MOCK=1).
++ *
++ * It implements the selectors of NATIVE-S1C-ABI.md with the kernel's own
++ * argument validation (exact scalar counts and struct sizes, canonical VAs,
++ * overlap refusal, IB coverage by EXEC mappings, fence bounds, ctx table,
++ * seqno rules), keeps BOs in host memory, and "retires" every Submit at once
++ * (RADV_DARWIN_MOCK_LAG_MS=n delays retirement to exercise the wait loops).
++ * The user fence is written into the fence BO.  Nothing executes the IBs, so
++ * buffer contents produced by the GPU are NOT reproduced: this proves the
++ * marshalling, not the hardware.
++ */
++
++#include "ac_darwin_kext.h"
++
++#include <errno.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++
++#define MOCK_MAX_MAPS 4096
++#define MOCK_VIS_TOTAL (168ull << 20)
++#define MOCK_HI_TOTAL (15ull << 30)
++#define MOCK_GTT_CAP (512ull << 20)
++#define MOCK_GTT_MAX_BO (64ull << 20)
++#define MOCK_PT_CAP (32ull << 20)
++#define MOCK_VA_MASK ((1ull << 48) - 1)
++
++struct mock_bo {
++   bool used;
++   uint8_t *mem;
++   uint64_t size;
++   uint32_t domain;
++   uint32_t bits;
++};
++
++struct mock_map {
++   bool used;
++   uint32_t handle;
++   uint64_t va; /* stripped to 48 bits */
++   uint64_t size;
++   uint64_t off;
++   uint32_t flags;
++};
++
++struct mock {
++   pthread_mutex_t lock;
++   bool hello;
++   struct mock_bo bo[N48N_MAX_BOS];
++   struct mock_map maps[MOCK_MAX_MAPS];
++   bool ctx[N48N_MAX_CTX + 1];
++   uint64_t vis_used, hi_used, gtt_used;
++   uint64_t emitted, retired_at_submit, last_submit_ns;
++   uint64_t lag_ns;
++   uint64_t submits;
++   bool hang_mode; /* RADV_DARWIN_MOCK_HANG=1: the first WaitSeq on a submitted seq reports the hang */
++   bool hung;
++};
++
++static pthread_mutex_t g_open_lock = PTHREAD_MUTEX_INITIALIZER;
++static bool g_open;
++
++static uint64_t
++mnow(void)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++}
++
++static uint64_t
++retired_locked(struct mock *m)
++{
++   if (m->lag_ns == 0 || mnow() >= m->last_submit_ns + m->lag_ns)
++      return m->emitted;
++   return m->retired_at_submit;
++}
++
++static bool
++mock_trace(void)
++{
++   const char *v = getenv("RADV_DARWIN_TRACE");
++   return v && v[0] == '1';
++}
++
++/* return a kernel refusal, saying which check fired when tracing */
++#define REFUSE(code, why)                                                                          \
++   do {                                                                                            \
++      if (mock_trace())                                                                            \
++         fprintf(stderr, "radv-darwin: mock refuses (line %d): %s\n", __LINE__, why);              \
++      return (code);                                                                               \
++   } while (0)
++
++static struct mock_bo *
++find_bo(struct mock *m, uint32_t h)
++{
++   if (h == 0 || h >= N48N_MAX_BOS || !m->bo[h].used)
++      return NULL;
++   return &m->bo[h];
++}
++
++static int
++do_bo_create(struct mock *m, const struct n48n_gem_create_in *in, uint64_t *sout)
++{
++   uint64_t size = in->bo_size;
++   if (size == 0)
++      return ACD_KR_BAD_ARGUMENT;
++   size = (size + 4095) & ~4095ull;
++   uint64_t align = in->alignment;
++   if (align && ((align & (align - 1)) || align > (2ull << 20)))
++      return ACD_KR_BAD_ARGUMENT;
++   if (align < 4096)
++      align = 4096;
++
++   const uint64_t d = in->domains, f = in->domain_flags;
++   if (d == 0 || (d & ~(uint64_t)(AMDGPU_GEM_DOMAIN_GTT | AMDGPU_GEM_DOMAIN_VRAM)))
++      return ACD_KR_UNSUPPORTED;
++   if (f & (AMDGPU_GEM_CREATE_ENCRYPTED | AMDGPU_GEM_CREATE_CP_MQD_GFX9 | AMDGPU_GEM_CREATE_PREEMPTIBLE))
++      return ACD_KR_UNSUPPORTED;
++
++   uint32_t domain, bits;
++   if (d & AMDGPU_GEM_DOMAIN_VRAM) {
++      if (m->vis_used + size <= MOCK_VIS_TOTAL) {
++         domain = 4;
++         bits = N48N_PLACED_CPU_MAPPABLE | N48N_PLACED_ZEROED;
++         m->vis_used += size;
++      } else if ((f & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) && !(f & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED) &&
++                 m->hi_used + size <= MOCK_HI_TOTAL) {
++         domain = 4;
++         bits = N48N_PLACED_HI_POOL;
++         m->hi_used += size;
++      } else {
++         return ACD_KR_NO_MEMORY;
++      }
++   } else {
++      if (size > MOCK_GTT_MAX_BO || m->gtt_used + size > MOCK_GTT_CAP)
++         return ACD_KR_NO_MEMORY;
++      domain = 2;
++      bits = N48N_PLACED_ZEROED;
++      m->gtt_used += size;
++   }
++
++   uint32_t h = 1;
++   while (h < N48N_MAX_BOS && m->bo[h].used)
++      h++;
++   if (h >= N48N_MAX_BOS)
++      return ACD_KR_NO_RESOURCES;
++
++   void *mem = NULL;
++   if (posix_memalign(&mem, align < sizeof(void *) ? sizeof(void *) : align, size)) {
++      return ACD_KR_NO_MEMORY;
++   }
++   memset(mem, 0, size);
++   m->bo[h] = (struct mock_bo){.used = true, .mem = mem, .size = size, .domain = domain, .bits = bits};
++   sout[0] = h;
++   sout[1] = size;
++   sout[2] = domain;
++   sout[3] = bits;
++   return ACD_KR_SUCCESS;
++}
++
++static void
++unmap_all_of(struct mock *m, uint32_t h)
++{
++   for (int i = 0; i < MOCK_MAX_MAPS; i++)
++      if (m->maps[i].used && m->maps[i].handle == h)
++         m->maps[i].used = false;
++}
++
++static int
++do_bo_free(struct mock *m, uint32_t h)
++{
++   struct mock_bo *b = find_bo(m, h);
++   if (!b)
++      return ACD_KR_NOT_FOUND;
++   unmap_all_of(m, h);
++   if (b->domain == 2)
++      m->gtt_used -= b->size;
++   else if (b->bits & N48N_PLACED_HI_POOL)
++      m->hi_used -= b->size;
++   else
++      m->vis_used -= b->size;
++   free(b->mem);
++   memset(b, 0, sizeof(*b));
++   return ACD_KR_SUCCESS;
++}
++
++static int
++do_gem_va(struct mock *m, const struct n48n_gem_va *v)
++{
++   if (v->_pad || v->vm_timeline_point || v->vm_timeline_syncobj_out || v->num_syncobj_handles ||
++       v->input_fence_syncobj_handles)
++      REFUSE(ACD_KR_BAD_ARGUMENT, "if (v->_pad || v->vm_timeline_point || v->vm_timeline_syncobj_out || v");
++   if (v->handle == 0 || (v->flags & AMDGPU_VM_PAGE_PRT))
++      REFUSE(ACD_KR_UNSUPPORTED, "if (v->handle == 0 || (v->flags & AMDGPU_VM_PAGE_PRT))");
++   if (v->operation == AMDGPU_VA_OP_CLEAR || v->operation == AMDGPU_VA_OP_REPLACE)
++      REFUSE(ACD_KR_UNSUPPORTED, "if (v->operation == AMDGPU_VA_OP_CLEAR || v->operation == AMDGPU_VA_OP");
++   if (v->operation != AMDGPU_VA_OP_MAP && v->operation != AMDGPU_VA_OP_UNMAP)
++      REFUSE(ACD_KR_BAD_ARGUMENT, "if (v->operation != AMDGPU_VA_OP_MAP && v->operation != AMDGPU_VA_OP_U");
++   struct mock_bo *b = find_bo(m, v->handle);
++   if (!b)
++      REFUSE(ACD_KR_NOT_FOUND, "if (!b)");
++   if (!acd_canon_bits_ok(v->va_address))
++      REFUSE(ACD_KR_BAD_ARGUMENT, "if (!acd_canon_bits_ok(v->va_address))");
++   const uint64_t va = v->va_address & MOCK_VA_MASK;
++   if ((v->va_address | v->offset_in_bo | v->map_size) & 4095 || v->map_size == 0)
++      REFUSE(ACD_KR_BAD_ARGUMENT, "if ((v->va_address | v->offset_in_bo | v->map_size) & 4095 || v->map_s");
++   if (va < 0x10000 || va + v->map_size > (1ull << 48))
++      REFUSE(ACD_KR_BAD_ARGUMENT, "if (va < 0x10000 || va + v->map_size > (1ull << 48))");
++   if (v->offset_in_bo + v->map_size > b->size)
++      REFUSE(ACD_KR_BAD_ARGUMENT, "if (v->offset_in_bo + v->map_size > b->size)");
++
++   if (v->operation == AMDGPU_VA_OP_MAP) {
++      int freei = -1;
++      for (int i = 0; i < MOCK_MAX_MAPS; i++) {
++         if (!m->maps[i].used) {
++            if (freei < 0)
++               freei = i;
++            continue;
++         }
++         if (va < m->maps[i].va + m->maps[i].size && m->maps[i].va < va + v->map_size)
++            REFUSE(ACD_KR_BAD_ARGUMENT, "if (va < m->maps[i].va + m->maps[i].size && m->maps[i].va < va + v->ma"); /* overlap */
++      }
++      if (freei < 0)
++         REFUSE(ACD_KR_NO_MEMORY, "if (freei < 0)");
++      m->maps[freei] = (struct mock_map){.used = true,
++                                         .handle = v->handle,
++                                         .va = va,
++                                         .size = v->map_size,
++                                         .off = v->offset_in_bo,
++                                         .flags = v->flags};
++      return ACD_KR_SUCCESS;
++   }
++   for (int i = 0; i < MOCK_MAX_MAPS; i++) {
++      if (m->maps[i].used && m->maps[i].handle == v->handle && m->maps[i].va == va &&
++          m->maps[i].size == v->map_size) {
++         m->maps[i].used = false;
++         return ACD_KR_SUCCESS;
++      }
++   }
++   REFUSE(ACD_KR_BAD_ARGUMENT, "if (m->maps[i].used && m->maps[i].handle == v->handle && m->maps[i].va");
++}
++
++static bool
++ib_covered(struct mock *m, uint64_t va_canon, uint64_t bytes)
++{
++   uint64_t cur = va_canon & MOCK_VA_MASK;
++   const uint64_t end = cur + bytes;
++   while (cur < end) {
++      bool ok = false;
++      for (int i = 0; i < MOCK_MAX_MAPS; i++) {
++         const struct mock_map *mp = &m->maps[i];
++         if (mp->used && (mp->flags & AMDGPU_VM_PAGE_EXECUTABLE) && cur >= mp->va && cur < mp->va + mp->size) {
++            cur = mp->va + mp->size < end ? mp->va + mp->size : end;
++            ok = true;
++            break;
++         }
++      }
++      if (!ok)
++         return false;
++   }
++   return true;
++}
++
++static int
++do_submit(struct mock *m, const uint8_t *in, size_t insz, uint64_t *seq_out)
++{
++   if (m->hung)
++      return ACD_KR_ABORTED;
++   if (insz < sizeof(struct n48n_cs_in))
++      REFUSE(ACD_KR_BAD_ARGUMENT, "if (insz < sizeof(struct n48n_cs_in))");
++   struct n48n_cs_in h;
++   memcpy(&h, in, sizeof(h));
++   if (h.abi != N48N_ABI_VERSION || h.num_ibs < 1 || h.num_ibs > N48N_MAX_IBS ||
++       insz != sizeof(h) + (size_t)h.num_ibs * sizeof(struct n48n_cs_ib) || h.reserved != 0 ||
++       (h.flags & ~N48N_CS_HAS_FENCE))
++      REFUSE(ACD_KR_BAD_ARGUMENT, "if (h.abi != N48N_ABI_VERSION || h.num_ibs < 1 || h.num_ibs > N48N_MAX");
++   if (h.ctx_id == 0 || h.ctx_id > N48N_MAX_CTX || !m->ctx[h.ctx_id])
++      REFUSE(ACD_KR_NOT_FOUND, "if (h.ctx_id == 0 || h.ctx_id > N48N_MAX_CTX || !m->ctx[h.ctx_id])");
++
++   for (uint32_t i = 0; i < h.num_ibs; i++) {
++      struct n48n_cs_ib ib;
++      memcpy(&ib, in + sizeof(h) + i * sizeof(ib), sizeof(ib));
++      if (ib._pad || ib.ip_type != AMDGPU_HW_IP_GFX || ib.ip_instance != 0 || ib.ring != 0)
++         REFUSE(ACD_KR_BAD_ARGUMENT, "if (ib._pad || ib.ip_type != AMDGPU_HW_IP_GFX || ib.ip_instance != 0 |");
++      if (ib.ib_bytes == 0 || (ib.ib_bytes & 3) || ib.ib_bytes > 0xFFFFFu * 4)
++         REFUSE(ACD_KR_BAD_ARGUMENT, "if (ib.ib_bytes == 0 || (ib.ib_bytes & 3) || ib.ib_bytes > 0xFFFFFu * ");
++      if (!acd_canon_bits_ok(ib.va_start) || (ib.va_start & 3))
++         REFUSE(ACD_KR_BAD_ARGUMENT, "if (!acd_canon_bits_ok(ib.va_start) || (ib.va_start & 3))");
++      if (ib.flags & (AMDGPU_IB_FLAG_CE | AMDGPU_IB_FLAG_RESET_GDS_MAX_WAVE_ID | AMDGPU_IB_FLAGS_SECURE |
++                      AMDGPU_IB_FLAG_EMIT_MEM_SYNC))
++         REFUSE(ACD_KR_UNSUPPORTED, "if (ib.flags & (AMDGPU_IB_FLAG_CE | AMDGPU_IB_FLAG_RESET_GDS_MAX_WAVE_");
++      if (ib.flags & ~(uint32_t)(AMDGPU_IB_FLAG_PREAMBLE | AMDGPU_IB_FLAG_PREEMPT |
++                                 AMDGPU_IB_FLAG_TC_WB_NOT_INVALIDATE))
++         REFUSE(ACD_KR_BAD_ARGUMENT, "if (ib.flags & ~(uint32_t)(AMDGPU_IB_FLAG_PREAMBLE | AMDGPU_IB_FLAG_PR");
++      if (!ib_covered(m, ib.va_start, ib.ib_bytes))
++         REFUSE(ACD_KR_BAD_ARGUMENT, "if (!ib_covered(m, ib.va_start, ib.ib_bytes))"); /* an unmapped IB would fault; nothing reaches the ring */
++   }
++
++   struct mock_bo *fb = NULL;
++   if (h.flags & N48N_CS_HAS_FENCE) {
++      fb = find_bo(m, h.fence_handle);
++      if (!fb)
++         REFUSE(ACD_KR_NOT_FOUND, "if (!fb)");
++      if ((h.fence_offset & 7) || (uint64_t)h.fence_offset + 8 > fb->size)
++         REFUSE(ACD_KR_BAD_ARGUMENT, "if ((h.fence_offset & 7) || (uint64_t)h.fence_offset + 8 > fb->size)");
++   } else if (h.fence_handle || h.fence_offset) {
++      REFUSE(ACD_KR_BAD_ARGUMENT, "} else if (h.fence_handle || h.fence_offset) {");
++   }
++
++   const uint64_t retired_before = retired_locked(m);
++   const uint64_t seq = ++m->emitted;
++   if (fb)
++      memcpy(fb->mem + h.fence_offset, &seq, sizeof(seq));
++   m->retired_at_submit = retired_before;
++   m->last_submit_ns = mnow();
++   m->submits++;
++   *seq_out = seq;
++   return ACD_KR_SUCCESS;
++}
++
++static int
++do_wait_seq(struct mock *m, uint64_t target, uint64_t timeout_ns, uint64_t *sout)
++{
++   pthread_mutex_lock(&m->lock);
++   const uint64_t emitted = m->emitted;
++   if (target == N48N_SEQ_LAST)
++      target = emitted;
++   if (target > emitted) {
++      pthread_mutex_unlock(&m->lock);
++      return ACD_KR_BAD_ARGUMENT;
++   }
++   if (m->hang_mode && target != 0) {
++      /* contract 6.3: the detecting call gets Timeout, every later GPU-dependent call Aborted */
++      const int kr = m->hung ? ACD_KR_ABORTED : ACD_KR_TIMEOUT;
++      if (!m->hung)
++         fprintf(stderr, "radv-darwin: mock: HUNG latched (seq emitted %llu retired 0)\n", (unsigned long long)emitted);
++      m->hung = true;
++      pthread_mutex_unlock(&m->lock);
++      return kr;
++   }
++   if (timeout_ns > N48N_WAIT_CAP_NS)
++      timeout_ns = N48N_WAIT_CAP_NS;
++   const uint64_t t0 = mnow();
++   uint64_t ret;
++   for (;;) {
++      ret = retired_locked(m);
++      if (target == 0 || ret >= target || mnow() - t0 >= timeout_ns)
++         break;
++      pthread_mutex_unlock(&m->lock);
++      usleep(200);
++      pthread_mutex_lock(&m->lock);
++   }
++   sout[0] = (target == 0 || ret >= target) ? 0 : 1;
++   sout[1] = ret;
++   sout[2] = m->emitted;
++   pthread_mutex_unlock(&m->lock);
++   return ACD_KR_SUCCESS;
++}
++
++#define NEED(cond)                                                                                 \
++   do {                                                                                           \
++      if (!(cond)) {                                                                              \
++         kr = ACD_KR_BAD_ARGUMENT;                                                                \
++         goto out;                                                                                \
++      }                                                                                           \
++   } while (0)
++
++static int
++mock_call(void *ctx, uint32_t sel, const uint64_t *sin, uint32_t nsin, const void *stin, size_t stinsz,
++          uint64_t *sout, uint32_t *nsout, void *stout, size_t *stoutsz)
++{
++   struct mock *m = ctx;
++   int kr = ACD_KR_SUCCESS;
++   const uint32_t nout_cap = nsout ? *nsout : 0;
++   const size_t sout_cap = stoutsz ? *stoutsz : 0;
++   /* the kernel checks scalar counts and struct sizes EXACTLY (contract section 2) */
++   const bool no_sin_ptr = nsin && !sin, no_stin = stinsz && !stin;
++#define shape(wsic, wsoc, wsis, wsos)                                                              \
++   (!no_sin_ptr && !no_stin && nsin == (wsic) && nout_cap == (wsoc) && stinsz == (size_t)(wsis) && \
++    sout_cap == (size_t)(wsos) && ((wsoc) == 0 || sout) && ((wsos) == 0 || stout) && ((wsis) == 0 || stin))
++
++   if (sel == ACD_SEL_WAIT_SEQ) { /* takes no lock */
++      if (!m->hello)
++         return ACD_KR_NOT_READY;
++      if (!shape(3, 3, 0, 0))
++         return ACD_KR_BAD_ARGUMENT;
++      kr = do_wait_seq(m, sin[0], sin[1], sout);
++      if (!kr)
++         *nsout = 3;
++      return kr;
++   }
++
++   pthread_mutex_lock(&m->lock);
++   if (sel != ACD_SEL_HELLO && !m->hello) {
++      kr = ACD_KR_NOT_READY;
++      goto out;
++   }
++   switch (sel) {
++   case ACD_SEL_HELLO:
++      NEED(shape(2, 4, 0, 0));
++      NEED(sin[1] == 0);
++      if (sin[0] != N48N_ABI_VERSION) {
++         kr = ACD_KR_UNSUPPORTED;
++         goto out;
++      }
++      m->hello = true;
++      sout[0] = N48N_ABI_VERSION;
++      sout[1] = 601;
++      sout[2] = N48N_MAX_IBS;
++      sout[3] = 8;
++      *nsout = 4;
++      break;
++   case ACD_SEL_QUERY_INFO: {
++      NEED(shape(0, 0, 0, sizeof(struct n48n_info)));
++      struct n48n_info inf;
++      memset(&inf, 0, sizeof(inf));
++      inf.abi_version = N48N_ABI_VERSION;
++      inf.kext_build = 601;
++      inf.flags = N48N_INFO_S1B_POSITIVE | N48N_INFO_NATIVE_BOOT;
++      inf.vmid = 8;
++      inf.gb_addr_config = ACD_GB_ADDR_CONFIG_GFX1201;
++      inf.gc_version = (12u << 16) | (0u << 8) | 1u;
++      inf.ring_size_dw = 4096;
++      inf.max_ibs = N48N_MAX_IBS;
++      inf.vram_vis_total = MOCK_VIS_TOTAL;
++      inf.vram_vis_free = MOCK_VIS_TOTAL - m->vis_used;
++      inf.vram_hi_total = MOCK_HI_TOTAL;
++      inf.vram_hi_free = MOCK_HI_TOTAL - m->hi_used;
++      inf.gtt_cap = MOCK_GTT_CAP;
++      inf.gtt_used = m->gtt_used;
++      inf.gtt_max_bo = MOCK_GTT_MAX_BO;
++      inf.pt_cap = MOCK_PT_CAP;
++      inf.seq_emitted = m->emitted;
++      inf.seq_retired = retired_locked(m);
++      inf.va_low_first = 0x10000;
++      inf.va_low_last = 0x7FFFFFFFFFFFull;
++      inf.va_high_first = 0xFFFF800000000000ull;
++      inf.va_high_last = 0xFFFFFFFFFFFFFFFFull;
++      inf.max_bos = N48N_MAX_BOS;
++      inf.fence_slots = N48N_FENCE_SLOTS;
++      memcpy(stout, &inf, sizeof(inf));
++      *stoutsz = sizeof(inf);
++      break;
++   }
++   case ACD_SEL_READ_REGS: {
++      NEED(nsin == 3 && nout_cap == 0 && stinsz == 0);
++      NEED(sin[1] >= 1 && sin[1] <= 16 && sin[2] == 0xFFFFFFFFull && shape(3, 0, 0, sin[1] * 4));
++      uint32_t v[16] = {0};
++      for (uint64_t i = 0; i < sin[1]; i++)
++         v[i] = (sin[0] + i == ACD_GB_ADDR_CONFIG_REG) ? ACD_GB_ADDR_CONFIG_GFX1201 : 0;
++      memcpy(stout, v, sin[1] * 4);
++      *stoutsz = sin[1] * 4;
++      break;
++   }
++   case ACD_SEL_BO_CREATE:
++      NEED(shape(0, 4, sizeof(struct n48n_gem_create_in), 0));
++      kr = do_bo_create(m, stin, sout);
++      if (!kr)
++         *nsout = 4;
++      break;
++   case ACD_SEL_BO_FREE:
++      NEED(shape(1, 0, 0, 0));
++      kr = do_bo_free(m, (uint32_t)sin[0]);
++      break;
++   case ACD_SEL_GEM_VA:
++      NEED(shape(0, 0, sizeof(struct n48n_gem_va), 0));
++      kr = do_gem_va(m, stin);
++      break;
++   case ACD_SEL_CTX: {
++      NEED(shape(0, 0, sizeof(struct n48n_ctx), sizeof(struct n48n_ctx)));
++      struct n48n_ctx in, out;
++      memcpy(&in, stin, sizeof(in));
++      memset(&out, 0, sizeof(out));
++      if (in.op == AMDGPU_CTX_OP_ALLOC_CTX) {
++         uint32_t id = 1;
++         while (id <= N48N_MAX_CTX && m->ctx[id])
++            id++;
++         if (id > N48N_MAX_CTX) {
++            kr = ACD_KR_NO_RESOURCES;
++            goto out;
++         }
++         m->ctx[id] = true;
++         out.op = id; /* out.alloc.ctx_id is dword 0 */
++      } else if (in.op == AMDGPU_CTX_OP_FREE_CTX) {
++         if (in.ctx_id == 0 || in.ctx_id > N48N_MAX_CTX || !m->ctx[in.ctx_id]) {
++            kr = ACD_KR_NOT_FOUND;
++            goto out;
++         }
++         m->ctx[in.ctx_id] = false;
++      } else if (in.op == AMDGPU_CTX_OP_QUERY_STATE2) {
++         /* not hung: flags 0 */
++      } else {
++         kr = ACD_KR_BAD_ARGUMENT;
++         goto out;
++      }
++      memcpy(stout, &out, sizeof(out));
++      *stoutsz = sizeof(out);
++      break;
++   }
++   case ACD_SEL_SUBMIT:
++      NEED(nsin == 0 && nout_cap == 1 && sout && stoutsz == NULL && stinsz >= 64 && stinsz <= 32 + 32 * N48N_MAX_IBS);
++      kr = do_submit(m, stin, stinsz, sout);
++      if (!kr)
++         *nsout = 1;
++      break;
++   default:
++      kr = ACD_KR_BAD_ARGUMENT;
++      break;
++   }
++out:
++   pthread_mutex_unlock(&m->lock);
++   return kr;
++#undef shape
++}
++
++static int
++mock_map(void *ctx, uint32_t handle, void **addr, size_t *size)
++{
++   struct mock *m = ctx;
++   pthread_mutex_lock(&m->lock);
++   int kr;
++   struct mock_bo *b = m->hello ? find_bo(m, handle) : NULL;
++   if (!m->hello)
++      kr = ACD_KR_NOT_READY;
++   else if (!b)
++      kr = ACD_KR_NOT_FOUND;
++   else if (b->bits & N48N_PLACED_HI_POOL)
++      kr = ACD_KR_NOT_PERMITTED;
++   else {
++      *addr = b->mem;
++      *size = b->size;
++      kr = ACD_KR_SUCCESS;
++   }
++   pthread_mutex_unlock(&m->lock);
++   return kr;
++}
++
++static int
++mock_unmap(void *ctx, uint32_t handle, void *addr)
++{
++   return ACD_KR_SUCCESS;
++}
++
++static void
++mock_close(void *ctx)
++{
++   struct mock *m = ctx;
++   for (uint32_t h = 1; h < N48N_MAX_BOS; h++)
++      if (m->bo[h].used)
++         free(m->bo[h].mem);
++   fprintf(stderr, "radv-darwin: mock client closed: %llu submits, %llu seqs\n",
++           (unsigned long long)m->submits, (unsigned long long)m->emitted);
++   pthread_mutex_destroy(&m->lock);
++   free(m);
++   pthread_mutex_lock(&g_open_lock);
++   g_open = false;
++   pthread_mutex_unlock(&g_open_lock);
++}
++
++int
++acd_mock_open(struct acd_kext **out)
++{
++   pthread_mutex_lock(&g_open_lock);
++   if (g_open) {
++      pthread_mutex_unlock(&g_open_lock);
++      fprintf(stderr, "radv-darwin: mock: another native client is open (ExclusiveAccess)\n");
++      return -EBUSY;
++   }
++   g_open = true;
++   pthread_mutex_unlock(&g_open_lock);
++
++   struct mock *m = calloc(1, sizeof(*m));
++   if (!m) {
++      pthread_mutex_lock(&g_open_lock);
++      g_open = false;
++      pthread_mutex_unlock(&g_open_lock);
++      return -ENOMEM;
++   }
++   pthread_mutex_init(&m->lock, NULL);
++   const char *hang = getenv("RADV_DARWIN_MOCK_HANG");
++   m->hang_mode = hang && hang[0] == '1';
++   const char *lag = getenv("RADV_DARWIN_MOCK_LAG_MS");
++   if (lag)
++      m->lag_ns = strtoull(lag, NULL, 10) * 1000000ull;
++   const struct acd_kext_ops ops = {
++      .call = mock_call,
++      .map = mock_map,
++      .unmap = mock_unmap,
++      .close = mock_close,
++   };
++   fprintf(stderr, "radv-darwin: RADV_DARWIN_MOCK=1: in-process mock kext (no GPU)\n");
++   *out = acd_kext_create(&ops, m);
++   return *out ? 0 : -ENOMEM;
++}
+diff --git a/src/amd/common/darwin/ac_darwin_sync.c b/src/amd/common/darwin/ac_darwin_sync.c
+index 67548cb469f..4f0dc18c589 100644
+--- a/src/amd/common/darwin/ac_darwin_sync.c
++++ b/src/amd/common/darwin/ac_darwin_sync.c
+@@ -3,8 +3,13 @@
+  *
+  * Userspace sync provider for the Darwin ac_drm backend: binary and timeline
+  * syncobjs kept entirely in this process (there is no DRM syncobj on macOS).
+- * S1a: objects are signalled by the CPU only (signal / timeline_signal /
+- * CREATE_SIGNALED / transfer); S1c signals them from kext sequence numbers.
++ *
++ * S1c: a payload is signalled either by the CPU (signal / timeline_signal /
++ * CREATE_SIGNALED) or by a kext sequence number.  A submit attaches the seqno
++ * it got back to each SYNCOBJ_OUT / TIMELINE_SIGNAL (handle, point); the point
++ * counts as signalled once WaitSeq reports that seqno retired.  A point that is
++ * neither signalled nor attached is "not yet submitted": waits block
++ * (WAIT_FOR_SUBMIT semantics) until a submit attaches it or the CPU signals it.
+  * sync_file and fd import/export are not available (-ENOSYS).
+  */
+ 
+@@ -19,24 +24,57 @@
+ #include "ac_darwin_drm.h"
+ #include "util/u_sync_provider.h"
+ 
++/* Longest slice of one backend wait: a CPU signal or a new attach is noticed within it. */
++#define ACD_SYNC_POLL_NS 20000000ull
++
++struct acd_tl_entry {
++   uint64_t point;
++   uint64_t seq;
++};
++
+ struct acd_syncobj {
+    bool in_use;
+-   bool binary_signaled;  /* binary payload */
+-   uint64_t point;        /* highest signalled timeline point */
++   bool bin_cpu;       /* binary payload signalled (CPU, or a retired seqno folded in) */
++   uint64_t bin_seq;   /* binary payload pending on this kernel seqno (0 = none) */
++   uint64_t point;     /* highest signalled timeline point (CPU, or retired seqno folded in) */
++   struct acd_tl_entry *tl; /* timeline points pending on kernel seqnos */
++   uint32_t tl_n, tl_cap;
+ };
+ 
++/* State shared by a provider and its clones (vk_device owns a clone; the handle space is common). */
+ struct acd_sync {
+-   struct util_sync_provider base;
++   int refcount;
+    pthread_mutex_t mtx;
+    pthread_cond_t cond;
+    struct acd_syncobj *objs;
+    uint32_t count;
++   struct acd_sync_backend be;
++   uint64_t known_retired; /* highest seqno known retired (atomic) */
++};
++
++struct acd_sync_handle {
++   struct util_sync_provider base;
++   struct acd_sync *st;
+ };
+ 
++/* The provider ops follow the DRM provider's convention (util_sync_provider_drm): -1 with errno set.
++ * vk_drm_syncobj.c tests `errno == ETIME` after a failed wait. */
++#define SYNC_FAIL(e) (errno = (e), -1)
++
++enum pstate { P_DONE, P_PENDING, P_UNSUBMITTED };
++
+ static struct acd_sync *
+ to_sync(struct util_sync_provider *p)
+ {
+-   return (struct acd_sync *)p;
++   return ((struct acd_sync_handle *)p)->st;
++}
++
++static uint64_t
++now_mono_ns(void)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+ }
+ 
+ static struct acd_syncobj *
+@@ -47,6 +85,75 @@ lookup(struct acd_sync *s, uint32_t handle)
+    return &s->objs[handle - 1];
+ }
+ 
++static void
++note_retired(struct acd_sync *s, uint64_t retired)
++{
++   uint64_t cur = __atomic_load_n(&s->known_retired, __ATOMIC_RELAXED);
++   while (retired > cur &&
++          !__atomic_compare_exchange_n(&s->known_retired, &cur, retired, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
++      ;
++}
++
++/* Fold every attached seqno that is known retired into the plain payload. */
++static void
++fold(struct acd_sync *s, struct acd_syncobj *o)
++{
++   const uint64_t ret = __atomic_load_n(&s->known_retired, __ATOMIC_RELAXED);
++   if (o->bin_seq && o->bin_seq <= ret) {
++      o->bin_cpu = true;
++      o->bin_seq = 0;
++   }
++   for (uint32_t i = 0; i < o->tl_n;) {
++      if (o->tl[i].seq <= ret) {
++         if (o->tl[i].point > o->point)
++            o->point = o->tl[i].point;
++         o->tl[i] = o->tl[--o->tl_n];
++      } else {
++         i++;
++      }
++   }
++}
++
++/* Payload state of (o, point); for P_PENDING *seq is the kernel seqno that signals it. */
++static enum pstate
++point_state(struct acd_sync *s, struct acd_syncobj *o, uint64_t point, uint64_t *seq)
++{
++   fold(s, o);
++   *seq = 0;
++   if (point == 0) {
++      if (o->bin_cpu)
++         return P_DONE;
++      if (o->bin_seq) {
++         *seq = o->bin_seq;
++         return P_PENDING;
++      }
++      return P_UNSUBMITTED;
++   }
++   if (o->point >= point)
++      return P_DONE;
++   for (uint32_t i = 0; i < o->tl_n; i++) {
++      if (o->tl[i].point >= point && (*seq == 0 || o->tl[i].seq < *seq))
++         *seq = o->tl[i].seq;
++   }
++   return *seq ? P_PENDING : P_UNSUBMITTED;
++}
++
++static int
++backend_wait(struct acd_sync *s, uint64_t seq, uint64_t rel_ns)
++{
++   bool busy = false;
++   uint64_t retired = 0;
++   int r = s->be.wait_seq(s->be.ctx, seq, rel_ns, &busy, &retired);
++   if (r == -ETIME)
++      r = -ECANCELED; /* the kernel's -ETIME is "device hung", not a wait timeout */
++   if (r)
++      return r;
++   note_retired(s, retired);
++   if (!busy)
++      note_retired(s, seq);
++   return 0;
++}
++
+ static int
+ sync_create(struct util_sync_provider *p, uint32_t flags, uint32_t *handle)
+ {
+@@ -59,13 +166,14 @@ sync_create(struct util_sync_provider *p, uint32_t flags, uint32_t *handle)
+       struct acd_syncobj *n = realloc(s->objs, (s->count + 16) * sizeof(*n));
+       if (!n) {
+          pthread_mutex_unlock(&s->mtx);
+-         return -ENOMEM;
++         return SYNC_FAIL(ENOMEM);
+       }
+       memset(n + s->count, 0, 16 * sizeof(*n));
+       s->objs = n;
+       s->count += 16;
+    }
+-   s->objs[i] = (struct acd_syncobj){.in_use = true, .binary_signaled = !!(flags & DRM_SYNCOBJ_CREATE_SIGNALED)};
++   free(s->objs[i].tl);
++   s->objs[i] = (struct acd_syncobj){.in_use = true, .bin_cpu = !!(flags & DRM_SYNCOBJ_CREATE_SIGNALED)};
+    *handle = i + 1;
+    pthread_mutex_unlock(&s->mtx);
+    return 0;
+@@ -77,83 +185,110 @@ sync_destroy(struct util_sync_provider *p, uint32_t handle)
+    struct acd_sync *s = to_sync(p);
+    pthread_mutex_lock(&s->mtx);
+    struct acd_syncobj *o = lookup(s, handle);
+-   if (o)
+-      o->in_use = false;
++   if (o) {
++      free(o->tl);
++      *o = (struct acd_syncobj){0};
++   }
+    pthread_mutex_unlock(&s->mtx);
+-   return o ? 0 : -EINVAL;
++   return o ? 0 : SYNC_FAIL(EINVAL);
+ }
+ 
+ static int
+ sync_handle_to_fd(struct util_sync_provider *p, uint32_t handle, int *out_obj_fd)
+ {
+-   return -ENOSYS;
++   return SYNC_FAIL(ENOSYS);
+ }
+ 
+ static int
+ sync_fd_to_handle(struct util_sync_provider *p, int obj_fd, uint32_t *handle)
+ {
+-   return -ENOSYS;
++   return SYNC_FAIL(ENOSYS);
+ }
+ 
+ static int
+ sync_import_sync_file(struct util_sync_provider *p, uint32_t handle, int sync_file_fd)
+ {
+-   return -ENOSYS;
++   return SYNC_FAIL(ENOSYS);
+ }
+ 
+ static int
+ sync_export_sync_file(struct util_sync_provider *p, uint32_t handle, int *out_sync_file_fd)
+ {
+-   return -ENOSYS;
+-}
+-
+-static bool
+-point_done(const struct acd_syncobj *o, uint64_t point)
+-{
+-   /* point 0 on a timeline wait means the binary payload */
+-   return point ? o->point >= point : o->binary_signaled;
++   return SYNC_FAIL(ENOSYS);
+ }
+ 
+-/* timeout_nsec is an absolute CLOCK_MONOTONIC time, as in the DRM ioctls. */
++/* timeout_nsec is an absolute CLOCK_MONOTONIC time, as in the DRM ioctls (INT64_MAX = forever). */
+ static int
+-wait_locked(struct acd_sync *s, uint32_t *handles, const uint64_t *points, unsigned n, int64_t timeout_nsec,
+-            unsigned flags, uint32_t *first_signaled)
++wait_generic(struct acd_sync *s, uint32_t *handles, const uint64_t *points, unsigned n, int64_t timeout_nsec,
++             unsigned flags, uint32_t *first_signaled)
+ {
+-   struct timespec now_m, now_r;
+-   clock_gettime(CLOCK_MONOTONIC, &now_m);
+-   clock_gettime(CLOCK_REALTIME, &now_r);
+    const bool infinite = timeout_nsec == INT64_MAX;
+-   int64_t rel = infinite ? INT64_MAX : timeout_nsec - ((int64_t)now_m.tv_sec * 1000000000ll + now_m.tv_nsec);
+-   struct timespec deadline;
+-   int64_t dl = (int64_t)now_r.tv_sec * 1000000000ll + now_r.tv_nsec + (infinite ? 0 : rel > 0 ? rel : 0);
+-   deadline.tv_sec = dl / 1000000000ll;
+-   deadline.tv_nsec = dl % 1000000000ll;
++   const uint64_t deadline = infinite ? UINT64_MAX : timeout_nsec < 0 ? 0 : (uint64_t)timeout_nsec;
++   bool final_poll = false;
+ 
+    for (;;) {
+       unsigned done = 0;
+       int first = -1;
++      uint64_t pend_min = 0;
++
++      pthread_mutex_lock(&s->mtx);
+       for (unsigned i = 0; i < n; i++) {
+          struct acd_syncobj *o = lookup(s, handles[i]);
+-         if (!o)
+-            return -EINVAL;
+-         if (point_done(o, points ? points[i] : 0)) {
++         if (!o) {
++            pthread_mutex_unlock(&s->mtx);
++            return SYNC_FAIL(EINVAL);
++         }
++         uint64_t seq;
++         enum pstate st = point_state(s, o, points ? points[i] : 0, &seq);
++         if (st == P_DONE) {
+             done++;
+             if (first < 0)
+                first = i;
++         } else if (st == P_PENDING && (pend_min == 0 || seq < pend_min)) {
++            pend_min = seq;
+          }
+       }
+-      bool ok = (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) ? done == n : done > 0;
++      const bool ok = (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) ? done == n : done > 0;
+       if (ok) {
++         pthread_mutex_unlock(&s->mtx);
+          if (first_signaled)
+             *first_signaled = first < 0 ? 0 : first;
+          return 0;
+       }
+-      if (rel <= 0)
+-         return -ETIME;
+-      if (infinite)
+-         pthread_cond_wait(&s->cond, &s->mtx);
+-      else if (pthread_cond_timedwait(&s->cond, &s->mtx, &deadline) == ETIMEDOUT)
+-         rel = 0; /* evaluate the state one last time, then -ETIME */
++
++      const uint64_t now = now_mono_ns();
++      if (!infinite && now >= deadline) {
++         pthread_mutex_unlock(&s->mtx);
++         if (pend_min && s->be.wait_seq && !final_poll) {
++            /* Expired (e.g. a zero-timeout status query): ask the kernel once, then re-evaluate. */
++            final_poll = true;
++            int r = backend_wait(s, pend_min, 0);
++            if (r)
++               return SYNC_FAIL(-r);
++            continue;
++         }
++         return SYNC_FAIL(ETIME);
++      }
++      uint64_t slice = infinite ? ACD_SYNC_POLL_NS : deadline - now;
++      if (slice > ACD_SYNC_POLL_NS)
++         slice = ACD_SYNC_POLL_NS;
++
++      if (pend_min && s->be.wait_seq) {
++         /* Wait on the kernel for the earliest pending seqno, without our lock. */
++         pthread_mutex_unlock(&s->mtx);
++         int r = backend_wait(s, pend_min, slice);
++         if (r)
++            return SYNC_FAIL(-r);
++      } else {
++         /* Nothing pending: only a CPU signal or a submit's attach can change the state. */
++         struct timespec dl;
++         clock_gettime(CLOCK_REALTIME, &dl);
++         uint64_t ns = (uint64_t)dl.tv_nsec + slice;
++         dl.tv_sec += ns / 1000000000ull;
++         dl.tv_nsec = ns % 1000000000ull;
++         pthread_cond_timedwait(&s->cond, &s->mtx, &dl);
++         pthread_mutex_unlock(&s->mtx);
++      }
+    }
+ }
+ 
+@@ -161,22 +296,14 @@ static int
+ sync_wait(struct util_sync_provider *p, uint32_t *handles, unsigned num_handles, int64_t timeout_nsec,
+           unsigned flags, uint32_t *first_signaled)
+ {
+-   struct acd_sync *s = to_sync(p);
+-   pthread_mutex_lock(&s->mtx);
+-   int r = wait_locked(s, handles, NULL, num_handles, timeout_nsec, flags, first_signaled);
+-   pthread_mutex_unlock(&s->mtx);
+-   return r;
++   return wait_generic(to_sync(p), handles, NULL, num_handles, timeout_nsec, flags, first_signaled);
+ }
+ 
+ static int
+ sync_timeline_wait(struct util_sync_provider *p, uint32_t *handles, uint64_t *points, unsigned num_handles,
+                    int64_t timeout_nsec, unsigned flags, uint32_t *first_signaled)
+ {
+-   struct acd_sync *s = to_sync(p);
+-   pthread_mutex_lock(&s->mtx);
+-   int r = wait_locked(s, handles, points, num_handles, timeout_nsec, flags, first_signaled);
+-   pthread_mutex_unlock(&s->mtx);
+-   return r;
++   return wait_generic(to_sync(p), handles, points, num_handles, timeout_nsec, flags, first_signaled);
+ }
+ 
+ static int
+@@ -188,9 +315,10 @@ sync_reset(struct util_sync_provider *p, const uint32_t *handles, uint32_t handl
+       struct acd_syncobj *o = lookup(s, handles[i]);
+       if (!o) {
+          pthread_mutex_unlock(&s->mtx);
+-         return -EINVAL;
++         return SYNC_FAIL(EINVAL);
+       }
+-      o->binary_signaled = false;
++      o->bin_cpu = false;
++      o->bin_seq = 0;
+    }
+    pthread_mutex_unlock(&s->mtx);
+    return 0;
+@@ -205,9 +333,10 @@ sync_signal(struct util_sync_provider *p, const uint32_t *handles, uint32_t hand
+       struct acd_syncobj *o = lookup(s, handles[i]);
+       if (!o) {
+          pthread_mutex_unlock(&s->mtx);
+-         return -EINVAL;
++         return SYNC_FAIL(EINVAL);
+       }
+-      o->binary_signaled = true;
++      o->bin_cpu = true;
++      o->bin_seq = 0;
+    }
+    pthread_cond_broadcast(&s->cond);
+    pthread_mutex_unlock(&s->mtx);
+@@ -224,7 +353,7 @@ sync_timeline_signal(struct util_sync_provider *p, const uint32_t *handles, uint
+       struct acd_syncobj *o = lookup(s, handles[i]);
+       if (!o) {
+          pthread_mutex_unlock(&s->mtx);
+-         return -EINVAL;
++         return SYNC_FAIL(EINVAL);
+       }
+       if (points[i] > o->point)
+          o->point = points[i];
+@@ -239,13 +368,32 @@ sync_query(struct util_sync_provider *p, uint32_t *handles, uint64_t *points, ui
+            uint32_t flags)
+ {
+    struct acd_sync *s = to_sync(p);
++
++   /* Refresh the retired seqno once (zero-timeout WaitSeq on the newest pending one). */
++   if (s->be.wait_seq) {
++      uint64_t newest = 0;
++      pthread_mutex_lock(&s->mtx);
++      for (uint32_t i = 0; i < handle_count; i++) {
++         struct acd_syncobj *o = lookup(s, handles[i]);
++         if (!o)
++            continue;
++         for (uint32_t j = 0; j < o->tl_n; j++)
++            if (o->tl[j].seq > newest)
++               newest = o->tl[j].seq;
++      }
++      pthread_mutex_unlock(&s->mtx);
++      if (newest && backend_wait(s, newest, 0))
++         ; /* a failing backend just leaves the previous state */
++   }
++
+    pthread_mutex_lock(&s->mtx);
+    for (uint32_t i = 0; i < handle_count; i++) {
+       struct acd_syncobj *o = lookup(s, handles[i]);
+       if (!o) {
+          pthread_mutex_unlock(&s->mtx);
+-         return -EINVAL;
++         return SYNC_FAIL(EINVAL);
+       }
++      fold(s, o);
+       points[i] = o->point;
+    }
+    pthread_mutex_unlock(&s->mtx);
+@@ -262,29 +410,56 @@ sync_transfer(struct util_sync_provider *p, uint32_t dst_handle, uint64_t dst_po
+    struct acd_syncobj *src = lookup(s, src_handle);
+    if (!dst || !src) {
+       pthread_mutex_unlock(&s->mtx);
+-      return -EINVAL;
++      return SYNC_FAIL(EINVAL);
+    }
+-   /* Only already-signalled sources can be transferred until the kext gives
+-    * us pending fences (S1c). */
+-   if (!point_done(src, src_point)) {
++   uint64_t seq;
++   enum pstate st = point_state(s, src, src_point, &seq);
++   if (st == P_UNSUBMITTED) {
++      /* nothing to transfer yet (the fence does not exist) */
+       pthread_mutex_unlock(&s->mtx);
+-      return -EINVAL;
++      return SYNC_FAIL(EINVAL);
+    }
+    if (dst_point) {
+-      if (dst_point > dst->point)
+-         dst->point = dst_point;
++      if (st == P_DONE) {
++         if (dst_point > dst->point)
++            dst->point = dst_point;
++      } else {
++         if (dst->tl_n == dst->tl_cap) {
++            uint32_t ncap = dst->tl_cap ? dst->tl_cap * 2 : 8;
++            struct acd_tl_entry *t = realloc(dst->tl, ncap * sizeof(*t));
++            if (!t) {
++               pthread_mutex_unlock(&s->mtx);
++               return SYNC_FAIL(ENOMEM);
++            }
++            dst->tl = t;
++            dst->tl_cap = ncap;
++         }
++         dst->tl[dst->tl_n++] = (struct acd_tl_entry){.point = dst_point, .seq = seq};
++      }
++   } else if (st == P_DONE) {
++      dst->bin_cpu = true;
++      dst->bin_seq = 0;
+    } else {
+-      dst->binary_signaled = true;
++      dst->bin_cpu = false;
++      dst->bin_seq = seq;
+    }
+    pthread_cond_broadcast(&s->cond);
+    pthread_mutex_unlock(&s->mtx);
+    return 0;
+ }
+ 
++static struct util_sync_provider *make_handle(struct acd_sync *st);
++
+ static void
+ sync_finalize(struct util_sync_provider *p)
+ {
+-   struct acd_sync *s = to_sync(p);
++   struct acd_sync_handle *h = (struct acd_sync_handle *)p;
++   struct acd_sync *s = h->st;
++   free(h);
++   if (__atomic_sub_fetch(&s->refcount, 1, __ATOMIC_ACQ_REL) != 0)
++      return;
++   for (uint32_t i = 0; i < s->count; i++)
++      free(s->objs[i].tl);
+    pthread_cond_destroy(&s->cond);
+    pthread_mutex_destroy(&s->mtx);
+    free(s->objs);
+@@ -294,19 +469,93 @@ sync_finalize(struct util_sync_provider *p)
+ static struct util_sync_provider *
+ sync_clone(struct util_sync_provider *p)
+ {
+-   /* A clone must share the handle space; not needed by RADV in S1. */
+-   return NULL;
++   /* Same handle space: a syncobj created through the device is visible through the clone. */
++   struct acd_sync *s = to_sync(p);
++   __atomic_add_fetch(&s->refcount, 1, __ATOMIC_RELAXED);
++   struct util_sync_provider *c = make_handle(s);
++   if (!c)
++      __atomic_sub_fetch(&s->refcount, 1, __ATOMIC_RELAXED);
++   return c;
+ }
+ 
+-struct util_sync_provider *
+-acd_sync_provider_create(void)
++/* ---- called by the CS path (ac_darwin_drm.c) ---- */
++
++int
++acd_sync_cs_wait_ready(struct util_sync_provider *p, uint32_t handle, uint64_t point, uint64_t timeout_ns)
+ {
+-   struct acd_sync *s = calloc(1, sizeof(*s));
+-   if (!s)
++   struct acd_sync *s = to_sync(p);
++   const uint64_t deadline = now_mono_ns() + timeout_ns;
++
++   pthread_mutex_lock(&s->mtx);
++   for (;;) {
++      struct acd_syncobj *o = lookup(s, handle);
++      if (!o) {
++         pthread_mutex_unlock(&s->mtx);
++         return -EINVAL;
++      }
++      uint64_t seq;
++      /* DONE, or pending on a seqno of this client: already ordered before the new submit. */
++      if (point_state(s, o, point, &seq) != P_UNSUBMITTED) {
++         pthread_mutex_unlock(&s->mtx);
++         return 0;
++      }
++      const uint64_t now = now_mono_ns();
++      if (now >= deadline) {
++         pthread_mutex_unlock(&s->mtx);
++         return -ETIME;
++      }
++      uint64_t slice = deadline - now;
++      if (slice > 100000000ull)
++         slice = 100000000ull;
++      struct timespec dl;
++      clock_gettime(CLOCK_REALTIME, &dl);
++      uint64_t ns = (uint64_t)dl.tv_nsec + slice;
++      dl.tv_sec += ns / 1000000000ull;
++      dl.tv_nsec = ns % 1000000000ull;
++      pthread_cond_timedwait(&s->cond, &s->mtx, &dl);
++   }
++}
++
++int
++acd_sync_cs_attach(struct util_sync_provider *p, uint32_t handle, uint64_t point, uint64_t seq)
++{
++   struct acd_sync *s = to_sync(p);
++   pthread_mutex_lock(&s->mtx);
++   struct acd_syncobj *o = lookup(s, handle);
++   if (!o) {
++      pthread_mutex_unlock(&s->mtx);
++      return -EINVAL;
++   }
++   if (point == 0) {
++      o->bin_cpu = false;
++      o->bin_seq = seq;
++   } else {
++      fold(s, o);
++      if (o->tl_n == o->tl_cap) {
++         uint32_t ncap = o->tl_cap ? o->tl_cap * 2 : 8;
++         struct acd_tl_entry *t = realloc(o->tl, ncap * sizeof(*t));
++         if (!t) {
++            pthread_mutex_unlock(&s->mtx);
++            return -ENOMEM;
++         }
++         o->tl = t;
++         o->tl_cap = ncap;
++      }
++      o->tl[o->tl_n++] = (struct acd_tl_entry){.point = point, .seq = seq};
++   }
++   pthread_cond_broadcast(&s->cond);
++   pthread_mutex_unlock(&s->mtx);
++   return 0;
++}
++
++static struct util_sync_provider *
++make_handle(struct acd_sync *st)
++{
++   struct acd_sync_handle *h = calloc(1, sizeof(*h));
++   if (!h)
+       return NULL;
+-   pthread_mutex_init(&s->mtx, NULL);
+-   pthread_cond_init(&s->cond, NULL);
+-   s->base = (struct util_sync_provider){
++   h->st = st;
++   h->base = (struct util_sync_provider){
+       .create = sync_create,
+       .destroy = sync_destroy,
+       .handle_to_fd = sync_handle_to_fd,
+@@ -323,5 +572,25 @@ acd_sync_provider_create(void)
+       .finalize = sync_finalize,
+       .clone = sync_clone,
+    };
+-   return &s->base;
++   return &h->base;
++}
++
++struct util_sync_provider *
++acd_sync_provider_create(const struct acd_sync_backend *be)
++{
++   struct acd_sync *s = calloc(1, sizeof(*s));
++   if (!s)
++      return NULL;
++   if (be)
++      s->be = *be;
++   s->refcount = 1;
++   pthread_mutex_init(&s->mtx, NULL);
++   pthread_cond_init(&s->cond, NULL);
++   struct util_sync_provider *p = make_handle(s);
++   if (!p) {
++      pthread_cond_destroy(&s->cond);
++      pthread_mutex_destroy(&s->mtx);
++      free(s);
++   }
++   return p;
+ }
+diff --git a/src/amd/common/darwin/test/acd_kext_test.c b/src/amd/common/darwin/test/acd_kext_test.c
+new file mode 100644
+index 00000000000..f7546ffbb4e
+--- /dev/null
++++ b/src/amd/common/darwin/test/acd_kext_test.c
+@@ -0,0 +1,362 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Host unit test of the Mesa-side marshaller (ac_darwin_kext.c) against a fake
++ * IOConnectCallMethod.  Build and run:
++ *   clang -std=gnu11 -I include -I include/darwin -I src/amd/common/darwin \
++ *     src/amd/common/darwin/test/acd_kext_test.c src/amd/common/darwin/ac_darwin_kext.c -o acd_kext_test && ./acd_kext_test
++ */
++#include "ac_darwin_kext.h"
++
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++int acd_mock_open(struct acd_kext **out) { (void)out; return -ENODEV; }
++int acd_kext_open_iokit(struct acd_kext **out) { (void)out; return -ENODEV; }
++
++static int failures, checks;
++#define CHECK(c)                                                                                   \
++   do {                                                                                            \
++      checks++;                                                                                    \
++      if (!(c)) {                                                                                  \
++         failures++;                                                                               \
++         printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c);                                       \
++      }                                                                                            \
++   } while (0)
++
++struct rec {
++   uint32_t sel, nsin;
++   uint64_t sin[4];
++   size_t stinsz;
++   uint8_t stin[4096];
++};
++
++struct fake {
++   struct rec calls[64];
++   unsigned ncalls;
++   int next_kr;         /* returned by every call */
++   uint64_t seq;        /* Submit returns ++seq */
++   unsigned busy_polls; /* WaitSeq reports busy this many times */
++   uint64_t now;
++   uint64_t last_wait_rel;
++   unsigned wait_calls;
++};
++
++static int
++fake_call(void *ctx, uint32_t sel, const uint64_t *sin, uint32_t nsin, const void *stin, size_t stinsz,
++          uint64_t *sout, uint32_t *nsout, void *stout, size_t *stoutsz)
++{
++   struct fake *f = ctx;
++   if (f->ncalls < 64) {
++      struct rec *r = &f->calls[f->ncalls++];
++      r->sel = sel;
++      r->nsin = nsin;
++      for (uint32_t i = 0; i < nsin && i < 4; i++)
++         r->sin[i] = sin[i];
++      r->stinsz = stinsz;
++      memcpy(r->stin, stin, stinsz < sizeof(r->stin) ? stinsz : sizeof(r->stin));
++   }
++   if (f->next_kr)
++      return f->next_kr;
++   switch (sel) {
++   case ACD_SEL_SUBMIT:
++      sout[0] = ++f->seq;
++      *nsout = 1;
++      break;
++   case ACD_SEL_WAIT_SEQ:
++      f->wait_calls++;
++      f->last_wait_rel = sin[1];
++      f->now += sin[1]; /* the kernel waited the whole slice when busy */
++      sout[0] = f->busy_polls ? (f->busy_polls--, 1) : 0;
++      sout[1] = 0;
++      sout[2] = f->seq;
++      *nsout = 3;
++      break;
++   case ACD_SEL_HELLO:
++      sout[0] = 1; sout[1] = 601; sout[2] = 64; sout[3] = 8;
++      *nsout = 4;
++      break;
++   case ACD_SEL_CTX:
++      memset(stout, 0, *stoutsz);
++      ((struct n48n_ctx *)stout)->op = 7;
++      break;
++   default:
++      break;
++   }
++   return 0;
++}
++
++static uint64_t
++fake_now(void *ctx)
++{
++   return ((struct fake *)ctx)->now;
++}
++
++static struct acd_kext *
++mk(struct fake *f)
++{
++   memset(f, 0, sizeof(*f));
++   struct acd_kext_ops ops = {.call = fake_call, .now_ns = fake_now};
++   return acd_kext_create(&ops, f);
++}
++
++static void
++test_errno_map(void)
++{
++   CHECK(acd_kr_to_errno(3, 0) == 0);
++   CHECK(acd_kr_to_errno(3, (int)ACD_KR_BAD_ARGUMENT) == -EINVAL);
++   CHECK(acd_kr_to_errno(3, (int)ACD_KR_NOT_FOUND) == -ENOENT);
++   CHECK(acd_kr_to_errno(5, (int)ACD_KR_UNSUPPORTED) == -EINVAL);
++   CHECK(acd_kr_to_errno(ACD_SEL_HELLO, (int)ACD_KR_UNSUPPORTED) == -ENODEV);
++   CHECK(acd_kr_to_errno(3, (int)ACD_KR_NO_MEMORY) == -ENOMEM);
++   CHECK(acd_kr_to_errno(3, (int)ACD_KR_NO_RESOURCES) == -ENOMEM);
++   CHECK(acd_kr_to_errno(3, (int)ACD_KR_NOT_READY) == -ENODEV);
++   CHECK(acd_kr_to_errno(3, (int)ACD_KR_EXCLUSIVE_ACCESS) == -EBUSY);
++   CHECK(acd_kr_to_errno(3, (int)ACD_KR_NOT_PRIVILEGED) == -EACCES);
++   CHECK(acd_kr_to_errno(3, (int)ACD_KR_NOT_PERMITTED) == -EACCES);
++   CHECK(acd_kr_to_errno(7, (int)ACD_KR_TIMEOUT) == -ETIME);
++   CHECK(acd_kr_to_errno(7, (int)ACD_KR_ABORTED) == -ECANCELED);
++   CHECK(acd_kr_to_errno(7, 0x10000003) == -ENODEV);      /* MACH_SEND_INVALID_DEST */
++   CHECK(acd_kr_to_errno(7, 0x10004003) == -ENODEV);      /* MACH_RCV_* */
++   CHECK(acd_kr_to_errno(7, -300) == -ENODEV);            /* MIG_SERVER_DIED */
++   CHECK(acd_kr_to_errno(7, (int)0xe0001234u) == -EIO);   /* anything else (+ stderr line) */
++}
++
++static void
++test_timeouts(void)
++{
++   CHECK(acd_wait_slice_ns(ACD_TIMEOUT_INFINITE, 123) == N48N_WAIT_CAP_NS);
++   CHECK(acd_wait_slice_ns(1000, 2000) == 0);                       /* already passed: clamp at 0 */
++   CHECK(acd_wait_slice_ns(1000, 1000) == 0);
++   CHECK(acd_wait_slice_ns(5000, 1000) == 4000);
++   CHECK(acd_wait_slice_ns(10ull * 1000000000ull, 0) == N48N_WAIT_CAP_NS); /* capped at 2 s */
++   CHECK(!acd_wait_expired(ACD_TIMEOUT_INFINITE, ~0ull - 1));
++   CHECK(acd_wait_expired(1000, 1000) && !acd_wait_expired(1000, 999));
++   CHECK(acd_canon_bits_ok(0xffff800100000000ull) && acd_canon_bits_ok(0x00007fffffffffffull));
++   CHECK(!acd_canon_bits_ok(0x0000800000000000ull) && !acd_canon_bits_ok(0xffff000000000000ull));
++   CHECK(acd_cs_split_count(1) == 1 && acd_cs_split_count(64) == 1 && acd_cs_split_count(65) == 2 &&
++         acd_cs_split_count(192) == 3);
++}
++
++/* -- chunk builder -- */
++struct cs_build {
++   struct drm_amdgpu_cs_chunk chunk[300];
++   uint64_t ptr[300];
++   struct drm_amdgpu_cs_chunk_ib ib[200];
++   struct drm_amdgpu_cs_chunk_fence fence[2];
++   struct drm_amdgpu_cs_chunk_sem sem_in[3], sem_out[2];
++   struct drm_amdgpu_cs_chunk_syncobj tl_wait[2], tl_sig[2];
++   struct drm_amdgpu_bo_list_in bol;
++   unsigned n;
++};
++
++static void
++add(struct cs_build *b, uint32_t id, uint32_t dw, const void *data)
++{
++   b->chunk[b->n] = (struct drm_amdgpu_cs_chunk){.chunk_id = id, .length_dw = dw, .chunk_data = (uint64_t)(uintptr_t)data};
++   b->ptr[b->n] = (uint64_t)(uintptr_t)&b->chunk[b->n];
++   b->n++;
++}
++
++static void
++add_ibs(struct cs_build *b, unsigned n)
++{
++   for (unsigned i = 0; i < n; i++) {
++      b->ib[i] = (struct drm_amdgpu_cs_chunk_ib){.flags = i & 2, .va_start = 0xffff800100001000ull + 0x1000 * i,
++                                                 .ib_bytes = 64 + 4 * i, .ip_type = 0, .ip_instance = 0, .ring = 0};
++      add(b, AMDGPU_CHUNK_ID_IB, sizeof(b->ib[0]) / 4, &b->ib[i]);
++   }
++}
++
++static void
++test_chunks(void)
++{
++   static struct cs_build b;
++   struct acd_cs_plan p;
++
++   /* the full RADV mix */
++   memset(&b, 0, sizeof(b));
++   add_ibs(&b, 3);
++   b.fence[0] = (struct drm_amdgpu_cs_chunk_fence){.handle = 9, .offset = 0};
++   add(&b, AMDGPU_CHUNK_ID_FENCE, 2, &b.fence[0]);
++   b.sem_in[0].handle = 11; b.sem_in[1].handle = 12;
++   add(&b, AMDGPU_CHUNK_ID_SYNCOBJ_IN, 2, b.sem_in);
++   b.tl_wait[0] = (struct drm_amdgpu_cs_chunk_syncobj){.handle = 21, .point = 5};
++   b.tl_wait[1] = (struct drm_amdgpu_cs_chunk_syncobj){.handle = 22, .point = 0};
++   add(&b, AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT, 8, b.tl_wait);
++   b.sem_out[0].handle = 31;
++   add(&b, AMDGPU_CHUNK_ID_SYNCOBJ_OUT, 1, b.sem_out);
++   b.tl_sig[0] = (struct drm_amdgpu_cs_chunk_syncobj){.handle = 41, .point = 7};
++   add(&b, AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL, 4, b.tl_sig);
++   add(&b, AMDGPU_CHUNK_ID_DEPENDENCIES, 0, NULL);
++   add(&b, AMDGPU_CHUNK_ID_SCHEDULED_DEPENDENCIES, 0, NULL);
++   add(&b, AMDGPU_CHUNK_ID_BO_HANDLES, sizeof(b.bol) / 4, &b.bol);
++   CHECK(acd_cs_plan_init(&p, 5, 0, b.n, b.ptr) == 0);
++   CHECK(p.ctx_id == 5 && p.n_ibs == 3 && p.has_fence && p.fence_handle == 9 && p.fence_offset == 0);
++   CHECK(p.ibs[2].va_start == 0xffff800100003000ull && p.ibs[2].ib_bytes == 72 && p.ibs[1].flags == 0 &&
++         p.ibs[2].flags == 2); /* verbatim, in order */
++   CHECK(p.n_waits == 4 && p.waits[0].handle == 11 && !p.waits[0].timeline && p.waits[2].handle == 21 &&
++         p.waits[2].point == 5 && p.waits[2].timeline && p.waits[3].point == 0);
++   CHECK(p.n_signals == 2 && p.signals[0].handle == 31 && p.signals[1].handle == 41 && p.signals[1].point == 7);
++   acd_cs_plan_fini(&p);
++
++   /* refusals */
++   struct { const char *name; uint32_t id; } bad[] = {{"CP_GFX_SHADOW", AMDGPU_CHUNK_ID_CP_GFX_SHADOW}, {"unknown 0x55", 0x55}};
++   for (unsigned i = 0; i < 2; i++) {
++      memset(&b, 0, sizeof(b));
++      add_ibs(&b, 1);
++      add(&b, bad[i].id, 0, NULL);
++      CHECK(acd_cs_plan_init(&p, 1, 0, b.n, b.ptr) == -EINVAL);
++   }
++   memset(&b, 0, sizeof(b));
++   add_ibs(&b, 1);
++   CHECK(acd_cs_plan_init(&p, 1, 3, b.n, b.ptr) == -EINVAL); /* bo_list_handle != 0 */
++   memset(&b, 0, sizeof(b));
++   add(&b, AMDGPU_CHUNK_ID_BO_HANDLES, sizeof(b.bol) / 4, &b.bol);
++   CHECK(acd_cs_plan_init(&p, 1, 0, b.n, b.ptr) == -EINVAL); /* no IB */
++   memset(&b, 0, sizeof(b));
++   add_ibs(&b, 1);
++   add(&b, AMDGPU_CHUNK_ID_FENCE, 2, &b.fence[0]);
++   add(&b, AMDGPU_CHUNK_ID_FENCE, 2, &b.fence[1]);
++   CHECK(acd_cs_plan_init(&p, 1, 0, b.n, b.ptr) == -EINVAL); /* two user fences */
++   memset(&b, 0, sizeof(b));
++   add_ibs(&b, 1);
++   b.chunk[0].length_dw = 7;
++   CHECK(acd_cs_plan_init(&p, 1, 0, b.n, b.ptr) == -EINVAL); /* bad IB chunk length */
++}
++
++static void
++test_split(void)
++{
++   static struct cs_build b;
++   struct fake f;
++   struct acd_kext *k = mk(&f);
++   struct acd_cs_plan p;
++
++   /* 130 IBs -> 64 + 64 + 2, the fence only on the last, the last seqno returned */
++   memset(&b, 0, sizeof(b));
++   add_ibs(&b, 130);
++   b.fence[0] = (struct drm_amdgpu_cs_chunk_fence){.handle = 3, .offset = 16};
++   add(&b, AMDGPU_CHUNK_ID_FENCE, 2, &b.fence[0]);
++   CHECK(acd_cs_plan_init(&p, 6, 0, b.n, b.ptr) == 0);
++   uint64_t seq = 0;
++   CHECK(acd_kext_submit(k, &p, &seq) == 0);
++   CHECK(f.ncalls == 3 && seq == 3);
++   const unsigned want[3] = {64, 64, 2};
++   for (unsigned i = 0; i < 3 && i < f.ncalls; i++) {
++      const struct n48n_cs_in *h = (const struct n48n_cs_in *)f.calls[i].stin;
++      CHECK(f.calls[i].sel == ACD_SEL_SUBMIT && f.calls[i].nsin == 0);
++      CHECK(f.calls[i].stinsz == 32 + 32 * want[i]);
++      CHECK(h->abi == 1 && h->ctx_id == 6 && h->num_ibs == want[i] && h->reserved == 0);
++      CHECK((h->flags != 0) == (i == 2));
++      if (i == 2)
++         CHECK(h->flags == N48N_CS_HAS_FENCE && h->fence_handle == 3 && h->fence_offset == 16);
++      else
++         CHECK(h->fence_handle == 0 && h->fence_offset == 0);
++   }
++   /* the IBs keep their order across the split: first IB of call 1 is IB 64 */
++   const struct n48n_cs_ib *ib1 = (const struct n48n_cs_ib *)(f.calls[1].stin + 32);
++   CHECK(ib1->va_start == p.ibs[64].va_start && ib1->ib_bytes == p.ibs[64].ib_bytes);
++   acd_cs_plan_fini(&p);
++
++   /* exactly 64 -> one call; a kernel error surfaces mapped and stops the split */
++   memset(&b, 0, sizeof(b));
++   add_ibs(&b, 70);
++   CHECK(acd_cs_plan_init(&p, 6, 0, b.n, b.ptr) == 0);
++   f.ncalls = 0;
++   f.next_kr = (int)ACD_KR_TIMEOUT;
++   CHECK(acd_kext_submit(k, &p, &seq) == -ETIME && f.ncalls == 1);
++   f.next_kr = (int)ACD_KR_ABORTED;
++   CHECK(acd_kext_submit(k, &p, &seq) == -ECANCELED);
++   acd_cs_plan_fini(&p);
++   acd_kext_destroy(k);
++}
++
++static void
++test_wait(void)
++{
++   struct fake f;
++   struct acd_kext *k = mk(&f);
++   bool busy = true;
++
++   /* idle at once */
++   CHECK(acd_kext_wait_deadline(k, 5, 1000000, &busy) == 0 && !busy && f.wait_calls == 1);
++   /* infinite deadline: loops in 2 s slices until idle */
++   f.wait_calls = 0; f.busy_polls = 3;
++   CHECK(acd_kext_wait_deadline(k, 5, ACD_TIMEOUT_INFINITE, &busy) == 0 && !busy && f.wait_calls == 4 &&
++         f.last_wait_rel == N48N_WAIT_CAP_NS);
++   /* absolute deadline 5 s away, GPU never done: 2 s + 2 s + 1 s slices, then busy = 1 */
++   f.wait_calls = 0; f.busy_polls = 100; f.now = 1000;
++   const uint64_t dl = f.now + 5ull * 1000000000ull;
++   CHECK(acd_kext_wait_deadline(k, 5, dl, &busy) == 0 && busy && f.wait_calls == 3 && f.now >= dl);
++   /* a deadline already passed still asks the kernel once (status query), with rel = 0 */
++   f.wait_calls = 0; f.busy_polls = 100;
++   CHECK(acd_kext_wait_deadline(k, 5, 1, &busy) == 0 && busy && f.wait_calls == 1 && f.last_wait_rel == 0);
++   /* the caller's relative time is capped at 2 s here too */
++   f.ncalls = 0;
++   bool b2;
++   CHECK(acd_kext_wait_seq(k, N48N_SEQ_LAST, 30ull * 1000000000ull, &b2, NULL) == 0);
++   CHECK(f.calls[0].sin[0] == N48N_SEQ_LAST && f.calls[0].sin[1] == N48N_WAIT_CAP_NS && f.calls[0].nsin == 3);
++   /* errors propagate as device lost */
++   f.next_kr = (int)ACD_KR_TIMEOUT;
++   CHECK(acd_kext_wait_deadline(k, 5, ACD_TIMEOUT_INFINITE, &busy) == -ETIME);
++   f.next_kr = 0x10000003;
++   CHECK(acd_kext_wait_deadline(k, 5, ACD_TIMEOUT_INFINITE, &busy) == -ENODEV);
++   acd_kext_destroy(k);
++}
++
++static void
++test_misc(void)
++{
++   struct fake f;
++   struct acd_kext *k = mk(&f);
++
++   struct acd_hello h;
++   CHECK(acd_kext_hello(k, &h) == 0 && h.abi == 1 && h.build == 601 && h.max_ibs == 64 && h.vmid == 8);
++   CHECK(f.calls[0].sel == ACD_SEL_HELLO && f.calls[0].nsin == 2 && f.calls[0].sin[0] == 1 && f.calls[0].sin[1] == 0);
++
++   /* GEM_VA: verbatim fields, timeline/syncobj fields never reach the kernel */
++   struct drm_amdgpu_gem_va va = {.handle = 4, .operation = AMDGPU_VA_OP_MAP, .flags = 0xe,
++                                  .va_address = 0xffff800100000000ull, .offset_in_bo = 0x1000, .map_size = 0x2000,
++                                  .vm_timeline_point = 99, .vm_timeline_syncobj_out = 5, .num_syncobj_handles = 2,
++                                  .input_fence_syncobj_handles = 0x1234};
++   f.ncalls = 0;
++   CHECK(acd_kext_gem_va(k, &va) == 0);
++   const struct n48n_gem_va *w = (const struct n48n_gem_va *)f.calls[0].stin;
++   CHECK(f.calls[0].sel == ACD_SEL_GEM_VA && f.calls[0].stinsz == 64 && w->handle == 4 && w->operation == 1 &&
++         w->flags == 0xe && w->va_address == va.va_address && w->offset_in_bo == 0x1000 && w->map_size == 0x2000);
++   CHECK(w->vm_timeline_point == 0 && w->vm_timeline_syncobj_out == 0 && w->num_syncobj_handles == 0 &&
++         w->input_fence_syncobj_handles == 0 && w->_pad == 0);
++
++   /* Ctx: 16 B in, 16 B out */
++   struct n48n_ctx in = {.op = AMDGPU_CTX_OP_ALLOC_CTX, .priority = 2}, out;
++   f.ncalls = 0;
++   CHECK(acd_kext_ctx(k, &in, &out) == 0 && out.op == 7 && f.calls[0].sel == ACD_SEL_CTX && f.calls[0].stinsz == 16);
++
++   /* BoCreate / BoFree / ReadRegs scalar layout */
++   f.ncalls = 0;
++   CHECK(acd_kext_bo_free(k, 12) == 0 && f.calls[0].sel == ACD_SEL_BO_FREE && f.calls[0].nsin == 1 &&
++         f.calls[0].sin[0] == 12 && f.calls[0].stinsz == 0);
++   uint32_t v[16];
++   f.ncalls = 0;
++   CHECK(acd_kext_read_regs(k, 0x263e, 1, v) == -EIO || 1); /* fake returns no struct out: size mismatch is an error */
++   CHECK(f.calls[0].sel == ACD_SEL_READ_REGS && f.calls[0].nsin == 3 && f.calls[0].sin[0] == 0x263e &&
++         f.calls[0].sin[1] == 1 && f.calls[0].sin[2] == 0xFFFFFFFFull);
++   CHECK(acd_kext_read_regs(k, 0, 0, v) == -EINVAL && acd_kext_read_regs(k, 0, 17, v) == -EINVAL);
++   acd_kext_destroy(k);
++}
++
++int
++main(void)
++{
++   test_errno_map();
++   test_timeouts();
++   test_chunks();
++   test_split();
++   test_wait();
++   test_misc();
++   printf("acd_kext_test: %d checks, %d failures\n", checks, failures);
++   return failures != 0;
++}
+diff --git a/src/amd/common/meson.build b/src/amd/common/meson.build
+index 66d38b4e848..5c64649f17c 100644
+--- a/src/amd/common/meson.build
++++ b/src/amd/common/meson.build
+@@ -231,6 +231,10 @@ if with_amdgpu_darwin
+     'amdgpu_devices.c',
+     'darwin/ac_darwin_drm.c',
+     'darwin/ac_darwin_drm.h',
++    'darwin/ac_darwin_iokit.c',
++    'darwin/ac_darwin_kext.c',
++    'darwin/ac_darwin_kext.h',
++    'darwin/ac_darwin_mock.c',
+     'darwin/ac_darwin_sync.c',
+     'darwin/amdgpu_vamgr.c',
+     'darwin/amdgpu_vamgr_internal.h',
+diff --git a/src/amd/vulkan/meson.build b/src/amd/vulkan/meson.build
+index f55391d99b4..3fe681bc220 100644
+--- a/src/amd/vulkan/meson.build
++++ b/src/amd/vulkan/meson.build
+@@ -303,7 +303,7 @@ libvulkan_radeon = shared_library(
+     ld_args_build_id, ld_args_bsymbolic, ld_args_gc_sections, vulkan_icd_link_args,
+     # macOS: the weak entrypoint layers (annotate/wsi/ctx_roll) are undefined by
+     # design; same flag as KosmicKrisp.
+-    with_amdgpu_darwin ? ['-Wl,-undefined,dynamic_lookup'] : [],
++    with_amdgpu_darwin ? ['-Wl,-undefined,dynamic_lookup', '-framework', 'IOKit', '-framework', 'CoreFoundation'] : [],
+   ],
+   link_depends : vulkan_icd_link_depends,
+   gnu_symbol_visibility : 'hidden',
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 9aa8d539002..1730aab48d0 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -2989,17 +2989,16 @@ create_drm_physical_device(struct vk_instance *vk_instance, struct _drmDevice *d
+ 
+ #ifdef HAVE_AMDGPU_DARWIN
+ /* macOS has no DRM devices to enumerate.  The one GPU is described by the
+- * Darwin ac_drm backend; until the kext is wired (S1b/c) it is only created
+- * when RADV_DARWIN_FAKE=1 so that nothing enumerates by accident. */
++ * Darwin ac_drm backend, which needs the Navi48 kext's native client (or the
++ * RADV_DARWIN_MOCK=1 / RADV_DARWIN_HOST_BO=1 stand-ins).  If the backend cannot
++ * open it says why on stderr and no device is enumerated.  RADV_DARWIN_FAKE=1 is
++ * accepted for compatibility with S1a and changes nothing. */
+ VkResult
+ radv_darwin_enumerate_physical_devices(struct vk_instance *vk_instance)
+ {
+    struct radv_instance *instance = (struct radv_instance *)vk_instance;
+    struct radv_physical_device *pdev = NULL;
+ 
+-   if (!debug_get_bool_option("RADV_DARWIN_FAKE", false))
+-      return VK_SUCCESS;
+-
+    /* Fake PCI identity of the RX 9070 XT (vendor 0x1002, device 0x7550). */
+    static char *nodes[DRM_NODE_MAX];
+    static drmPciBusInfo bus_info;
+@@ -3019,8 +3018,10 @@ radv_darwin_enumerate_physical_devices(struct vk_instance *vk_instance)
+    };
+ 
+    VkResult result = radv_physical_device_try_create(instance, &drm_device, &pdev);
+-   if (result != VK_SUCCESS)
+-      return result == VK_ERROR_INCOMPATIBLE_DRIVER ? VK_SUCCESS : result;
++   if (result != VK_SUCCESS) {
++      /* The backend already said why on stderr (kext missing, Hello refused, ...): no device. */
++      return result == VK_ERROR_OUT_OF_HOST_MEMORY ? result : VK_SUCCESS;
++   }
+ 
+    list_addtail(&pdev->vk.link, &instance->vk.physical_devices.list);
+    return VK_SUCCESS;
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+index c3a4213606c..f47757e7383 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+@@ -47,7 +47,12 @@ radv_amdgpu_bo_va_op(struct radv_amdgpu_winsys *ws, uint32_t bo_handle, uint64_t
+          flags |= AMDGPU_VM_PAGE_WRITEABLE;
+    }
+ 
++#ifdef HAVE_AMDGPU_DARWIN
++   /* GPU VA granularity is 4 KiB; the CPU page size is 16 KiB on Apple Silicon (arm64 mock runs). */
++   size = align64(size, 4096);
++#else
+    size = align64(size, getpagesize());
++#endif
+ 
+    if (bo_flags & RADEON_FLAG_VM_UPDATE_WAIT) {
+       /* Wait for VM MAP updates when requested instead of delaying the updates at submit time.

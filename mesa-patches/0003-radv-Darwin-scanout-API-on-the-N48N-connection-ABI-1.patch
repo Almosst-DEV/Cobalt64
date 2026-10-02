@@ -1,0 +1,964 @@
+From 9583cf0c80a4467ae013621ca592e55c3fd979a0 Mon Sep 17 00:00:00 2001
+From: Navi48-MacOS contributors <noreply@example.invalid>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH 3/5] radv: Darwin scanout API on the N48N connection, ABI 1.1
+ (Navi48 S2b)
+
+Header refreshed from the kext (0.0.603, ABI 1 minor 1; sha256 8f1399d7...).
+Hello asks for the minor (flags bit 8) and falls back to plain on a v1.0
+kernel. Marshals selectors 9..14 (ScanoutQuery/Acquire/Register/Present/
+Status/Release) and exports radv_darwin_scanout_* from libvulkan_radeon
+(VkDevice/VkDeviceMemory -> BO handle) so present shares the one per-process
+connection (D-S2-1). The mock models the scanout with a 60 Hz frame counter.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ include/darwin/navi48_native_abi.h            |  82 ++++++-
+ src/amd/common/ac_linux_drm.c                 |   9 +
+ src/amd/common/darwin/ac_darwin_drm.c         |  18 +-
+ src/amd/common/darwin/ac_darwin_drm.h         |   4 +
+ src/amd/common/darwin/ac_darwin_kext.c        | 106 +++++++-
+ src/amd/common/darwin/ac_darwin_kext.h        |  19 ++
+ src/amd/common/darwin/ac_darwin_mock.c        | 229 +++++++++++++++++-
+ src/amd/common/darwin/test/acd_kext_test.c    |  35 ++-
+ src/amd/vulkan/meson.build                    |   4 +
+ .../winsys/amdgpu/radv_darwin_scanout.c       | 120 +++++++++
+ .../winsys/amdgpu/radv_darwin_scanout.h       |  38 +++
+ 11 files changed, 639 insertions(+), 25 deletions(-)
+ create mode 100644 src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.c
+ create mode 100644 src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.h
+
+diff --git a/include/darwin/navi48_native_abi.h b/include/darwin/navi48_native_abi.h
+index 9ffedc2253f..7ec88e8776e 100644
+--- a/include/darwin/navi48_native_abi.h
++++ b/include/darwin/navi48_native_abi.h
+@@ -1,5 +1,5 @@
+ /*
+- * Navi48NativeABI.h - the user-client ABI of the native stack (kext 0.0.601, native step S1c).
++ * Navi48NativeABI.h - the user-client ABI of the native stack (kext 0.0.601, native step S1c; ABI 1.1 scanout selectors added in 0.0.603).
+  *
+  * ONE plain-C header shared by three consumers: the kext (Navi48NativeClient), the Mesa Darwin backend
+  * (copied byte for byte to mesa-mac/include/darwin/navi48_native_abi.h) and the PC test tools
+@@ -25,7 +25,9 @@
+ #endif
+ 
+ #define N48N_UC_TYPE       0x4E34384Eu      /* 'N48N' */
+-#define N48N_ABI_VERSION   1u
++#define N48N_ABI_VERSION   1u            /* the MAJOR: unchanged, so every v1.0 client (Mesa, n48native, s1d-replay) still handshakes */
++#define N48N_ABI_MINOR     1u            /* 1.1 (kext 0.0.603): the scanout selectors 9..14, native-S2a. Reported when Hello asks (below) and in n48n_info.reserved[2]. */
++#define N48N_HELLO_F_MINOR (1u << 8)     /* Hello flags bit 8: "report the minor": out[0] = ABI | (MINOR << 16). Without it out[0] is exactly the major, as in v1.0. Bit 8, not 0: flags = 1, which T1 leg 1 sends and expects refused, still is. */
+ #define N48N_MAX_IBS       64u
+ #define N48N_MAX_BOS       4096u            /* handles 1..4095; 0 is never valid */
+ #define N48N_MAX_CTX       64u              /* ids 1..64 */
+@@ -44,7 +46,15 @@ enum {
+     N48N_SEL_CTX       = 6,   /* struct in: n48n_ctx (16 B)   struct out: n48n_ctx (16 B) */
+     N48N_SEL_SUBMIT    = 7,   /* struct in: n48n_cs_in (32 + 32*n B)   out: [0] seqno */
+     N48N_SEL_WAITSEQ   = 8,   /* in: [0] seqno [1] timeout ns (relative) [2] ctx id (ignored)   out: [0] busy [1] retired [2] emitted */
+-    N48N_SEL_COUNT     = 9
++    N48N_SEL_COUNT     = 9,   /* the v1.0 selectors; unchanged so old clients' tables stay valid */
++    /* ---- ABI 1.1 (kext 0.0.603): native scanout, contract section "ABI 1.1 addendum" of NATIVE-S1C-ABI.md. All need Hello first. ---- */
++    N48N_SEL_SCAN_QUERY    = 9,   /* struct out: n48n_scan_query (96 B). Valid without Acquire. */
++    N48N_SEL_SCAN_ACQUIRE  = 10,  /* in: [0] flags (0)   out: [0] console MC [1] OTG frame count (24-bit, extended) */
++    N48N_SEL_SCAN_REGISTER = 11,  /* struct in: n48n_scan_reg (32 B)   out: [0] slot id [1] slot MC */
++    N48N_SEL_SCAN_PRESENT  = 12,  /* in: [0] slot [1] flags (0)   out: [0] present id [1] target frame [2] VUPDATE count at program */
++    N48N_SEL_SCAN_STATUS   = 13,  /* struct out: n48n_scan_status (256 B) */
++    N48N_SEL_SCAN_RELEASE  = 14,  /* out: [0] console restore verified (1/0) [1] plane MC after; idempotent */
++    N48N_SEL_COUNT_1_1     = 15
+ };
+ 
+ /* ---- the drm values the kernel interprets (identical to include/drm-uapi/amdgpu_drm.h) ----------------------- */
+@@ -161,6 +171,58 @@ struct n48n_info {                 /* 192 B */
+ #define N48N_PLACED_ZEROED       (1u << 1)
+ #define N48N_PLACED_HI_POOL      (1u << 2)
+ 
++/* ---- ABI 1.1: native scanout (kext 0.0.603) ------------------------------------------------------------------------------------ */
++#define N48N_SCAN_MAX_SLOTS   3u
++#define N48N_SCAN_NO_SLOT     0xFFFFFFFFu
++#define N48N_SCAN_FMT_ARGB8888 8u          /* HUBP SURFACE_PIXEL_FORMAT 8: dword 0xAARRGGBB = VK_FORMAT_B8G8R8A8_UNORM memory order */
++/* n48n_scan_query.flags */
++#define N48N_SCANQ_LIT        (1u << 0)    /* OTG0 is master-enabled */
++#define N48N_SCANQ_NATIVE     (1u << 1)    /* native boot (S1b gate accepted) */
++#define N48N_SCANQ_ACQUIRED   (1u << 2)    /* the plane is taken (by this or an earlier call of this client) */
++#define N48N_SCANQ_GEOM_OK    (1u << 3)    /* linear ARGB8888, no DCC, plausible viewport/pitch: Acquire would proceed */
++#define N48N_SCANQ_DTO_VALID  (1u << 4)    /* refresh derived from the DP DTO; else from the EDID row matching the raster, else 0 */
++/* n48n_scan_slot.flags */
++#define N48N_SCANSLOT_PENDING  (1u << 0)   /* this slot's Present is programmed and has not latched */
++#define N48N_SCANSLOT_INUSE    (1u << 1)   /* HUBP0 EARLIEST_INUSE equals this slot's MC: the hardware is still fetching it */
++#define N48N_SCANSLOT_REUSABLE (1u << 2)   /* neither pending nor in use: safe to overwrite */
++/* n48n_scan_status.flags */
++#define N48N_SCANST_RESTORING  (1u << 0)
++#define N48N_SCANST_STORM      (1u << 1)   /* the rate guard tripped this session (the plane is being / was restored) */
++#define N48N_SCANST_WANT_RESTORE (1u << 2)
++
++struct n48n_scan_query {           /* 96 B, ScanoutQuery out */
++    uint32_t h_active, v_active, h_total, v_total;        /*  0: live OTG timing */
++    uint32_t pitch_px, hubp_format, sw_mode, otg;         /* 16: live HUBP; pitch in pixels */
++    uint32_t refresh_mhz, pix_clk_khz, dcc_en, flags;     /* 32: millihertz; N48N_SCANQ_* */
++    uint64_t frame_count;                                 /* 48: OTG_STATUS_FRAME_COUNT (24 bits), extended to 64 while acquired */
++    uint64_t console_mc;                                  /* 56: the console plane address (recorded at Acquire; the live one before) */
++    uint64_t plane_mc;                                    /* 64: HUBP0's programmed primary surface address now */
++    uint64_t earliest_mc;                                 /* 72: HUBP0's EARLIEST_INUSE address now */
++    uint32_t acquired, plane_w, plane_h, reserved;        /* 80: HUBP0's viewport (what ScanoutRegister's width / height must equal); reserved 0 */
++};
++struct n48n_scan_reg {             /* 32 B, ScanoutRegister in. width/height/format must equal the live plane; reserved0 must be 0 */
++    uint32_t handle, reserved0;                           /*  0: BO handle from BoCreate (visible-pool VRAM only) */
++    uint64_t offset;                                      /*  8: byte offset in the BO; offset + pitch_bytes*height <= BO size; MC 64 KiB aligned */
++    uint32_t pitch_bytes, height;                         /* 16: pitch_bytes == live pitch * 4 */
++    uint32_t width, format;                               /* 24: N48N_SCAN_FMT_ARGB8888 */
++};
++struct n48n_scan_slot {            /* 32 B */
++    uint64_t mc;                                          /*  0 */
++    uint64_t latched_frame;                               /*  8: extended OTG frame count when this slot's flip was SEEN to latch (0 = never) */
++    uint32_t used, flags;                                 /* 16: N48N_SCANSLOT_* */
++    uint32_t presents, latches;                           /* 24 */
++};
++struct n48n_scan_status {          /* 256 B, ScanoutStatus out */
++    uint32_t acquired, flags, front_slot, pending_slot;   /*  0: slot ids or N48N_SCAN_NO_SLOT */
++    uint64_t frame_count;                                 /* 16: extended OTG frame count now */
++    uint64_t console_mc, plane_mc, earliest_mc;           /* 24 */
++    uint64_t presents, latched, replaced, repeats;        /* 48: latched = DISTINCT presents seen latched; replaced = overwritten before shown; repeats = VUPDATEs that showed the same front */
++    uint64_t vupdates, latch_irq, latch_poll, refused;    /* 80: VUPDATE IRQs while acquired; latches seen by the IRQ / by a poll; refused Presents */
++    uint64_t first_latch_ns, last_latch_ns;               /* 112: kernel uptime ns of the first / last latch observation */
++    uint64_t idle_ms, watchdog_restores, storm_trips, geom_refused;   /* 128 */
++    struct n48n_scan_slot slot[N48N_SCAN_MAX_SLOTS];      /* 160 */
++};
++
+ N48N_STATIC_ASSERT(sizeof(struct n48n_gem_create_in) == 32, "n48n_gem_create_in is 32 B");
+ N48N_STATIC_ASSERT(sizeof(struct n48n_gem_va) == 64, "n48n_gem_va is 64 B");
+ N48N_STATIC_ASSERT(sizeof(struct n48n_ctx) == 16, "n48n_ctx is 16 B");
+@@ -179,5 +241,19 @@ N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_info, seq_emitted) == 104, "in
+ N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_info, va_low_first) == 120, "info.va_low_first at 120");
+ N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_info, max_bos) == 152, "info.max_bos at 152");
+ N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_info, reserved) == 160, "info.reserved at 160");
++N48N_STATIC_ASSERT(sizeof(struct n48n_scan_query) == 96, "n48n_scan_query is 96 B");
++N48N_STATIC_ASSERT(sizeof(struct n48n_scan_reg) == 32, "n48n_scan_reg is 32 B");
++N48N_STATIC_ASSERT(sizeof(struct n48n_scan_slot) == 32, "n48n_scan_slot is 32 B");
++N48N_STATIC_ASSERT(sizeof(struct n48n_scan_status) == 256, "n48n_scan_status is 256 B");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_scan_query, frame_count) == 48, "scan_query.frame_count at 48");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_scan_query, acquired) == 80, "scan_query.acquired at 80");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_scan_reg, offset) == 8, "scan_reg.offset at 8");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_scan_reg, width) == 24, "scan_reg.width at 24");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_scan_status, frame_count) == 16, "scan_status.frame_count at 16");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_scan_status, presents) == 48, "scan_status.presents at 48");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_scan_status, vupdates) == 80, "scan_status.vupdates at 80");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_scan_status, first_latch_ns) == 112, "scan_status.first_latch_ns at 112");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_scan_status, idle_ms) == 128, "scan_status.idle_ms at 128");
++N48N_STATIC_ASSERT(__builtin_offsetof(struct n48n_scan_status, slot) == 160, "scan_status.slot at 160");
+ 
+ #endif /* NAVI48_NATIVE_ABI_H */
+diff --git a/src/amd/common/ac_linux_drm.c b/src/amd/common/ac_linux_drm.c
+index dbe4c8efc63..a14049c3d30 100644
+--- a/src/amd/common/ac_linux_drm.c
++++ b/src/amd/common/ac_linux_drm.c
+@@ -61,6 +61,15 @@ ac_drm_ioctl_write_read(ac_drm_device *dev, unsigned drm_command_index, void *da
+    return drm_ioctl_write_read(dev->fd, drm_command_index, data, size);
+ }
+ 
++#ifdef HAVE_AMDGPU_DARWIN
++/* Darwin-only: the native kext connection behind this device (for the scanout API). */
++struct acd_kext *ac_drm_darwin_kext(ac_drm_device *dev, uint32_t *abi_minor);
++struct acd_kext *ac_drm_darwin_kext(ac_drm_device *dev, uint32_t *abi_minor)
++{
++   return dev->is_darwin ? acd_device_kext(dev->ddev, abi_minor) : NULL;
++}
++#endif
++
+ int ac_drm_device_initialize(int fd, bool is_virtio,
+                              uint32_t *major_version, uint32_t *minor_version,
+                              ac_drm_device **dev)
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+index 7aeb3cece7d..5b9f03658c1 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -57,6 +57,7 @@ struct amdgpu_bo {
+  * device to go closes the connection. */
+ struct acd_core {
+    int refcount;
++   uint32_t minor; /* ABI minor the kernel reported */
+    bool shared; /* the process-wide core (false: the private HOST_BO stand-in core) */
+    struct acd_kext *kext; /* NULL in the HOST_BO stand-in */
+    struct amdgpu_va_manager *va_mgr;
+@@ -113,7 +114,7 @@ env_is_1(const char *name)
+ 
+ /* Hello, live checks and the info snapshot; every failure is one clear stderr line. */
+ static int
+-acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned)
++acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned, uint32_t *minor_out)
+ {
+    struct acd_hello h;
+    int r = acd_kext_hello(kext, &h);
+@@ -123,6 +124,7 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned)
+               r, strerror(-r));
+       return r < 0 ? r : -ENODEV;
+    }
++   *minor_out = h.minor;
+    if (h.abi != N48N_ABI_VERSION) {
+       fprintf(stderr, "radv-darwin: kext ABI %u != Mesa ABI %u\n", h.abi, N48N_ABI_VERSION);
+       return -ENODEV;
+@@ -169,14 +171,22 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned)
+    static bool logged;
+    if (!logged) {
+       logged = true;
+-      fprintf(stderr, "radv-darwin: native kext: ABI %u, build %u, VMID %u, max %u IBs/submit, GB_ADDR_CONFIG "
++      fprintf(stderr, "radv-darwin: native kext: ABI %u.%u, build %u, VMID %u, max %u IBs/submit, GB_ADDR_CONFIG "
+                       "0x%08x, VRAM %llu MiB visible + %llu MiB hi, GTT cap %llu MiB\n",
+-              h.abi, h.build, h.vmid, h.max_ibs, gb, (unsigned long long)(info.vram_vis_total >> 20),
++              h.abi, h.minor, h.build, h.vmid, h.max_ibs, gb, (unsigned long long)(info.vram_vis_total >> 20),
+               (unsigned long long)(info.vram_hi_total >> 20), (unsigned long long)(info.gtt_cap >> 20));
+    }
+    return 0;
+ }
+ 
++struct acd_kext *
++acd_device_kext(acd_device_handle dev, uint32_t *abi_minor)
++{
++   if (abi_minor)
++      *abi_minor = dev->core->minor;
++   return dev->core->kext;
++}
++
+ /* Builds the core: connection (unless the HOST_BO stand-in), handshake, VA manager, master provider. */
+ static int
+ acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_core **out)
+@@ -190,7 +200,7 @@ acd_core_create(const struct amdgpu_device *canned, bool host_bo, struct acd_cor
+    if (!host_bo) {
+       int r = acd_kext_open(&c->kext);
+       if (r == 0)
+-         r = acd_native_handshake(c->kext, canned);
++         r = acd_native_handshake(c->kext, canned, &c->minor);
+       if (r) {
+          acd_kext_destroy(c->kext);
+          pthread_mutex_destroy(&c->bo_lock);
+diff --git a/src/amd/common/darwin/ac_darwin_drm.h b/src/amd/common/darwin/ac_darwin_drm.h
+index 129cdba5b4d..a15d35ff6c1 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.h
++++ b/src/amd/common/darwin/ac_darwin_drm.h
+@@ -38,6 +38,10 @@ struct util_sync_provider *acd_device_get_sync_provider(acd_device_handle dev);
+ /* Emulates the DRM_AMDGPU_* command ioctls that ac_linux_drm.c issues. */
+ int acd_ioctl(acd_device_handle dev, unsigned cmd_index, void *data, unsigned size);
+ 
++/* The process's native kext connection (NULL in the HOST_BO stand-in) and the ABI minor it reported. */
++struct acd_kext;
++struct acd_kext *acd_device_kext(acd_device_handle dev, uint32_t *abi_minor);
++
+ const char *acd_get_marketing_name(acd_device_handle dev);
+ int acd_query_sw_info(acd_device_handle dev, enum amdgpu_sw_info info, void *value);
+ int acd_va_range_alloc(acd_device_handle dev, enum amdgpu_gpu_va_range va_range_type,
+diff --git a/src/amd/common/darwin/ac_darwin_kext.c b/src/amd/common/darwin/ac_darwin_kext.c
+index e2373f4f910..4fcbde454ee 100644
+--- a/src/amd/common/darwin/ac_darwin_kext.c
++++ b/src/amd/common/darwin/ac_darwin_kext.c
+@@ -42,6 +42,10 @@ _Static_assert(offsetof(struct n48n_cs_ib, ip_type) == offsetof(struct drm_amdgp
+ _Static_assert(offsetof(struct n48n_cs_ib, ring) == offsetof(struct drm_amdgpu_cs_chunk_ib, ring), "ib.ring");
+ _Static_assert(sizeof(struct n48n_cs_in) == 32, "cs_in size");
+ _Static_assert(sizeof(struct n48n_info) == 192, "info size");
++_Static_assert(ACD_SEL_SCAN_QUERY == N48N_SEL_SCAN_QUERY && ACD_SEL_SCAN_ACQUIRE == N48N_SEL_SCAN_ACQUIRE &&
++               ACD_SEL_SCAN_REGISTER == N48N_SEL_SCAN_REGISTER && ACD_SEL_SCAN_PRESENT == N48N_SEL_SCAN_PRESENT &&
++               ACD_SEL_SCAN_STATUS == N48N_SEL_SCAN_STATUS && ACD_SEL_SCAN_RELEASE == N48N_SEL_SCAN_RELEASE,
++               "scanout selector numbers");
+ 
+ /* my selector enum must equal the header's */
+ _Static_assert(ACD_SEL_HELLO == N48N_SEL_HELLO && ACD_SEL_QUERY_INFO == N48N_SEL_QUERYINFO &&
+@@ -141,6 +145,8 @@ acd_kr_to_errno(uint32_t sel, int kr_signed)
+       return -ETIME; /* RADV: DEVICE_LOST (the call that detected the hang) */
+    case ACD_KR_ABORTED:
+       return -ECANCELED; /* RADV: DEVICE_LOST (every later GPU call) */
++   case ACD_KR_BUSY:
++      return -EBUSY;
+    default:
+       break;
+    }
+@@ -223,19 +229,27 @@ acd_cs_split_count(uint32_t n_ibs)
+ int
+ acd_kext_hello(struct acd_kext *k, struct acd_hello *out)
+ {
+-   const uint64_t sin[2] = {N48N_ABI_VERSION, 0};
+-   uint64_t sout[4] = {0};
+-   uint32_t nout = 4;
+-   int r = kcall(k, ACD_SEL_HELLO, sin, 2, NULL, 0, sout, &nout, NULL, NULL);
+-   if (r)
+-      return r;
+-   if (nout != 4)
+-      return -EIO;
+-   out->abi = (uint32_t)sout[0];
+-   out->build = (uint32_t)sout[1];
+-   out->max_ibs = (uint32_t)sout[2];
+-   out->vmid = (uint32_t)sout[3];
+-   return 0;
++   /* First ask for the minor (ABI 1.1, flags bit 8); a v1.0 kernel refuses unknown flags with
++    * BadArgument, which is the probe: retry plain. */
++   for (int with_minor = 1; with_minor >= 0; with_minor--) {
++      const uint64_t sin[2] = {N48N_ABI_VERSION, with_minor ? N48N_HELLO_F_MINOR : 0};
++      uint64_t sout[4] = {0};
++      uint32_t nout = 4;
++      int r = kcall(k, ACD_SEL_HELLO, sin, 2, NULL, 0, sout, &nout, NULL, NULL);
++      if (r == -EINVAL && with_minor)
++         continue;
++      if (r)
++         return r;
++      if (nout != 4)
++         return -EIO;
++      out->abi = (uint32_t)(sout[0] & 0xffff);
++      out->minor = with_minor ? (uint32_t)(sout[0] >> 16) : 0;
++      out->build = (uint32_t)sout[1];
++      out->max_ibs = (uint32_t)sout[2];
++      out->vmid = (uint32_t)sout[3];
++      return 0;
++   }
++   return -EINVAL;
+ }
+ 
+ int
+@@ -540,3 +554,69 @@ acd_kext_wait_deadline(struct acd_kext *k, uint64_t seq, uint64_t abs_deadline_n
+       }
+    }
+ }
++
++/* ---- ABI 1.1 scanout ---- */
++
++int
++acd_kext_scan_query(struct acd_kext *k, struct n48n_scan_query *q)
++{
++   size_t sz = sizeof(*q);
++   memset(q, 0, sizeof(*q));
++   int r = kcall(k, ACD_SEL_SCAN_QUERY, NULL, 0, NULL, 0, NULL, NULL, q, &sz);
++   return r ? r : (sz == sizeof(*q) ? 0 : -EIO);
++}
++
++int
++acd_kext_scan_acquire(struct acd_kext *k, uint64_t *console_mc, uint64_t *frame_count)
++{
++   const uint64_t sin[1] = {0};
++   uint64_t sout[2] = {0};
++   uint32_t nout = 2;
++   int r = kcall(k, ACD_SEL_SCAN_ACQUIRE, sin, 1, NULL, 0, sout, &nout, NULL, NULL);
++   if (r)
++      return r;
++   *console_mc = sout[0];
++   *frame_count = sout[1];
++   return nout == 2 ? 0 : -EIO;
++}
++
++int
++acd_kext_scan_register(struct acd_kext *k, const struct n48n_scan_reg *reg, uint32_t *slot, uint64_t *mc)
++{
++   uint64_t sout[2] = {0};
++   uint32_t nout = 2;
++   acd_sfence();
++   int r = kcall(k, ACD_SEL_SCAN_REGISTER, NULL, 0, reg, sizeof(*reg), sout, &nout, NULL, NULL);
++   if (r)
++      return r;
++   *slot = (uint32_t)sout[0];
++   *mc = sout[1];
++   return nout == 2 ? 0 : -EIO;
++}
++
++int
++acd_kext_scan_present(struct acd_kext *k, uint32_t slot, uint64_t out[3])
++{
++   const uint64_t sin[2] = {slot, 0};
++   uint32_t nout = 3;
++   acd_sfence(); /* CPU-written (WC) scanout pixels must be visible before the flip */
++   int r = kcall(k, ACD_SEL_SCAN_PRESENT, sin, 2, NULL, 0, out, &nout, NULL, NULL);
++   return r ? r : (nout == 3 ? 0 : -EIO);
++}
++
++int
++acd_kext_scan_status(struct acd_kext *k, struct n48n_scan_status *st)
++{
++   size_t sz = sizeof(*st);
++   memset(st, 0, sizeof(*st));
++   int r = kcall(k, ACD_SEL_SCAN_STATUS, NULL, 0, NULL, 0, NULL, NULL, st, &sz);
++   return r ? r : (sz == sizeof(*st) ? 0 : -EIO);
++}
++
++int
++acd_kext_scan_release(struct acd_kext *k, uint64_t out[2])
++{
++   uint32_t nout = 2;
++   int r = kcall(k, ACD_SEL_SCAN_RELEASE, NULL, 0, NULL, 0, out, &nout, NULL, NULL);
++   return r ? r : (nout == 2 ? 0 : -EIO);
++}
+diff --git a/src/amd/common/darwin/ac_darwin_kext.h b/src/amd/common/darwin/ac_darwin_kext.h
+index cd8e60c65c6..fe49d70ea2e 100644
+--- a/src/amd/common/darwin/ac_darwin_kext.h
++++ b/src/amd/common/darwin/ac_darwin_kext.h
+@@ -33,6 +33,13 @@ enum acd_sel {
+    ACD_SEL_CTX = 6,
+    ACD_SEL_SUBMIT = 7,
+    ACD_SEL_WAIT_SEQ = 8,
++   /* ABI 1.1 (kext 0.0.603) */
++   ACD_SEL_SCAN_QUERY = 9,
++   ACD_SEL_SCAN_ACQUIRE = 10,
++   ACD_SEL_SCAN_REGISTER = 11,
++   ACD_SEL_SCAN_PRESENT = 12,
++   ACD_SEL_SCAN_STATUS = 13,
++   ACD_SEL_SCAN_RELEASE = 14,
+ };
+ 
+ /* IOReturn values, contract section 1.1 (numeric, so this file needs no IOKit). */
+@@ -48,6 +55,7 @@ enum acd_sel {
+ #define ACD_KR_NOT_PERMITTED    0xe00002e2u
+ #define ACD_KR_TIMEOUT          0xe00002d6u
+ #define ACD_KR_ABORTED          0xe00002ebu
++#define ACD_KR_BUSY             0xe00002d5u /* second ScanoutAcquire */
+ 
+ #define ACD_TIMEOUT_INFINITE    0xffffffffffffffffull /* == AMDGPU_TIMEOUT_INFINITE */
+ #define ACD_GB_ADDR_CONFIG_GFX1201 0x08200545u
+@@ -90,6 +98,7 @@ uint32_t acd_canon_bits_ok(uint64_t va); /* 1 if bits 63..47 are all equal */
+ 
+ struct acd_hello {
+    uint32_t abi, build, max_ibs, vmid;
++   uint32_t minor; /* ABI minor the kernel reported (0 on a v1.0 kernel) */
+ };
+ 
+ int acd_kext_hello(struct acd_kext *k, struct acd_hello *out);
+@@ -154,6 +163,16 @@ int acd_kext_wait_seq(struct acd_kext *k, uint64_t seq, uint64_t rel_ns, bool *b
+  * (or ACD_TIMEOUT_INFINITE). *busy = 1 when the deadline passed first. */
+ int acd_kext_wait_deadline(struct acd_kext *k, uint64_t seq, uint64_t abs_deadline_ns, bool *busy);
+ 
++/* ---- ABI 1.1 scanout (needs hello.minor >= 1) ---- */
++int acd_kext_scan_query(struct acd_kext *k, struct n48n_scan_query *q);
++int acd_kext_scan_acquire(struct acd_kext *k, uint64_t *console_mc, uint64_t *frame_count);
++int acd_kext_scan_register(struct acd_kext *k, const struct n48n_scan_reg *reg, uint32_t *slot, uint64_t *mc);
++/* out[0] present id, [1] target frame, [2] VUPDATE count at program */
++int acd_kext_scan_present(struct acd_kext *k, uint32_t slot, uint64_t out[3]);
++int acd_kext_scan_status(struct acd_kext *k, struct n48n_scan_status *st);
++/* out[0] console restore verified, [1] plane MC after */
++int acd_kext_scan_release(struct acd_kext *k, uint64_t out[2]);
++
+ uint64_t acd_kext_now_ns(struct acd_kext *k);
+ 
+ #ifdef __cplusplus
+diff --git a/src/amd/common/darwin/ac_darwin_mock.c b/src/amd/common/darwin/ac_darwin_mock.c
+index 87d297a8d53..b7588d5efba 100644
+--- a/src/amd/common/darwin/ac_darwin_mock.c
++++ b/src/amd/common/darwin/ac_darwin_mock.c
+@@ -58,6 +58,20 @@ struct mock {
+    uint64_t emitted, retired_at_submit, last_submit_ns;
+    uint64_t lag_ns;
+    uint64_t submits;
++   /* scanout model (ABI 1.1): a 60 Hz OTG frame counter from a timer, VUPDATE-latched flips */
++   uint64_t t0_ns;
++   bool scan_acq;
++   uint64_t scan_acq_frame, scan_synced_frame;
++   struct {
++      bool used;
++      uint32_t handle;
++      uint64_t mc;
++      uint64_t latched_frame;
++      uint32_t presents, latches;
++   } sslot[N48N_SCAN_MAX_SLOTS];
++   int front, pending;      /* slot index or -1 */
++   uint64_t pending_frame;  /* frame count at program */
++   uint64_t s_presents, s_latched, s_replaced, s_repeats, s_vupdates, s_refused, first_latch_ns, last_latch_ns;
+    bool hang_mode; /* RADV_DARWIN_MOCK_HANG=1: the first WaitSeq on a submitted seq reports the hang */
+    bool hung;
+ };
+@@ -363,6 +377,178 @@ do_wait_seq(struct mock *m, uint64_t target, uint64_t timeout_ns, uint64_t *sout
+    return ACD_KR_SUCCESS;
+ }
+ 
++
++/* ---- scanout model ---- */
++#define MOCK_SCAN_W 2560u
++#define MOCK_SCAN_H 1440u
++#define MOCK_SCAN_PITCH_PX 2560u
++#define MOCK_SCAN_HZ 60ull
++
++static uint64_t
++scan_frame_now(struct mock *m)
++{
++   return (mnow() - m->t0_ns) * MOCK_SCAN_HZ / 1000000000ull;
++}
++
++/* Advance the model to the current frame: every frame boundary is one VUPDATE; a pending flip latches at
++ * the first one after its program, later ones with nothing pending are repeats of the front. */
++static void
++scan_advance(struct mock *m)
++{
++   if (!m->scan_acq)
++      return;
++   const uint64_t f = scan_frame_now(m);
++   if (f <= m->scan_synced_frame)
++      return;
++   uint64_t vu = f - m->scan_synced_frame;
++   m->s_vupdates += vu;
++   if (m->pending >= 0 && f > m->pending_frame) {
++      /* one of the vupdates latched the pending flip (the first after program) */
++      const int p = m->pending;
++      m->sslot[p].latched_frame = m->pending_frame + 1;
++      m->sslot[p].latches++;
++      m->s_latched++;
++      if (!m->first_latch_ns)
++         m->first_latch_ns = mnow();
++      m->last_latch_ns = mnow();
++      m->front = p;
++      m->pending = -1;
++      vu -= 1;
++   }
++   if (m->front >= 0)
++      m->s_repeats += vu;
++   m->scan_synced_frame = f;
++}
++
++static int
++scan_slot_flags(struct mock *m, int i)
++{
++   if (i == m->pending)
++      return N48N_SCANSLOT_PENDING;
++   if (i == m->front)
++      return N48N_SCANSLOT_INUSE; /* the front slot is what the hardware is showing */
++   return N48N_SCANSLOT_REUSABLE;
++}
++
++static int
++do_scan(struct mock *m, uint32_t sel, const uint64_t *sin, const void *stin, uint64_t *sout, void *stout)
++{
++   scan_advance(m);
++   switch (sel) {
++   case ACD_SEL_SCAN_QUERY: {
++      struct n48n_scan_query q;
++      memset(&q, 0, sizeof(q));
++      q.h_active = MOCK_SCAN_W; q.v_active = MOCK_SCAN_H; q.h_total = 2720; q.v_total = 1481;
++      q.pitch_px = MOCK_SCAN_PITCH_PX; q.hubp_format = N48N_SCAN_FMT_ARGB8888; q.sw_mode = 0; q.otg = 0;
++      q.refresh_mhz = MOCK_SCAN_HZ * 1000; q.pix_clk_khz = 241700; q.dcc_en = 0;
++      q.flags = N48N_SCANQ_LIT | N48N_SCANQ_NATIVE | N48N_SCANQ_GEOM_OK | N48N_SCANQ_DTO_VALID |
++                (m->scan_acq ? N48N_SCANQ_ACQUIRED : 0);
++      q.frame_count = scan_frame_now(m);
++      q.console_mc = 0x8000000000ull;
++      q.plane_mc = q.earliest_mc = 0x8000000000ull;
++      q.acquired = m->scan_acq;
++      q.plane_w = MOCK_SCAN_W; q.plane_h = MOCK_SCAN_H;
++      memcpy(stout, &q, sizeof(q));
++      return ACD_KR_SUCCESS;
++   }
++   case ACD_SEL_SCAN_ACQUIRE:
++      if (sin[0] != 0)
++         REFUSE(ACD_KR_BAD_ARGUMENT, "acquire flags != 0");
++      if (m->scan_acq)
++         return ACD_KR_BUSY;
++      m->scan_acq = true;
++      m->front = m->pending = -1;
++      m->scan_acq_frame = m->scan_synced_frame = scan_frame_now(m);
++      sout[0] = 0x8000000000ull;
++      sout[1] = m->scan_acq_frame;
++      return ACD_KR_SUCCESS;
++   case ACD_SEL_SCAN_REGISTER: {
++      struct n48n_scan_reg r;
++      memcpy(&r, stin, sizeof(r));
++      if (!m->scan_acq)
++         return ACD_KR_NOT_READY;
++      if (r.reserved0 || r.format != N48N_SCAN_FMT_ARGB8888)
++         REFUSE(ACD_KR_BAD_ARGUMENT, "register reserved/format");
++      if (r.width != MOCK_SCAN_W || r.height != MOCK_SCAN_H || r.pitch_bytes != MOCK_SCAN_PITCH_PX * 4)
++         REFUSE(ACD_KR_BAD_ARGUMENT, "register geometry != live plane");
++      struct mock_bo *b = find_bo(m, r.handle);
++      if (!b)
++         return ACD_KR_NOT_FOUND;
++      if (b->domain != 4 || !(b->bits & N48N_PLACED_CPU_MAPPABLE))
++         REFUSE(ACD_KR_BAD_ARGUMENT, "register: BO is not visible-pool VRAM");
++      if (r.offset > b->size || (uint64_t)r.pitch_bytes * r.height > b->size - r.offset)
++         REFUSE(ACD_KR_BAD_ARGUMENT, "register: offset + pitch*height > BO size");
++      const uint64_t mc = 0x9000000000ull + ((uint64_t)r.handle << 28) + r.offset;
++      if (mc & 0xFFFF)
++         REFUSE(ACD_KR_BAD_ARGUMENT, "register: MC not 64 KiB aligned");
++      int fr = -1;
++      for (int i = 0; i < (int)N48N_SCAN_MAX_SLOTS; i++) {
++         if (m->sslot[i].used && m->sslot[i].mc == mc)
++            REFUSE(ACD_KR_BAD_ARGUMENT, "register: slot already registered");
++         if (!m->sslot[i].used && fr < 0)
++            fr = i;
++      }
++      if (fr < 0)
++         return ACD_KR_NO_RESOURCES;
++      m->sslot[fr].used = true;
++      m->sslot[fr].handle = r.handle;
++      m->sslot[fr].mc = mc;
++      sout[0] = fr;
++      sout[1] = mc;
++      return ACD_KR_SUCCESS;
++   }
++   case ACD_SEL_SCAN_PRESENT: {
++      if (!m->scan_acq)
++         return ACD_KR_NOT_READY;
++      if (sin[1] != 0 || sin[0] >= N48N_SCAN_MAX_SLOTS || !m->sslot[sin[0]].used) {
++         m->s_refused++;
++         REFUSE(ACD_KR_BAD_ARGUMENT, "present: bad slot/flags");
++      }
++      if (m->pending >= 0)
++         m->s_replaced++;
++      m->pending = (int)sin[0];
++      m->pending_frame = scan_frame_now(m);
++      m->sslot[sin[0]].presents++;
++      m->s_presents++;
++      sout[0] = m->s_presents;
++      sout[1] = m->pending_frame + 1;
++      sout[2] = m->s_vupdates;
++      return ACD_KR_SUCCESS;
++   }
++   case ACD_SEL_SCAN_STATUS: {
++      struct n48n_scan_status st;
++      memset(&st, 0, sizeof(st));
++      st.acquired = m->scan_acq;
++      st.front_slot = m->front >= 0 ? (uint32_t)m->front : N48N_SCAN_NO_SLOT;
++      st.pending_slot = m->pending >= 0 ? (uint32_t)m->pending : N48N_SCAN_NO_SLOT;
++      st.frame_count = scan_frame_now(m);
++      st.console_mc = st.plane_mc = st.earliest_mc = 0x8000000000ull;
++      st.presents = m->s_presents; st.latched = m->s_latched; st.replaced = m->s_replaced;
++      st.repeats = m->s_repeats; st.vupdates = m->s_vupdates; st.latch_poll = m->s_latched;
++      st.refused = m->s_refused;
++      st.first_latch_ns = m->first_latch_ns; st.last_latch_ns = m->last_latch_ns;
++      for (int i = 0; i < (int)N48N_SCAN_MAX_SLOTS; i++) {
++         st.slot[i].mc = m->sslot[i].mc;
++         st.slot[i].latched_frame = m->sslot[i].latched_frame;
++         st.slot[i].used = m->sslot[i].used;
++         st.slot[i].flags = m->sslot[i].used ? scan_slot_flags(m, i) : 0;
++         st.slot[i].presents = m->sslot[i].presents;
++         st.slot[i].latches = m->sslot[i].latches;
++      }
++      memcpy(stout, &st, sizeof(st));
++      return ACD_KR_SUCCESS;
++   }
++   case ACD_SEL_SCAN_RELEASE:
++      m->scan_acq = false;
++      m->front = m->pending = -1;
++      memset(m->sslot, 0, sizeof(m->sslot));
++      sout[0] = 1;
++      sout[1] = 0x8000000000ull;
++      return ACD_KR_SUCCESS;
++   }
++   return ACD_KR_BAD_ARGUMENT;
++}
++
+ #define NEED(cond)                                                                                 \
+    do {                                                                                           \
+       if (!(cond)) {                                                                              \
+@@ -404,14 +590,14 @@ mock_call(void *ctx, uint32_t sel, const uint64_t *sin, uint32_t nsin, const voi
+    switch (sel) {
+    case ACD_SEL_HELLO:
+       NEED(shape(2, 4, 0, 0));
+-      NEED(sin[1] == 0);
++      NEED(sin[1] == 0 || sin[1] == N48N_HELLO_F_MINOR); /* any other bit is BadArgument, as flags = 1 in v1.0 */
+       if (sin[0] != N48N_ABI_VERSION) {
+          kr = ACD_KR_UNSUPPORTED;
+          goto out;
+       }
+       m->hello = true;
+-      sout[0] = N48N_ABI_VERSION;
+-      sout[1] = 601;
++      sout[0] = N48N_ABI_VERSION | (sin[1] ? (uint64_t)N48N_ABI_MINOR << 16 : 0);
++      sout[1] = 603;
+       sout[2] = N48N_MAX_IBS;
+       sout[3] = 8;
+       *nsout = 4;
+@@ -421,7 +607,8 @@ mock_call(void *ctx, uint32_t sel, const uint64_t *sin, uint32_t nsin, const voi
+       struct n48n_info inf;
+       memset(&inf, 0, sizeof(inf));
+       inf.abi_version = N48N_ABI_VERSION;
+-      inf.kext_build = 601;
++      inf.kext_build = 603;
++      inf.reserved[2] = N48N_ABI_MINOR;
+       inf.flags = N48N_INFO_S1B_POSITIVE | N48N_INFO_NATIVE_BOOT;
+       inf.vmid = 8;
+       inf.gb_addr_config = ACD_GB_ADDR_CONFIG_GFX1201;
+@@ -509,6 +696,38 @@ mock_call(void *ctx, uint32_t sel, const uint64_t *sin, uint32_t nsin, const voi
+       if (!kr)
+          *nsout = 1;
+       break;
++   case ACD_SEL_SCAN_QUERY:
++      NEED(shape(0, 0, 0, sizeof(struct n48n_scan_query)));
++      kr = do_scan(m, sel, sin, stin, sout, stout);
++      break;
++   case ACD_SEL_SCAN_ACQUIRE:
++      NEED(shape(1, 2, 0, 0));
++      kr = do_scan(m, sel, sin, stin, sout, stout);
++      if (!kr)
++         *nsout = 2;
++      break;
++   case ACD_SEL_SCAN_REGISTER:
++      NEED(shape(0, 2, sizeof(struct n48n_scan_reg), 0));
++      kr = do_scan(m, sel, sin, stin, sout, stout);
++      if (!kr)
++         *nsout = 2;
++      break;
++   case ACD_SEL_SCAN_PRESENT:
++      NEED(shape(2, 3, 0, 0));
++      kr = do_scan(m, sel, sin, stin, sout, stout);
++      if (!kr)
++         *nsout = 3;
++      break;
++   case ACD_SEL_SCAN_STATUS:
++      NEED(shape(0, 0, 0, sizeof(struct n48n_scan_status)));
++      kr = do_scan(m, sel, sin, stin, sout, stout);
++      break;
++   case ACD_SEL_SCAN_RELEASE:
++      NEED(shape(0, 2, 0, 0));
++      kr = do_scan(m, sel, sin, stin, sout, stout);
++      if (!kr)
++         *nsout = 2;
++      break;
+    default:
+       kr = ACD_KR_BAD_ARGUMENT;
+       break;
+@@ -583,6 +802,8 @@ acd_mock_open(struct acd_kext **out)
+       return -ENOMEM;
+    }
+    pthread_mutex_init(&m->lock, NULL);
++   m->t0_ns = mnow();
++   m->front = m->pending = -1;
+    const char *hang = getenv("RADV_DARWIN_MOCK_HANG");
+    m->hang_mode = hang && hang[0] == '1';
+    const char *lag = getenv("RADV_DARWIN_MOCK_LAG_MS");
+diff --git a/src/amd/common/darwin/test/acd_kext_test.c b/src/amd/common/darwin/test/acd_kext_test.c
+index f7546ffbb4e..fb2e35644e5 100644
+--- a/src/amd/common/darwin/test/acd_kext_test.c
++++ b/src/amd/common/darwin/test/acd_kext_test.c
+@@ -42,6 +42,7 @@ struct fake {
+    uint64_t now;
+    uint64_t last_wait_rel;
+    unsigned wait_calls;
++   int first_refuse;
+ };
+ 
+ static int
+@@ -58,6 +59,10 @@ fake_call(void *ctx, uint32_t sel, const uint64_t *sin, uint32_t nsin, const voi
+       r->stinsz = stinsz;
+       memcpy(r->stin, stin, stinsz < sizeof(r->stin) ? stinsz : sizeof(r->stin));
+    }
++   if (f->first_refuse) {
++      f->first_refuse = 0;
++      return (int)ACD_KR_BAD_ARGUMENT;
++   }
+    if (f->next_kr)
+       return f->next_kr;
+    switch (sel) {
+@@ -315,7 +320,16 @@ test_misc(void)
+ 
+    struct acd_hello h;
+    CHECK(acd_kext_hello(k, &h) == 0 && h.abi == 1 && h.build == 601 && h.max_ibs == 64 && h.vmid == 8);
+-   CHECK(f.calls[0].sel == ACD_SEL_HELLO && f.calls[0].nsin == 2 && f.calls[0].sin[0] == 1 && f.calls[0].sin[1] == 0);
++   CHECK(f.calls[0].sel == ACD_SEL_HELLO && f.calls[0].nsin == 2 && f.calls[0].sin[0] == 1 && f.calls[0].sin[1] == N48N_HELLO_F_MINOR);
++   CHECK(h.minor == 0); /* the fake answers the plain major */
++   /* a v1.0 kernel refuses the flag (BadArgument): Hello retries with flags 0 and reports minor 0 */
++   f.ncalls = 0; f.next_kr = 0;
++   {
++      /* fake: refuse the first call only */
++      f.first_refuse = 1;
++      struct acd_hello h2;
++      CHECK(acd_kext_hello(k, &h2) == 0 && h2.minor == 0 && f.ncalls == 2 && f.calls[1].sin[1] == 0);
++   }
+ 
+    /* GEM_VA: verbatim fields, timeline/syncobj fields never reach the kernel */
+    struct drm_amdgpu_gem_va va = {.handle = 4, .operation = AMDGPU_VA_OP_MAP, .flags = 0xe,
+@@ -345,6 +359,25 @@ test_misc(void)
+    CHECK(f.calls[0].sel == ACD_SEL_READ_REGS && f.calls[0].nsin == 3 && f.calls[0].sin[0] == 0x263e &&
+          f.calls[0].sin[1] == 1 && f.calls[0].sin[2] == 0xFFFFFFFFull);
+    CHECK(acd_kext_read_regs(k, 0, 0, v) == -EINVAL && acd_kext_read_regs(k, 0, 17, v) == -EINVAL);
++   /* ABI 1.1 scanout marshalling: counts, sizes, flags */
++   struct n48n_scan_query q;
++   f.ncalls = 0;
++   CHECK(acd_kext_scan_query(k, &q) == 0 && f.calls[0].sel == 9 && f.calls[0].nsin == 0 && f.calls[0].stinsz == 0);
++   uint64_t con, fc;
++   CHECK(acd_kext_scan_acquire(k, &con, &fc) == 0 && f.calls[1].sel == 10 && f.calls[1].nsin == 1 && f.calls[1].sin[0] == 0);
++   struct n48n_scan_reg reg = {.handle = 4, .offset = 0, .pitch_bytes = 10240, .height = 1440, .width = 2560,
++                               .format = N48N_SCAN_FMT_ARGB8888};
++   uint32_t slot; uint64_t mc;
++   CHECK(acd_kext_scan_register(k, &reg, &slot, &mc) == 0 && f.calls[2].sel == 11 && f.calls[2].stinsz == 32);
++   uint64_t po[3];
++   CHECK(acd_kext_scan_present(k, 2, po) == 0 && f.calls[3].sel == 12 && f.calls[3].nsin == 2 && f.calls[3].sin[0] == 2 &&
++         f.calls[3].sin[1] == 0);
++   struct n48n_scan_status st;
++   CHECK(acd_kext_scan_status(k, &st) == 0 && f.calls[4].sel == 13);
++   uint64_t ro[2];
++   CHECK(acd_kext_scan_release(k, ro) == 0 && f.calls[5].sel == 14 && f.calls[5].nsin == 0);
++   f.next_kr = (int)ACD_KR_BUSY;
++   CHECK(acd_kext_scan_acquire(k, &con, &fc) == -EBUSY);
+    acd_kext_destroy(k);
+ }
+ 
+diff --git a/src/amd/vulkan/meson.build b/src/amd/vulkan/meson.build
+index 3fe681bc220..663adefdd22 100644
+--- a/src/amd/vulkan/meson.build
++++ b/src/amd/vulkan/meson.build
+@@ -251,6 +251,10 @@ endif
+ 
+ if with_amdgpu_darwin
+   radv_flags += '-DHAVE_AMDGPU_DARWIN'
++  libradv_files += files(
++    'winsys/amdgpu/radv_darwin_scanout.c',
++    'winsys/amdgpu/radv_darwin_scanout.h',
++  )
+ endif
+ 
+ if with_platform_x11
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.c b/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.c
+new file mode 100644
+index 00000000000..0ed1cd6a4bd
+--- /dev/null
++++ b/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.c
+@@ -0,0 +1,120 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Darwin scanout API: VkDevice / VkDeviceMemory -> kext BO handle -> selectors 9..14.
++ */
++
++#include "radv_darwin_scanout.h"
++
++#include <errno.h>
++
++#include "common/darwin/ac_darwin_kext.h"
++#include "radv_amdgpu_bo.h"
++#include "radv_amdgpu_winsys.h"
++#include "radv_device.h"
++#include "radv_device_memory.h"
++
++struct acd_kext *ac_drm_darwin_kext(ac_drm_device *dev, uint32_t *abi_minor);
++
++#define API __attribute__((visibility("default")))
++
++static struct acd_kext *
++scan_kext(VkDevice _dev)
++{
++   VK_FROM_HANDLE(radv_device, device, _dev);
++   if (!device)
++      return NULL;
++   uint32_t minor = 0;
++   struct acd_kext *k = ac_drm_darwin_kext(radv_amdgpu_winsys(device->ws)->dev, &minor);
++   return (k && minor >= 1) ? k : NULL;
++}
++
++API int
++radv_darwin_scanout_query(VkDevice dev, struct n48n_scan_query *q)
++{
++   struct acd_kext *k = scan_kext(dev);
++   return k ? acd_kext_scan_query(k, q) : -ENOSYS;
++}
++
++API int
++radv_darwin_scanout_acquire(VkDevice dev, uint64_t *console_mc, uint64_t *frame_count)
++{
++   struct acd_kext *k = scan_kext(dev);
++   if (!k)
++      return -ENOSYS;
++   uint64_t c = 0, f = 0;
++   int r = acd_kext_scan_acquire(k, &c, &f);
++   if (!r) {
++      if (console_mc)
++         *console_mc = c;
++      if (frame_count)
++         *frame_count = f;
++   }
++   return r;
++}
++
++API int
++radv_darwin_scanout_register(VkDevice _dev, VkDeviceMemory _mem, uint64_t offset, uint32_t pitch_bytes,
++                             uint32_t width, uint32_t height, uint32_t *slot, uint64_t *slot_mc)
++{
++   struct acd_kext *k = scan_kext(_dev);
++   if (!k)
++      return -ENOSYS;
++   VK_FROM_HANDLE(radv_device_memory, mem, _mem);
++   if (!mem || !mem->bo)
++      return -EINVAL;
++   const struct n48n_scan_reg reg = {
++      .handle = radv_amdgpu_winsys_bo(mem->bo)->bo_handle,
++      .offset = offset,
++      .pitch_bytes = pitch_bytes,
++      .height = height,
++      .width = width,
++      .format = N48N_SCAN_FMT_ARGB8888,
++   };
++   uint32_t s = 0;
++   uint64_t mc = 0;
++   int r = acd_kext_scan_register(k, &reg, &s, &mc);
++   if (!r) {
++      if (slot)
++         *slot = s;
++      if (slot_mc)
++         *slot_mc = mc;
++   }
++   return r;
++}
++
++API int
++radv_darwin_scanout_present(VkDevice dev, uint32_t slot, uint64_t out[3])
++{
++   struct acd_kext *k = scan_kext(dev);
++   if (!k)
++      return -ENOSYS;
++   uint64_t o[3] = {0};
++   int r = acd_kext_scan_present(k, slot, o);
++   if (!r && out)
++      for (int i = 0; i < 3; i++)
++         out[i] = o[i];
++   return r;
++}
++
++API int
++radv_darwin_scanout_status(VkDevice dev, struct n48n_scan_status *st)
++{
++   struct acd_kext *k = scan_kext(dev);
++   return k ? acd_kext_scan_status(k, st) : -ENOSYS;
++}
++
++API int
++radv_darwin_scanout_release(VkDevice dev, uint64_t out[2])
++{
++   struct acd_kext *k = scan_kext(dev);
++   if (!k)
++      return -ENOSYS;
++   uint64_t o[2] = {0};
++   int r = acd_kext_scan_release(k, o);
++   if (!r && out) {
++      out[0] = o[0];
++      out[1] = o[1];
++   }
++   return r;
++}
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.h b/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.h
+new file mode 100644
+index 00000000000..6daf9eb248c
+--- /dev/null
++++ b/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.h
+@@ -0,0 +1,38 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Darwin-only C API exported by libvulkan_radeon.dylib for native scanout (kext ABI 1.1, selectors 9..14).
++ * Present goes through the SAME per-process N48N connection the Darwin winsys owns (decision D-S2-1).
++ * Look the functions up with dlsym on the ICD library.  All return 0 or -errno
++ * (-ENOSYS: not a native kext / ABI minor < 1; -EINVAL: VkDeviceMemory has no BO handle).
++ * The structs are those of navi48_native_abi.h.
++ */
++#ifndef RADV_DARWIN_SCANOUT_H
++#define RADV_DARWIN_SCANOUT_H
++
++#include <vulkan/vulkan.h>
++#include "navi48_native_abi.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Live plane geometry (valid before acquire). */
++int radv_darwin_scanout_query(VkDevice dev, struct n48n_scan_query *q);
++/* Takes the plane. *console_mc and *frame_count may be NULL. Second call: -EBUSY. */
++int radv_darwin_scanout_acquire(VkDevice dev, uint64_t *console_mc, uint64_t *frame_count);
++/* Registers `mem` (must be visible-pool VRAM: a HOST_VISIBLE|DEVICE_LOCAL allocation) at byte `offset` as a scanout buffer.
++ * width/height/pitch_bytes must equal the live plane (query: plane_w, plane_h, pitch_px*4); format is ARGB8888/B8G8R8A8. */
++int radv_darwin_scanout_register(VkDevice dev, VkDeviceMemory mem, uint64_t offset, uint32_t pitch_bytes,
++                                 uint32_t width, uint32_t height, uint32_t *slot, uint64_t *slot_mc);
++/* out[0] present id, [1] target frame, [2] VUPDATE count at program (out may be NULL). */
++int radv_darwin_scanout_present(VkDevice dev, uint32_t slot, uint64_t out[3]);
++int radv_darwin_scanout_status(VkDevice dev, struct n48n_scan_status *st);
++/* Restores the console; out[0] = restore verified, [1] plane MC after (out may be NULL). Idempotent. */
++int radv_darwin_scanout_release(VkDevice dev, uint64_t out[2]);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif

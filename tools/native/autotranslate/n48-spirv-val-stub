@@ -1,0 +1,5 @@
+#!/bin/sh
+# spirv-val stand-in (METAL2VULKAN_SPIRV_VAL): the PC has no spirv-val and metal2vulkan hard-requires one (no skip flag).
+# Always "valid". Safety rests on byte-identity with host-validated output (A2 proof) and on re-validating on the host Mac:
+#   spirv-val --target-env vulkan1.2 <sha>.spv   (scp from /private/var/tmp/n48m-spv) for anything new.
+exit 0

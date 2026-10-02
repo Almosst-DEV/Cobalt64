@@ -1,0 +1,692 @@
+/* gfx_fillset.h — 0.0.404/0.0.405 (a items 1-7, as corrected byb, and): THE FIRST-SHOT FILL-SET
+ * RESERVATION, PURE PARTS.
+ *
+ * WHY. measured the fill recurrence across arm21-24: WindowServer clears each of its five surfaces EXACTLY ONCE at
+ * start (f1 -> `0x400800000`, f3 -> `0x401800000`, f6 -> `0x402800000`, f8 -> `0x403800000`, f13-18 -> `0x404800000`) and
+ * never again, and a given boot's presenting frames then alternate between TWO of {ours `0x400800000`, twin `0x404800000`,
+ * third `0x406800000`}. So "the fill follows the plane" cannot work — NO fill ever follows — and a boot that commits only
+ * f1's fill (`0x400800000`) scores nothing on a boot whose presenter reads the twin. THE DESIGN THAT DOES WORK, and what
+ * this header implements: spend the FIRST TWO SHOTS on the two fills that target `0x400800000` and `0x404800000` (both
+ * occur before the first plane frame on EVERY measured boot), so that on every boot shape at least one sampled surface is
+ * ours. The third shot is the plane frame.
+ *
+ * WHAT LIVES HERE. The reservation rule as a PURE state machine, so the host suite can drive it and the kext compiles the
+ * IDENTICAL code:
+ *   - n48_fs_open / n48_fs_clear: the arm scope's lifetime (fresh members, fresh count);
+ *   - n48_fs_win_open: is the window still open? (used by the policy-divisor bypass and by the gate caller);
+ *   - n48_fs_step: ONE judged frame -> PASS / RESERVE / REFUSE, with the expiry counted;
+ *   - n48_fs_identify_fill (0.0.405,): is THIS frame a reservable fill? exactly one segment AND the ColorFill PS
+ *     AND an uncommitted member CB0 — the sticky per-frame identity alone is NOT enough;
+ *   - n48_fs_bypass_divisor (0.0.405,): may THIS frame skip the policy stride? only an IDENTIFIED member fill;
+ *   - n48_fs_commit: record a reserved fill's commit (member + token seq), at the one instant the gate answers OK AND the
+ *     shot is actually spent;
+ *   - n48_fs_retire (0.0.406,; tightened 0.0.407,; corrected 0.0.408,): a RESERVE frame that did
+ *     NOT go live because the DEPENDENCY CHECK FAILED (`!c.dep_ok`) retires its member and the window is re-evaluated -
+ *     measured that without this, a member that never commits keeps the window open and the plane is refused
+ *     `RESERVED-FOR-FILL` after all. A frame whose dependency is CLEAN does NOT retire (it is left for a retry), and the
+ *     dependency world's OWN reason is recorded for the report line. 0.0.407 keyed this on the GATE's answer instead, which
+ *     is structurally UNREACHABLE for a non-live frame: with the write branch skipped its `pages` is 0 and the gate refuses
+ *     at PAGE-NOT-HOST above the dependency rung, so the retirement never fired;
+ *   - n48_fs_plane_win_open / n48_fs_plane_step / n48_fs_plane_commit (0.0.420, STEP10-PLAN P1): THE SECOND WINDOW, behind
+ *     its OWN switch (`gfxneuter 35`). Once the FILL window closes it admits only a PLANE-SHAPED frame (in-force PS
+ *     `ws_D_GPUPass`) until one plane frame commits or its own 60 judged frames pass. Refuse-only: the only field it can
+ *     change about a non-plane frame is to have the gate append `RESERVED-FOR-PLANE`;
+ *   - N48_FILLSET_FMT: the ONE report line, so its worst-case width is bounded by a test rather than by arithmetic in a
+ *     commit message (the lesson).
+ *
+ * THE RULE, VERBATIM FROMa ITEM 2. While ON and the arm is at COMMIT: a TRANSLATE-eligible frame is allowed to commit
+ * only if it is a ColorFill (in-force PS identity `ws_B_ColorFill`) whose CB0 is a set member NOT YET COMMITTED, until both
+ * members have committed or the reservation expires (after N48_FS_EXPIRE_JUDGED judged frames since the arm, counted;
+ * expiry lifts the reservation and counts it). A non-fill TRANSLATE-eligible frame refused under the reservation gets the
+ * appended commit reason `RESERVED-FOR-FILL` (gfx_commit.h's N48_CM_RESERVED_FOR_FILL). Once both fills are committed (or
+ * expired), the remaining shots follow today's rule (the plane frame).
+ *
+ * THE SECOND RULE, VERBATIM FROM STEP10-PLAN P1 (0.0.420). While its own switch is ON and the arm is at COMMIT and the FILL
+ * window is closed: a TRANSLATE-eligible frame is allowed to commit only if it is PLANE-SHAPED (in-force PS identity
+ * `ws_D_GPUPass`), until one plane frame commits or N48_FS_PLANE_EXPIRE_JUDGED judged frames pass. A non-plane
+ * TRANSLATE-eligible frame refused under this window gets the appended commit reason `RESERVED-FOR-PLANE`
+ * (gfx_commit.h's N48_CM_RESERVED_FOR_PLANE). The window is independent of `on`: with the fill-set switch off the fill
+ * window is already closed, so the second window opens at the arm and reserves the first shot for the plane. This is what
+ * arm29 and arm31 needed - a "second pair" of non-plane frames took the shot the plane frame was for.
+ *
+ * FAIL-CLOSED. An UNIDENTIFIED frame is NOT a fill: the caller passes `is_fill` 0 when it could not resolve the in-force
+ * fragment identity, and while the window is open every `is_fill` 0 eligible frame is REFUSED, never admitted on a guess.
+ * `n48_fs_step` is defined for a null state (PASS, the direction that can never spend a shot it did not reserve) and for a
+ * state whose switch is off, whose window is closed, or whose members are zero — each returns PASS, so a caller that
+ * forgot a field cannot make the rung fire.
+ *
+ * OFF IS TODAY. With `on` 0 `n48_fs_step` returns PASS for every frame, `n48_fs_win_open` returns 0, no field of the
+ * commit gate is set and no line is printed. A boot that never throws `gfxneuter 33` is 0.0.403's, dword for dword. With
+ * `plane_on` ALSO 0 the second window is absent the same way: `n48_fs_plane_win_open` returns 0, `n48_fs_plane_step`
+ * returns PASS and `n48_fs_plane_commit` answers 0, so every `fp_*` field of the gate stays 0 and the gate is 0.0.419's,
+ * dword for dword. The second window is behind `gfxneuter 35`, never `33`.
+ *
+ * THE EXACT BOUNDARY, so the test can pin it: `judged` counts EVERY step taken while the window is open, and the window
+ * expires on the step whose `judged + 1` would exceed N48_FS_EXPIRE_JUDGED — i.e. after exactly 200 judged frames the
+ * NEXT judged frame lifts the reservation and passes. The frame that triggers expiry PASSES (it is judged under today's
+ * rule, which is what "expiry lifts the reservation" means). */
+#ifndef N48_GFX_FILLSET_H
+#define N48_GFX_FILLSET_H
+
+#include <stdint.h>
+
+/*a item 1: M 1 turns the switch ON with the INSTRUMENT fill set, the two surfaces measured. These are DOCUMENTED
+ * values, not learned ones: there is nothing to learn before the first judged frame, which is the whole reason's
+ * "learned set" designs were rejected in favour of this fixed pair. The kext compares each frame's own CB0 to these. */
+#define N48_FS_MEMBERS       2u
+static const uint64_t kN48FsMemberVa[N48_FS_MEMBERS] = { 0x400800000ull, 0x404800000ull };
+/* build 0.0.544 item 4b: THE MEMBERS BY CONSOLE SIZE. The pair above is 1080p WindowServer's (its five surfaces
+ * 0x400800000 + 16 MiB steps); at native 2560x1440 WindowServer lays them out elsewhere (run11ap-r, judge-only: the five P-slot CB0s
+ * `present73: P CB0 VA 0x400100000` / 0x401200000 / 0x402200000 / 0x403100000 / 0x404000000 in slot order, and the plane frame
+ * (identity 39, ws_D_GPUPass) refused PROVENANCE on exactly 0x400100000 x11 and 0x404000000 x8 - the 1440p analogues of
+ * 0x400800000 and its twin). LEARNING was considered and NOT taken: the members must be known when the new WindowServer's first
+ * fill is judged, which is before any P frame of that instance exists; the only earlier source is the killed instance's P slots,
+ * which exist only when 73 was ON before the arm, and whose VAs equalling the new instance's is SUSPECTED, not established. So the
+ * set is keyed by the CONSOLE SIZE the kext read at start (getConsoleInfo): N48_FS_GEO_1080 (0 = the zero-initialised state, so
+ * every existing caller is 0.0.543's exactly), N48_FS_GEO_1440, and N48_FS_GEO_UNKNOWN - no members at all, which n48_fs_step
+ * answers PASS for (the fill window is then closed from the start, exactly switch 33 OFF's rule). A wrong or missing member can
+ * only change WHICH already-safe frame spends a reserved shot (every RESERVE still passes every safety rung): liveness, never
+ * safety. */
+enum { N48_FS_GEO_1080 = 0u, N48_FS_GEO_1440 = 1u, N48_FS_GEO_UNKNOWN = 2u };
+static const uint64_t kN48FsMemberVa1440[N48_FS_MEMBERS] = { 0x400100000ull, 0x404000000ull };
+static inline uint32_t n48_fs_geo_of(uint32_t w, uint32_t h)
+{
+    if (w == 1920u && h == 1080u) return N48_FS_GEO_1080;
+    if (w == 2560u && h == 1440u) return N48_FS_GEO_1440;
+    return N48_FS_GEO_UNKNOWN;
+}
+static inline uint64_t n48_fs_member_va_of(uint32_t geo, uint32_t m)
+{
+    if (m >= N48_FS_MEMBERS) return 0ull;
+    return geo == N48_FS_GEO_1080 ? kN48FsMemberVa[m] : geo == N48_FS_GEO_1440 ? kN48FsMemberVa1440[m] : 0ull;
+}
+static inline const char *n48_fs_geo_name(uint32_t geo)
+{
+    return geo == N48_FS_GEO_1080 ? "1920x1080" : geo == N48_FS_GEO_1440 ? "2560x1440" : "unknown (no members)";
+}
+
+/*a item 2, CUT BY: the reservation expires after this many judged frames since the arm. 200 was the spec's
+ * number; ruled it too long and cut it to 60. 60 judged frames is NOT about a second: MEASURED it is about 5 s
+ * (notes/design/SRCFILL85.md Fact 1, run11i/j/l/m), because judged frames arrive far slower than 60 Hz during start-up
+ * (build 0.0.530: comment corrected, value unchanged). Long enough for the start-up burst (f1 and f13-18) and
+ * short enough that a boot whose twin fill never comes falls back to today's rule
+ * rather than refusing the plane until the window's own end. The RETIREMENT below is what rescues arm22's f35 in the
+ * window; expiry is the backstop for a boot where no reserved fill even reaches the gate. */
+#define N48_FS_EXPIRE_JUDGED 60u
+
+/* 0.0.420 (notes/design/STEP10-PLAN.md P1) — THE SECOND WINDOW: HOLD A SHOT FOR THE PLANE.'s
+ * retirement closes the FILL window once every member is committed or retired, and the NEXT eligible frame under today's
+ * rule is whatever comes first: arm29 and arm31 measured a "second pair" - two non-plane frames drawing
+ * into the same two surfaces (IB `0x400750000`, PS `0x400595600`) - taking the shots the plane frame needed, so NO plane
+ * frame ever committed and the run scored nothing. This window closes that residue: once the fill window is closed, the
+ * FIRST eligible frame that is PLANE-SHAPED is the only frame allowed to spend a shot, until one plane frame commits OR
+ * this many judged frames pass. The bound is the same 60 chose, for the same reason (a boot with no eligible plane
+ * frame loses 60 frames, not the boot). Unlike the fill window this window has no per-member set and no retirement: a
+ * plane frame that reserves but does not go live leaves the window open to its own expiry, which is the spec (P1 says
+ * "until one plane frame commits or 60 judged frames pass"). */
+#define N48_FS_PLANE_EXPIRE_JUDGED 60u
+
+typedef struct {
+    uint32_t on;               /* `gfxneuter 33 | M << 8`, M 1 on / 0xFF off. OFF AT BOOT. */
+    uint32_t opened;           /* the reservation was opened by an arm */
+    uint32_t expired;          /* expiry has lifted the reservation this scope */
+    uint32_t members;          /* members in force (N48_FS_MEMBERS when opened) */
+    uint32_t committed_n;      /* members committed so far */
+    uint32_t retired_n;        /* members RETIRED so far (0.0.406,): a RESERVE frame the gate then refused */
+    uint32_t judged;           /* judged frames counted since the open */
+    uint32_t member_committed[N48_FS_MEMBERS];
+    uint32_t member_retired[N48_FS_MEMBERS];   /* 0.0.406,: this member was given up on (see n48_fs_retire) */
+    uint64_t member_va[N48_FS_MEMBERS];
+    uint64_t member_seq[N48_FS_MEMBERS];   /* the committing frame's token seq, per member */
+    uint64_t refused;          /* TRANSLATE-eligible frames refused under the reservation */
+    uint64_t retired;          /* times a member was retired (at most once per member per scope) */
+    uint64_t expiry;           /* times expiry fired (at most once per scope; kept as a count, like every counter here) */
+    uint32_t last_retire_reason; /* 0.0.407/0.0.408: the DEPENDENCY world's own reason for the last retirement (gfx_dep.h's N48_DEP_*), printed by the line */
+    /* 0.0.420 (STEP10-PLAN P1) — THE SECOND WINDOW (hold a shot for the plane). Behind its OWN switch (`plane_on`,
+     * `gfxneuter 35`), independent of the fill-set switch: the window opens only once the FILL window has closed, and
+     * closes on one plane frame's commit or on its own 60-judged-frame expiry. uint16_t on the counters on purpose: each
+     * is bounded far below 65535 by construction (judged/refused <= N48_FS_PLANE_EXPIRE_JUDGED, expiry <= 1, committed is
+     * a flag), and gfx_fillset_test's width proof uses the TYPE's worst case - see the report-width check. */
+    uint32_t plane_on;         /* switch `gfxneuter 35 | M << 8`: M 1 on, M 0xFF off. OFF AT BOOT. */
+    uint16_t plane_committed;  /* a PLANE-SHAPED frame committed this scope (the window's first terminal state) */
+    uint16_t plane_expired;    /* the second window's own expiry fired this scope */
+    uint16_t plane_judged;     /* judged frames counted while the second window was open */
+    uint16_t plane_refused;    /* TRANSLATE-eligible non-plane frames refused under the second window */
+    uint16_t plane_expiry;     /* times the second window expired (at most once per scope) */
+    uint32_t geo;              /* build 0.0.544 4b: N48_FS_GEO_* - the member set in force (n48_fs_open: 1080p; n48_fs_seat_geo) */
+} n48_fs;
+
+enum {
+    N48_FS_PASS = 0,   /* the reservation does not apply to this frame: today's rule decides */
+    N48_FS_RESERVE,    /* this frame IS a reservable fill: it may spend a shot */
+    N48_FS_REFUSE,     /* a TRANSLATE-eligible frame refused under the reservation: RESERVED-FOR-FILL */
+    N48_FS_VERDICTS
+};
+
+static inline const char *n48_fs_verdict_name(uint32_t v)
+{
+    return v == N48_FS_PASS ? "PASS" : (v == N48_FS_RESERVE ? "RESERVE" : (v == N48_FS_REFUSE ? "REFUSE" : "?"));
+}
+
+/* Open the window at the arm. Keeps `on`; resets every per-scope field and re-seats the fixed member set. */
+static inline void n48_fs_open(n48_fs *f)
+{
+    if (!f) return;
+    f->opened = 1u;
+    f->expired = 0u;
+    f->members = N48_FS_MEMBERS;
+    f->geo = N48_FS_GEO_1080;   /* build 0.0.544 4b: 0.0.543's set; the kext re-seats it by console size (n48_fs_seat_geo) */
+    f->committed_n = 0u;
+    f->retired_n = 0u;
+    f->judged = 0u;
+    f->refused = 0u;
+    f->retired = 0u;
+    f->expiry = 0u;
+    f->last_retire_reason = 0u;   /* 0.0.407: a stale reason must not outlive the scope it was recorded in */
+    /* 0.0.420 (P1): a fresh arm scope starts the SECOND window fresh too. `plane_on` is the switch and is kept (like
+     * `on`); every per-scope field is cleared so a previous scope's plane commit/expiry cannot close a new window. */
+    f->plane_committed = 0u;
+    f->plane_expired = 0u;
+    f->plane_judged = 0u;
+    f->plane_refused = 0u;
+    f->plane_expiry = 0u;
+    for (uint32_t m = 0u; m < N48_FS_MEMBERS; m++) {
+        f->member_va[m] = kN48FsMemberVa[m];
+        f->member_committed[m] = 0u;
+        f->member_retired[m] = 0u;
+        f->member_seq[m] = 0u;
+    }
+}
+
+/* build 0.0.544 item 4b: RE-SEAT a just-opened scope's members for the console size (the kext: right after the arm's n48_fs_open,
+ * before any frame of the scope is judged). 1080p leaves 0.0.543's set exactly; 1440p seats kN48FsMemberVa1440; an unknown size seats
+ * NO members (members 0: n48_fs_step answers PASS, n48_fs_win_open 0 - switch 33 OFF's rule). Only the member set moves. */
+static inline void n48_fs_seat_geo(n48_fs *f, uint32_t geo)
+{
+    if (!f) return;
+    f->geo = geo <= N48_FS_GEO_UNKNOWN ? geo : (uint32_t)N48_FS_GEO_UNKNOWN;
+    f->members = f->geo == N48_FS_GEO_UNKNOWN ? 0u : N48_FS_MEMBERS;
+    for (uint32_t m = 0u; m < N48_FS_MEMBERS; m++) f->member_va[m] = n48_fs_member_va_of(f->geo, m);
+}
+
+/* Close the window (the disarm). The switch is untouched: a later arm re-opens with a fresh count. */
+static inline void n48_fs_clear(n48_fs *f)
+{
+    if (f) f->opened = 0u;
+}
+
+/* Is the reservation still open? 1 only while the switch is on, an arm opened it, it has not expired, and at least one
+ * member is still neither COMMITTED nor RETIRED (0.0.406,: a retired member is one given up on, so it no longer
+ * holds the window open). This is the predicate the policy-divisor bypass reads (a reserved fill must not be sampled
+ * away), so it must be pure. OFF returns 0 and the divisor is today's. */
+static inline uint32_t n48_fs_win_open(const n48_fs *f)
+{
+    if (!f || !f->on || !f->opened) return 0u;
+    if (f->expired || f->committed_n + f->retired_n >= f->members) return 0u;
+    return 1u;
+}
+
+/* 0.0.405 (K2 — ) — THE STRICT MEMBER-FILL IDENTIFICATION. 0.0.404 took any frame whose in-force fragment identity
+ * was the ColorFill as a fill, but that flag is STICKY within a frame: a MULTI-SEGMENT frame carrying ONE ColorFill draw set
+ * it, so such a frame could be taken as a fill (fail-open). A reservable fill is exactly: a SINGLE-segment frame (nseg 1),
+ * whose in-force fragment identity is the ColorFill (`ps_fill`, the translator's `ws_B_ColorFill`), and whose CB0 is a set
+ * member NOT YET COMMITTED AND NOT RETIRED (0.0.406,). Everything else is not a fill, and while the window is open an eligible frame that is not a fill
+ * is refused at the gate's appended rung. OFF / unarmed / expired / both-committed-or-retired read 0, so a caller that forgot a field
+ * cannot make a fill out of nothing. Pure: the kext calls it with THIS frame's own nseg, identity and CB0. */
+static inline uint32_t n48_fs_identify_fill(const n48_fs *f, uint32_t nseg, uint32_t ps_fill, uint64_t cb0)
+{
+    if (!f || !f->on || !f->opened) return 0u;
+    if (f->expired || f->committed_n + f->retired_n >= f->members) return 0u;
+    if (nseg != 1u || !ps_fill) return 0u;
+    for (uint32_t m = 0u; m < f->members && m < N48_FS_MEMBERS; m++)
+        if (!f->member_committed[m] && !f->member_retired[m] && f->member_va[m] == cb0) return 1u;
+    return 0u;
+}
+
+/* 0.0.405 (K1 — ) — MAY THE POLICY DIVISOR BE BYPASSED FOR THIS FRAME? 0.0.404 bypassed it for EVERY eligible frame
+ * while the window was open, NOT only for reserved fills, so a non-fill frame was admitted to the policy the stride exists to
+ * skip. Only a frame IDENTIFIED AS A MEMBER FILL may bypass: `frame_fill` is the caller's identified-fill flag (this frame's
+ * own fragment program is `ws_B_ColorFill`), read BEFORE the divisor runs, and `cb0` must be a set member not yet committed
+ * and not retired (0.0.406,). A
+ * frame the flag does not name — including an UNIDENTIFIED frame — reads 0, so the divisor samples it at today's rate. OFF
+ * reads 0, which leaves the divisor exactly what it is with the switch never thrown. The single-segment half of
+ * n48_fs_identify_fill CANNOT be applied here: the segmentation is what this divisor decides whether to run, so a
+ * multi-segment frame carrying a ColorFill is admitted here and REFUSED by n48_fs_identify_fill at the gate — one extra
+ * policy run, never a fail-open commit. */
+/* build 0.0.515 D1: does the gather READ this program for the identified-fill flag? The flag's only reader
+ * is n48_fs_bypass_divisor below, inside the policy divisor's `!(COMMIT && bypass) && (eligible++ % every) != 0` skip - and at
+ * every <= 1 that skip is never taken (x % 1 == 0), so no answer the flag could give changes whether the policy runs. The read
+ * (up to 1344 dwords through the MM window per distinct fragment program per frame) is therefore done only when every > 1.
+ * At every <= 1 the flag stays 0 (no bypass), the fail-closed reading. Pure. */
+static inline uint32_t n48_fs_fill_read_wanted(uint32_t fs_on, uint32_t stage, uint32_t frame_fill, uint32_t every)
+{
+    return (fs_on && stage == 0u && !frame_fill && every > 1u) ? 1u : 0u;
+}
+
+static inline uint32_t n48_fs_bypass_divisor(const n48_fs *f, uint32_t frame_fill, uint64_t cb0)
+{
+    if (!f || !f->on || !f->opened) return 0u;
+    if (f->expired || f->committed_n + f->retired_n >= f->members) return 0u;
+    if (!frame_fill) return 0u;
+    for (uint32_t m = 0u; m < f->members && m < N48_FS_MEMBERS; m++)
+        if (!f->member_committed[m] && !f->member_retired[m] && f->member_va[m] == cb0) return 1u;
+    return 0u;
+}
+
+/* ONE judged frame. `eligible` = the verdict is TRANSLATE (the gate refuses anything else before the reservation rung);
+ * `is_fill` = the in-force fragment identity is `ws_B_ColorFill`; `cb0` = this frame's first colour target. Returns PASS /
+ * RESERVE / REFUSE and updates the state: `judged` counts every step while the window is open (the spec's "judged frames
+ * since the arm"), `refused` counts eligible frames refused, `expiry` counts the lift. RESERVE does NOT mark a member
+ * committed — only n48_fs_commit does, when the shot is actually spent, and a reserved frame whose dependency failed is
+ * RETIRED by n48_fs_retire, so it is not retried forever. A RETIRED member can never RESERVE again. */
+static inline uint32_t n48_fs_step(n48_fs *f, uint32_t eligible, uint32_t is_fill, uint64_t cb0)
+{
+    if (!f || !f->on || !f->opened) return N48_FS_PASS;                 /* OFF / not armed: today's order */
+    if (f->expired || f->committed_n + f->retired_n >= f->members) return N48_FS_PASS; /* the window is already closed */
+    if (f->judged + 1u > N48_FS_EXPIRE_JUDGED) {                        /* expire: lift, count, and pass this frame */
+        f->expired = 1u;
+        f->expiry++;
+        return N48_FS_PASS;
+    }
+    f->judged++;
+    if (!eligible) return N48_FS_PASS;   /* the gate refuses it on an earlier rung; not a reservation refusal */
+    if (is_fill) {
+        for (uint32_t m = 0u; m < f->members && m < N48_FS_MEMBERS; m++)
+            if (!f->member_committed[m] && !f->member_retired[m] && f->member_va[m] == cb0) return N48_FS_RESERVE;
+    }
+    /* A NON-fill, or a fill whose CB0 is not an uncommitted member: refused under the reservation. FAIL-CLOSED for an
+     * UNIDENTIFIED frame (is_fill 0) — it is not a fill and may not spend a reserved shot. */
+    f->refused++;
+    return N48_FS_REFUSE;
+}
+
+/* 0.0.420 (STEP10-PLAN P1) — THE SECOND WINDOW'S PREDICATE. 1 only while its own switch is on, an arm opened the scope,
+ * no plane frame has committed, it has not expired, AND the fill window has CLOSED (n48_fs_win_open == 0). The last clause
+ * is the spec's "once the fill window closes": while the fills are still being reserved this window is not open, so the
+ * fill shots are untouched. With the fill-set switch off, `n48_fs_win_open` is 0 and the second window opens at the arm -
+ * the two switches are independent. Pure: the kext calls it before the rewrite (for the tgtsample skip) and at the gate. */
+static inline uint32_t n48_fs_plane_win_open(const n48_fs *f)
+{
+    if (!f || !f->plane_on || !f->opened) return 0u;
+    if (f->plane_committed || f->plane_expired) return 0u;
+    if (n48_fs_win_open(f)) return 0u;        /* the fill window has not closed yet */
+    return 1u;
+}
+
+/* ONE judged frame for the SECOND window, called by the caller AFTER n48_fs_step and only while the fill window is closed
+ * (the two windows are mutually exclusive by construction, so exactly one of the two counters advances per frame). `eligible`
+ * = the verdict is TRANSLATE; `is_plane` = the frame's in-force fragment identity is the plane's `ws_D_GPUPass`. Returns
+ * PASS when the window is not open (OFF, unarmed, already closed), RESERVE when the frame IS plane-shaped and may spend a
+ * shot, REFUSE for an eligible non-plane frame - the arm29/arm31 "second pair" - and PASS for a non-eligible one (the gate
+ * refuses it on an earlier rung; not a second-window refusal). The frame that triggers expiry PASSES, exactly as the fill
+ * window's does. NO retirement: P1 gives this window one commit and one 60-frame bound. */
+static inline uint32_t n48_fs_plane_step(n48_fs *f, uint32_t eligible, uint32_t is_plane)
+{
+    if (!n48_fs_plane_win_open(f)) return N48_FS_PASS;
+    if ((uint32_t)f->plane_judged + 1u > N48_FS_PLANE_EXPIRE_JUDGED) {
+        f->plane_expired = 1u;
+        f->plane_expiry++;
+        return N48_FS_PASS;
+    }
+    f->plane_judged++;
+    if (!eligible) return N48_FS_PASS;
+    if (is_plane) return N48_FS_RESERVE;
+    f->plane_refused++;
+    return N48_FS_REFUSE;
+}
+
+/* Record the commit of a plane frame, at the same instant the keystone proved the reserved fill commits: a plane
+ * frame whose keystone WITHDREW it never reaches this call, so the window stays open for the next one (or its expiry).
+ * Answers 1 when the window was newly closed. The switch state alone is read; OFF never commits anything. */
+static inline uint32_t n48_fs_plane_commit(n48_fs *f)
+{
+    if (!f || !f->plane_on) return 0u;
+    if (f->plane_committed) return 0u;
+    f->plane_committed = 1u;
+    return 1u;
+}
+
+/* THE SECOND WINDOW'S ONE WORD, for the report line. Longest "committed" (9 B), used by the width proof. */
+static inline const char *n48_fs_plane_state(const n48_fs *f)
+{
+    if (!f || !f->plane_on) return "off";
+    if (!f->opened) return "closed";
+    if (f->plane_committed) return "committed";
+    if (f->plane_expired) return "expired";
+    if (n48_fs_win_open(f)) return "waiting";
+    return "OPEN";
+}
+
+/* Record the commit of a reserved fill, at the one instant the gate answered N48_CM_OK AND the shot was spent. Matches by
+ * CB0, so the caller needs no carried index; answers 1 when a member was newly marked. */
+static inline uint32_t n48_fs_commit(n48_fs *f, uint64_t cb0, uint64_t seq)
+{
+    if (!f || !f->on) return 0u;
+    for (uint32_t m = 0u; m < f->members && m < N48_FS_MEMBERS; m++) {
+        if (!f->member_committed[m] && !f->member_retired[m] && f->member_va[m] == cb0) {
+            f->member_committed[m] = 1u;
+            f->member_seq[m] = seq;
+            f->committed_n++;
+            return 1u;
+        }
+    }
+    return 0u;
+}
+
+/* 0.0.406 ( — THE REVIEWER'S CONDITION 1) — RETIRE A MEMBER WHOSE RESERVE FRAME DID NOT GO LIVE. A step that
+ * returned RESERVE is only an intent: the frame can still be refused by every rung ABOVE the reservation rung (the
+ * dependency rung, the read-back, the coverage). measured the consequence of leaving the member for a retry: the
+ * twin fill at f13-18 never goes live (its consumer never enumerates, so the dependency is never clean), so the member is
+ * NEVER committed, the window NEVER closes, and `RESERVED-FOR-FILL` goes on refusing the plane frame arm21/arm22 actually
+ * committed. Retiring it re-evaluates the window - n48_fs_win_open closes when every member is COMMITTED OR RETIRED - so
+ * the plane is admitted once the surviving member is done (or expiry fires). Retired is a THIRD terminal state, distinct
+ * from committed (it never spent a shot and records no seq). A retired member is not reservable again (identify / bypass /
+ * step / commit all skip it) and its CB0 does not bypass the divisor. Answers 1 when a member was newly retired, so the
+ * caller can count it. Only the switch state is read; OFF never retires anything.
+ *
+ * 0.0.407 / 0.0.408 — RETIRE ON THE DEPENDENCY READOUT, NOT ON THE GATE REASON. 0.0.406
+ * retired on ANY refusal of a RESERVE frame, including a transient EARLIER rung (a page that has not resolved yet, a short
+ * write, a read-back mismatch): those can clear on the next attempt, and giving the member up on one of them throws away a
+ * shot the design reserved. 0.0.407 then tried to name the one good rung by comparing the GATE's answer to
+ * `N48_CM_DEP_STALE` — but a reserved fill that did not go live has its write branch SKIPPED, so its `pages` is 0 and the
+ * gate refuses it at PAGE-NOT-HOST, ABOVE the dependency rung: the gate's answer can never be DEPENDENCY-STALE for exactly
+ * the frame this rule exists for, and no member was ever retired. The `reason` wanted is not the gate's answer at
+ * all: it is the DEPENDENCY world's own reading (gfx_dep.h's `n48_dep_check`, the same value gfxsrc_commit_try calls
+ * `c.dep_ok`). So the caller passes `dep_failed` (nonzero iff that reading was NOT `N48_DEP_OK`, i.e. `!c.dep_ok`) and the
+ * dependency's OWN reason `dep_reason`, recorded VERBATIM so the ONE report line can name WHY the member was given up on.
+ * A clean dependency does NOT retire: the member is left seated for a retry, expiry the backstop. */
+static inline uint32_t n48_fs_retire(n48_fs *f, uint64_t cb0, uint32_t dep_failed, uint32_t dep_reason)
+{
+    if (!f || !f->on) return 0u;
+    if (!dep_failed) return 0u;          /* N1: only a FAILED dependency gives a member up; a clean one is a retry */
+    for (uint32_t m = 0u; m < f->members && m < N48_FS_MEMBERS; m++) {
+        if (!f->member_committed[m] && !f->member_retired[m] && f->member_va[m] == cb0) {
+            f->member_retired[m] = 1u;
+            f->retired_n++;
+            f->retired++;
+            f->last_retire_reason = dep_reason;
+            return 1u;
+        }
+    }
+    return 0u;
+}
+
+/* build 0.0.497 — RETIRE A RESERVED MEMBER WHOSE COMMIT THE KEYSTONE WITHDREW.
+ * RUN F: f1, the reserved fill of `0x400800000`, was handed COMMIT at the gate (so the gate RECORDED it in gFsPend,
+ * K2) and then WITHDRAWN at the keystone (VERDICT 15). The keystone's refusal branch dropped the record, so the member was
+ * left neither committed nor retired: it held the window open, every later non-fill frame was refused RESERVED-FOR-FILL,
+ * and n48_fs_retire could not help because it is asked only for a RESERVE frame that did not go LIVE at the gate - f1
+ * DID go live. This is the missing third exit: the member is RETIRED (the terminal "given up" state, exactly as a failed
+ * dependency retires it), never COMMITTED (it spent a shot that never reached the ring and records no seq). A retired
+ * member is not reservable again, so a later frame is judged under the window that remains - its own rungs and the
+ * keystone still apply to it. `reason` is recorded for the `fillset:` line exactly as n48_fs_retire's is (the kext passes
+ * N48_DEP_SOURCE_NEUTER: the withdrawn frame is neutered at the source). Matches by CB0 (the gate's recorded cb0), so
+ * ONLY that member moves. Answers 1 when a member was newly retired. OFF (switch 33 off) never retires anything; the
+ * kext calls this only with switch 64 ON (latched for the pass). */
+static inline uint32_t n48_fs_retire_withdrawn(n48_fs *f, uint64_t cb0, uint32_t reason)
+{
+    if (!f || !f->on) return 0u;
+    for (uint32_t m = 0u; m < f->members && m < N48_FS_MEMBERS; m++) {
+        if (!f->member_committed[m] && !f->member_retired[m] && f->member_va[m] == cb0) {
+            f->member_retired[m] = 1u;
+            f->retired_n++;
+            f->retired++;
+            f->last_retire_reason = reason;
+            return 1u;
+        }
+    }
+    return 0u;
+}
+
+/* build 0.0.532 item 11 (a) (; notes/design/HW72M3.md): REPORT ONLY. The commit hook's EXIT 3 saw the walk NOT
+ * spare token seq `seq` (any answer but SPARED). A member COMMITTED with that seq is marked walk-NOPed in a SEPARATE record (n48_fs
+ * keeps 0.0.529's layout: gfx_fs85_test asserts it), which the arm's open resets with the window. Committed stays committed: a
+ * walk-NOPed member counted as retired would change the window's and S3's semantics (its own review). The mark is printed on its
+ * own line right after the fillset line (N48_FILLSET_NOP_FMT: "committed seq 4 (walk-NOPed)"), so the fillset line itself, and
+ * its 480-byte width proof, are unchanged. Answers 1 when a member was newly marked. OFF (switch 33 off) marks nothing. */
+typedef struct { uint64_t seq[N48_FS_MEMBERS]; } n48_fs_nop;   /* the walk-NOPed seq per member; 0 = not marked */
+static inline void n48_fs_nop_open(n48_fs_nop *x)
+{
+    if (x) for (uint32_t m = 0u; m < N48_FS_MEMBERS; m++) x->seq[m] = 0u;
+}
+static inline uint32_t n48_fs_note_nopped(const n48_fs *f, n48_fs_nop *x, uint64_t seq)
+{
+    if (!f || !x || !f->on || !seq) return 0u;
+    for (uint32_t m = 0u; m < f->members && m < N48_FS_MEMBERS; m++) {
+        if (f->member_committed[m] && f->member_seq[m] == seq && x->seq[m] != seq) {
+            x->seq[m] = seq;
+            return 1u;
+        }
+    }
+    return 0u;
+}
+/* Member m is COMMITTED and its committed seq is the one the walk NOPed. */
+static inline uint32_t n48_fs_is_nopped(const n48_fs *f, const n48_fs_nop *x, uint32_t m)
+{
+    return (f && x && m < N48_FS_MEMBERS && f->member_committed[m] && x->seq[m] && f->member_seq[m] == x->seq[m]) ? 1u : 0u;
+}
+/* Printed only when a member is marked. Args per member: VA, "committed" or "-", seq, " (walk-NOPed)" or "". */
+#define N48_FILLSET_NOP_FMT \
+    "fillset: walk-NOPed members (their IB never ran; REPORT ONLY, still counted committed): %#llx %s seq %u%s, %#llx %s seq %u%s"
+
+/* THE ONE REPORT LINE, in one place so its worst case is bounded by a test rather than by arithmetic in a commit message
+ *. Args: switch state, change word, members, VA0, state0, seq0, VA1, state1, seq1, committed_n,
+ * members, refused-under-reservation, expired, judged, window word, retired_n, the retiring DEPENDENCY reason
+ * ( /, "none" when no member was retired). It carries every fielda item 6 asks for - the members, the
+ * per-member commit and token seq, the refused count and the expiry count - plus the retirement count added and
+ * the reason asks for. 0.0.420 (P1) appends the SECOND window's own five fields, on the SAME line and within the
+ * same 480-byte body budget: its state word (n48_fs_plane_state), committed, refused, expired and judged. */
+#define N48_FILLSET_FMT \
+    "fillset: `gfxneuter 33 | M << 8` is %s - %s. %u member(s): %#llx %s seq %u, %#llx %s seq %u; committed %u of %u; " \
+    "refused-under-reservation %llu, expired %llu, judged %u, window %s; retired %llu, retire reason %s; " \
+    "plane win %s: committed %u, refused %u, expired %u, judged %u."
+
+/* The brief's own ceiling for this line, and the same 480-body-byte bound the other instruments use. */
+#ifndef N48_LOG_CAP_BODY
+#define N48_LOG_CAP_BODY 491u
+#endif
+#define N48_FILLSET_BODY_CAP 480u
+
+/* =====================================================================================================================
+ * build 0.0.548 — THE LEARNED FILL SET: SWITCH 106 "fslearn", how switch 33's fill set picks its members.
+ * `106 | M << 8`: M 1 LEARNED (= 362), M 2 OFF = TABLED (= 618, the default and the boot value: today's console-size table), M 3
+ * SHADOW (= 874); bare `106` reads. It does nothing while 33 is OFF. Mid-arm guarded (the continuous guard, and any arm scope).
+ *
+ * WHY. At native 1440p the fill set's second member drifts per boot ('s P-slot table: run11ap-r and RUN AW 0x404000000, RUN AX
+ * 0x403f00000; and at 1080p run11m's was 0x405800000). A missed member never RESERVEs and never retires, so the window runs to its
+ * 60-judged-frame expiry REFUSING WindowServer's start-up frames, which its damage-only compositor never redraws (RUN AX: black
+ * glass).'s INVARIANT on every measured boot: the members are the 1st and the 5th DISTINCT CB0 of a P-shaped frame (single IB,
+ * 1040 dwords; gfx_present73.h n48_p73_is_p_shape) - slot order = fill order.
+ *
+ * THE LEARNER (n48_fs_learn), called by the kext on EVERY frame the fill set is about to step, BEFORE that step (so the frame that
+ * supplies a member is itself judged against it: RESERVE, not REFUSE), whatever its eligibility or verdict:
+ *   - it keys by CB0 VA, never by VRAM (a surface re-seated at a new VRAM under the same VA is the same surface);
+ *   - it counts only P-shaped, non-plane frames with a colour target, only from the FIRST submitting pid after the open; a frame
+ *     from another pid RESETS the list (a new WindowServer instance clears its surfaces again,) and becomes the new pid;
+ *   - member 0 = the 1st distinct CB0, member 1 = the 5th;
+ *   - FALLBACK: when the fill set's judged count reaches N48_FS_LEARN_BY (30, 0.0.549) and the FILL window is still open - whether
+ *     fewer than 5 distinct CB0s were seen, or all 5 were learned but a member fill is still uncommitted (0.0.549 SHOULD: a member
+ *     RESERVEd but refused by an earlier rung holds the window to 60, RUN AX's pattern) - LEARNED LIFTS the FILL window (expired = 1
+ *     without an expiry count: n48_fs_step answers PASS for that frame and every later one). WHAT LIFTING DOES NOT MEAN: with switch
+ *     35 ON, closing the fill window OPENS THE PLANE WINDOW (n48_fs_plane_win_open), which REFUSES every eligible non-plane frame
+ *     until a plane frame commits or its own 60-frame bound expires. So later frames are NOT all passed: a member fill arriving after
+ *     the lift is refused RESERVED-FOR-PLANE. That is why the bound is 30, not 20 (the 0.0.548 review, : run11m's 5th
+ *     distinct CB0 came at judged 22 and must be learned, not lifted over). Never hold the fill window on an unlearned member.
+ * LEARNED seats the learned VAs into the member slots (a slot committed or retired is never re-seated; an unlearned slot holds
+ * N48_FS_UNLEARNED, which no CB0 equals). SHADOW learns beside the table and changes nothing the step, the gate or the report
+ * reads; both modes count "would-differ" frames (the table's and the learned set's answers differ on the same pre-step state).
+ * TABLED (M 1, the default): the kext never calls any of this, so the fill set is 0.0.547's.
+ *
+ * SAFETY. The learner can only change WHICH member CB0 a single-segment ColorFill must name to RESERVE, or lift the window early
+ * (PASS = today's rule without the reservation). A RESERVE is a POLICY answer, not an admission: the frame still passes every other
+ * rung of the commit gate (gfx_commit.h: the reservation rung is appended last, after every safety rung). A wrong member costs
+ * content and liveness, never hardware. Pure: no lock, no clock, no log. */
+enum { N48_FS_MODE_TABLED = 0u, N48_FS_MODE_LEARNED = 1u, N48_FS_MODE_SHADOW = 2u, N48_FS_MODES = 3u };
+#define N48_FS_LEARN_NTH    5u                       /* member 1 = the 5th distinct CB0 */
+#define N48_FS_LEARN_BY     30u                      /* the fallback's judged-frame bound (0.0.549: 20 -> 30) */
+#define N48_FS_LEARN_WD     8u                       /* would-differ frame numbers kept */
+#define N48_FS_UNLEARNED    0xffffffffffffffffull    /* an unlearned member slot: equals no CB0 */
+enum { N48_FS_LEV_NEW = 1u, N48_FS_LEV_RESET = 2u, N48_FS_LEV_FALLBACK = 4u };
+
+typedef struct {
+    uint32_t mode;                        /* N48_FS_MODE_*; kept across opens (the switch) */
+    uint32_t have_pid;                    /* per scope from here on */
+    int32_t pid;
+    uint32_t n;                           /* distinct CB0s recorded (<= N48_FS_LEARN_NTH) */
+    uint64_t va[N48_FS_LEARN_NTH];
+    uint32_t at[N48_FS_LEARN_NTH];        /* the judged frame (the kext's frame number) that supplied each */
+    uint32_t fallback, fallback_at;       /* the fallback fired (LEARNED: lifted; SHADOW: would have), at fill-set judged N */
+    uint32_t resets;                      /* pid changes */
+    uint32_t lines;                       /* event lines printed this scope (the kext's cap) */
+    uint32_t wd;                          /* would-differ frames */
+    uint32_t wd_first[N48_FS_LEARN_WD];
+    uint64_t ref_single, ref_multi, ref_other;   /* refused-under-reservation: single-IB 1040 / multi-IB / other shape */
+} n48_fs_lrn;
+
+static inline const char *n48_fs_mode_name(uint32_t m)
+{
+    return m == N48_FS_MODE_LEARNED ? "LEARNED" : m == N48_FS_MODE_SHADOW ? "SHADOW" : "OFF (TABLED, default)";
+}
+
+/* A fresh arm scope (beside n48_fs_open). Keeps `mode`; clears every per-scope field. */
+static inline void n48_fs_learn_open(n48_fs_lrn *L)
+{
+    if (!L) return;
+    const uint32_t mode = L->mode;
+    *L = n48_fs_lrn {};
+    L->mode = mode;
+}
+
+/* The learned VA of member m (0: the 1st distinct CB0; 1: the 5th), or N48_FS_UNLEARNED. */
+static inline uint64_t n48_fs_learn_member(const n48_fs_lrn *L, uint32_t m)
+{
+    if (!L) return N48_FS_UNLEARNED;
+    if (m == 0u) return L->n >= 1u ? L->va[0] : N48_FS_UNLEARNED;
+    if (m == 1u) return L->n >= N48_FS_LEARN_NTH ? L->va[N48_FS_LEARN_NTH - 1u] : N48_FS_UNLEARNED;
+    return N48_FS_UNLEARNED;
+}
+
+/* LEARNED only: seat the learned VAs into the member slots, never over a slot already committed or retired. SHADOW / TABLED:
+ * nothing. build 0.0.549 MUST-FIX 2: at an UNKNOWN console size (N48_FS_GEO_UNKNOWN) the member count stays 0,
+ * exactly as TABLED seats it (n48_fs_seat_geo): the window is closed from the start and n48_fs_step answers PASS for every frame.
+ * Through 0.0.548 LEARNED forced members = 2 there and so REFUSED frames TABLED passes. At a known size: N48_FS_MEMBERS. */
+static inline uint32_t n48_fs_learn_members_of(uint32_t geo)
+{
+    return geo == N48_FS_GEO_UNKNOWN ? 0u : N48_FS_MEMBERS;
+}
+static inline void n48_fs_learn_seat(n48_fs *f, const n48_fs_lrn *L)
+{
+    if (!f || !L || L->mode != N48_FS_MODE_LEARNED) return;
+    f->members = n48_fs_learn_members_of(f->geo);
+    for (uint32_t m = 0u; m < N48_FS_MEMBERS; m++)
+        if (!f->member_committed[m] && !f->member_retired[m]) f->member_va[m] = n48_fs_learn_member(L, m);
+}
+
+/* ONE frame, BEFORE the fill set steps it. `pshape` = n48_p73_is_p_shape; `plane` = the in-force PS is the plane's (ws_D_GPUPass);
+ * `cb0` = the frame's first colour target VA (0 = none); `pid` the submitter; `frame` the kext's judged-frame number (log only).
+ * Answers N48_FS_LEV_* bits; *idx = the index (1-based) of a NEW distinct CB0. TABLED, OFF, or no scope: 0 and nothing moves. */
+static inline uint32_t n48_fs_learn(n48_fs *f, n48_fs_lrn *L, uint32_t pshape, uint32_t plane, uint64_t cb0, int32_t pid,
+                                    uint32_t frame, uint32_t *idx)
+{
+    if (idx) *idx = 0u;
+    if (!f || !L || L->mode == N48_FS_MODE_TABLED || L->mode >= N48_FS_MODES || !f->on || !f->opened) return 0u;
+    uint32_t ev = 0u;
+    if (!L->have_pid) {
+        L->have_pid = 1u;
+        L->pid = pid;
+    } else if (pid != L->pid) {           /* a new submitter: the list starts again from ITS first fill */
+        L->pid = pid;
+        L->n = 0u;
+        for (uint32_t i = 0u; i < N48_FS_LEARN_NTH; i++) { L->va[i] = 0ull; L->at[i] = 0u; }
+        L->resets++;
+        ev |= N48_FS_LEV_RESET;
+    }
+    if (pshape && !plane && cb0 && cb0 != N48_FS_UNLEARNED && L->n < N48_FS_LEARN_NTH) {
+        uint32_t seen = 0u;
+        for (uint32_t i = 0u; i < L->n; i++) if (L->va[i] == cb0) seen = 1u;
+        if (!seen) {
+            L->va[L->n] = cb0;
+            L->at[L->n] = frame;
+            L->n++;
+            if (idx) *idx = L->n;
+            ev |= N48_FS_LEV_NEW;
+        }
+    }
+    if (ev) n48_fs_learn_seat(f, L);
+    /* FALLBACK: this frame would be the fill set's N48_FS_LEARN_BY-th judged frame (or later) and the FILL window is still OPEN -
+     * member 1 unlearned, OR (0.0.549 SHOULD) all 5 learned but a member still neither committed nor retired. LEARNED lifts the fill
+     * window here: n48_fs_step answers PASS for this frame and every later one (with 35 ON the PLANE window then opens and refuses
+     * eligible non-plane frames - see the header). */
+    if (!L->fallback && n48_fs_win_open(f) && f->judged + 1u >= N48_FS_LEARN_BY) {
+        L->fallback = 1u;
+        L->fallback_at = f->judged + 1u;
+        if (L->mode == N48_FS_MODE_LEARNED) f->expired = 1u;
+        ev |= N48_FS_LEV_FALLBACK;
+    }
+    return ev;
+}
+
+/* What n48_fs_step WOULD answer for this frame on the state as it stands, with member VAs va0/va1 and `members` of them (no side
+ * effect). `raw_fill` = single segment AND the ColorFill PS (n48_fs_identify_fill's own first two clauses). */
+static inline uint32_t n48_fs_preview(const n48_fs *f, uint64_t va0, uint64_t va1, uint32_t members, uint32_t eligible,
+                                      uint32_t raw_fill, uint64_t cb0)
+{
+    if (!f || !f->on || !f->opened) return N48_FS_PASS;
+    if (f->expired || f->committed_n + f->retired_n >= members) return N48_FS_PASS;
+    if (f->judged + 1u > N48_FS_EXPIRE_JUDGED) return N48_FS_PASS;
+    if (!eligible) return N48_FS_PASS;
+    const uint64_t va[N48_FS_MEMBERS] = { va0, va1 };
+    if (raw_fill)
+        for (uint32_t m = 0u; m < members && m < N48_FS_MEMBERS; m++)
+            if (!f->member_committed[m] && !f->member_retired[m] && va[m] == cb0) return N48_FS_RESERVE;
+    return N48_FS_REFUSE;
+}
+
+/* The learned set's and the table's answers for THIS frame on the same pre-step state (called right after n48_fs_learn, before the
+ * step); counts a would-differ frame and keeps the first N48_FS_LEARN_WD frame numbers. `geo` = the console size's table. The
+ * learned side answers PASS once the fallback fired (LEARNED lifts there). Answers 1 when they differ. Log only. */
+static inline uint32_t n48_fs_learn_compare(const n48_fs *f, n48_fs_lrn *L, uint32_t geo, uint32_t eligible, uint32_t raw_fill,
+                                            uint64_t cb0, uint32_t frame)
+{
+    if (!f || !L || L->mode == N48_FS_MODE_TABLED || L->mode >= N48_FS_MODES) return 0u;
+    const uint32_t tm = geo == N48_FS_GEO_UNKNOWN ? 0u : N48_FS_MEMBERS;
+    const uint32_t vt = (L->mode == N48_FS_MODE_LEARNED && L->fallback) ? (uint32_t)N48_FS_PASS
+                      : n48_fs_preview(f, n48_fs_member_va_of(geo, 0u), n48_fs_member_va_of(geo, 1u), tm, eligible, raw_fill, cb0);
+    const uint32_t vl = L->fallback ? (uint32_t)N48_FS_PASS
+                      : n48_fs_preview(f, n48_fs_learn_member(L, 0u), n48_fs_learn_member(L, 1u), n48_fs_learn_members_of(geo),
+                                       eligible, raw_fill, cb0);
+    if (vt == vl) return 0u;
+    if (L->wd < N48_FS_LEARN_WD) L->wd_first[L->wd] = frame;
+    L->wd++;
+    return 1u;
+}
+
+/* A frame the fill set REFUSED under the reservation (after the step), split by its start-up shape. Log only. */
+static inline void n48_fs_learn_note_refuse(n48_fs_lrn *L, uint32_t pshape, uint32_t nib)
+{
+    if (!L || L->mode == N48_FS_MODE_TABLED || L->mode >= N48_FS_MODES) return;
+    if (pshape) L->ref_single++;
+    else if (nib > 1u) L->ref_multi++;
+    else L->ref_other++;
+}
+
+/* THE LINES (the width test bounds each <= N48_LOG_CAP_BODY). Event: index, VA, frame, fill-set judged, pid, member word. */
+#define N48_FSL_EVENT_FMT \
+    "fslearn: %s learn #%u CB0 %#llx at frame %u (fill-set judged %u) pid %d%s"
+#define N48_FSL_RESET_FMT \
+    "fslearn: %s submitter pid %d at frame %u - a new submitter: the learned list starts again (reset %u)"
+/* 0.0.549 MUST-FIX 3: the LEARNED fallback's word. The FILL step passes from this frame; with 35 ON the plane window opens and refuses
+ * eligible non-plane frames, so the line must not say every later frame passes. */
+#define N48_FSL_LIFTED_WORD "is LIFTED (the fill step PASSes from here; 35 ON: the plane window opens)"
+#define N48_FSL_FALLBACK_FMT \
+    "fslearn: %s FALLBACK at fill-set judged %u (frame %u): %u distinct CB0(s) of 5 - the fill window %s"
+/* STOP: mode, learned m0/m1, distinct, pid, resets, tabled m0/m1, would-differ, the first 8 frames, fallback word, fallback judged,
+ * refused total, single-IB 1040, multi-IB, other. */
+#define N48_FSL_STOP_FMT \
+    "fslearn: STOP %s: learned %#llx %#llx (%u of 5 distinct, pid %d, resets %u) vs tabled %#llx %#llx; would-differ %u " \
+    "(first %u %u %u %u %u %u %u %u); fallback %s at judged %u; refused %llu = single-IB-1040 %llu + multi-IB %llu + other %llu."
+#define N48_FSL_MODE_FMT \
+    "fslearn: `gfxneuter 106 | M << 8` is %s (362 LEARNED, 618 OFF = TABLED the default, 874 SHADOW; mid-arm guarded); switch 33 " \
+    "is %s; %s."
+
+#endif /* N48_GFX_FILLSET_H */

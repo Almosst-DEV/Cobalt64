@@ -1,0 +1,4465 @@
+From 6ad43301d07dfa9c31f3d6d5d22dd0d549696df3 Mon Sep 17 00:00:00 2001
+From: Navi48-MacOS contributors <noreply@example.invalid>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH 1/5] radv: Darwin (macOS) backend with canned gfx1201 device
+ info (Navi48 S1a)
+
+Build RADV for Darwin without libdrm and without a DRM node.  meson: allow
+-Dvulkan-drivers=amd on Darwin (no libdrm_amdgpu; compile vk_drm_syncobj.c;
+HAVE_TSERVER for addrlib; -undefined dynamic_lookup like KosmicKrisp).
+ac_linux_drm.c dispatches to a new Darwin backend (src/amd/common/darwin):
+device info is the drm-shim gfx1201 table, the VA manager is libdrm's
+(vendored), syncobjs are a userspace util_sync_provider, and every kernel
+call returns -ENODEV with a log line (S1b/c wire them to the kext).
+RADV enumerates the one device through vk_instance's .enumerate hook, only
+when RADV_DARWIN_FAKE=1.  RADV_DARWIN_HOST_BO=1 makes BOs host memory so
+vkCreateDevice succeeds; the first real stub then is CS submit.
+Stand-in headers for xf86drm.h, amdgpu.h (libdrm's, verbatim) and libsync.h
+live in include/darwin.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ cross-x86_64.ini                              |   13 +
+ include/darwin/amdgpu.h                       | 2102 +++++++++++++++++
+ include/darwin/libsync.h                      |   32 +
+ include/darwin/xf86drm.h                      |   54 +
+ include/meson.build                           |    6 +
+ meson.build                                   |   10 +-
+ src/amd/common/ac_gpu_info.c                  |    4 +
+ src/amd/common/ac_linux_drm.c                 |  170 +-
+ src/amd/common/darwin/ac_darwin_drm.c         |  371 +++
+ src/amd/common/darwin/ac_darwin_drm.h         |   64 +
+ src/amd/common/darwin/ac_darwin_sync.c        |  327 +++
+ src/amd/common/darwin/amdgpu_vamgr.c          |  383 +++
+ src/amd/common/darwin/amdgpu_vamgr_internal.h |   61 +
+ .../common/darwin/libdrm_util_double_list.h   |  121 +
+ src/amd/common/meson.build                    |   16 +
+ src/amd/vulkan/meson.build                    |    7 +
+ src/amd/vulkan/radv_instance.c                |    3 +
+ src/amd/vulkan/radv_physical_device.c         |   50 +-
+ src/amd/vulkan/radv_physical_device.h         |    5 +
+ src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c |   11 +-
+ .../vulkan/winsys/amdgpu/radv_amdgpu_winsys.c |    5 +
+ src/vulkan/runtime/meson.build                |    3 +
+ 22 files changed, 3783 insertions(+), 35 deletions(-)
+ create mode 100644 cross-x86_64.ini
+ create mode 100644 include/darwin/amdgpu.h
+ create mode 100644 include/darwin/libsync.h
+ create mode 100644 include/darwin/xf86drm.h
+ create mode 100644 src/amd/common/darwin/ac_darwin_drm.c
+ create mode 100644 src/amd/common/darwin/ac_darwin_drm.h
+ create mode 100644 src/amd/common/darwin/ac_darwin_sync.c
+ create mode 100644 src/amd/common/darwin/amdgpu_vamgr.c
+ create mode 100644 src/amd/common/darwin/amdgpu_vamgr_internal.h
+ create mode 100644 src/amd/common/darwin/libdrm_util_double_list.h
+
+diff --git a/cross-x86_64.ini b/cross-x86_64.ini
+new file mode 100644
+index 00000000000..4d4cf60b3c8
+--- /dev/null
++++ b/cross-x86_64.ini
+@@ -0,0 +1,13 @@
++[binaries]
++c = ['clang', '-arch', 'x86_64']
++cpp = ['clang++', '-arch', 'x86_64']
++objc = ['clang', '-arch', 'x86_64']
++ar = 'ar'
++strip = 'strip'
++pkg-config = 'pkg-config'
++
++[host_machine]
++system = 'darwin'
++cpu_family = 'x86_64'
++cpu = 'x86_64'
++endian = 'little'
+diff --git a/include/darwin/amdgpu.h b/include/darwin/amdgpu.h
+new file mode 100644
+index 00000000000..6efb7a7decb
+--- /dev/null
++++ b/include/darwin/amdgpu.h
+@@ -0,0 +1,2102 @@
++/*
++ * Copyright 2014 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++/**
++ * \file amdgpu.h
++ *
++ * Declare public libdrm_amdgpu API
++ *
++ * This file define API exposed by libdrm_amdgpu library.
++ * User wanted to use libdrm_amdgpu functionality must include
++ * this file.
++ *
++ */
++#ifndef _AMDGPU_H_
++#define _AMDGPU_H_
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct drm_amdgpu_info_hw_ip;
++struct drm_amdgpu_info_uq_fw_areas;
++struct drm_amdgpu_bo_list_entry;
++struct drm_amdgpu_userq_signal;
++struct drm_amdgpu_userq_wait;
++
++/*--------------------------------------------------------------------------*/
++/* --------------------------- Defines ------------------------------------ */
++/*--------------------------------------------------------------------------*/
++
++/**
++ * Define max. number of Command Buffers (IB) which could be sent to the single
++ * hardware IP to accommodate CE/DE requirements
++ *
++ * \sa amdgpu_cs_ib_info
++*/
++#define AMDGPU_CS_MAX_IBS_PER_SUBMIT		4
++
++/**
++ * Special timeout value meaning that the timeout is infinite.
++ */
++#define AMDGPU_TIMEOUT_INFINITE			0xffffffffffffffffull
++
++/**
++ * Used in amdgpu_cs_query_fence_status(), meaning that the given timeout
++ * is absolute.
++ */
++#define AMDGPU_QUERY_FENCE_TIMEOUT_IS_ABSOLUTE     (1 << 0)
++
++/*--------------------------------------------------------------------------*/
++/* ----------------------------- Enums ------------------------------------ */
++/*--------------------------------------------------------------------------*/
++
++/**
++ * Enum describing possible handle types
++ *
++ * \sa amdgpu_bo_import, amdgpu_bo_export
++ *
++*/
++enum amdgpu_bo_handle_type {
++	/** GEM flink name (needs DRM authentication, used by DRI2) */
++	amdgpu_bo_handle_type_gem_flink_name = 0,
++
++	/** KMS handle which is used by all driver ioctls */
++	amdgpu_bo_handle_type_kms = 1,
++
++	/** DMA-buf fd handle */
++	amdgpu_bo_handle_type_dma_buf_fd = 2,
++
++	/** Deprecated in favour of and same behaviour as
++	 * amdgpu_bo_handle_type_kms, use that instead of this
++	 */
++	amdgpu_bo_handle_type_kms_noimport = 3,
++};
++
++/** Define known types of GPU VM VA ranges */
++enum amdgpu_gpu_va_range
++{
++	/** Allocate from "normal"/general range */
++	amdgpu_gpu_va_range_general = 0
++};
++
++enum amdgpu_sw_info {
++	amdgpu_sw_info_address32_hi = 0,
++	/** Query the PRT control bit when the half VA range is reserved for
++	 * PRT when the device is initialized. This depends on the GFX version.
++	 * A return value of ~0 should be ignored.
++	 */
++	amdgpu_sw_info_address_prt_wa_control_bit = 1,
++};
++
++enum amdgpu_va_manager_sw_info {
++	/** Query the PRT control bit when the half VA range is reserved for
++	 * PRT with AMDGPU_VA_MGR_RESERVE_HALF_VA_FOR_PRT. The default value of
++	 * ~0 shouldn't be considered a valid value.
++	 */
++	amdgpu_va_manager_sw_info_address_prt_wa_control_bit = 0,
++};
++
++/*--------------------------------------------------------------------------*/
++/* -------------------------- Datatypes ----------------------------------- */
++/*--------------------------------------------------------------------------*/
++
++/**
++ * Define opaque pointer to context associated with fd.
++ * This context will be returned as the result of
++ * "initialize" function and should be pass as the first
++ * parameter to any API call
++ */
++typedef struct amdgpu_device *amdgpu_device_handle;
++
++/**
++ * Define GPU Context type as pointer to opaque structure
++ * Example of GPU Context is the "rendering" context associated
++ * with OpenGL context (glCreateContext)
++ */
++typedef struct amdgpu_context *amdgpu_context_handle;
++
++/**
++ * Define handle for amdgpu resources: buffer, GDS, etc.
++ */
++typedef struct amdgpu_bo *amdgpu_bo_handle;
++
++/**
++ * Define handle for list of BOs
++ */
++typedef struct amdgpu_bo_list *amdgpu_bo_list_handle;
++
++/**
++ * Define handle to be used to work with VA allocated ranges
++ */
++typedef struct amdgpu_va *amdgpu_va_handle;
++
++/**
++ * Define handle dealing with VA allocation. An amdgpu_device
++ * owns one of these, but they can also be used without a device.
++ */
++typedef struct amdgpu_va_manager *amdgpu_va_manager_handle;
++
++/**
++ * Define handle for semaphore
++ */
++typedef struct amdgpu_semaphore *amdgpu_semaphore_handle;
++
++/*--------------------------------------------------------------------------*/
++/* -------------------------- Structures ---------------------------------- */
++/*--------------------------------------------------------------------------*/
++
++/**
++ * Structure describing memory allocation request
++ *
++ * \sa amdgpu_bo_alloc()
++ *
++*/
++struct amdgpu_bo_alloc_request {
++	/** Allocation request. It must be aligned correctly. */
++	uint64_t alloc_size;
++
++	/**
++	 * It may be required to have some specific alignment requirements
++	 * for physical back-up storage (e.g. for displayable surface).
++	 * If 0 there is no special alignment requirement
++	 */
++	uint64_t phys_alignment;
++
++	/**
++	 * UMD should specify where to allocate memory and how it
++	 * will be accessed by the CPU.
++	 */
++	uint32_t preferred_heap;
++
++	/** Additional flags passed on allocation */
++	uint64_t flags;
++};
++
++/**
++ * Special UMD specific information associated with buffer.
++ *
++ * It may be need to pass some buffer charactersitic as part
++ * of buffer sharing. Such information are defined UMD and
++ * opaque for libdrm_amdgpu as well for kernel driver.
++ *
++ * \sa amdgpu_bo_set_metadata(), amdgpu_bo_query_info,
++ *     amdgpu_bo_import(), amdgpu_bo_export
++ *
++*/
++struct amdgpu_bo_metadata {
++	/** Special flag associated with surface */
++	uint64_t flags;
++
++	/**
++	 * ASIC-specific tiling information (also used by DCE).
++	 * The encoding is defined by the AMDGPU_TILING_* definitions.
++	 */
++	uint64_t tiling_info;
++
++	/** Size of metadata associated with the buffer, in bytes. */
++	uint32_t size_metadata;
++
++	/** UMD specific metadata. Opaque for kernel */
++	uint32_t umd_metadata[64];
++};
++
++/**
++ * Structure describing allocated buffer. Client may need
++ * to query such information as part of 'sharing' buffers mechanism
++ *
++ * \sa amdgpu_bo_set_metadata(), amdgpu_bo_query_info(),
++ *     amdgpu_bo_import(), amdgpu_bo_export()
++*/
++struct amdgpu_bo_info {
++	/** Allocated memory size */
++	uint64_t alloc_size;
++
++	/**
++	 * It may be required to have some specific alignment requirements
++	 * for physical back-up storage.
++	 */
++	uint64_t phys_alignment;
++
++	/** Heap where to allocate memory. */
++	uint32_t preferred_heap;
++
++	/** Additional allocation flags. */
++	uint64_t alloc_flags;
++
++	/** Metadata associated with buffer if any. */
++	struct amdgpu_bo_metadata metadata;
++};
++
++/**
++ * Structure with information about "imported" buffer
++ *
++ * \sa amdgpu_bo_import()
++ *
++ */
++struct amdgpu_bo_import_result {
++	/** Handle of memory/buffer to use */
++	amdgpu_bo_handle buf_handle;
++
++	 /** Buffer size */
++	uint64_t alloc_size;
++};
++
++/**
++ *
++ * Structure to describe GDS partitioning information.
++ * \note OA and GWS resources are asscoiated with GDS partition
++ *
++ * \sa amdgpu_gpu_resource_query_gds_info
++ *
++*/
++struct amdgpu_gds_resource_info {
++	uint32_t gds_gfx_partition_size;
++	uint32_t compute_partition_size;
++	uint32_t gds_total_size;
++	uint32_t gws_per_gfx_partition;
++	uint32_t gws_per_compute_partition;
++	uint32_t oa_per_gfx_partition;
++	uint32_t oa_per_compute_partition;
++};
++
++/**
++ * Structure describing CS fence
++ *
++ * \sa amdgpu_cs_query_fence_status(), amdgpu_cs_request, amdgpu_cs_submit()
++ *
++*/
++struct amdgpu_cs_fence {
++
++	/** In which context IB was sent to execution */
++	amdgpu_context_handle context;
++
++	/** To which HW IP type the fence belongs */
++	uint32_t ip_type;
++
++	/** IP instance index if there are several IPs of the same type. */
++	uint32_t ip_instance;
++
++	/** Ring index of the HW IP */
++	uint32_t ring;
++
++	/** Specify fence for which we need to check submission status.*/
++	uint64_t fence;
++};
++
++/**
++ * Structure describing IB
++ *
++ * \sa amdgpu_cs_request, amdgpu_cs_submit()
++ *
++*/
++struct amdgpu_cs_ib_info {
++	/** Special flags */
++	uint64_t flags;
++
++	/** Virtual MC address of the command buffer */
++	uint64_t ib_mc_address;
++
++	/**
++	 * Size of Command Buffer to be submitted.
++	 *   - The size is in units of dwords (4 bytes).
++	 *   - Could be 0
++	 */
++	uint32_t size;
++};
++
++/**
++ * Structure describing fence information
++ *
++ * \sa amdgpu_cs_request, amdgpu_cs_query_fence,
++ *     amdgpu_cs_submit(), amdgpu_cs_query_fence_status()
++*/
++struct amdgpu_cs_fence_info {
++	/** buffer object for the fence */
++	amdgpu_bo_handle handle;
++
++	/** fence offset in the unit of sizeof(uint64_t) */
++	uint64_t offset;
++};
++
++/**
++ * Structure describing submission request
++ *
++ * \note We could have several IBs as packet. e.g. CE, CE, DE case for gfx
++ *
++ * \sa amdgpu_cs_submit()
++*/
++struct amdgpu_cs_request {
++	/** Specify flags with additional information */
++	uint64_t flags;
++
++	/** Specify HW IP block type to which to send the IB. */
++	unsigned ip_type;
++
++	/** IP instance index if there are several IPs of the same type. */
++	unsigned ip_instance;
++
++	/**
++	 * Specify ring index of the IP. We could have several rings
++	 * in the same IP. E.g. 0 for SDMA0 and 1 for SDMA1.
++	 */
++	uint32_t ring;
++
++	/**
++	 * List handle with resources used by this request.
++	 */
++	amdgpu_bo_list_handle resources;
++
++	/**
++	 * Number of dependencies this Command submission needs to
++	 * wait for before starting execution.
++	 */
++	uint32_t number_of_dependencies;
++
++	/**
++	 * Array of dependencies which need to be met before
++	 * execution can start.
++	 */
++	struct amdgpu_cs_fence *dependencies;
++
++	/** Number of IBs to submit in the field ibs. */
++	uint32_t number_of_ibs;
++
++	/**
++	 * IBs to submit. Those IBs will be submit together as single entity
++	 */
++	struct amdgpu_cs_ib_info *ibs;
++
++	/**
++	 * The returned sequence number for the command submission 
++	 */
++	uint64_t seq_no;
++
++	/**
++	 * The fence information
++	 */
++	struct amdgpu_cs_fence_info fence_info;
++};
++
++/**
++ * Structure which provide information about GPU VM MC Address space
++ * alignments requirements
++ *
++ * \sa amdgpu_query_buffer_size_alignment
++ */
++struct amdgpu_buffer_size_alignments {
++	/** Size alignment requirement for allocation in
++	 * local memory */
++	uint64_t size_local;
++
++	/**
++	 * Size alignment requirement for allocation in remote memory
++	 */
++	uint64_t size_remote;
++};
++
++/**
++ * Structure which provide information about heap
++ *
++ * \sa amdgpu_query_heap_info()
++ *
++ */
++struct amdgpu_heap_info {
++	/** Theoretical max. available memory in the given heap */
++	uint64_t heap_size;
++
++	/**
++	 * Number of bytes allocated in the heap. This includes all processes
++	 * and private allocations in the kernel. It changes when new buffers
++	 * are allocated, freed, and moved. It cannot be larger than
++	 * heap_size.
++	 */
++	uint64_t heap_usage;
++
++	/**
++	 * Theoretical possible max. size of buffer which
++	 * could be allocated in the given heap
++	 */
++	uint64_t max_allocation;
++};
++
++/**
++ * Describe GPU h/w info needed for UMD correct initialization
++ *
++ * \sa amdgpu_query_gpu_info()
++*/
++struct amdgpu_gpu_info {
++	/** Asic id */
++	uint32_t asic_id;
++	/** Chip revision */
++	uint32_t chip_rev;
++	/** Chip external revision */
++	uint32_t chip_external_rev;
++	/** Family ID */
++	uint32_t family_id;
++	/** Special flags */
++	uint64_t ids_flags;
++	/** max engine clock*/
++	uint64_t max_engine_clk;
++	/** max memory clock */
++	uint64_t max_memory_clk;
++	/** number of shader engines */
++	uint32_t num_shader_engines;
++	/** number of shader arrays per engine */
++	uint32_t num_shader_arrays_per_engine;
++	/**  Number of available good shader pipes */
++	uint32_t avail_quad_shader_pipes;
++	/**  Max. number of shader pipes.(including good and bad pipes  */
++	uint32_t max_quad_shader_pipes;
++	/** Number of parameter cache entries per shader quad pipe */
++	uint32_t cache_entries_per_quad_pipe;
++	/**  Number of available graphics context */
++	uint32_t num_hw_gfx_contexts;
++	/** Number of render backend pipes */
++	uint32_t rb_pipes;
++	/**  Enabled render backend pipe mask */
++	uint32_t enabled_rb_pipes_mask;
++	/** Frequency of GPU Counter */
++	uint32_t gpu_counter_freq;
++	/** CC_RB_BACKEND_DISABLE.BACKEND_DISABLE per SE */
++	uint32_t backend_disable[4];
++	/** Value of MC_ARB_RAMCFG register*/
++	uint32_t mc_arb_ramcfg;
++	/** Value of GB_ADDR_CONFIG */
++	uint32_t gb_addr_cfg;
++	/** Values of the GB_TILE_MODE0..31 registers */
++	uint32_t gb_tile_mode[32];
++	/** Values of GB_MACROTILE_MODE0..15 registers */
++	uint32_t gb_macro_tile_mode[16];
++	/** Value of PA_SC_RASTER_CONFIG register per SE */
++	uint32_t pa_sc_raster_cfg[4];
++	/** Value of PA_SC_RASTER_CONFIG_1 register per SE */
++	uint32_t pa_sc_raster_cfg1[4];
++	/* CU info */
++	uint32_t cu_active_number;
++	uint32_t cu_ao_mask;
++	uint32_t cu_bitmap[4][4];
++	/* video memory type info*/
++	uint32_t vram_type;
++	/* video memory bit width*/
++	uint32_t vram_bit_width;
++	/** constant engine ram size*/
++	uint32_t ce_ram_size;
++	/* vce harvesting instance */
++	uint32_t vce_harvest_config;
++	/* PCI revision ID */
++	uint32_t pci_rev_id;
++};
++
++
++/*--------------------------------------------------------------------------*/
++/*------------------------- Functions --------------------------------------*/
++/*--------------------------------------------------------------------------*/
++
++/*
++ * Initialization / Cleanup
++ *
++*/
++
++/**
++ *
++ * \param   fd            - \c [in]  File descriptor for AMD GPU device
++ *                                   received previously as the result of
++ *                                   e.g. drmOpen() call.
++ *                                   For legacy fd type, the DRI2/DRI3
++ *                                   authentication should be done before
++ *                                   calling this function.
++ * \param   major_version - \c [out] Major version of library. It is assumed
++ *                                   that adding new functionality will cause
++ *                                   increase in major version
++ * \param   minor_version - \c [out] Minor version of library
++ * \param   device_handle - \c [out] Pointer to opaque context which should
++ *                                   be passed as the first parameter on each
++ *                                   API call
++ *
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ *
++ * \sa amdgpu_device_deinitialize()
++*/
++int amdgpu_device_initialize(int fd,
++			     uint32_t *major_version,
++			     uint32_t *minor_version,
++			     amdgpu_device_handle *device_handle);
++
++/**
++ * Same as amdgpu_device_initialize() except when deduplicate_device
++ * is false *and* fd points to a device that was already initialized.
++ * In this case, amdgpu_device_initialize would return the same
++ * amdgpu_device_handle while here amdgpu_device_initialize2 would
++ * return a new handle.
++ * amdgpu_device_initialize() should be preferred in most situations;
++ * the only use-case where not-deduplicating devices make sense is
++ * when one wants to have isolated device handles in the same process.
++ */
++int amdgpu_device_initialize2(int fd, bool deduplicate_device,
++			      uint32_t *major_version,
++			      uint32_t *minor_version,
++			      amdgpu_device_handle *device_handle);
++/**
++ *
++ * When access to such library does not needed any more the special
++ * function must be call giving opportunity to clean up any
++ * resources if needed.
++ *
++ * \param   device_handle - \c [in]  Context associated with file
++ *                                   descriptor for AMD GPU device
++ *                                   received previously as the
++ *                                   result e.g. of drmOpen() call.
++ *
++ * \return  0 on success\n
++ *         <0 - Negative POSIX Error code
++ *
++ * \sa amdgpu_device_initialize()
++ *
++*/
++int amdgpu_device_deinitialize(amdgpu_device_handle device_handle);
++
++/**
++ *
++ * /param device_handle - \c [in] Device handle.
++ *                           See #amdgpu_device_initialize()
++ *
++ * \return Returns the drm fd used for operations on this
++ *         device. This is still owned by the library and hence
++ *         should not be closed. Guaranteed to be valid until
++ *         #amdgpu_device_deinitialize gets called.
++ *
++*/
++int amdgpu_device_get_fd(amdgpu_device_handle device_handle);
++
++/*
++ * Memory Management
++ *
++*/
++
++/**
++ * Allocate memory to be used by UMD for GPU related operations
++ *
++ * \param   dev		 - \c [in] Device handle.
++ *				   See #amdgpu_device_initialize()
++ * \param   alloc_buffer - \c [in] Pointer to the structure describing an
++ *				   allocation request
++ * \param   buf_handle	- \c [out] Allocated buffer handle
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \sa amdgpu_bo_free()
++*/
++int amdgpu_bo_alloc(amdgpu_device_handle dev,
++		    struct amdgpu_bo_alloc_request *alloc_buffer,
++		    amdgpu_bo_handle *buf_handle);
++
++/**
++ * Associate opaque data with buffer to be queried by another UMD
++ *
++ * \param   dev	       - \c [in] Device handle. See #amdgpu_device_initialize()
++ * \param   buf_handle - \c [in] Buffer handle
++ * \param   info       - \c [in] Metadata to associated with buffer
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++*/
++int amdgpu_bo_set_metadata(amdgpu_bo_handle buf_handle,
++			   struct amdgpu_bo_metadata *info);
++
++/**
++ * Query buffer information including metadata previusly associated with
++ * buffer.
++ *
++ * \param   dev	       - \c [in] Device handle.
++ *				 See #amdgpu_device_initialize()
++ * \param   buf_handle - \c [in]   Buffer handle
++ * \param   info       - \c [out]  Structure describing buffer
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \sa amdgpu_bo_set_metadata(), amdgpu_bo_alloc()
++*/
++int amdgpu_bo_query_info(amdgpu_bo_handle buf_handle,
++			 struct amdgpu_bo_info *info);
++
++/**
++ * Allow others to get access to buffer
++ *
++ * \param   dev		  - \c [in] Device handle.
++ *				    See #amdgpu_device_initialize()
++ * \param   buf_handle    - \c [in] Buffer handle
++ * \param   type          - \c [in] Type of handle requested
++ * \param   shared_handle - \c [out] Special "shared" handle
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \sa amdgpu_bo_import()
++ *
++*/
++int amdgpu_bo_export(amdgpu_bo_handle buf_handle,
++		     enum amdgpu_bo_handle_type type,
++		     uint32_t *shared_handle);
++
++/**
++ * Request access to "shared" buffer
++ *
++ * \param   dev		  - \c [in] Device handle.
++ *				    See #amdgpu_device_initialize()
++ * \param   type	  - \c [in] Type of handle requested
++ * \param   shared_handle - \c [in] Shared handle received as result "import"
++ *				     operation
++ * \param   output        - \c [out] Pointer to structure with information
++ *				     about imported buffer
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \note  Buffer must be "imported" only using new "fd" (different from
++ *	  one used by "exporter").
++ *
++ * \sa amdgpu_bo_export()
++ *
++*/
++int amdgpu_bo_import(amdgpu_device_handle dev,
++		     enum amdgpu_bo_handle_type type,
++		     uint32_t shared_handle,
++		     struct amdgpu_bo_import_result *output);
++
++/**
++ * Request GPU access to user allocated memory e.g. via "malloc"
++ *
++ * \param dev - [in] Device handle. See #amdgpu_device_initialize()
++ * \param cpu - [in] CPU address of user allocated memory which we
++ * want to map to GPU address space (make GPU accessible)
++ * (This address must be correctly aligned).
++ * \param size - [in] Size of allocation (must be correctly aligned)
++ * \param buf_handle - [out] Buffer handle for the userptr memory
++ * resource on submission and be used in other operations.
++ *
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \note
++ * This call doesn't guarantee that such memory will be persistently
++ * "locked" / make non-pageable. The purpose of this call is to provide
++ * opportunity for GPU get access to this resource during submission.
++ *
++ * The maximum amount of memory which could be mapped in this call depends
++ * if overcommit is disabled or not. If overcommit is disabled than the max.
++ * amount of memory to be pinned will be limited by left "free" size in total
++ * amount of memory which could be locked simultaneously ("GART" size).
++ *
++ * Supported (theoretical) max. size of mapping is restricted only by
++ * "GART" size.
++ *
++ * It is responsibility of caller to correctly specify access rights
++ * on VA assignment.
++*/
++int amdgpu_create_bo_from_user_mem(amdgpu_device_handle dev,
++				    void *cpu, uint64_t size,
++				    amdgpu_bo_handle *buf_handle);
++
++/**
++ * Validate if the user memory comes from BO
++ *
++ * \param dev - [in] Device handle. See #amdgpu_device_initialize()
++ * \param cpu - [in] CPU address of user allocated memory which we
++ * want to map to GPU address space (make GPU accessible)
++ * (This address must be correctly aligned).
++ * \param size - [in] Size of allocation (must be correctly aligned)
++ * \param buf_handle - [out] Buffer handle for the userptr memory
++ * if the user memory is not from BO, the buf_handle will be NULL.
++ * \param offset_in_bo - [out] offset in this BO for this user memory
++ *
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_find_bo_by_cpu_mapping(amdgpu_device_handle dev,
++				  void *cpu,
++				  uint64_t size,
++				  amdgpu_bo_handle *buf_handle,
++				  uint64_t *offset_in_bo);
++
++/**
++ * Free previously allocated memory
++ *
++ * \param   dev	       - \c [in] Device handle. See #amdgpu_device_initialize()
++ * \param   buf_handle - \c [in]  Buffer handle to free
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \note In the case of memory shared between different applications all
++ *	 resources will be “physically” freed only all such applications
++ *	 will be terminated
++ * \note If is UMD responsibility to ‘free’ buffer only when there is no
++ *	 more GPU access
++ *
++ * \sa amdgpu_bo_set_metadata(), amdgpu_bo_alloc()
++ *
++*/
++int amdgpu_bo_free(amdgpu_bo_handle buf_handle);
++
++/**
++ * Increase the reference count of a buffer object
++ *
++ * \param   bo - \c [in]  Buffer object handle to increase the reference count
++ *
++ * \sa amdgpu_bo_alloc(), amdgpu_bo_free()
++ *
++*/
++void amdgpu_bo_inc_ref(amdgpu_bo_handle bo);
++
++/**
++ * Request CPU access to GPU accessible memory
++ *
++ * \param   buf_handle - \c [in] Buffer handle
++ * \param   cpu        - \c [out] CPU address to be used for access
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \sa amdgpu_bo_cpu_unmap()
++ *
++*/
++int amdgpu_bo_cpu_map(amdgpu_bo_handle buf_handle, void **cpu);
++
++/**
++ * Release CPU access to GPU memory
++ *
++ * \param   buf_handle  - \c [in] Buffer handle
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \sa amdgpu_bo_cpu_map()
++ *
++*/
++int amdgpu_bo_cpu_unmap(amdgpu_bo_handle buf_handle);
++
++/**
++ * Wait until a buffer is not used by the device.
++ *
++ * \param   dev           - \c [in] Device handle. See #amdgpu_device_initialize()
++ * \param   buf_handle    - \c [in] Buffer handle.
++ * \param   timeout_ns    - Timeout in nanoseconds.
++ * \param   buffer_busy   - 0 if buffer is idle, all GPU access was completed
++ *                            and no GPU access is scheduled.
++ *                          1 GPU access is in fly or scheduled
++ *
++ * \return   0 - on success
++ *          <0 - Negative POSIX Error code
++ */
++int amdgpu_bo_wait_for_idle(amdgpu_bo_handle buf_handle,
++			    uint64_t timeout_ns,
++			    bool *buffer_busy);
++
++/**
++ * Creates a BO list handle for command submission.
++ *
++ * \param   dev			- \c [in] Device handle.
++ *				   See #amdgpu_device_initialize()
++ * \param   number_of_buffers	- \c [in] Number of BOs in the list
++ * \param   buffers		- \c [in] List of BO handles
++ * \param   result		- \c [out] Created BO list handle
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \sa amdgpu_bo_list_destroy_raw(), amdgpu_cs_submit_raw2()
++*/
++int amdgpu_bo_list_create_raw(amdgpu_device_handle dev,
++			      uint32_t number_of_buffers,
++			      struct drm_amdgpu_bo_list_entry *buffers,
++			      uint32_t *result);
++
++/**
++ * Destroys a BO list handle.
++ *
++ * \param   bo_list	- \c [in] BO list handle.
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \sa amdgpu_bo_list_create_raw(), amdgpu_cs_submit_raw2()
++*/
++int amdgpu_bo_list_destroy_raw(amdgpu_device_handle dev, uint32_t bo_list);
++
++/**
++ * Creates a BO list handle for command submission.
++ *
++ * \param   dev			- \c [in] Device handle.
++ *				   See #amdgpu_device_initialize()
++ * \param   number_of_resources	- \c [in] Number of BOs in the list
++ * \param   resources		- \c [in] List of BO handles
++ * \param   resource_prios	- \c [in] Optional priority for each handle
++ * \param   result		- \c [out] Created BO list handle
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \sa amdgpu_bo_list_destroy()
++*/
++int amdgpu_bo_list_create(amdgpu_device_handle dev,
++			  uint32_t number_of_resources,
++			  amdgpu_bo_handle *resources,
++			  uint8_t *resource_prios,
++			  amdgpu_bo_list_handle *result);
++
++/**
++ * Destroys a BO list handle.
++ *
++ * \param   handle	- \c [in] BO list handle.
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \sa amdgpu_bo_list_create()
++*/
++int amdgpu_bo_list_destroy(amdgpu_bo_list_handle handle);
++
++/**
++ * Update resources for existing BO list
++ *
++ * \param   handle              - \c [in] BO list handle
++ * \param   number_of_resources - \c [in] Number of BOs in the list
++ * \param   resources           - \c [in] List of BO handles
++ * \param   resource_prios      - \c [in] Optional priority for each handle
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \sa amdgpu_bo_list_update()
++*/
++int amdgpu_bo_list_update(amdgpu_bo_list_handle handle,
++			  uint32_t number_of_resources,
++			  amdgpu_bo_handle *resources,
++			  uint8_t *resource_prios);
++
++/*
++ * GPU Execution context
++ *
++*/
++
++/**
++ * Create GPU execution Context
++ *
++ * For the purpose of GPU Scheduler and GPU Robustness extensions it is
++ * necessary to have information/identify rendering/compute contexts.
++ * It also may be needed to associate some specific requirements with such
++ * contexts.  Kernel driver will guarantee that submission from the same
++ * context will always be executed in order (first come, first serve).
++ *
++ *
++ * \param   dev      - \c [in] Device handle. See #amdgpu_device_initialize()
++ * \param   priority - \c [in] Context creation flags. See AMDGPU_CTX_PRIORITY_*
++ * \param   context  - \c [out] GPU Context handle
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \sa amdgpu_cs_ctx_free()
++ *
++*/
++int amdgpu_cs_ctx_create2(amdgpu_device_handle dev,
++			 uint32_t priority,
++			 amdgpu_context_handle *context);
++/**
++ * Create GPU execution Context
++ *
++ * Refer to amdgpu_cs_ctx_create2 for full documentation. This call
++ * is missing the priority parameter.
++ *
++ * \sa amdgpu_cs_ctx_create2()
++ *
++*/
++int amdgpu_cs_ctx_create(amdgpu_device_handle dev,
++			 amdgpu_context_handle *context);
++
++/**
++ *
++ * Destroy GPU execution context when not needed any more
++ *
++ * \param   context - \c [in] GPU Context handle
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \sa amdgpu_cs_ctx_create()
++ *
++*/
++int amdgpu_cs_ctx_free(amdgpu_context_handle context);
++
++/**
++ * Override the submission priority for the given context using a master fd.
++ *
++ * \param   dev        - \c [in] device handle
++ * \param   context    - \c [in] context handle for context id
++ * \param   master_fd  - \c [in] The master fd to authorize the override.
++ * \param   priority   - \c [in] The priority to assign to the context.
++ *
++ * \return 0 on success or a a negative Posix error code on failure.
++ */
++int amdgpu_cs_ctx_override_priority(amdgpu_device_handle dev,
++                                    amdgpu_context_handle context,
++                                    int master_fd,
++                                    unsigned priority);
++
++/**
++ * Set or query the stable power state for GPU profiling.
++ *
++ * \param   dev        - \c [in] device handle
++ * \param   op         - \c [in] AMDGPU_CTX_OP_{GET,SET}_STABLE_PSTATE
++ * \param   flags      - \c [in] AMDGPU_CTX_STABLE_PSTATE_*
++ * \param   out_flags  - \c [out] output current stable pstate
++ *
++ * \return  0 on success otherwise POSIX Error code.
++ */
++int amdgpu_cs_ctx_stable_pstate(amdgpu_context_handle context,
++			        uint32_t op,
++			        uint32_t flags,
++			        uint32_t *out_flags);
++
++/**
++ * Query reset state for the specific GPU Context
++ *
++ * \param   context - \c [in]  GPU Context handle
++ * \param   state   - \c [out] One of AMDGPU_CTX_*_RESET
++ * \param   hangs   - \c [out] Number of hangs caused by the context.
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \sa amdgpu_cs_ctx_create()
++ *
++*/
++int amdgpu_cs_query_reset_state(amdgpu_context_handle context,
++				uint32_t *state, uint32_t *hangs);
++
++/**
++ * Query reset state for the specific GPU Context.
++ *
++ * \param   context - \c [in]  GPU Context handle
++ * \param   flags   - \c [out] A combination of AMDGPU_CTX_QUERY2_FLAGS_*
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \sa amdgpu_cs_ctx_create()
++ *
++*/
++int amdgpu_cs_query_reset_state2(amdgpu_context_handle context,
++				 uint64_t *flags);
++
++/*
++ * Command Buffers Management
++ *
++*/
++
++/**
++ * Send request to submit command buffers to hardware.
++ *
++ * Kernel driver could use GPU Scheduler to make decision when physically
++ * sent this request to the hardware. Accordingly this request could be put
++ * in queue and sent for execution later. The only guarantee is that request
++ * from the same GPU context to the same ip:ip_instance:ring will be executed in
++ * order.
++ *
++ * The caller can specify the user fence buffer/location with the fence_info in the
++ * cs_request.The sequence number is returned via the 'seq_no' parameter
++ * in ibs_request structure.
++ *
++ *
++ * \param   dev		       - \c [in]  Device handle.
++ *					  See #amdgpu_device_initialize()
++ * \param   context            - \c [in]  GPU Context
++ * \param   flags              - \c [in]  Global submission flags
++ * \param   ibs_request        - \c [in/out] Pointer to submission requests.
++ *					  We could submit to the several
++ *					  engines/rings simulteniously as
++ *					  'atomic' operation
++ * \param   number_of_requests - \c [in]  Number of submission requests
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \note It is required to pass correct resource list with buffer handles
++ *	 which will be accessible by command buffers from submission
++ *	 This will allow kernel driver to correctly implement "paging".
++ *	 Failure to do so will have unpredictable results.
++ *
++ * \sa amdgpu_command_buffer_alloc(), amdgpu_command_buffer_free(),
++ *     amdgpu_cs_query_fence_status()
++ *
++*/
++int amdgpu_cs_submit(amdgpu_context_handle context,
++		     uint64_t flags,
++		     struct amdgpu_cs_request *ibs_request,
++		     uint32_t number_of_requests);
++
++/**
++ *  Query status of Command Buffer Submission
++ *
++ * \param   fence   - \c [in] Structure describing fence to query
++ * \param   timeout_ns - \c [in] Timeout value to wait
++ * \param   flags   - \c [in] Flags for the query
++ * \param   expired - \c [out] If fence expired or not.\n
++ *				0  – if fence is not expired\n
++ *				!0 - otherwise
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \note If UMD wants only to check operation status and returned immediately
++ *	 then timeout value as 0 must be passed. In this case success will be
++ *	 returned in the case if submission was completed or timeout error
++ *	 code.
++ *
++ * \sa amdgpu_cs_submit()
++*/
++int amdgpu_cs_query_fence_status(struct amdgpu_cs_fence *fence,
++				 uint64_t timeout_ns,
++				 uint64_t flags,
++				 uint32_t *expired);
++
++/**
++ *  Wait for multiple fences
++ *
++ * \param   fences      - \c [in] The fence array to wait
++ * \param   fence_count - \c [in] The fence count
++ * \param   wait_all    - \c [in] If true, wait all fences to be signaled,
++ *                                otherwise, wait at least one fence
++ * \param   timeout_ns  - \c [in] The timeout to wait, in nanoseconds
++ * \param   status      - \c [out] '1' for signaled, '0' for timeout
++ * \param   first       - \c [out] the index of the first signaled fence from @fences
++ *
++ * \return  0 on success
++ *          <0 - Negative POSIX Error code
++ *
++ * \note    Currently it supports only one amdgpu_device. All fences come from
++ *          the same amdgpu_device with the same fd.
++*/
++int amdgpu_cs_wait_fences(struct amdgpu_cs_fence *fences,
++			  uint32_t fence_count,
++			  bool wait_all,
++			  uint64_t timeout_ns,
++			  uint32_t *status, uint32_t *first);
++
++/*
++ * Query / Info API
++ *
++*/
++
++/**
++ * Query allocation size alignments
++ *
++ * UMD should query information about GPU VM MC size alignments requirements
++ * to be able correctly choose required allocation size and implement
++ * internal optimization if needed.
++ *
++ * \param   dev  - \c [in] Device handle. See #amdgpu_device_initialize()
++ * \param   info - \c [out] Pointer to structure to get size alignment
++ *			  requirements
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_query_buffer_size_alignment(amdgpu_device_handle dev,
++				       struct amdgpu_buffer_size_alignments
++						*info);
++
++/**
++ * Query firmware versions
++ *
++ * \param   dev	        - \c [in] Device handle. See #amdgpu_device_initialize()
++ * \param   fw_type     - \c [in] AMDGPU_INFO_FW_*
++ * \param   ip_instance - \c [in] Index of the IP block of the same type.
++ * \param   index       - \c [in] Index of the engine. (for SDMA and MEC)
++ * \param   version     - \c [out] Pointer to to the "version" return value
++ * \param   feature     - \c [out] Pointer to to the "feature" return value
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_query_firmware_version(amdgpu_device_handle dev, unsigned fw_type,
++				  unsigned ip_instance, unsigned index,
++				  uint32_t *version, uint32_t *feature);
++
++/**
++ * Query the number of HW IP instances of a certain type.
++ *
++ * \param   dev      - \c [in] Device handle. See #amdgpu_device_initialize()
++ * \param   type     - \c [in] Hardware IP block type = AMDGPU_HW_IP_*
++ * \param   count    - \c [out] Pointer to structure to get information
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++*/
++int amdgpu_query_hw_ip_count(amdgpu_device_handle dev, unsigned type,
++			     uint32_t *count);
++
++/**
++ * Query engine information
++ *
++ * This query allows UMD to query information different engines and their
++ * capabilities.
++ *
++ * \param   dev         - \c [in] Device handle. See #amdgpu_device_initialize()
++ * \param   type        - \c [in] Hardware IP block type = AMDGPU_HW_IP_*
++ * \param   ip_instance - \c [in] Index of the IP block of the same type.
++ * \param   info        - \c [out] Pointer to structure to get information
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++*/
++int amdgpu_query_hw_ip_info(amdgpu_device_handle dev, unsigned type,
++			    unsigned ip_instance,
++			    struct drm_amdgpu_info_hw_ip *info);
++
++/**
++ * Query FW area related information.
++ *
++ * The return size is query-specific and depends on the "type" parameter.
++ * No more than "size" bytes is returned.
++ *
++ * \param	dev		- \c [in] Device handle. See #amdgpu_device_initialize()
++ * \param	type		- \c [in] AMDGPU_HW_IP_*
++ * \param	ip_instance	- \c [in] HW IP index.
++ * \param	info		- \c [out] The pointer to return value
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX error code
++ *
++*/
++int amdgpu_query_uq_fw_area_info(amdgpu_device_handle dev,
++				  unsigned type,
++				  unsigned ip_instance,
++				  struct drm_amdgpu_info_uq_fw_areas *info);
++
++/**
++ * Query heap information
++ *
++ * This query allows UMD to query potentially available memory resources and
++ * adjust their logic if necessary.
++ *
++ * \param   dev  - \c [in] Device handle. See #amdgpu_device_initialize()
++ * \param   heap - \c [in] Heap type
++ * \param   info - \c [in] Pointer to structure to get needed information
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_query_heap_info(amdgpu_device_handle dev, uint32_t heap,
++			   uint32_t flags, struct amdgpu_heap_info *info);
++
++/**
++ * Get the CRTC ID from the mode object ID
++ *
++ * \param   dev    - \c [in] Device handle. See #amdgpu_device_initialize()
++ * \param   id     - \c [in] Mode object ID
++ * \param   result - \c [in] Pointer to the CRTC ID
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_query_crtc_from_id(amdgpu_device_handle dev, unsigned id,
++			      int32_t *result);
++
++/**
++ * Query GPU H/w Info
++ *
++ * Query hardware specific information
++ *
++ * \param   dev  - \c [in] Device handle. See #amdgpu_device_initialize()
++ * \param   heap - \c [in] Heap type
++ * \param   info - \c [in] Pointer to structure to get needed information
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_query_gpu_info(amdgpu_device_handle dev,
++			   struct amdgpu_gpu_info *info);
++
++/**
++ * Query hardware or driver information.
++ *
++ * The return size is query-specific and depends on the "info_id" parameter.
++ * No more than "size" bytes is returned.
++ *
++ * \param   dev     - \c [in] Device handle. See #amdgpu_device_initialize()
++ * \param   info_id - \c [in] AMDGPU_INFO_*
++ * \param   size    - \c [in] Size of the returned value.
++ * \param   value   - \c [out] Pointer to the return value.
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX error code
++ *
++*/
++int amdgpu_query_info(amdgpu_device_handle dev, unsigned info_id,
++		      unsigned size, void *value);
++
++/**
++ * Query hardware or driver information.
++ *
++ * The return size is query-specific and depends on the "info_id" parameter.
++ * No more than "size" bytes is returned.
++ *
++ * \param   dev     - \c [in] Device handle. See #amdgpu_device_initialize()
++ * \param   info    - \c [in] amdgpu_sw_info_*
++ * \param   value   - \c [out] Pointer to the return value.
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX error code
++ *
++*/
++int amdgpu_query_sw_info(amdgpu_device_handle dev, enum amdgpu_sw_info info,
++			 void *value);
++
++/**
++ * Query information about GDS
++ *
++ * \param   dev	     - \c [in] Device handle. See #amdgpu_device_initialize()
++ * \param   gds_info - \c [out] Pointer to structure to get GDS information
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_query_gds_info(amdgpu_device_handle dev,
++			struct amdgpu_gds_resource_info *gds_info);
++
++/**
++ * Query information about sensor.
++ *
++ * The return size is query-specific and depends on the "sensor_type"
++ * parameter. No more than "size" bytes is returned.
++ *
++ * \param   dev         - \c [in] Device handle. See #amdgpu_device_initialize()
++ * \param   sensor_type - \c [in] AMDGPU_INFO_SENSOR_*
++ * \param   size        - \c [in] Size of the returned value.
++ * \param   value       - \c [out] Pointer to the return value.
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_query_sensor_info(amdgpu_device_handle dev, unsigned sensor_type,
++			     unsigned size, void *value);
++
++/**
++ * Query information about video capabilities
++ *
++ * The return sizeof(struct drm_amdgpu_info_video_caps)
++ *
++ * \param   dev         - \c [in] Device handle. See #amdgpu_device_initialize()
++ * \param   caps_type   - \c [in] AMDGPU_INFO_VIDEO_CAPS_DECODE(ENCODE)
++ * \param   size        - \c [in] Size of the returned value.
++ * \param   value       - \c [out] Pointer to the return value.
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_query_video_caps_info(amdgpu_device_handle dev, unsigned cap_type,
++                                 unsigned size, void *value);
++
++/**
++ * Query information about VM faults
++ *
++ * The return sizeof(struct drm_amdgpu_info_gpuvm_fault)
++ *
++ * \param   dev         - \c [in] Device handle. See #amdgpu_device_initialize()
++ * \param   size        - \c [in] Size of the returned value.
++ * \param   value       - \c [out] Pointer to the return value.
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_query_gpuvm_fault_info(amdgpu_device_handle dev, unsigned size,
++				  void *value);
++
++/**
++ * Read a set of consecutive memory-mapped registers.
++ * Not all registers are allowed to be read by userspace.
++ *
++ * \param   dev          - \c [in] Device handle. See #amdgpu_device_initialize(
++ * \param   dword_offset - \c [in] Register offset in dwords
++ * \param   count        - \c [in] The number of registers to read starting
++ *                                 from the offset
++ * \param   instance     - \c [in] GRBM_GFX_INDEX selector. It may have other
++ *                                 uses. Set it to 0xffffffff if unsure.
++ * \param   flags        - \c [in] Flags with additional information.
++ * \param   values       - \c [out] The pointer to return values.
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX error code
++ *
++*/
++int amdgpu_read_mm_registers(amdgpu_device_handle dev, unsigned dword_offset,
++			     unsigned count, uint32_t instance, uint32_t flags,
++			     uint32_t *values);
++
++/**
++ * Flag to request VA address range in the 32bit address space
++*/
++#define AMDGPU_VA_RANGE_32_BIT		0x1
++#define AMDGPU_VA_RANGE_HIGH		0x2
++#define AMDGPU_VA_RANGE_REPLAYABLE	0x4
++
++/**
++ * Allocate virtual address range
++ *
++ * \param dev - [in] Device handle. See #amdgpu_device_initialize()
++ * \param va_range_type - \c [in] Type of MC va range from which to allocate
++ * \param size - \c [in] Size of range. Size must be correctly* aligned.
++ * It is client responsibility to correctly aligned size based on the future
++ * usage of allocated range.
++ * \param va_base_alignment - \c [in] Overwrite base address alignment
++ * requirement for GPU VM MC virtual
++ * address assignment. Must be multiple of size alignments received as
++ * 'amdgpu_buffer_size_alignments'.
++ * If 0 use the default one.
++ * \param va_base_required - \c [in] Specified required va base address.
++ * If 0 then library choose available one.
++ * If !0 value will be passed and those value already "in use" then
++ * corresponding error status will be returned.
++ * \param va_base_allocated - \c [out] On return: Allocated VA base to be used
++ * by client.
++ * \param va_range_handle - \c [out] On return: Handle assigned to allocation
++ * \param flags - \c [in] flags for special VA range
++ *
++ * \return 0 on success\n
++ * >0 - AMD specific error code\n
++ * <0 - Negative POSIX Error code
++ *
++ * \notes \n
++ * It is client responsibility to correctly handle VA assignments and usage.
++ * Neither kernel driver nor libdrm_amdpgu are able to prevent and
++ * detect wrong va assignment.
++ *
++ * It is client responsibility to correctly handle multi-GPU cases and to pass
++ * the corresponding arrays of all devices handles where corresponding VA will
++ * be used.
++ *
++*/
++int amdgpu_va_range_alloc(amdgpu_device_handle dev,
++			   enum amdgpu_gpu_va_range va_range_type,
++			   uint64_t size,
++			   uint64_t va_base_alignment,
++			   uint64_t va_base_required,
++			   uint64_t *va_base_allocated,
++			   amdgpu_va_handle *va_range_handle,
++			   uint64_t flags);
++
++/**
++ * Free previously allocated virtual address range
++ *
++ *
++ * \param va_range_handle - \c [in] Handle assigned to VA allocation
++ *
++ * \return 0 on success\n
++ * >0 - AMD specific error code\n
++ * <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_va_range_free(amdgpu_va_handle va_range_handle);
++
++/**
++ * Return the starting address of the allocated virtual address range.
++ */
++uint64_t amdgpu_va_get_start_addr(amdgpu_va_handle va_handle);
++
++/**
++* Query virtual address range
++*
++* UMD can query GPU VM range supported by each device
++* to initialize its own VAM accordingly.
++*
++* \param   dev    - [in] Device handle. See #amdgpu_device_initialize()
++* \param   type   - \c [in] Type of virtual address range
++* \param   offset - \c [out] Start offset of virtual address range
++* \param   size   - \c [out] Size of virtual address range
++*
++* \return   0 on success\n
++*          <0 - Negative POSIX Error code
++*
++*/
++
++int amdgpu_va_range_query(amdgpu_device_handle dev,
++			  enum amdgpu_gpu_va_range type,
++			  uint64_t *start,
++			  uint64_t *end);
++
++/**
++ * Allocate a amdgpu_va_manager object.
++ * The returned object has be initialized with the amdgpu_va_manager_init
++ * before use.
++ * On release, amdgpu_va_manager_deinit needs to be called, then the memory
++ * can be released using free().
++ */
++amdgpu_va_manager_handle amdgpu_va_manager_alloc(void);
++
++void amdgpu_va_manager_init(amdgpu_va_manager_handle va_mgr,
++			    uint64_t low_va_offset, uint64_t low_va_max,
++			    uint64_t high_va_offset, uint64_t high_va_max,
++			    uint32_t virtual_address_alignment);
++
++#define AMDGPU_VA_MGR_RESERVE_HALF_VA_FOR_PRT 0x1
++
++void amdgpu_va_manager_init2(struct amdgpu_va_manager *va_mgr,
++			     uint64_t low_va_offset, uint64_t low_va_max,
++			     uint64_t high_va_offset, uint64_t high_va_max,
++			     uint32_t virtual_address_alignment,
++			     uint32_t flags);
++
++void amdgpu_va_manager_deinit(amdgpu_va_manager_handle va_mgr);
++
++/**
++ * Similar to #amdgpu_va_range_alloc() but allocates VA
++ * directly from an amdgpu_va_manager_handle instead of using
++ * the manager from an amdgpu_device.
++ */
++
++int amdgpu_va_range_alloc2(amdgpu_va_manager_handle va_mgr,
++			   enum amdgpu_gpu_va_range va_range_type,
++			   uint64_t size,
++			   uint64_t va_base_alignment,
++			   uint64_t va_base_required,
++			   uint64_t *va_base_allocated,
++			   amdgpu_va_handle *va_range_handle,
++			   uint64_t flags);
++
++/**
++ * Query VA manager information.
++ *
++ * \param   va_mgr  - \c [in] VA manager
++ * \param   info    - \c [in] amdgpu_va_manager_sw_info_*
++ * \param   value   - \c [out] Pointer to the return value.
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX error code
++ *
++*/
++int amdgpu_va_manager_query_sw_info(struct amdgpu_va_manager *va_mgr,
++				    enum amdgpu_va_manager_sw_info info,
++				    void *value);
++
++/**
++ *  VA mapping/unmapping for the buffer object
++ *
++ * \param  bo		- \c [in] BO handle
++ * \param  offset	- \c [in] Start offset to map
++ * \param  size		- \c [in] Size to map
++ * \param  addr		- \c [in] Start virtual address.
++ * \param  flags	- \c [in] Supported flags for mapping/unmapping
++ * \param  ops		- \c [in] AMDGPU_VA_OP_MAP or AMDGPU_VA_OP_UNMAP
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++
++int amdgpu_bo_va_op(amdgpu_bo_handle bo,
++		    uint64_t offset,
++		    uint64_t size,
++		    uint64_t addr,
++		    uint64_t flags,
++		    uint32_t ops);
++
++/**
++ *  VA mapping/unmapping for a buffer object or PRT region.
++ *
++ * This is not a simple drop-in extension for amdgpu_bo_va_op; instead, all
++ * parameters are treated "raw", i.e. size is not automatically aligned, and
++ * all flags must be specified explicitly.
++ *
++ * \param  dev		- \c [in] device handle
++ * \param  bo		- \c [in] BO handle (may be NULL)
++ * \param  offset	- \c [in] Start offset to map
++ * \param  size		- \c [in] Size to map
++ * \param  addr		- \c [in] Start virtual address.
++ * \param  flags	- \c [in] Supported flags for mapping/unmapping
++ * \param  ops		- \c [in] AMDGPU_VA_OP_MAP or AMDGPU_VA_OP_UNMAP
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++
++int amdgpu_bo_va_op_raw(amdgpu_device_handle dev,
++			amdgpu_bo_handle bo,
++			uint64_t offset,
++			uint64_t size,
++			uint64_t addr,
++			uint64_t flags,
++			uint32_t ops);
++
++/**
++ *  VA mapping/unmapping of buffer object for usermode queue.
++ *
++ * This is not a simple drop-in extension for amdgpu_bo_va_op; instead, all
++ * parameters are treated "raw2", i.e. size is not automatically aligned, and
++ * all flags must be specified explicitly.
++ *
++ * \param  dev				- \c [in] device handle
++ * \param  bo				- \c [in] BO handle (may be NULL)
++ * \param  offset			- \c [in] Start offset to map
++ * \param  size				- \c [in] Size to map
++ * \param  addr				- \c [in] Start virtual address.
++ * \param  flags			- \c [in] Supported flags for mapping/unmapping
++ * \param  ops				- \c [in] AMDGPU_VA_OP_MAP or AMDGPU_VA_OP_UNMAP
++ * \param  vm_timeline_syncobj_out	- \c [out] syncobj handle for PT update fence
++ * \param  vm_timeline_point		- \c [in] input timeline point
++ * \param  input_fence_syncobj_handles	- \c [in] Array of syncobj handles for bo unmap,
++ * 						  clear and replace
++ * \param  num_syncobj_handles		- \c [in] Number of syncobj handles
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_bo_va_op_raw2(amdgpu_device_handle dev,
++			 amdgpu_bo_handle bo,
++			 uint64_t offset,
++			 uint64_t size,
++			 uint64_t addr,
++			 uint64_t flags,
++			 uint32_t ops,
++			 uint32_t vm_timeline_syncobj_out,
++			 uint64_t vm_timeline_point,
++			 uint64_t input_fence_syncobj_array_in,
++			 uint32_t num_syncobj_handles_in);
++
++/**
++ *  create semaphore
++ *
++ * \param   sem	   - \c [out] semaphore handle
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_cs_create_semaphore(amdgpu_semaphore_handle *sem);
++
++/**
++ *  signal semaphore
++ *
++ * \param   context        - \c [in] GPU Context
++ * \param   ip_type        - \c [in] Hardware IP block type = AMDGPU_HW_IP_*
++ * \param   ip_instance    - \c [in] Index of the IP block of the same type
++ * \param   ring           - \c [in] Specify ring index of the IP
++ * \param   sem	           - \c [in] semaphore handle
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_cs_signal_semaphore(amdgpu_context_handle ctx,
++			       uint32_t ip_type,
++			       uint32_t ip_instance,
++			       uint32_t ring,
++			       amdgpu_semaphore_handle sem);
++
++/**
++ *  wait semaphore
++ *
++ * \param   context        - \c [in] GPU Context
++ * \param   ip_type        - \c [in] Hardware IP block type = AMDGPU_HW_IP_*
++ * \param   ip_instance    - \c [in] Index of the IP block of the same type
++ * \param   ring           - \c [in] Specify ring index of the IP
++ * \param   sem	           - \c [in] semaphore handle
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_cs_wait_semaphore(amdgpu_context_handle ctx,
++			     uint32_t ip_type,
++			     uint32_t ip_instance,
++			     uint32_t ring,
++			     amdgpu_semaphore_handle sem);
++
++/**
++ *  destroy semaphore
++ *
++ * \param   sem	    - \c [in] semaphore handle
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_cs_destroy_semaphore(amdgpu_semaphore_handle sem);
++
++/**
++ *  Get the ASIC marketing name
++ *
++ * \param   dev         - \c [in] Device handle. See #amdgpu_device_initialize()
++ *
++ * \return  the constant string of the marketing name
++ *          "NULL" means the ASIC is not found
++*/
++const char *amdgpu_get_marketing_name(amdgpu_device_handle dev);
++
++/**
++ *  Create kernel sync object
++ *
++ * \param   dev         - \c [in]  device handle
++ * \param   flags       - \c [in]  flags that affect creation
++ * \param   syncobj     - \c [out] sync object handle
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_cs_create_syncobj2(amdgpu_device_handle dev,
++			      uint32_t  flags,
++			      uint32_t *syncobj);
++
++/**
++ *  Create kernel sync object
++ *
++ * \param   dev	      - \c [in]  device handle
++ * \param   syncobj   - \c [out] sync object handle
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_cs_create_syncobj(amdgpu_device_handle dev,
++			     uint32_t *syncobj);
++/**
++ *  Destroy kernel sync object
++ *
++ * \param   dev	    - \c [in] device handle
++ * \param   syncobj - \c [in] sync object handle
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_cs_destroy_syncobj(amdgpu_device_handle dev,
++			      uint32_t syncobj);
++
++/**
++ * Reset kernel sync objects to unsignalled state.
++ *
++ * \param dev           - \c [in] device handle
++ * \param syncobjs      - \c [in] array of sync object handles
++ * \param syncobj_count - \c [in] number of handles in syncobjs
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_cs_syncobj_reset(amdgpu_device_handle dev,
++			    const uint32_t *syncobjs, uint32_t syncobj_count);
++
++/**
++ * Signal kernel sync objects.
++ *
++ * \param dev           - \c [in] device handle
++ * \param syncobjs      - \c [in] array of sync object handles
++ * \param syncobj_count - \c [in] number of handles in syncobjs
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_cs_syncobj_signal(amdgpu_device_handle dev,
++			     const uint32_t *syncobjs, uint32_t syncobj_count);
++
++/**
++ * Signal kernel timeline sync objects.
++ *
++ * \param dev           - \c [in] device handle
++ * \param syncobjs      - \c [in] array of sync object handles
++ * \param points	- \c [in] array of timeline points
++ * \param syncobj_count - \c [in] number of handles in syncobjs
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_cs_syncobj_timeline_signal(amdgpu_device_handle dev,
++				      const uint32_t *syncobjs,
++				      uint64_t *points,
++				      uint32_t syncobj_count);
++
++/**
++ *  Wait for one or all sync objects to signal.
++ *
++ * \param   dev	    - \c [in] self-explanatory
++ * \param   handles - \c [in] array of sync object handles
++ * \param   num_handles - \c [in] self-explanatory
++ * \param   timeout_nsec - \c [in] self-explanatory
++ * \param   flags   - \c [in] a bitmask of DRM_SYNCOBJ_WAIT_FLAGS_*
++ * \param   first_signaled - \c [in] self-explanatory
++ *
++ * \return   0 on success\n
++ *          -ETIME - Timeout
++ *          <0 - Negative POSIX Error code
++ *
++ */
++int amdgpu_cs_syncobj_wait(amdgpu_device_handle dev,
++			   uint32_t *handles, unsigned num_handles,
++			   int64_t timeout_nsec, unsigned flags,
++			   uint32_t *first_signaled);
++
++/**
++ *  Wait for one or all sync objects on their points to signal.
++ *
++ * \param   dev	    - \c [in] self-explanatory
++ * \param   handles - \c [in] array of sync object handles
++ * \param   points - \c [in] array of sync points to wait
++ * \param   num_handles - \c [in] self-explanatory
++ * \param   timeout_nsec - \c [in] self-explanatory
++ * \param   flags   - \c [in] a bitmask of DRM_SYNCOBJ_WAIT_FLAGS_*
++ * \param   first_signaled - \c [in] self-explanatory
++ *
++ * \return   0 on success\n
++ *          -ETIME - Timeout
++ *          <0 - Negative POSIX Error code
++ *
++ */
++int amdgpu_cs_syncobj_timeline_wait(amdgpu_device_handle dev,
++				    uint32_t *handles, uint64_t *points,
++				    unsigned num_handles,
++				    int64_t timeout_nsec, unsigned flags,
++				    uint32_t *first_signaled);
++/**
++ *  Query sync objects payloads.
++ *
++ * \param   dev	    - \c [in] self-explanatory
++ * \param   handles - \c [in] array of sync object handles
++ * \param   points - \c [out] array of sync points returned, which presents
++ * syncobj payload.
++ * \param   num_handles - \c [in] self-explanatory
++ *
++ * \return   0 on success\n
++ *          -ETIME - Timeout
++ *          <0 - Negative POSIX Error code
++ *
++ */
++int amdgpu_cs_syncobj_query(amdgpu_device_handle dev,
++			    uint32_t *handles, uint64_t *points,
++			    unsigned num_handles);
++/**
++ *  Query sync objects last signaled or submitted point.
++ *
++ * \param   dev	    - \c [in] self-explanatory
++ * \param   handles - \c [in] array of sync object handles
++ * \param   points - \c [out] array of sync points returned, which presents
++ * syncobj payload.
++ * \param   num_handles - \c [in] self-explanatory
++ * \param   flags   - \c [in] a bitmask of DRM_SYNCOBJ_QUERY_FLAGS_*
++ *
++ * \return   0 on success\n
++ *          -ETIME - Timeout
++ *          <0 - Negative POSIX Error code
++ *
++ */
++int amdgpu_cs_syncobj_query2(amdgpu_device_handle dev,
++			     uint32_t *handles, uint64_t *points,
++			     unsigned num_handles, uint32_t flags);
++
++/**
++ *  Export kernel sync object to shareable fd.
++ *
++ * \param   dev	       - \c [in] device handle
++ * \param   syncobj    - \c [in] sync object handle
++ * \param   shared_fd  - \c [out] shared file descriptor.
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_cs_export_syncobj(amdgpu_device_handle dev,
++			     uint32_t syncobj,
++			     int *shared_fd);
++/**
++ *  Import kernel sync object from shareable fd.
++ *
++ * \param   dev	       - \c [in] device handle
++ * \param   shared_fd  - \c [in] shared file descriptor.
++ * \param   syncobj    - \c [out] sync object handle
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++*/
++int amdgpu_cs_import_syncobj(amdgpu_device_handle dev,
++			     int shared_fd,
++			     uint32_t *syncobj);
++
++/**
++ *  Export kernel sync object to a sync_file.
++ *
++ * \param   dev	       - \c [in] device handle
++ * \param   syncobj    - \c [in] sync object handle
++ * \param   sync_file_fd - \c [out] sync_file file descriptor.
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ */
++int amdgpu_cs_syncobj_export_sync_file(amdgpu_device_handle dev,
++				       uint32_t syncobj,
++				       int *sync_file_fd);
++
++/**
++ *  Import kernel sync object from a sync_file.
++ *
++ * \param   dev	       - \c [in] device handle
++ * \param   syncobj    - \c [in] sync object handle
++ * \param   sync_file_fd - \c [in] sync_file file descriptor.
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ */
++int amdgpu_cs_syncobj_import_sync_file(amdgpu_device_handle dev,
++				       uint32_t syncobj,
++				       int sync_file_fd);
++/**
++ *  Export kernel timeline sync object to a sync_file.
++ *
++ * \param   dev		- \c [in] device handle
++ * \param   syncobj	- \c [in] sync object handle
++ * \param   point	- \c [in] timeline point
++ * \param   flags	- \c [in] flags
++ * \param   sync_file_fd - \c [out] sync_file file descriptor.
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ */
++int amdgpu_cs_syncobj_export_sync_file2(amdgpu_device_handle dev,
++					uint32_t syncobj,
++					uint64_t point,
++					uint32_t flags,
++					int *sync_file_fd);
++
++/**
++ *  Import kernel timeline sync object from a sync_file.
++ *
++ * \param   dev		- \c [in] device handle
++ * \param   syncobj	- \c [in] sync object handle
++ * \param   point	- \c [in] timeline point
++ * \param   sync_file_fd - \c [in] sync_file file descriptor.
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ */
++int amdgpu_cs_syncobj_import_sync_file2(amdgpu_device_handle dev,
++					uint32_t syncobj,
++					uint64_t point,
++					int sync_file_fd);
++
++/**
++ *  transfer between syncbojs.
++ *
++ * \param   dev		- \c [in] device handle
++ * \param   dst_handle	- \c [in] sync object handle
++ * \param   dst_point	- \c [in] timeline point, 0 presents dst is binary
++ * \param   src_handle	- \c [in] sync object handle
++ * \param   src_point	- \c [in] timeline point, 0 presents src is binary
++ * \param   flags	- \c [in] flags
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ */
++int amdgpu_cs_syncobj_transfer(amdgpu_device_handle dev,
++			       uint32_t dst_handle,
++			       uint64_t dst_point,
++			       uint32_t src_handle,
++			       uint64_t src_point,
++			       uint32_t flags);
++
++/**
++ * Export an amdgpu fence as a handle (syncobj or fd).
++ *
++ * \param what		AMDGPU_FENCE_TO_HANDLE_GET_{SYNCOBJ, FD}
++ * \param out_handle	returned handle
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ */
++int amdgpu_cs_fence_to_handle(amdgpu_device_handle dev,
++			      struct amdgpu_cs_fence *fence,
++			      uint32_t what,
++			      uint32_t *out_handle);
++
++/**
++ *  Submit raw command submission to kernel
++ *
++ * \param   dev	       - \c [in] device handle
++ * \param   context    - \c [in] context handle for context id
++ * \param   bo_list_handle - \c [in] request bo list handle (0 for none)
++ * \param   num_chunks - \c [in] number of CS chunks to submit
++ * \param   chunks     - \c [in] array of CS chunks
++ * \param   seq_no     - \c [out] output sequence number for submission.
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ */
++struct drm_amdgpu_cs_chunk;
++struct drm_amdgpu_cs_chunk_dep;
++struct drm_amdgpu_cs_chunk_data;
++
++int amdgpu_cs_submit_raw(amdgpu_device_handle dev,
++			 amdgpu_context_handle context,
++			 amdgpu_bo_list_handle bo_list_handle,
++			 int num_chunks,
++			 struct drm_amdgpu_cs_chunk *chunks,
++			 uint64_t *seq_no);
++
++/**
++ * Submit raw command submission to the kernel with a raw BO list handle.
++ *
++ * \param   dev	       - \c [in] device handle
++ * \param   context    - \c [in] context handle for context id
++ * \param   bo_list_handle - \c [in] raw bo list handle (0 for none)
++ * \param   num_chunks - \c [in] number of CS chunks to submit
++ * \param   chunks     - \c [in] array of CS chunks
++ * \param   seq_no     - \c [out] output sequence number for submission.
++ *
++ * \return   0 on success\n
++ *          <0 - Negative POSIX Error code
++ *
++ * \sa amdgpu_bo_list_create_raw(), amdgpu_bo_list_destroy_raw()
++ */
++int amdgpu_cs_submit_raw2(amdgpu_device_handle dev,
++			  amdgpu_context_handle context,
++			  uint32_t bo_list_handle,
++			  int num_chunks,
++			  struct drm_amdgpu_cs_chunk *chunks,
++			  uint64_t *seq_no);
++
++void amdgpu_cs_chunk_fence_to_dep(struct amdgpu_cs_fence *fence,
++				  struct drm_amdgpu_cs_chunk_dep *dep);
++void amdgpu_cs_chunk_fence_info_to_data(struct amdgpu_cs_fence_info *fence_info,
++					struct drm_amdgpu_cs_chunk_data *data);
++
++/**
++ * Reserve VMID
++ * \param   context - \c [in]  GPU Context
++ * \param   flags - \c [in]  TBD
++ *
++ * \return  0 on success otherwise POSIX Error code
++*/
++int amdgpu_vm_reserve_vmid(amdgpu_device_handle dev, uint32_t flags);
++
++/**
++ * Free reserved VMID
++ * \param   context - \c [in]  GPU Context
++ * \param   flags - \c [in]  TBD
++ *
++ * \return  0 on success otherwise POSIX Error code
++*/
++int amdgpu_vm_unreserve_vmid(amdgpu_device_handle dev, uint32_t flags);
++
++/**
++ * Create USERQUEUE
++ * \param   dev			- \c [in] device handle
++ * \param   ip_type		- \c [in] ip type
++ * \param   doorbell_handle	- \c [in] doorbell handle
++ * \param   doorbell_offset	- \c [in] doorbell index
++ * \param   mqd_in		- \c [in] MQD data
++ * \param   queue_va		- \c [in] Virtual address of queue
++ * \param   queue_size		- \c [in] userqueue size
++ * \param   wptr_va		- \c [in] Virtual address of wptr
++ * \param   rptr_va		- \c [in] Virtual address of rptr
++ * \param   queue_id		- \c [out] queue id
++ *
++ * \return  0 on success otherwise POSIX Error code
++ */
++
++int amdgpu_create_userqueue(amdgpu_device_handle dev,
++			    uint32_t ip_type,
++			    uint32_t doorbell_handle,
++			    uint32_t doorbell_offset,
++			    uint64_t queue_va,
++			    uint64_t queue_size,
++			    uint64_t wptr_va,
++			    uint64_t rptr_va,
++			    void *mqd_in,
++			    uint32_t flags,
++			    uint32_t *queue_id);
++
++/**
++ * Free USERQUEUE
++ * \param   dev		- \c [in] device handle
++ * \param   queue_id	- \c [in]  queue id
++ *
++ * \return  0 on success otherwise POSIX Error code
++ */
++int amdgpu_free_userqueue(amdgpu_device_handle dev, uint32_t queue_id);
++
++/**
++ * Signal USERQUEUE
++ * \param   dev               - \c [in] device handle
++ * \param   signal_data       - \c [in] pointer to struct drm_amdgpu_userq_signal
++ *                                      to be filled by the caller
++ *
++ * \return  0 on success otherwise POSIX Error code
++ */
++int amdgpu_userq_signal(amdgpu_device_handle dev,
++		        struct drm_amdgpu_userq_signal *signal_data);
++
++/**
++ * Wait USERQUEUE
++ * \param   dev               - \c [in]     device handle
++ * \param   wait_data         - \c [in/out] pointer to struct drm_amdgpu_userq_wait
++ *                                          to be filled by the caller
++ *
++ * \return  0 on success otherwise POSIX Error code
++ */
++int amdgpu_userq_wait(amdgpu_device_handle dev,
++		      struct drm_amdgpu_userq_wait *wait_data);
++
++#ifdef __cplusplus
++}
++#endif
++#endif /* #ifdef _AMDGPU_H_ */
+diff --git a/include/darwin/libsync.h b/include/darwin/libsync.h
+new file mode 100644
+index 00000000000..f13d990003e
+--- /dev/null
++++ b/include/darwin/libsync.h
+@@ -0,0 +1,32 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Stand-in for libdrm's libsync.h on macOS (RADV, src/amd/common/darwin).
++ * There are no Linux sync_file fds on macOS: everything reports -ENOSYS.
++ * The Darwin sync provider never hands out a sync_file, so these are only
++ * reached if RADV is asked to merge or wait on one.
++ */
++#ifndef DARWIN_LIBSYNC_H
++#define DARWIN_LIBSYNC_H
++
++#include <errno.h>
++
++static inline int
++sync_wait(int fd, int timeout)
++{
++   return -ENOSYS;
++}
++
++static inline int
++sync_merge(const char *name, int fd1, int fd2)
++{
++   return -ENOSYS;
++}
++
++static inline int
++sync_accumulate(const char *name, int *fd1, int fd2)
++{
++   return -ENOSYS;
++}
++
++#endif
+diff --git a/include/darwin/xf86drm.h b/include/darwin/xf86drm.h
+new file mode 100644
+index 00000000000..98626503d51
+--- /dev/null
++++ b/include/darwin/xf86drm.h
+@@ -0,0 +1,54 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Stand-in for libdrm's xf86drm.h on macOS (RADV, src/amd/common/darwin).
++ * There is no DRM node on macOS, so everything libdrm would answer from a
++ * device node is answered as "no device" by util/libdrm.h's shim; this file
++ * adds only what util/os_drm.h and RADV need on top of it.
++ */
++#ifndef DARWIN_XF86DRM_H
++#define DARWIN_XF86DRM_H
++
++#include <errno.h>
++#include <stdint.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++
++#include "drm-uapi/drm.h"
++#include "util/libdrm.h"
++
++#ifndef DRM_IOC_READ
++#define DRM_IOC_VOID  IOC_VOID
++#define DRM_IOC_READ  IOC_OUT
++#define DRM_IOC_WRITE IOC_IN
++#endif
++#ifndef DRM_IOC
++#define DRM_IOC(dir, group, nr, size) _IOC(dir, group, nr, size)
++#endif
++
++static inline int
++drmIoctl(int fd, unsigned long request, void *arg)
++{
++   return -1;
++}
++
++static inline int
++drmGetCap(int fd, uint64_t capability, uint64_t *value)
++{
++   return -EINVAL;
++}
++
++static inline char *
++drmGetFormatModifierName(uint64_t modifier)
++{
++   return strdup("(unavailable: no libdrm)");
++}
++
++static inline char *
++drmGetPrimaryDeviceNameFromFd(int fd)
++{
++   return NULL;
++}
++
++#endif
+diff --git a/include/meson.build b/include/meson.build
+index 397d4b424d9..2d2dfe20c85 100644
+--- a/include/meson.build
++++ b/include/meson.build
+@@ -11,6 +11,12 @@ if with_android_stub
+   inc_include += [include_directories('android_stub')]
+ endif
+ 
++# RADV on macOS (src/amd/common/darwin): headers standing in for libdrm's
++# xf86drm.h and amdgpu.h.
++if with_amdgpu_darwin
++  inc_include += [include_directories('darwin')]
++endif
++
+ if not with_glvnd and host_machine.system() != 'windows'
+   if with_gles1 or with_gles2 or with_opengl or with_egl
+     install_headers('KHR/khrplatform.h', subdir : 'KHR')
+diff --git a/meson.build b/meson.build
+index df0241e1af0..c88192b18e5 100644
+--- a/meson.build
++++ b/meson.build
+@@ -302,6 +302,14 @@ endif
+ with_intel_vk = _vulkan_drivers.contains('intel')
+ with_intel_hasvk = _vulkan_drivers.contains('intel_hasvk')
+ with_amd_vk = _vulkan_drivers.contains('amd')
++# RADV on macOS: no libdrm and no kernel DRM node.  The ac_drm layer gets a
++# Darwin backend (src/amd/common/darwin), see docs of that directory.
++with_amdgpu_darwin = with_amd_vk and host_machine.system() == 'darwin'
++if with_amdgpu_darwin
++  # addrlib's addrtypes.h takes an Apple-only header (addrExtDef.h) on
++  # __APPLE__ unless HAVE_TSERVER is defined.
++  pre_args += '-DHAVE_TSERVER'
++endif
+ with_freedreno_vk = _vulkan_drivers.contains('freedreno')
+ with_panfrost_vk = _vulkan_drivers.contains('panfrost')
+ with_swrast_vk = _vulkan_drivers.contains('swrast')
+@@ -789,7 +797,7 @@ _libdrm_checks = {
+   },
+   'amdgpu': {
+     'version': '2.4.133',
+-    'enabled': (with_amd_vk and not with_platform_windows) or with_gallium_radeonsi,
++    'enabled': (with_amd_vk and not with_platform_windows and not with_amdgpu_darwin) or with_gallium_radeonsi,
+   },
+ }
+ 
+diff --git a/src/amd/common/ac_gpu_info.c b/src/amd/common/ac_gpu_info.c
+index 3c854a906dd..1840b76d2ce 100644
+--- a/src/amd/common/ac_gpu_info.c
++++ b/src/amd/common/ac_gpu_info.c
+@@ -1083,7 +1083,11 @@ void ac_fill_feature_info(struct radeon_info *info, const struct drm_amdgpu_info
+ {
+    info->r600_has_virtual_memory = true;
+ 
++#ifdef HAVE_AMDGPU_DARWIN
++   info->has_userptr = false; /* no user memory BOs on the Darwin backend */
++#else
+    info->has_userptr = !info->is_virtio;
++#endif
+    info->has_syncobj = true;
+    info->has_fence_to_handle = true;
+ 
+diff --git a/src/amd/common/ac_linux_drm.c b/src/amd/common/ac_linux_drm.c
+index 21fb2c9e4e3..080976ab733 100644
+--- a/src/amd/common/ac_linux_drm.c
++++ b/src/amd/common/ac_linux_drm.c
+@@ -18,18 +18,49 @@
+ #include "virtio/amdgpu_virtio.h"
+ #endif
+ 
++#ifdef HAVE_AMDGPU_DARWIN
++#include "darwin/ac_darwin_drm.h"
++#endif
++
+ struct ac_drm_device {
+    union {
+       amdgpu_device_handle adev;
+ #ifdef HAVE_AMDGPU_VIRTIO
+       amdvgpu_device_handle vdev;
++#endif
++#ifdef HAVE_AMDGPU_DARWIN
++      acd_device_handle ddev;
+ #endif
+    };
+    struct util_sync_provider *p;
+    int fd;
+    bool is_virtio;
++   bool is_darwin;
+ };
+ 
++/* DRM_AMDGPU_* command ioctls.  On Darwin there is no fd: the command is
++ * emulated by the Darwin backend (canned info, userspace-only commands,
++ * kernel stubs). */
++static inline int
++ac_drm_ioctl_write(ac_drm_device *dev, unsigned drm_command_index, void *data, unsigned size)
++{
++#ifdef HAVE_AMDGPU_DARWIN
++   if (dev->is_darwin)
++      return acd_ioctl(dev->ddev, drm_command_index, data, size);
++#endif
++   return drm_ioctl_write(dev->fd, drm_command_index, data, size);
++}
++
++static inline int
++ac_drm_ioctl_write_read(ac_drm_device *dev, unsigned drm_command_index, void *data, unsigned size)
++{
++#ifdef HAVE_AMDGPU_DARWIN
++   if (dev->is_darwin)
++      return acd_ioctl(dev->ddev, drm_command_index, data, size);
++#endif
++   return drm_ioctl_write_read(dev->fd, drm_command_index, data, size);
++}
++
+ int ac_drm_device_initialize(int fd, bool is_virtio,
+                              uint32_t *major_version, uint32_t *minor_version,
+                              ac_drm_device **dev)
+@@ -40,6 +71,24 @@ int ac_drm_device_initialize(int fd, bool is_virtio,
+    if (!(*dev))
+       return -1;
+ 
++#ifdef HAVE_AMDGPU_DARWIN
++   /* No DRM node: fd and is_virtio are ignored. */
++   {
++      acd_device_handle ddev;
++      r = acd_device_initialize(major_version, minor_version, &ddev);
++      if (r == 0) {
++         (*dev)->ddev = ddev;
++         (*dev)->fd = -1;
++         (*dev)->p = acd_device_get_sync_provider(ddev);
++         (*dev)->is_virtio = false;
++         (*dev)->is_darwin = true;
++      } else {
++         free(*dev);
++      }
++      return r;
++   }
++#endif
++
+ #ifdef HAVE_AMDGPU_VIRTIO
+    if (is_virtio) {
+       struct util_sync_provider *p;
+@@ -64,8 +113,10 @@ int ac_drm_device_initialize(int fd, bool is_virtio,
+       }
+    }
+ 
+-   if (r == 0)
++   if (r == 0) {
+       (*dev)->is_virtio = is_virtio;
++      (*dev)->is_darwin = false;
++   }
+    else
+       free(*dev);
+ 
+@@ -86,12 +137,21 @@ void ac_drm_device_deinitialize(ac_drm_device *dev)
+ {
+    dev->p->finalize(dev->p);
+ 
++#ifdef HAVE_AMDGPU_DARWIN
++   if (dev->is_darwin)
++      acd_device_deinitialize(dev->ddev);
++   else
++#endif
+ #ifdef HAVE_AMDGPU_VIRTIO
+    if (dev->is_virtio)
+       amdvgpu_device_deinitialize(dev->vdev);
+    else
+ #endif
++#ifndef HAVE_AMDGPU_DARWIN
+       amdgpu_device_deinitialize(dev->adev);
++#else
++      ;
++#endif
+    free(dev);
+ }
+ 
+@@ -121,7 +181,7 @@ int ac_drm_bo_set_metadata(ac_drm_device *dev, uint32_t bo_handle, struct amdgpu
+       memcpy(args.data.data, info->umd_metadata, info->size_metadata);
+    }
+ 
+-   return drm_ioctl_write_read(dev->fd, DRM_AMDGPU_GEM_METADATA, &args, sizeof(args));
++   return ac_drm_ioctl_write_read(dev, DRM_AMDGPU_GEM_METADATA, &args, sizeof(args));
+ 
+ }
+ 
+@@ -144,7 +204,7 @@ int ac_drm_bo_query_info(ac_drm_device *dev, uint32_t bo_handle, struct amdgpu_b
+    metadata.handle = bo_handle;
+    metadata.op = AMDGPU_GEM_METADATA_OP_GET_METADATA;
+ 
+-   r = drm_ioctl_write_read(dev->fd, DRM_AMDGPU_GEM_METADATA, &metadata, sizeof(metadata));
++   r = ac_drm_ioctl_write_read(dev, DRM_AMDGPU_GEM_METADATA, &metadata, sizeof(metadata));
+    if (r)
+       return r;
+ 
+@@ -156,7 +216,7 @@ int ac_drm_bo_query_info(ac_drm_device *dev, uint32_t bo_handle, struct amdgpu_b
+    gem_op.op = AMDGPU_GEM_OP_GET_GEM_CREATE_INFO;
+    gem_op.value = (uintptr_t)&bo_info;
+ 
+-   r = drm_ioctl_write_read(dev->fd, DRM_AMDGPU_GEM_OP, &gem_op, sizeof(gem_op));
++   r = ac_drm_ioctl_write_read(dev, DRM_AMDGPU_GEM_OP, &gem_op, sizeof(gem_op));
+    if (r)
+       return r;
+ 
+@@ -213,7 +273,7 @@ int ac_drm_bo_wait_for_idle(ac_drm_device *dev, ac_drm_bo bo, uint64_t timeout_n
+    {
+       ac_drm_bo_export(dev, bo, amdgpu_bo_handle_type_kms,
+                        &args.in.handle);
+-      r = drm_ioctl_write_read(dev->fd, DRM_AMDGPU_GEM_WAIT_IDLE, &args, sizeof(args));
++      r = ac_drm_ioctl_write_read(dev, DRM_AMDGPU_GEM_WAIT_IDLE, &args, sizeof(args));
+    }
+ 
+    if (r == 0) {
+@@ -258,7 +318,7 @@ int ac_drm_bo_va_op_raw(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset,
+    va.offset_in_bo = offset;
+    va.map_size = size;
+ 
+-   r = drm_ioctl_write_read(dev->fd, DRM_AMDGPU_GEM_VA, &va, sizeof(va));
++   r = ac_drm_ioctl_write_read(dev, DRM_AMDGPU_GEM_VA, &va, sizeof(va));
+ 
+    return r;
+ }
+@@ -287,7 +347,7 @@ int ac_drm_bo_va_op_raw2(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset
+    va.input_fence_syncobj_handles = input_fence_syncobj_handles;
+    va.num_syncobj_handles = num_syncobj_handles;
+ 
+-   r = drm_ioctl_write_read(dev->fd, DRM_AMDGPU_GEM_VA, &va, sizeof(va));
++   r = ac_drm_ioctl_write_read(dev, DRM_AMDGPU_GEM_VA, &va, sizeof(va));
+ 
+    return r;
+ }
+@@ -317,7 +377,7 @@ int ac_drm_cs_ctx_create2(ac_drm_device *dev, uint32_t priority, uint32_t *ctx_i
+    args.in.op = AMDGPU_CTX_OP_ALLOC_CTX;
+    args.in.priority = priority;
+ 
+-   r = drm_ioctl_write_read(dev->fd, DRM_AMDGPU_CTX, &args, sizeof(args));
++   r = ac_drm_ioctl_write_read(dev, DRM_AMDGPU_CTX, &args, sizeof(args));
+ 
+    if (r)
+       return r;
+@@ -339,7 +399,7 @@ int ac_drm_cs_ctx_free(ac_drm_device *dev, uint32_t ctx_id)
+    memset(&args, 0, sizeof(args));
+    args.in.op = AMDGPU_CTX_OP_FREE_CTX;
+    args.in.ctx_id = ctx_id;
+-   return drm_ioctl_write_read(dev->fd, DRM_AMDGPU_CTX, &args, sizeof(args));
++   return ac_drm_ioctl_write_read(dev, DRM_AMDGPU_CTX, &args, sizeof(args));
+ }
+ 
+ int ac_drm_cs_ctx_stable_pstate(ac_drm_device *dev, uint32_t ctx_id, uint32_t op, uint32_t flags,
+@@ -359,7 +419,7 @@ int ac_drm_cs_ctx_stable_pstate(ac_drm_device *dev, uint32_t ctx_id, uint32_t op
+    args.in.op = op;
+    args.in.ctx_id = ctx_id;
+    args.in.flags = flags;
+-   r = drm_ioctl_write_read(dev->fd, DRM_AMDGPU_CTX, &args, sizeof(args));
++   r = ac_drm_ioctl_write_read(dev, DRM_AMDGPU_CTX, &args, sizeof(args));
+    if (!r && out_flags)
+       *out_flags = args.out.pstate.flags;
+    return r;
+@@ -381,13 +441,13 @@ int ac_drm_cs_query_reset_state2(ac_drm_device *dev, uint32_t ctx_id, uint64_t *
+    memset(&args, 0, sizeof(args));
+    args.in.op = AMDGPU_CTX_OP_QUERY_STATE2;
+    args.in.ctx_id = ctx_id;
+-   r = drm_ioctl_write_read(dev->fd, DRM_AMDGPU_CTX, &args, sizeof(args));
++   r = ac_drm_ioctl_write_read(dev, DRM_AMDGPU_CTX, &args, sizeof(args));
+    if (!r)
+       *flags = args.out.state.flags;
+    return r;
+ }
+ 
+-static int amdgpu_ioctl_wait_cs(int device_fd, uint32_t ctx_handle, unsigned ip,
++static int amdgpu_ioctl_wait_cs(ac_drm_device *dev, uint32_t ctx_handle, unsigned ip,
+                                 unsigned ip_instance, uint32_t ring, uint64_t handle,
+                                 uint64_t timeout_ns, uint64_t flags, bool *busy)
+ {
+@@ -406,9 +466,9 @@ static int amdgpu_ioctl_wait_cs(int device_fd, uint32_t ctx_handle, unsigned ip,
+    else
+       args.in.timeout = amdgpu_cs_calculate_timeout(timeout_ns);
+ 
+-   r = drm_ioctl(device_fd, DRM_IOCTL_AMDGPU_WAIT_CS, &args);
++   r = ac_drm_ioctl_write_read(dev, DRM_AMDGPU_WAIT_CS, &args, sizeof(args));
+    if (r)
+-      return -errno;
++      return r;
+ 
+    *busy = args.out.status;
+    return 0;
+@@ -434,7 +494,7 @@ int ac_drm_cs_query_fence_status(ac_drm_device *dev, uint32_t ctx_id, uint32_t i
+                                         timeout_ns, flags, expired);
+    else
+ #endif
+-      r = amdgpu_ioctl_wait_cs(dev->fd, ctx_id, ip_type, ip_instance, ring, fence_seq_no,
++      r = amdgpu_ioctl_wait_cs(dev, ctx_id, ip_type, ip_instance, ring, fence_seq_no,
+                                timeout_ns, flags, &busy);
+ 
+    if (!r && !busy)
+@@ -536,7 +596,7 @@ int ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_
+    cs.in.ctx_id = ctx_id;
+    cs.in.bo_list_handle = bo_list_handle;
+    cs.in.num_chunks = num_chunks;
+-   r = drm_ioctl_write_read(dev->fd, DRM_AMDGPU_CS, &cs, sizeof(cs));
++   r = ac_drm_ioctl_write_read(dev, DRM_AMDGPU_CS, &cs, sizeof(cs));
+    if (!r && seq_no)
+       *seq_no = cs.out.handle;
+    return r;
+@@ -562,7 +622,7 @@ int ac_drm_query_info(ac_drm_device *dev, unsigned info_id, unsigned size, void
+    if (dev->is_virtio)
+       return amdvgpu_query_info(dev->vdev, &request);
+ #endif
+-   return drm_ioctl_write(dev->fd, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
++   return ac_drm_ioctl_write(dev, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
+ }
+ 
+ int ac_drm_read_mm_registers(ac_drm_device *dev, unsigned dword_offset, unsigned count,
+@@ -583,7 +643,7 @@ int ac_drm_read_mm_registers(ac_drm_device *dev, unsigned dword_offset, unsigned
+    if (dev->is_virtio)
+       return amdvgpu_query_info(dev->vdev, &request);
+ #endif
+-   return drm_ioctl_write(dev->fd, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
++   return ac_drm_ioctl_write(dev, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
+ }
+ 
+ int ac_drm_query_hw_ip_count(ac_drm_device *dev, unsigned type, uint32_t *count)
+@@ -600,7 +660,7 @@ int ac_drm_query_hw_ip_count(ac_drm_device *dev, unsigned type, uint32_t *count)
+    if (dev->is_virtio)
+       return amdvgpu_query_info(dev->vdev, &request);
+ #endif
+-   return drm_ioctl_write(dev->fd, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
++   return ac_drm_ioctl_write(dev, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
+ }
+ 
+ int ac_drm_query_hw_ip_info(ac_drm_device *dev, unsigned type, unsigned ip_instance,
+@@ -619,7 +679,7 @@ int ac_drm_query_hw_ip_info(ac_drm_device *dev, unsigned type, unsigned ip_insta
+    if (dev->is_virtio)
+       return amdvgpu_query_info(dev->vdev, &request);
+ #endif
+-   return drm_ioctl_write(dev->fd, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
++   return ac_drm_ioctl_write(dev, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
+ }
+ 
+ int ac_drm_query_firmware_version(ac_drm_device *dev, unsigned fw_type, unsigned ip_instance,
+@@ -642,7 +702,7 @@ int ac_drm_query_firmware_version(ac_drm_device *dev, unsigned fw_type, unsigned
+       r = amdvgpu_query_info(dev->vdev, &request);
+    else
+ #endif
+-      r = drm_ioctl_write(dev->fd, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
++      r = ac_drm_ioctl_write(dev, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
+    if (r)
+       return r;
+ 
+@@ -670,7 +730,7 @@ int ac_drm_query_uq_fw_area_info(ac_drm_device *dev, unsigned type, unsigned ip_
+    request.query_hw_ip.type = type;
+    request.query_hw_ip.ip_instance = ip_instance;
+ 
+-   return drm_ioctl_write(dev->fd, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
++   return ac_drm_ioctl_write(dev, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
+ }
+ 
+ int ac_drm_query_gpu_info(ac_drm_device *dev, struct amdgpu_gpu_info *info)
+@@ -814,7 +874,7 @@ int ac_drm_query_sensor_info(ac_drm_device *dev, unsigned sensor_type, unsigned
+    if (dev->is_virtio)
+       return amdvgpu_query_info(dev->vdev, &request);
+ #endif
+-   return drm_ioctl_write(dev->fd, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
++   return ac_drm_ioctl_write(dev, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
+ }
+ 
+ int ac_drm_query_video_caps_info(ac_drm_device *dev, unsigned cap_type, unsigned size, void *value)
+@@ -831,7 +891,7 @@ int ac_drm_query_video_caps_info(ac_drm_device *dev, unsigned cap_type, unsigned
+    if (dev->is_virtio)
+       return amdvgpu_query_info(dev->vdev, &request);
+ #endif
+-   return drm_ioctl_write(dev->fd, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
++   return ac_drm_ioctl_write(dev, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
+ }
+ 
+ int ac_drm_query_gpuvm_fault_info(ac_drm_device *dev, unsigned size, void *value)
+@@ -847,7 +907,7 @@ int ac_drm_query_gpuvm_fault_info(ac_drm_device *dev, unsigned size, void *value
+    if (dev->is_virtio)
+       return amdvgpu_query_info(dev->vdev, &request);
+ #endif
+-   return drm_ioctl_write(dev->fd, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
++   return ac_drm_ioctl_write(dev, DRM_AMDGPU_INFO, &request, sizeof(struct drm_amdgpu_info));
+ }
+ 
+ int ac_drm_vm_reserve_vmid(ac_drm_device *dev, uint32_t flags)
+@@ -863,7 +923,7 @@ int ac_drm_vm_reserve_vmid(ac_drm_device *dev, uint32_t flags)
+    vm.in.op = AMDGPU_VM_OP_RESERVE_VMID;
+    vm.in.flags = flags;
+ 
+-   return drm_ioctl_write_read(dev->fd, DRM_AMDGPU_VM, &vm, sizeof(vm));
++   return ac_drm_ioctl_write_read(dev, DRM_AMDGPU_VM, &vm, sizeof(vm));
+ }
+ 
+ int ac_drm_vm_unreserve_vmid(ac_drm_device *dev, uint32_t flags)
+@@ -879,7 +939,7 @@ int ac_drm_vm_unreserve_vmid(ac_drm_device *dev, uint32_t flags)
+    vm.in.op = AMDGPU_VM_OP_UNRESERVE_VMID;
+    vm.in.flags = flags;
+ 
+-   return drm_ioctl_write_read(dev->fd, DRM_AMDGPU_VM, &vm, sizeof(vm));
++   return ac_drm_ioctl_write_read(dev, DRM_AMDGPU_VM, &vm, sizeof(vm));
+ }
+ 
+ const char *ac_drm_get_marketing_name(ac_drm_device *dev)
+@@ -888,7 +948,11 @@ const char *ac_drm_get_marketing_name(ac_drm_device *dev)
+    if (dev->is_virtio)
+       return amdvgpu_get_marketing_name(dev->vdev);
+ #endif
++#ifdef HAVE_AMDGPU_DARWIN
++   return acd_get_marketing_name(dev->ddev);
++#else
+    return amdgpu_get_marketing_name(dev->adev);
++#endif
+ }
+ 
+ int ac_drm_query_sw_info(ac_drm_device *dev,
+@@ -898,7 +962,11 @@ int ac_drm_query_sw_info(ac_drm_device *dev,
+    if (dev->is_virtio)
+       return amdvgpu_query_sw_info(dev->vdev, info, value);
+ #endif
++#ifdef HAVE_AMDGPU_DARWIN
++   return acd_query_sw_info(dev->ddev, info, value);
++#else
+    return amdgpu_query_sw_info(dev->adev, info, value);
++#endif
+ }
+ 
+ int ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *alloc_buffer,
+@@ -908,7 +976,11 @@ int ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *alloc_bu
+    if (dev->is_virtio)
+       return amdvgpu_bo_alloc(dev->vdev, alloc_buffer, &bo->vbo);
+ #endif
++#ifdef HAVE_AMDGPU_DARWIN
++   return acd_bo_alloc(dev->ddev, alloc_buffer, &bo->abo);
++#else
+    return amdgpu_bo_alloc(dev->adev, alloc_buffer, &bo->abo);
++#endif
+ }
+ int ac_drm_bo_export(ac_drm_device *dev, ac_drm_bo bo,
+                      enum amdgpu_bo_handle_type type, uint32_t *shared_handle)
+@@ -917,7 +989,11 @@ int ac_drm_bo_export(ac_drm_device *dev, ac_drm_bo bo,
+    if (dev->is_virtio)
+       return amdvgpu_bo_export(dev->vdev, bo.vbo, type, shared_handle);
+ #endif
++#ifdef HAVE_AMDGPU_DARWIN
++   return acd_bo_export(dev->ddev, bo.abo, type, shared_handle);
++#else
+    return amdgpu_bo_export(bo.abo, type, shared_handle);
++#endif
+ }
+ 
+ int ac_drm_bo_import(ac_drm_device *dev, enum amdgpu_bo_handle_type type,
+@@ -938,7 +1014,11 @@ int ac_drm_bo_import(ac_drm_device *dev, enum amdgpu_bo_handle_type type,
+ #endif
+    {
+       struct amdgpu_bo_import_result result;
++#ifdef HAVE_AMDGPU_DARWIN
++      r = acd_bo_import(dev->ddev, type, shared_handle, &result);
++#else
+       r = amdgpu_bo_import(dev->adev, type, shared_handle, &result);
++#endif
+       if (r == 0) {
+          output->bo.abo = result.buf_handle;
+          output->alloc_size = result.alloc_size;
+@@ -956,7 +1036,11 @@ int ac_drm_create_bo_from_user_mem(ac_drm_device *dev, void *cpu,
+       return -1;
+    }
+ #endif
++#ifdef HAVE_AMDGPU_DARWIN
++   return acd_create_bo_from_user_mem(dev->ddev, cpu, size, &bo->abo);
++#else
+    return amdgpu_create_bo_from_user_mem(dev->adev, cpu, size, &bo->abo);
++#endif
+ }
+ 
+ int ac_drm_bo_free(ac_drm_device *dev, ac_drm_bo bo)
+@@ -965,7 +1049,11 @@ int ac_drm_bo_free(ac_drm_device *dev, ac_drm_bo bo)
+    if (dev->is_virtio)
+       return amdvgpu_bo_free(dev->vdev, bo.vbo);
+ #endif
++#ifdef HAVE_AMDGPU_DARWIN
++   return acd_bo_free(dev->ddev, bo.abo);
++#else
+    return amdgpu_bo_free(bo.abo);
++#endif
+ }
+ 
+ int ac_drm_bo_cpu_map(ac_drm_device *dev, ac_drm_bo bo,
+@@ -975,7 +1063,11 @@ int ac_drm_bo_cpu_map(ac_drm_device *dev, ac_drm_bo bo,
+    if (dev->is_virtio)
+       return amdvgpu_bo_cpu_map(dev->vdev, bo.vbo, cpu);
+ #endif
++#ifdef HAVE_AMDGPU_DARWIN
++   return acd_bo_cpu_map(dev->ddev, bo.abo, cpu);
++#else
+    return amdgpu_bo_cpu_map(bo.abo, cpu);
++#endif
+ }
+ 
+ int ac_drm_bo_cpu_unmap(ac_drm_device *dev, ac_drm_bo bo)
+@@ -984,7 +1076,11 @@ int ac_drm_bo_cpu_unmap(ac_drm_device *dev, ac_drm_bo bo)
+    if (dev->is_virtio)
+       return amdvgpu_bo_cpu_unmap(dev->vdev, bo.vbo);
+ #endif
++#ifdef HAVE_AMDGPU_DARWIN
++   return acd_bo_cpu_unmap(dev->ddev, bo.abo);
++#else
+    return amdgpu_bo_cpu_unmap(bo.abo);
++#endif
+ }
+ 
+ int ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_type,
+@@ -998,9 +1094,15 @@ int ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_
+                                     va_base_required, va_base_allocated,
+                                     va_range_handle, flags);
+ #endif
++#ifdef HAVE_AMDGPU_DARWIN
++   return acd_va_range_alloc(dev->ddev, va_range_type, size, va_base_alignment,
++                             va_base_required, va_base_allocated,
++                             va_range_handle, flags);
++#else
+    return amdgpu_va_range_alloc(dev->adev, va_range_type, size, va_base_alignment,
+                                 va_base_required, va_base_allocated,
+                                 va_range_handle, flags);
++#endif
+ }
+ 
+ int ac_drm_va_range_free(amdgpu_va_handle va_range_handle)
+@@ -1011,7 +1113,11 @@ int ac_drm_va_range_free(amdgpu_va_handle va_range_handle)
+ int ac_drm_va_range_query(ac_drm_device *dev, enum amdgpu_gpu_va_range type, uint64_t *start,
+                           uint64_t *end)
+ {
++#ifdef HAVE_AMDGPU_DARWIN
++   return acd_va_range_query(dev->ddev, type, start, end);
++#else
+    return amdgpu_va_range_query(dev->adev, type, start, end);
++#endif
+ }
+ 
+ int ac_drm_create_userqueue(ac_drm_device *dev, uint32_t ip_type, uint32_t doorbell_handle,
+@@ -1059,7 +1165,7 @@ int ac_drm_create_userqueue(ac_drm_device *dev, uint32_t ip_type, uint32_t doorb
+    userq.in.mqd_size = mqd_size;
+    userq.in.flags = flags;
+ 
+-   ret = drm_ioctl_write_read(dev->fd, DRM_AMDGPU_USERQ,
++   ret = ac_drm_ioctl_write_read(dev, DRM_AMDGPU_USERQ,
+                               &userq, sizeof(userq));
+    *queue_id = userq.out.queue_id;
+ 
+@@ -1074,24 +1180,24 @@ int ac_drm_free_userqueue(ac_drm_device *dev, uint32_t queue_id)
+    userq.in.op = AMDGPU_USERQ_OP_FREE;
+    userq.in.queue_id = queue_id;
+ 
+-   return drm_ioctl_write_read(dev->fd, DRM_AMDGPU_USERQ, &userq, sizeof(userq));
++   return ac_drm_ioctl_write_read(dev, DRM_AMDGPU_USERQ, &userq, sizeof(userq));
+ }
+ 
+ int ac_drm_userq_signal(ac_drm_device *dev, struct drm_amdgpu_userq_signal *signal_data)
+ {
+-   return drm_ioctl_write_read(dev->fd, DRM_AMDGPU_USERQ_SIGNAL,
++   return ac_drm_ioctl_write_read(dev, DRM_AMDGPU_USERQ_SIGNAL,
+                                signal_data, sizeof(struct drm_amdgpu_userq_signal));
+ }
+ 
+ int ac_drm_userq_wait(ac_drm_device *dev, struct drm_amdgpu_userq_wait *wait_data)
+ {
+-   return drm_ioctl_write_read(dev->fd, DRM_AMDGPU_USERQ_WAIT, wait_data,
++   return ac_drm_ioctl_write_read(dev, DRM_AMDGPU_USERQ_WAIT, wait_data,
+                                sizeof(struct drm_amdgpu_userq_wait));
+ }
+ 
+ int ac_drm_query_pci_bus_info(ac_drm_device *dev, struct radeon_info *info)
+ {
+-   if (dev->is_virtio && dev->fd < 0) {
++   if ((dev->is_virtio && dev->fd < 0) || dev->is_darwin) {
+       info->pci.domain = 0;
+       info->pci.bus = 0;
+       info->pci.dev = 0;
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+new file mode 100644
+index 00000000000..9815937af3e
+--- /dev/null
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -0,0 +1,371 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Darwin backend of the ac_drm_* layer.  See ac_darwin_drm.h.
++ */
++
++#include "ac_darwin_drm.h"
++
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "common/amd_family.h"
++#include "common/amdgpu_devices.h"
++#include "util/macros.h"
++#include "util/u_math.h"
++#include "util/u_sync_provider.h"
++
++/* Kernel-facing DRM version reported to RADV: the minimum the amdgpu winsys
++ * accepts (ac_query_gpu_info refuses anything older). */
++#define ACD_DRM_MAJOR AC_AMDGPU_DRM_MAJOR
++#define ACD_DRM_MINOR AC_AMDGPU_DRM_MINOR
++
++/* amdgpu.ids: 7550,C0 */
++#define ACD_MARKETING_NAME "AMD Radeon RX 9070 XT"
++
++/* S1a stand-in: with RADV_DARWIN_HOST_BO=1 a BO is anonymous host memory and
++ * GEM_VA / GEM_WAIT_IDLE succeed without touching a GPU, so vkCreateDevice can
++ * get past RADV's own BO allocations and reach the first real kernel stub (CS
++ * submit).  Without it every BO call is a kernel stub.  Nothing here is GPU
++ * visible; S1c replaces it with kext-backed BOs. */
++struct amdgpu_bo {
++   uint64_t size;
++   uint32_t handle;
++   void *cpu;
++};
++
++struct acd_device {
++   bool host_bo;
++   uint32_t next_bo_handle;
++   const struct amdgpu_device *canned;
++   struct amdgpu_va_manager *va_mgr;
++   struct util_sync_provider *sync;
++   uint32_t next_ctx_id;
++};
++
++#define ACD_KERNEL_STUB(what)                                                                     \
++   do {                                                                                           \
++      fprintf(stderr, "radv-darwin: kernel stub '%s' -> -ENODEV (no kernel driver, S1a)\n", what); \
++      return -ENODEV;                                                                             \
++   } while (0)
++
++static const struct amdgpu_device *
++find_canned(const char *name)
++{
++   for (uint32_t i = 0; i < num_amdgpu_devices; i++) {
++      if (!strcmp(amdgpu_devices[i].name, name))
++         return &amdgpu_devices[i];
++   }
++   return NULL;
++}
++
++int
++acd_device_initialize(uint32_t *drm_major, uint32_t *drm_minor, acd_device_handle *out)
++{
++   struct acd_device *dev = calloc(1, sizeof(*dev));
++   if (!dev)
++      return -ENOMEM;
++
++   dev->canned = find_canned("gfx1201");
++   if (!dev->canned) {
++      free(dev);
++      return -ENODEV;
++   }
++
++   dev->sync = acd_sync_provider_create();
++   dev->va_mgr = amdgpu_va_manager_alloc();
++   if (!dev->sync || !dev->va_mgr) {
++      free(dev->va_mgr);
++      if (dev->sync)
++         dev->sync->finalize(dev->sync);
++      free(dev);
++      return -ENOMEM;
++   }
++
++   const struct drm_amdgpu_info_device *di = &dev->canned->dev;
++   /* gfx12: RADV needs half of the VA range reserved for PRT, as on Linux. */
++   amdgpu_va_manager_init2(dev->va_mgr, di->virtual_address_offset, di->virtual_address_max,
++                           di->high_va_offset, di->high_va_max, di->virtual_address_alignment,
++                           AMDGPU_VA_MGR_RESERVE_HALF_VA_FOR_PRT);
++
++   const char *host_bo = getenv("RADV_DARWIN_HOST_BO");
++   dev->host_bo = host_bo && host_bo[0] == '1';
++   dev->next_bo_handle = 1;
++   dev->next_ctx_id = 1;
++   *drm_major = ACD_DRM_MAJOR;
++   *drm_minor = ACD_DRM_MINOR;
++   *out = dev;
++   return 0;
++}
++
++void
++acd_device_deinitialize(acd_device_handle dev)
++{
++   amdgpu_va_manager_deinit(dev->va_mgr);
++   free(dev->va_mgr);
++   /* dev->sync is finalized by ac_drm_device_deinitialize() */
++   free(dev);
++}
++
++struct util_sync_provider *
++acd_device_get_sync_provider(acd_device_handle dev)
++{
++   return dev->sync;
++}
++
++const char *
++acd_get_marketing_name(acd_device_handle dev)
++{
++   return ACD_MARKETING_NAME;
++}
++
++int
++acd_query_sw_info(acd_device_handle dev, enum amdgpu_sw_info info, void *value)
++{
++   switch (info) {
++   case amdgpu_sw_info_address32_hi:
++      *(uint32_t *)value = (dev->canned->dev.high_va_offset ? dev->canned->dev.high_va_offset
++                                                             : dev->canned->dev.virtual_address_offset) >> 32;
++      return 0;
++   case amdgpu_sw_info_address_prt_wa_control_bit:
++      return amdgpu_va_manager_query_sw_info(dev->va_mgr, amdgpu_va_manager_sw_info_address_prt_wa_control_bit,
++                                             value);
++   }
++   return -EINVAL;
++}
++
++int
++acd_va_range_alloc(acd_device_handle dev, enum amdgpu_gpu_va_range va_range_type, uint64_t size,
++                   uint64_t va_base_alignment, uint64_t va_base_required, uint64_t *va_base_allocated,
++                   amdgpu_va_handle *va_range_handle, uint64_t flags)
++{
++   return amdgpu_va_range_alloc2(dev->va_mgr, va_range_type, size, va_base_alignment, va_base_required,
++                                 va_base_allocated, va_range_handle, flags);
++}
++
++int
++acd_va_range_query(acd_device_handle dev, enum amdgpu_gpu_va_range type, uint64_t *start, uint64_t *end)
++{
++   if (type != amdgpu_gpu_va_range_general)
++      return -EINVAL;
++   *start = dev->canned->dev.virtual_address_offset;
++   *end = dev->canned->dev.virtual_address_max;
++   return 0;
++}
++
++/* ---- AMDGPU_INFO: canned, the same nine ids the Linux drm-shim answers ---- */
++
++static void
++info_read_mmr_reg(const struct amdgpu_device *d, uint32_t reg, uint32_t count, uint32_t instance,
++                  uint32_t *vals)
++{
++   for (uint32_t i = 0; i < count; i++) {
++      bool found = false;
++      uint32_t val = 0;
++      for (uint32_t j = 0; j < d->mmr_reg_count; j++) {
++         const uint32_t *triple = &d->mmr_regs[j * 3];
++         if (triple[0] == reg + i && triple[1] == instance) {
++            val = triple[2];
++            found = true;
++            break;
++         }
++      }
++      if (!found)
++         fprintf(stderr, "radv-darwin: canned mmr reg 0x%04x instance 0x%x unknown, returning 0\n", reg + i,
++                 instance);
++      vals[i] = val;
++   }
++}
++
++static int
++acd_info(struct acd_device *dev, const struct drm_amdgpu_info *info)
++{
++   const struct amdgpu_device *d = dev->canned;
++   void *out = (void *)(uintptr_t)info->return_pointer;
++
++   switch (info->query) {
++   case AMDGPU_INFO_ACCEL_WORKING:
++      *(uint32_t *)out = 1;
++      return 0;
++   case AMDGPU_INFO_HW_IP_INFO:
++      if (info->query_hw_ip.type == AMDGPU_HW_IP_GFX)
++         *(struct drm_amdgpu_info_hw_ip *)out = d->hw_ip_gfx;
++      else if (info->query_hw_ip.type == AMDGPU_HW_IP_COMPUTE)
++         *(struct drm_amdgpu_info_hw_ip *)out = d->hw_ip_compute;
++      return 0;
++   case AMDGPU_INFO_HW_IP_COUNT:
++      *(uint32_t *)out = 1;
++      return 0;
++   case AMDGPU_INFO_FW_VERSION:
++      if (info->query_fw.fw_type == AMDGPU_INFO_FW_GFX_ME)
++         *(struct drm_amdgpu_info_firmware *)out = d->fw_gfx_me;
++      else if (info->query_fw.fw_type == AMDGPU_INFO_FW_GFX_PFP)
++         *(struct drm_amdgpu_info_firmware *)out = d->fw_gfx_pfp;
++      else if (info->query_fw.fw_type == AMDGPU_INFO_FW_GFX_MEC)
++         *(struct drm_amdgpu_info_firmware *)out = d->fw_gfx_mec;
++      return 0;
++   case AMDGPU_INFO_READ_MMR_REG:
++      info_read_mmr_reg(d, info->read_mmr_reg.dword_offset, info->read_mmr_reg.count,
++                        info->read_mmr_reg.instance, out);
++      return 0;
++   case AMDGPU_INFO_DEV_INFO:
++      *(struct drm_amdgpu_info_device *)out = d->dev;
++      return 0;
++   case AMDGPU_INFO_MEMORY: {
++      struct drm_amdgpu_memory_info *m = out;
++      *m = d->mem;
++      /* as drm-shim: keep only total_heap_size, no usage */
++      m->vram.usable_heap_size = m->vram.total_heap_size;
++      m->vram.heap_usage = 0;
++      m->vram.max_allocation = m->vram.total_heap_size * 3 / 4;
++      m->cpu_accessible_vram.usable_heap_size = m->cpu_accessible_vram.total_heap_size;
++      m->cpu_accessible_vram.heap_usage = 0;
++      m->cpu_accessible_vram.max_allocation = m->cpu_accessible_vram.total_heap_size * 3 / 4;
++      m->gtt.usable_heap_size = m->gtt.total_heap_size;
++      m->gtt.heap_usage = 0;
++      m->gtt.max_allocation = m->gtt.total_heap_size * 3 / 4;
++      return 0;
++   }
++   case AMDGPU_INFO_VIDEO_CAPS:
++      return 0;
++   default:
++      /* the drm-shim also answers -EINVAL here */
++      return -EINVAL;
++   }
++}
++
++/* ---- DRM_AMDGPU_* command emulation ---- */
++
++int
++acd_ioctl(acd_device_handle dev, unsigned cmd_index, void *data, unsigned size)
++{
++   switch (cmd_index) {
++   case DRM_AMDGPU_INFO:
++      return acd_info(dev, data);
++
++   case DRM_AMDGPU_CTX: {
++      /* Userspace-only: RADV's context is an id for the seqno space. */
++      union drm_amdgpu_ctx *args = data;
++      switch (args->in.op) {
++      case AMDGPU_CTX_OP_ALLOC_CTX:
++         memset(&args->out, 0, sizeof(args->out));
++         args->out.alloc.ctx_id = dev->next_ctx_id++;
++         return 0;
++      case AMDGPU_CTX_OP_FREE_CTX:
++         return 0;
++      case AMDGPU_CTX_OP_QUERY_STATE2:
++         memset(&args->out, 0, sizeof(args->out));
++         return 0;
++      case AMDGPU_CTX_OP_GET_STABLE_PSTATE:
++      case AMDGPU_CTX_OP_SET_STABLE_PSTATE:
++         memset(&args->out, 0, sizeof(args->out));
++         return 0;
++      default:
++         return -EINVAL;
++      }
++   }
++
++   case DRM_AMDGPU_VM:
++      /* The VMID is static per client in the kext design. */
++      return 0;
++
++   case DRM_AMDGPU_GEM_VA:
++      if (dev->host_bo)
++         return 0;
++      ACD_KERNEL_STUB("GEM_VA (BO map/unmap)");
++   case DRM_AMDGPU_GEM_METADATA:
++      ACD_KERNEL_STUB("GEM_METADATA");
++   case DRM_AMDGPU_GEM_OP:
++      ACD_KERNEL_STUB("GEM_OP");
++   case DRM_AMDGPU_GEM_WAIT_IDLE:
++      if (dev->host_bo)
++         return 0; /* out.status stays 0: idle */
++      ACD_KERNEL_STUB("GEM_WAIT_IDLE (bo_wait_for_idle)");
++   case DRM_AMDGPU_CS:
++      ACD_KERNEL_STUB("CS submit");
++   case DRM_AMDGPU_WAIT_CS:
++      ACD_KERNEL_STUB("WAIT_CS (fence wait)");
++   case DRM_AMDGPU_USERQ:
++   case DRM_AMDGPU_USERQ_SIGNAL:
++   case DRM_AMDGPU_USERQ_WAIT:
++      ACD_KERNEL_STUB("userqueue");
++   default:
++      fprintf(stderr, "radv-darwin: unhandled DRM_AMDGPU command %u -> -ENOSYS\n", cmd_index);
++      return -ENOSYS;
++   }
++}
++
++int
++acd_bo_alloc(acd_device_handle dev, struct amdgpu_bo_alloc_request *req, amdgpu_bo_handle *bo)
++{
++   if (!dev->host_bo)
++      ACD_KERNEL_STUB("BO alloc");
++
++   struct amdgpu_bo *b = calloc(1, sizeof(*b));
++   if (!b)
++      return -ENOMEM;
++   uint64_t align = req->phys_alignment > 4096 ? req->phys_alignment : 4096;
++   uint64_t size = align64(req->alloc_size, 4096);
++   if (posix_memalign(&b->cpu, align, size)) {
++      free(b);
++      return -ENOMEM;
++   }
++   memset(b->cpu, 0, size);
++   b->size = size;
++   b->handle = dev->next_bo_handle++;
++   *bo = b;
++   return 0;
++}
++
++int
++acd_bo_export(acd_device_handle dev, amdgpu_bo_handle bo, enum amdgpu_bo_handle_type type,
++              uint32_t *shared_handle)
++{
++   if (dev->host_bo && (type == amdgpu_bo_handle_type_kms || type == amdgpu_bo_handle_type_kms_noimport)) {
++      *shared_handle = bo->handle;
++      return 0;
++   }
++   ACD_KERNEL_STUB("BO export");
++}
++
++int
++acd_bo_import(acd_device_handle dev, enum amdgpu_bo_handle_type type, uint32_t shared_handle,
++              struct amdgpu_bo_import_result *result)
++{
++   ACD_KERNEL_STUB("BO import");
++}
++
++int
++acd_bo_free(acd_device_handle dev, amdgpu_bo_handle bo)
++{
++   if (!dev->host_bo)
++      ACD_KERNEL_STUB("BO free");
++   free(bo->cpu);
++   free(bo);
++   return 0;
++}
++
++int
++acd_bo_cpu_map(acd_device_handle dev, amdgpu_bo_handle bo, void **cpu)
++{
++   if (!dev->host_bo)
++      ACD_KERNEL_STUB("BO cpu map");
++   *cpu = bo->cpu;
++   return 0;
++}
++
++int
++acd_bo_cpu_unmap(acd_device_handle dev, amdgpu_bo_handle bo)
++{
++   if (!dev->host_bo)
++      ACD_KERNEL_STUB("BO cpu unmap");
++   return 0;
++}
++
++int
++acd_create_bo_from_user_mem(acd_device_handle dev, void *cpu, uint64_t size, amdgpu_bo_handle *bo)
++{
++   ACD_KERNEL_STUB("BO from user memory");
++}
+diff --git a/src/amd/common/darwin/ac_darwin_drm.h b/src/amd/common/darwin/ac_darwin_drm.h
+new file mode 100644
+index 00000000000..7da3aa411a2
+--- /dev/null
++++ b/src/amd/common/darwin/ac_darwin_drm.h
+@@ -0,0 +1,64 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Darwin backend of the ac_drm_* layer (ac_linux_drm.c), for RADV on macOS.
++ *
++ * There is no DRM node and no libdrm on macOS.  S1a state: every device-info
++ * query is answered from the canned gfx1201 table (amd/common/amdgpu_devices.c,
++ * the table the Linux drm-shim serves), everything that only needs userspace
++ * (VA manager, contexts, syncobjs) works, and everything that would need the
++ * kernel driver returns -ENODEV with a log line ("kernel stub").
++ */
++#ifndef AC_DARWIN_DRM_H
++#define AC_DARWIN_DRM_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "drm-uapi/amdgpu_drm.h"
++#include "amdgpu.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct util_sync_provider;
++struct acd_device;
++typedef struct acd_device *acd_device_handle;
++
++int acd_device_initialize(uint32_t *drm_major, uint32_t *drm_minor, acd_device_handle *dev);
++void acd_device_deinitialize(acd_device_handle dev);
++struct util_sync_provider *acd_device_get_sync_provider(acd_device_handle dev);
++
++/* Emulates the DRM_AMDGPU_* command ioctls that ac_linux_drm.c issues. */
++int acd_ioctl(acd_device_handle dev, unsigned cmd_index, void *data, unsigned size);
++
++const char *acd_get_marketing_name(acd_device_handle dev);
++int acd_query_sw_info(acd_device_handle dev, enum amdgpu_sw_info info, void *value);
++int acd_va_range_alloc(acd_device_handle dev, enum amdgpu_gpu_va_range va_range_type,
++                       uint64_t size, uint64_t va_base_alignment, uint64_t va_base_required,
++                       uint64_t *va_base_allocated, amdgpu_va_handle *va_range_handle,
++                       uint64_t flags);
++int acd_va_range_query(acd_device_handle dev, enum amdgpu_gpu_va_range type, uint64_t *start,
++                       uint64_t *end);
++
++/* Kernel stubs (S1c). */
++int acd_bo_alloc(acd_device_handle dev, struct amdgpu_bo_alloc_request *req, amdgpu_bo_handle *bo);
++int acd_bo_export(acd_device_handle dev, amdgpu_bo_handle bo, enum amdgpu_bo_handle_type type,
++                  uint32_t *shared_handle);
++int acd_bo_import(acd_device_handle dev, enum amdgpu_bo_handle_type type, uint32_t shared_handle,
++                  struct amdgpu_bo_import_result *result);
++int acd_bo_free(acd_device_handle dev, amdgpu_bo_handle bo);
++int acd_bo_cpu_map(acd_device_handle dev, amdgpu_bo_handle bo, void **cpu);
++int acd_bo_cpu_unmap(acd_device_handle dev, amdgpu_bo_handle bo);
++int acd_create_bo_from_user_mem(acd_device_handle dev, void *cpu, uint64_t size,
++                                amdgpu_bo_handle *bo);
++
++/* Userspace sync provider (ac_darwin_sync.c). */
++struct util_sync_provider *acd_sync_provider_create(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/amd/common/darwin/ac_darwin_sync.c b/src/amd/common/darwin/ac_darwin_sync.c
+new file mode 100644
+index 00000000000..67548cb469f
+--- /dev/null
++++ b/src/amd/common/darwin/ac_darwin_sync.c
+@@ -0,0 +1,327 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Userspace sync provider for the Darwin ac_drm backend: binary and timeline
++ * syncobjs kept entirely in this process (there is no DRM syncobj on macOS).
++ * S1a: objects are signalled by the CPU only (signal / timeline_signal /
++ * CREATE_SIGNALED / transfer); S1c signals them from kext sequence numbers.
++ * sync_file and fd import/export are not available (-ENOSYS).
++ */
++
++#include <errno.h>
++#include <stdint.h>
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++#include "drm-uapi/drm.h"
++#include "ac_darwin_drm.h"
++#include "util/u_sync_provider.h"
++
++struct acd_syncobj {
++   bool in_use;
++   bool binary_signaled;  /* binary payload */
++   uint64_t point;        /* highest signalled timeline point */
++};
++
++struct acd_sync {
++   struct util_sync_provider base;
++   pthread_mutex_t mtx;
++   pthread_cond_t cond;
++   struct acd_syncobj *objs;
++   uint32_t count;
++};
++
++static struct acd_sync *
++to_sync(struct util_sync_provider *p)
++{
++   return (struct acd_sync *)p;
++}
++
++static struct acd_syncobj *
++lookup(struct acd_sync *s, uint32_t handle)
++{
++   if (handle == 0 || handle > s->count || !s->objs[handle - 1].in_use)
++      return NULL;
++   return &s->objs[handle - 1];
++}
++
++static int
++sync_create(struct util_sync_provider *p, uint32_t flags, uint32_t *handle)
++{
++   struct acd_sync *s = to_sync(p);
++   pthread_mutex_lock(&s->mtx);
++   uint32_t i;
++   for (i = 0; i < s->count && s->objs[i].in_use; i++)
++      ;
++   if (i == s->count) {
++      struct acd_syncobj *n = realloc(s->objs, (s->count + 16) * sizeof(*n));
++      if (!n) {
++         pthread_mutex_unlock(&s->mtx);
++         return -ENOMEM;
++      }
++      memset(n + s->count, 0, 16 * sizeof(*n));
++      s->objs = n;
++      s->count += 16;
++   }
++   s->objs[i] = (struct acd_syncobj){.in_use = true, .binary_signaled = !!(flags & DRM_SYNCOBJ_CREATE_SIGNALED)};
++   *handle = i + 1;
++   pthread_mutex_unlock(&s->mtx);
++   return 0;
++}
++
++static int
++sync_destroy(struct util_sync_provider *p, uint32_t handle)
++{
++   struct acd_sync *s = to_sync(p);
++   pthread_mutex_lock(&s->mtx);
++   struct acd_syncobj *o = lookup(s, handle);
++   if (o)
++      o->in_use = false;
++   pthread_mutex_unlock(&s->mtx);
++   return o ? 0 : -EINVAL;
++}
++
++static int
++sync_handle_to_fd(struct util_sync_provider *p, uint32_t handle, int *out_obj_fd)
++{
++   return -ENOSYS;
++}
++
++static int
++sync_fd_to_handle(struct util_sync_provider *p, int obj_fd, uint32_t *handle)
++{
++   return -ENOSYS;
++}
++
++static int
++sync_import_sync_file(struct util_sync_provider *p, uint32_t handle, int sync_file_fd)
++{
++   return -ENOSYS;
++}
++
++static int
++sync_export_sync_file(struct util_sync_provider *p, uint32_t handle, int *out_sync_file_fd)
++{
++   return -ENOSYS;
++}
++
++static bool
++point_done(const struct acd_syncobj *o, uint64_t point)
++{
++   /* point 0 on a timeline wait means the binary payload */
++   return point ? o->point >= point : o->binary_signaled;
++}
++
++/* timeout_nsec is an absolute CLOCK_MONOTONIC time, as in the DRM ioctls. */
++static int
++wait_locked(struct acd_sync *s, uint32_t *handles, const uint64_t *points, unsigned n, int64_t timeout_nsec,
++            unsigned flags, uint32_t *first_signaled)
++{
++   struct timespec now_m, now_r;
++   clock_gettime(CLOCK_MONOTONIC, &now_m);
++   clock_gettime(CLOCK_REALTIME, &now_r);
++   const bool infinite = timeout_nsec == INT64_MAX;
++   int64_t rel = infinite ? INT64_MAX : timeout_nsec - ((int64_t)now_m.tv_sec * 1000000000ll + now_m.tv_nsec);
++   struct timespec deadline;
++   int64_t dl = (int64_t)now_r.tv_sec * 1000000000ll + now_r.tv_nsec + (infinite ? 0 : rel > 0 ? rel : 0);
++   deadline.tv_sec = dl / 1000000000ll;
++   deadline.tv_nsec = dl % 1000000000ll;
++
++   for (;;) {
++      unsigned done = 0;
++      int first = -1;
++      for (unsigned i = 0; i < n; i++) {
++         struct acd_syncobj *o = lookup(s, handles[i]);
++         if (!o)
++            return -EINVAL;
++         if (point_done(o, points ? points[i] : 0)) {
++            done++;
++            if (first < 0)
++               first = i;
++         }
++      }
++      bool ok = (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL) ? done == n : done > 0;
++      if (ok) {
++         if (first_signaled)
++            *first_signaled = first < 0 ? 0 : first;
++         return 0;
++      }
++      if (rel <= 0)
++         return -ETIME;
++      if (infinite)
++         pthread_cond_wait(&s->cond, &s->mtx);
++      else if (pthread_cond_timedwait(&s->cond, &s->mtx, &deadline) == ETIMEDOUT)
++         rel = 0; /* evaluate the state one last time, then -ETIME */
++   }
++}
++
++static int
++sync_wait(struct util_sync_provider *p, uint32_t *handles, unsigned num_handles, int64_t timeout_nsec,
++          unsigned flags, uint32_t *first_signaled)
++{
++   struct acd_sync *s = to_sync(p);
++   pthread_mutex_lock(&s->mtx);
++   int r = wait_locked(s, handles, NULL, num_handles, timeout_nsec, flags, first_signaled);
++   pthread_mutex_unlock(&s->mtx);
++   return r;
++}
++
++static int
++sync_timeline_wait(struct util_sync_provider *p, uint32_t *handles, uint64_t *points, unsigned num_handles,
++                   int64_t timeout_nsec, unsigned flags, uint32_t *first_signaled)
++{
++   struct acd_sync *s = to_sync(p);
++   pthread_mutex_lock(&s->mtx);
++   int r = wait_locked(s, handles, points, num_handles, timeout_nsec, flags, first_signaled);
++   pthread_mutex_unlock(&s->mtx);
++   return r;
++}
++
++static int
++sync_reset(struct util_sync_provider *p, const uint32_t *handles, uint32_t handle_count)
++{
++   struct acd_sync *s = to_sync(p);
++   pthread_mutex_lock(&s->mtx);
++   for (uint32_t i = 0; i < handle_count; i++) {
++      struct acd_syncobj *o = lookup(s, handles[i]);
++      if (!o) {
++         pthread_mutex_unlock(&s->mtx);
++         return -EINVAL;
++      }
++      o->binary_signaled = false;
++   }
++   pthread_mutex_unlock(&s->mtx);
++   return 0;
++}
++
++static int
++sync_signal(struct util_sync_provider *p, const uint32_t *handles, uint32_t handle_count)
++{
++   struct acd_sync *s = to_sync(p);
++   pthread_mutex_lock(&s->mtx);
++   for (uint32_t i = 0; i < handle_count; i++) {
++      struct acd_syncobj *o = lookup(s, handles[i]);
++      if (!o) {
++         pthread_mutex_unlock(&s->mtx);
++         return -EINVAL;
++      }
++      o->binary_signaled = true;
++   }
++   pthread_cond_broadcast(&s->cond);
++   pthread_mutex_unlock(&s->mtx);
++   return 0;
++}
++
++static int
++sync_timeline_signal(struct util_sync_provider *p, const uint32_t *handles, uint64_t *points,
++                     uint32_t handle_count)
++{
++   struct acd_sync *s = to_sync(p);
++   pthread_mutex_lock(&s->mtx);
++   for (uint32_t i = 0; i < handle_count; i++) {
++      struct acd_syncobj *o = lookup(s, handles[i]);
++      if (!o) {
++         pthread_mutex_unlock(&s->mtx);
++         return -EINVAL;
++      }
++      if (points[i] > o->point)
++         o->point = points[i];
++   }
++   pthread_cond_broadcast(&s->cond);
++   pthread_mutex_unlock(&s->mtx);
++   return 0;
++}
++
++static int
++sync_query(struct util_sync_provider *p, uint32_t *handles, uint64_t *points, uint32_t handle_count,
++           uint32_t flags)
++{
++   struct acd_sync *s = to_sync(p);
++   pthread_mutex_lock(&s->mtx);
++   for (uint32_t i = 0; i < handle_count; i++) {
++      struct acd_syncobj *o = lookup(s, handles[i]);
++      if (!o) {
++         pthread_mutex_unlock(&s->mtx);
++         return -EINVAL;
++      }
++      points[i] = o->point;
++   }
++   pthread_mutex_unlock(&s->mtx);
++   return 0;
++}
++
++static int
++sync_transfer(struct util_sync_provider *p, uint32_t dst_handle, uint64_t dst_point, uint32_t src_handle,
++              uint64_t src_point, uint32_t flags)
++{
++   struct acd_sync *s = to_sync(p);
++   pthread_mutex_lock(&s->mtx);
++   struct acd_syncobj *dst = lookup(s, dst_handle);
++   struct acd_syncobj *src = lookup(s, src_handle);
++   if (!dst || !src) {
++      pthread_mutex_unlock(&s->mtx);
++      return -EINVAL;
++   }
++   /* Only already-signalled sources can be transferred until the kext gives
++    * us pending fences (S1c). */
++   if (!point_done(src, src_point)) {
++      pthread_mutex_unlock(&s->mtx);
++      return -EINVAL;
++   }
++   if (dst_point) {
++      if (dst_point > dst->point)
++         dst->point = dst_point;
++   } else {
++      dst->binary_signaled = true;
++   }
++   pthread_cond_broadcast(&s->cond);
++   pthread_mutex_unlock(&s->mtx);
++   return 0;
++}
++
++static void
++sync_finalize(struct util_sync_provider *p)
++{
++   struct acd_sync *s = to_sync(p);
++   pthread_cond_destroy(&s->cond);
++   pthread_mutex_destroy(&s->mtx);
++   free(s->objs);
++   free(s);
++}
++
++static struct util_sync_provider *
++sync_clone(struct util_sync_provider *p)
++{
++   /* A clone must share the handle space; not needed by RADV in S1. */
++   return NULL;
++}
++
++struct util_sync_provider *
++acd_sync_provider_create(void)
++{
++   struct acd_sync *s = calloc(1, sizeof(*s));
++   if (!s)
++      return NULL;
++   pthread_mutex_init(&s->mtx, NULL);
++   pthread_cond_init(&s->cond, NULL);
++   s->base = (struct util_sync_provider){
++      .create = sync_create,
++      .destroy = sync_destroy,
++      .handle_to_fd = sync_handle_to_fd,
++      .fd_to_handle = sync_fd_to_handle,
++      .import_sync_file = sync_import_sync_file,
++      .export_sync_file = sync_export_sync_file,
++      .wait = sync_wait,
++      .reset = sync_reset,
++      .signal = sync_signal,
++      .timeline_signal = sync_timeline_signal,
++      .timeline_wait = sync_timeline_wait,
++      .query = sync_query,
++      .transfer = sync_transfer,
++      .finalize = sync_finalize,
++      .clone = sync_clone,
++   };
++   return &s->base;
++}
+diff --git a/src/amd/common/darwin/amdgpu_vamgr.c b/src/amd/common/darwin/amdgpu_vamgr.c
+new file mode 100644
+index 00000000000..108a7673980
+--- /dev/null
++++ b/src/amd/common/darwin/amdgpu_vamgr.c
+@@ -0,0 +1,383 @@
++/*
++ * libdrm's amdgpu_vamgr.c (MIT), vendored for RADV on macOS with the two
++ * amdgpu_device based entry points removed.  Upstream: libdrm b97cbde,
++ * amdgpu/amdgpu_vamgr.c.  See ac_darwin_drm.h.
++ */
++/*
++ * Copyright 2014 Advanced Micro Devices, Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ */
++
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include "amdgpu.h"
++#include "drm-uapi/amdgpu_drm.h"
++#include "amdgpu_vamgr_internal.h"
++
++drm_private void amdgpu_vamgr_init(struct amdgpu_bo_va_mgr *mgr, uint64_t start,
++				   uint64_t max, uint64_t alignment)
++{
++	struct amdgpu_bo_va_hole *n;
++
++	mgr->va_max = max;
++	mgr->va_alignment = alignment;
++
++	list_inithead(&mgr->va_holes);
++	pthread_mutex_init(&mgr->bo_va_mutex, NULL);
++	pthread_mutex_lock(&mgr->bo_va_mutex);
++	n = calloc(1, sizeof(struct amdgpu_bo_va_hole));
++	n->size = mgr->va_max - start;
++	n->offset = start;
++	list_add(&n->list, &mgr->va_holes);
++	pthread_mutex_unlock(&mgr->bo_va_mutex);
++}
++
++drm_private void amdgpu_vamgr_deinit(struct amdgpu_bo_va_mgr *mgr)
++{
++	struct amdgpu_bo_va_hole *hole, *tmp;
++	LIST_FOR_EACH_ENTRY_SAFE(hole, tmp, &mgr->va_holes, list) {
++		list_del(&hole->list);
++		free(hole);
++	}
++	pthread_mutex_destroy(&mgr->bo_va_mutex);
++}
++
++static drm_private int
++amdgpu_vamgr_subtract_hole(struct amdgpu_bo_va_hole *hole, uint64_t start_va,
++			   uint64_t end_va)
++{
++	if (start_va > hole->offset && end_va - hole->offset < hole->size) {
++		struct amdgpu_bo_va_hole *n = calloc(1, sizeof(struct amdgpu_bo_va_hole));
++		if (!n)
++			return -ENOMEM;
++
++		n->size = start_va - hole->offset;
++		n->offset = hole->offset;
++		list_add(&n->list, &hole->list);
++
++		hole->size -= (end_va - hole->offset);
++		hole->offset = end_va;
++	} else if (start_va > hole->offset) {
++		hole->size = start_va - hole->offset;
++	} else if (end_va - hole->offset < hole->size) {
++		hole->size -= (end_va - hole->offset);
++		hole->offset = end_va;
++	} else {
++		list_del(&hole->list);
++		free(hole);
++	}
++
++	return 0;
++}
++
++static drm_private int
++amdgpu_vamgr_find_va(struct amdgpu_bo_va_mgr *mgr, uint64_t size,
++		     uint64_t alignment, uint64_t base_required,
++		     bool search_from_top, uint64_t *va_out)
++{
++	struct amdgpu_bo_va_hole *hole, *n;
++	uint64_t offset = 0;
++	int ret;
++
++
++	alignment = MAX2(alignment, mgr->va_alignment);
++	size = ALIGN(size, mgr->va_alignment);
++
++	if (base_required % alignment)
++		return -EINVAL;
++
++	pthread_mutex_lock(&mgr->bo_va_mutex);
++	if (!search_from_top) {
++		LIST_FOR_EACH_ENTRY_SAFE_REV(hole, n, &mgr->va_holes, list) {
++			if (base_required) {
++				if (hole->offset > base_required ||
++				   (hole->offset + hole->size) < (base_required + size))
++					continue;
++				offset = base_required;
++			} else {
++				uint64_t waste = hole->offset % alignment;
++				waste = waste ? alignment - waste : 0;
++				offset = hole->offset + waste;
++				if (offset >= (hole->offset + hole->size) ||
++				    size > (hole->offset + hole->size) - offset) {
++					continue;
++				}
++			}
++			ret = amdgpu_vamgr_subtract_hole(hole, offset, offset + size);
++			pthread_mutex_unlock(&mgr->bo_va_mutex);
++			*va_out = offset;
++			return ret;
++		}
++	} else {
++		LIST_FOR_EACH_ENTRY_SAFE(hole, n, &mgr->va_holes, list) {
++			if (base_required) {
++				if (hole->offset > base_required ||
++				   (hole->offset + hole->size) < (base_required + size))
++					continue;
++				offset = base_required;
++			} else {
++				if (size > hole->size)
++					continue;
++
++				offset = hole->offset + hole->size - size;
++				offset -= offset % alignment;
++				if (offset < hole->offset) {
++					continue;
++				}
++			}
++
++			ret = amdgpu_vamgr_subtract_hole(hole, offset, offset + size);
++			pthread_mutex_unlock(&mgr->bo_va_mutex);
++			*va_out = offset;
++			return ret;
++		}
++	}
++
++	pthread_mutex_unlock(&mgr->bo_va_mutex);
++	return -ENOMEM;
++}
++
++static drm_private void
++amdgpu_vamgr_free_va(struct amdgpu_bo_va_mgr *mgr, uint64_t va, uint64_t size)
++{
++	struct amdgpu_bo_va_hole *hole, *next;
++
++	if (va == AMDGPU_INVALID_VA_ADDRESS)
++		return;
++
++	size = ALIGN(size, mgr->va_alignment);
++
++	pthread_mutex_lock(&mgr->bo_va_mutex);
++	hole = libdrm_container_of(&mgr->va_holes, hole, list);
++	LIST_FOR_EACH_ENTRY(next, &mgr->va_holes, list) {
++		if (next->offset < va)
++			break;
++		hole = next;
++	}
++
++	if (&hole->list != &mgr->va_holes) {
++		/* Grow upper hole if it's adjacent */
++		if (hole->offset == (va + size)) {
++			hole->offset = va;
++			hole->size += size;
++			/* Merge lower hole if it's adjacent */
++			if (next != hole &&
++			    &next->list != &mgr->va_holes &&
++			    (next->offset + next->size) == va) {
++				next->size += hole->size;
++				list_del(&hole->list);
++				free(hole);
++			}
++			goto out;
++		}
++	}
++
++	/* Grow lower hole if it's adjacent */
++	if (next != hole && &next->list != &mgr->va_holes &&
++	    (next->offset + next->size) == va) {
++		next->size += size;
++		goto out;
++	}
++
++	/* FIXME on allocation failure we just lose virtual address space
++	 * maybe print a warning
++	 */
++	next = calloc(1, sizeof(struct amdgpu_bo_va_hole));
++	if (next) {
++		next->size = size;
++		next->offset = va;
++		list_add(&next->list, &hole->list);
++	}
++
++out:
++	pthread_mutex_unlock(&mgr->bo_va_mutex);
++}
++
++drm_public int amdgpu_va_range_alloc2(amdgpu_va_manager_handle va_mgr,
++				      enum amdgpu_gpu_va_range va_range_type,
++				      uint64_t size,
++				      uint64_t va_base_alignment,
++				      uint64_t va_base_required,
++				      uint64_t *va_base_allocated,
++				      amdgpu_va_handle *va_range_handle,
++				      uint64_t flags)
++{
++	struct amdgpu_bo_va_mgr *vamgr;
++	bool search_from_top = !!(flags & AMDGPU_VA_RANGE_REPLAYABLE);
++	int ret;
++
++	/* Clear the flag when the high VA manager is not initialized */
++	if (flags & AMDGPU_VA_RANGE_HIGH && !va_mgr->vamgr_high_32.va_max)
++		flags &= ~AMDGPU_VA_RANGE_HIGH;
++
++	if (flags & AMDGPU_VA_RANGE_HIGH) {
++		if (flags & AMDGPU_VA_RANGE_32_BIT)
++			vamgr = &va_mgr->vamgr_high_32;
++		else
++			vamgr = &va_mgr->vamgr_high;
++	} else {
++		if (flags & AMDGPU_VA_RANGE_32_BIT)
++			vamgr = &va_mgr->vamgr_32;
++		else
++			vamgr = &va_mgr->vamgr_low;
++	}
++
++	va_base_alignment = MAX2(va_base_alignment, vamgr->va_alignment);
++	size = ALIGN(size, vamgr->va_alignment);
++
++	ret = amdgpu_vamgr_find_va(vamgr, size,
++				   va_base_alignment, va_base_required,
++				   search_from_top, va_base_allocated);
++
++	if (!(flags & AMDGPU_VA_RANGE_32_BIT) && ret) {
++		/* fallback to 32bit address */
++		if (flags & AMDGPU_VA_RANGE_HIGH)
++			vamgr = &va_mgr->vamgr_high_32;
++		else
++			vamgr = &va_mgr->vamgr_32;
++		ret = amdgpu_vamgr_find_va(vamgr, size,
++					   va_base_alignment, va_base_required,
++					   search_from_top, va_base_allocated);
++	}
++
++	if (!ret) {
++		struct amdgpu_va* va;
++		va = calloc(1, sizeof(struct amdgpu_va));
++		if(!va){
++			amdgpu_vamgr_free_va(vamgr, *va_base_allocated, size);
++			return -ENOMEM;
++		}
++		va->address = *va_base_allocated;
++		va->size = size;
++		va->range = va_range_type;
++		va->vamgr = vamgr;
++		*va_range_handle = va;
++	}
++
++	return ret;
++}
++
++drm_public int amdgpu_va_range_free(amdgpu_va_handle va_range_handle)
++{
++	if(!va_range_handle || !va_range_handle->address)
++		return 0;
++
++	amdgpu_vamgr_free_va(va_range_handle->vamgr,
++			va_range_handle->address,
++			va_range_handle->size);
++	free(va_range_handle);
++	return 0;
++}
++
++drm_public uint64_t amdgpu_va_get_start_addr(amdgpu_va_handle va_handle)
++{
++   return va_handle->address;
++}
++
++drm_public amdgpu_va_manager_handle amdgpu_va_manager_alloc(void)
++{
++	amdgpu_va_manager_handle r = calloc(1, sizeof(struct amdgpu_va_manager));
++	return r;
++}
++
++drm_public void amdgpu_va_manager_init(struct amdgpu_va_manager *va_mgr,
++				       uint64_t low_va_offset, uint64_t low_va_max,
++				       uint64_t high_va_offset, uint64_t high_va_max,
++				       uint32_t virtual_address_alignment)
++{
++	amdgpu_va_manager_init2(va_mgr, low_va_offset, low_va_max,
++				high_va_offset, high_va_max,
++				virtual_address_alignment, 0);
++}
++
++drm_public void amdgpu_va_manager_init2(struct amdgpu_va_manager *va_mgr,
++					uint64_t low_va_offset, uint64_t low_va_max,
++					uint64_t high_va_offset, uint64_t high_va_max,
++					uint32_t virtual_address_alignment,
++					uint32_t flags)
++{
++	uint64_t start, max;
++
++	va_mgr->address_prt_wa_control_bit = ~0;
++
++	start = low_va_offset;
++	max = MIN2(low_va_max, 0x100000000ULL);
++	amdgpu_vamgr_init(&va_mgr->vamgr_32, start, max,
++			  virtual_address_alignment);
++
++	start = max;
++	if ((flags & AMDGPU_VA_MGR_RESERVE_HALF_VA_FOR_PRT) && !high_va_max) {
++		/* Reserve the half VA range for PRT by splitting it in two
++		 * equal halves where one bit controls whether it's the LOW or
++		 * HIGH half.
++		 */
++		va_mgr->address_prt_wa_control_bit = util_last_bit64(low_va_offset ^ low_va_max) - 1;
++		max = low_va_max ^ (1ull << va_mgr->address_prt_wa_control_bit);
++	} else {
++		max = MAX2(low_va_max, 0x100000000ULL);
++	}
++
++	amdgpu_vamgr_init(&va_mgr->vamgr_low, start, max,
++			  virtual_address_alignment);
++
++	start = high_va_offset;
++	max = MIN2(high_va_max, (start & ~0xffffffffULL) + 0x100000000ULL);
++	amdgpu_vamgr_init(&va_mgr->vamgr_high_32, start, max,
++			  virtual_address_alignment);
++
++	start = max;
++	if ((flags & AMDGPU_VA_MGR_RESERVE_HALF_VA_FOR_PRT) && high_va_max) {
++		/* Reserve the half VA range for PRT by splitting it in two
++		 * equal halves where one bit controls whether it's the LOW or
++		 * HIGH half.
++		 */
++		va_mgr->address_prt_wa_control_bit = util_last_bit64(high_va_offset ^ high_va_max) - 1;
++		max = high_va_max ^ (1ull << va_mgr->address_prt_wa_control_bit);
++	} else {
++		max = MAX2(high_va_max, (start & ~0xffffffffULL) + 0x100000000ULL);
++	}
++
++	amdgpu_vamgr_init(&va_mgr->vamgr_high, start, max,
++			  virtual_address_alignment);
++}
++
++drm_public void amdgpu_va_manager_deinit(struct amdgpu_va_manager *va_mgr)
++{
++	amdgpu_vamgr_deinit(&va_mgr->vamgr_32);
++	amdgpu_vamgr_deinit(&va_mgr->vamgr_low);
++	amdgpu_vamgr_deinit(&va_mgr->vamgr_high_32);
++	amdgpu_vamgr_deinit(&va_mgr->vamgr_high);
++}
++
++drm_public int amdgpu_va_manager_query_sw_info(struct amdgpu_va_manager *va_mgr,
++					       enum amdgpu_va_manager_sw_info info,
++					       void *value)
++{
++	uint32_t *val32 = (uint32_t*)value;
++
++	switch (info) {
++	case amdgpu_va_manager_sw_info_address_prt_wa_control_bit:
++		*val32 = va_mgr->address_prt_wa_control_bit;
++		return 0;
++	}
++	return -EINVAL;
++}
+diff --git a/src/amd/common/darwin/amdgpu_vamgr_internal.h b/src/amd/common/darwin/amdgpu_vamgr_internal.h
+new file mode 100644
+index 00000000000..ca5c00115d7
+--- /dev/null
++++ b/src/amd/common/darwin/amdgpu_vamgr_internal.h
+@@ -0,0 +1,61 @@
++/*
++ * Subset of libdrm's amdgpu/amdgpu_internal.h (MIT) that the vendored VA
++ * manager needs.
++ */
++#ifndef AMDGPU_VAMGR_INTERNAL_H
++#define AMDGPU_VAMGR_INTERNAL_H
++
++#include <assert.h>
++#include <pthread.h>
++#include <stdint.h>
++
++#include "amdgpu.h"
++#include "libdrm_util_double_list.h"
++#include "util/macros.h"
++#include "util/u_math.h"
++
++#define drm_private __attribute__((visibility("hidden")))
++#define drm_public  __attribute__((visibility("default")))
++
++#define __round_mask(x, y) ((__typeof__(x))((y)-1))
++#define ROUND_UP(x, y) ((((x)-1) | __round_mask(x, y))+1)
++#define ROUND_DOWN(x, y) ((x) & ~__round_mask(x, y))
++
++#define __align_mask(value, mask)  (((value) + (mask)) & ~(mask))
++#define ALIGN(value, alignment)    __align_mask(value, (__typeof__(value))((alignment) - 1))
++
++#define AMDGPU_INVALID_VA_ADDRESS	0xffffffffffffffff
++
++struct amdgpu_bo_va_hole {
++	struct list_head list;
++	uint64_t offset;
++	uint64_t size;
++};
++
++struct amdgpu_bo_va_mgr {
++	uint64_t va_max;
++	struct list_head va_holes;
++	pthread_mutex_t bo_va_mutex;
++	uint32_t va_alignment;
++};
++
++struct amdgpu_va {
++	uint64_t address;
++	uint64_t size;
++	enum amdgpu_gpu_va_range range;
++	struct amdgpu_bo_va_mgr *vamgr;
++};
++
++struct amdgpu_va_manager {
++	struct amdgpu_bo_va_mgr vamgr_low;
++	struct amdgpu_bo_va_mgr vamgr_32;
++	struct amdgpu_bo_va_mgr vamgr_high;
++	struct amdgpu_bo_va_mgr vamgr_high_32;
++	unsigned address_prt_wa_control_bit;
++};
++
++drm_private void amdgpu_vamgr_init(struct amdgpu_bo_va_mgr *mgr, uint64_t start,
++		       uint64_t max, uint64_t alignment);
++drm_private void amdgpu_vamgr_deinit(struct amdgpu_bo_va_mgr *mgr);
++
++#endif
+diff --git a/src/amd/common/darwin/libdrm_util_double_list.h b/src/amd/common/darwin/libdrm_util_double_list.h
+new file mode 100644
+index 00000000000..5348628db30
+--- /dev/null
++++ b/src/amd/common/darwin/libdrm_util_double_list.h
+@@ -0,0 +1,121 @@
++/*
++ * SPDX-FileCopyrightText: 2006 Tungsten Graphics, Inc., Bismarck, ND. USA.
++ * SPDX-License-Identifier: MIT
++ */
++
++/**
++ * \file
++ * List macros heavily inspired by the Linux kernel
++ * list handling. No list looping yet.
++ *
++ * Is not threadsafe, so common operations need to
++ * be protected using an external mutex.
++ */
++#ifndef _U_DOUBLE_LIST_H_
++#define _U_DOUBLE_LIST_H_
++
++#include <stddef.h>
++
++struct list_head
++{
++    struct list_head *prev;
++    struct list_head *next;
++};
++
++static inline void list_inithead(struct list_head *item)
++{
++    item->prev = item;
++    item->next = item;
++}
++
++static inline void list_add(struct list_head *item, struct list_head *list)
++{
++    item->prev = list;
++    item->next = list->next;
++    list->next->prev = item;
++    list->next = item;
++}
++
++static inline void list_addtail(struct list_head *item, struct list_head *list)
++{
++    item->next = list;
++    item->prev = list->prev;
++    list->prev->next = item;
++    list->prev = item;
++}
++
++static inline void list_replace(struct list_head *from, struct list_head *to)
++{
++    to->prev = from->prev;
++    to->next = from->next;
++    from->next->prev = to;
++    from->prev->next = to;
++}
++
++static inline void list_del(struct list_head *item)
++{
++    item->prev->next = item->next;
++    item->next->prev = item->prev;
++}
++
++static inline void list_delinit(struct list_head *item)
++{
++    item->prev->next = item->next;
++    item->next->prev = item->prev;
++    item->next = item;
++    item->prev = item;
++}
++
++#define LIST_INITHEAD(__item) list_inithead(__item)
++#define LIST_ADD(__item, __list) list_add(__item, __list)
++#define LIST_ADDTAIL(__item, __list) list_addtail(__item, __list)
++#define LIST_REPLACE(__from, __to) list_replace(__from, __to)
++#define LIST_DEL(__item) list_del(__item)
++#define LIST_DELINIT(__item) list_delinit(__item)
++
++#define LIST_ENTRY(__type, __item, __field)   \
++    ((__type *)(((char *)(__item)) - offsetof(__type, __field)))
++
++#define LIST_FIRST_ENTRY(__ptr, __type, __field)   \
++    LIST_ENTRY(__type, (__ptr)->next, __field)
++
++#define LIST_LAST_ENTRY(__ptr, __type, __field)   \
++    LIST_ENTRY(__type, (__ptr)->prev, __field)
++
++#define LIST_IS_EMPTY(__list)                   \
++    ((__list)->next == (__list))
++
++#ifndef libdrm_container_of /* Mesa util/macros.h has a different container_of */
++#define libdrm_container_of(ptr, sample, member)				\
++    (void *)((char *)(ptr)						\
++	     - ((char *)&((__typeof__(sample))0)->member))
++#endif
++
++#define LIST_FOR_EACH_ENTRY(pos, head, member)				\
++   for (pos = libdrm_container_of((head)->next, pos, member);			\
++	&pos->member != (head);						\
++	pos = libdrm_container_of(pos->member.next, pos, member))
++
++#define LIST_FOR_EACH_ENTRY_SAFE(pos, storage, head, member)	\
++   for (pos = libdrm_container_of((head)->next, pos, member),			\
++	storage = libdrm_container_of(pos->member.next, pos, member);	\
++	&pos->member != (head);						\
++	pos = storage, storage = libdrm_container_of(storage->member.next, storage, member))
++
++#define LIST_FOR_EACH_ENTRY_SAFE_REV(pos, storage, head, member)	\
++   for (pos = libdrm_container_of((head)->prev, pos, member),			\
++	storage = libdrm_container_of(pos->member.prev, pos, member);		\
++	&pos->member != (head);						\
++	pos = storage, storage = libdrm_container_of(storage->member.prev, storage, member))
++
++#define LIST_FOR_EACH_ENTRY_FROM(pos, start, head, member)		\
++   for (pos = libdrm_container_of((start), pos, member);			\
++	&pos->member != (head);						\
++	pos = libdrm_container_of(pos->member.next, pos, member))
++
++#define LIST_FOR_EACH_ENTRY_FROM_REV(pos, start, head, member)		\
++   for (pos = libdrm_container_of((start), pos, member);			\
++	&pos->member != (head);						\
++	pos = libdrm_container_of(pos->member.prev, pos, member))
++
++#endif /*_U_DOUBLE_LIST_H_*/
+diff --git a/src/amd/common/meson.build b/src/amd/common/meson.build
+index 819bec05859..66d38b4e848 100644
+--- a/src/amd/common/meson.build
++++ b/src/amd/common/meson.build
+@@ -222,6 +222,22 @@ if with_amdgpu_virtio
+   link_with += libvdrm
+ endif
+ 
++if with_amdgpu_darwin
++  # macOS: no libdrm_amdgpu and no DRM node.  ac_linux_drm.c dispatches to
++  # the Darwin backend (canned gfx1201 info, userspace VA manager and
++  # syncobjs, kernel stubs).
++  c_args += ['-DHAVE_AMDGPU_DARWIN']
++  amd_common_files += files(
++    'amdgpu_devices.c',
++    'darwin/ac_darwin_drm.c',
++    'darwin/ac_darwin_drm.h',
++    'darwin/ac_darwin_sync.c',
++    'darwin/amdgpu_vamgr.c',
++    'darwin/amdgpu_vamgr_internal.h',
++    'darwin/libdrm_util_double_list.h',
++  )
++endif
++
+ if dep_elf.found()
+   amd_common_files += files(
+     'ac_rtld.c',
+diff --git a/src/amd/vulkan/meson.build b/src/amd/vulkan/meson.build
+index 0e5c08dc2e4..f55391d99b4 100644
+--- a/src/amd/vulkan/meson.build
++++ b/src/amd/vulkan/meson.build
+@@ -249,6 +249,10 @@ if with_amdgpu_virtio
+   radv_flags += '-DHAVE_AMDGPU_VIRTIO'
+ endif
+ 
++if with_amdgpu_darwin
++  radv_flags += '-DHAVE_AMDGPU_DARWIN'
++endif
++
+ if with_platform_x11
+   radv_deps += dep_xcb_dri3
+ endif
+@@ -297,6 +301,9 @@ libvulkan_radeon = shared_library(
+   cpp_args : [radv_flags, cpp_msvc_compat_args],
+   link_args : [
+     ld_args_build_id, ld_args_bsymbolic, ld_args_gc_sections, vulkan_icd_link_args,
++    # macOS: the weak entrypoint layers (annotate/wsi/ctx_roll) are undefined by
++    # design; same flag as KosmicKrisp.
++    with_amdgpu_darwin ? ['-Wl,-undefined,dynamic_lookup'] : [],
+   ],
+   link_depends : vulkan_icd_link_depends,
+   gnu_symbol_visibility : 'hidden',
+diff --git a/src/amd/vulkan/radv_instance.c b/src/amd/vulkan/radv_instance.c
+index 65330d89e05..8d4226228aa 100644
+--- a/src/amd/vulkan/radv_instance.c
++++ b/src/amd/vulkan/radv_instance.c
+@@ -320,6 +320,9 @@ radv_CreateInstance(const VkInstanceCreateInfo *pCreateInfo, const VkAllocationC
+    }
+ 
+    instance->vk.physical_devices.try_create_for_drm = create_drm_physical_device;
++#ifdef HAVE_AMDGPU_DARWIN
++   instance->vk.physical_devices.enumerate = radv_darwin_enumerate_physical_devices;
++#endif
+    instance->vk.physical_devices.destroy = radv_physical_device_destroy;
+ 
+    if (RADV_DEBUG(instance, STARTUP))
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 5edb3255fc1..9aa8d539002 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -2600,8 +2600,13 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+ #else
+    VkResult result;
+    int fd = -1;
+-   const char *path = drm_device->nodes[DRM_NODE_RENDER];
+    enum radv_drm_device_type drm_device_type;
++#ifdef HAVE_AMDGPU_DARWIN
++   /* macOS: no DRM node to open, the winsys is the Darwin ac_drm backend. */
++   const char *path = "darwin";
++   drm_device_type = RADV_DRM_DEVICE_AMDGPU_DARWIN;
++#else
++   const char *path = drm_device->nodes[DRM_NODE_RENDER];
+    drmVersionPtr version;
+ 
+    fd = open(path, O_RDWR | O_CLOEXEC);
+@@ -2640,6 +2645,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+                        path);
+    }
+    drmFreeVersion(version);
++#endif /* HAVE_AMDGPU_DARWIN */
+ 
+    if (RADV_DEBUG(instance, STARTUP))
+       fprintf(stderr, "radv: info: Found device '%s'.\n", path);
+@@ -2703,6 +2709,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+    pdev->sync_types[num_sync_types++] = NULL;
+    pdev->vk.supported_sync_types = pdev->sync_types;
+ 
++#ifndef HAVE_AMDGPU_DARWIN
+    if (instance->vk.enabled_extensions.KHR_display) {
+       pdev->wsi_master_fd = open(drm_device->nodes[DRM_NODE_PRIMARY], O_RDWR | O_CLOEXEC);
+       if (pdev->wsi_master_fd >= 0) {
+@@ -2721,6 +2728,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+       if (fd != -1)
+          pdev->wsi_syncobj_fd = os_dupfd_cloexec(fd);
+    }
++#endif
+ 
+    /* Allow all devices on a virtual winsys, otherwise do a basic support check. */
+    if (!radv_is_gpu_supported(&pdev->info)) {
+@@ -2979,6 +2987,46 @@ create_drm_physical_device(struct vk_instance *vk_instance, struct _drmDevice *d
+ #endif
+ }
+ 
++#ifdef HAVE_AMDGPU_DARWIN
++/* macOS has no DRM devices to enumerate.  The one GPU is described by the
++ * Darwin ac_drm backend; until the kext is wired (S1b/c) it is only created
++ * when RADV_DARWIN_FAKE=1 so that nothing enumerates by accident. */
++VkResult
++radv_darwin_enumerate_physical_devices(struct vk_instance *vk_instance)
++{
++   struct radv_instance *instance = (struct radv_instance *)vk_instance;
++   struct radv_physical_device *pdev = NULL;
++
++   if (!debug_get_bool_option("RADV_DARWIN_FAKE", false))
++      return VK_SUCCESS;
++
++   /* Fake PCI identity of the RX 9070 XT (vendor 0x1002, device 0x7550). */
++   static char *nodes[DRM_NODE_MAX];
++   static drmPciBusInfo bus_info;
++   static drmPciDeviceInfo device_info = {
++      .vendor_id = 0x1002,
++      .device_id = 0x7550,
++      .subvendor_id = 0x1002,
++      .subdevice_id = 0x0000,
++      .revision_id = 0xC0,
++   };
++   drmDevice drm_device = {
++      .nodes = nodes,
++      .available_nodes = 0,
++      .bustype = DRM_BUS_PCI,
++      .businfo.pci = &bus_info,
++      .deviceinfo.pci = &device_info,
++   };
++
++   VkResult result = radv_physical_device_try_create(instance, &drm_device, &pdev);
++   if (result != VK_SUCCESS)
++      return result == VK_ERROR_INCOMPATIBLE_DRIVER ? VK_SUCCESS : result;
++
++   list_addtail(&pdev->vk.link, &instance->vk.physical_devices.list);
++   return VK_SUCCESS;
++}
++#endif
++
+ static VkQueueFlags
+ radv_queue_family_protected_flag(const struct radv_physical_device *pdev, enum radv_queue_family qf)
+ {
+diff --git a/src/amd/vulkan/radv_physical_device.h b/src/amd/vulkan/radv_physical_device.h
+index 214d30d5eda..9eefdc50f73 100644
+--- a/src/amd/vulkan/radv_physical_device.h
++++ b/src/amd/vulkan/radv_physical_device.h
+@@ -76,6 +76,7 @@ enum radv_drm_device_type {
+    RADV_DRM_DEVICE_AMDGPU,
+    RADV_DRM_DEVICE_AMDGPU_VPIPE,
+    RADV_DRM_DEVICE_VIRTIO,
++   RADV_DRM_DEVICE_AMDGPU_DARWIN, /* macOS: no DRM node, fd is always -1 */
+ };
+ 
+ struct radv_physical_device {
+@@ -280,6 +281,10 @@ VkResult create_drm_physical_device(struct vk_instance *vk_instance, struct _drm
+ 
+ void radv_physical_device_destroy(struct vk_physical_device *vk_pdev);
+ 
++#ifdef HAVE_AMDGPU_DARWIN
++VkResult radv_darwin_enumerate_physical_devices(struct vk_instance *vk_instance);
++#endif
++
+ bool radv_graphics_queue_enabled(const struct radv_physical_device *pdev);
+ 
+ bool radv_transfer_queue_enabled(const struct radv_physical_device *pdev);
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+index 63ff7fa6dd7..c3a4213606c 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+@@ -713,9 +713,14 @@ radv_amdgpu_winsys_bo_map(struct radeon_winsys *_ws, struct radeon_winsys_bo *_b
+ 
+    assert(!bo->cpu_map);
+ 
+-#if HAVE_AMDGPU_VIRTIO
++#if HAVE_AMDGPU_VIRTIO || defined(HAVE_AMDGPU_DARWIN)
+    struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
++#ifdef HAVE_AMDGPU_DARWIN
++   /* No DRM fd on macOS: always map through the ac_drm backend. */
++   if (true) {
++#else
+    if (ws->info.is_virtio) {
++#endif
+       /* We can't use DRM_AMDGPU_GEM_MMAP directly on virtio. Instead use bo_cpu_map since
+        * the virtio version will map the buffer at the given address (if not NULL).
+        */
+@@ -759,6 +764,9 @@ radv_amdgpu_winsys_bo_unmap(struct radeon_winsys *_ws, struct radeon_winsys_bo *
+    if (replace) {
+       (void)mmap(bo->cpu_map, bo->base.size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    } else {
++#ifdef HAVE_AMDGPU_DARWIN
++      ac_drm_bo_cpu_unmap(radv_amdgpu_winsys(_ws)->dev, bo->bo);
++#else
+ #if HAVE_AMDGPU_VIRTIO
+       struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
+       if (ws->info.is_virtio)
+@@ -766,6 +774,7 @@ radv_amdgpu_winsys_bo_unmap(struct radeon_winsys *_ws, struct radeon_winsys_bo *
+       else
+ #endif
+          munmap(bo->cpu_map, bo->base.size);
++#endif
+    }
+    bo->cpu_map = NULL;
+ }
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
+index eac0a7f8c69..cf7ab40d9c4 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
+@@ -359,7 +359,12 @@ radv_amdgpu_winsys_query_info(int fd, const BITSET_WORD *debug_flags, bool is_vi
+    info->base.ip[AMD_IP_SDMA].num_queues = MIN2(info->base.ip[AMD_IP_SDMA].num_queues, MAX_RINGS_PER_TYPE);
+    info->base.ip[AMD_IP_COMPUTE].num_queues = MIN2(info->base.ip[AMD_IP_COMPUTE].num_queues, MAX_RINGS_PER_TYPE);
+ 
++#ifdef HAVE_AMDGPU_DARWIN
++   /* No DRM fd: syncobjs come from the device's userspace sync provider. */
++   info->syncobj_sync_type = vk_drm_syncobj_get_type_from_provider(ac_drm_device_get_sync_provider(dev));
++#else
+    info->syncobj_sync_type = vk_drm_syncobj_get_type(fd);
++#endif
+ 
+    /* Determine which context priorities are supported. */
+    for (uint32_t p = RADEON_CTX_PRIORITY_LOW; p <= RADEON_CTX_PRIORITY_REALTIME; p++) {
+diff --git a/src/vulkan/runtime/meson.build b/src/vulkan/runtime/meson.build
+index 404f51662ad..5188df7283e 100644
+--- a/src/vulkan/runtime/meson.build
++++ b/src/vulkan/runtime/meson.build
+@@ -57,6 +57,9 @@ vulkan_lite_runtime_deps = [
+ if dep_libdrm.found()
+   vulkan_lite_runtime_files += files('vk_drm_syncobj.c')
+   vulkan_lite_runtime_deps += dep_libdrm
++elif with_amdgpu_darwin
++  # RADV on macOS: syncobjs come from a userspace util_sync_provider, no libdrm.
++  vulkan_lite_runtime_files += files('vk_drm_syncobj.c')
+ endif
+ 
+ if with_platform_android
