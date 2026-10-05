@@ -910,11 +910,16 @@ extern const size_t  fw_shader_blit_copy_offen_gfx1201_size;
 }
 
 // Apple's original blit kernel: the 8 dwords at resource +0xfb00, measured in
-// r28/r30 (sections 314, 317). The exact-match guard for the substitution.
-static const uint32_t kAppleBlitKernel[8] = {
-    0xd7460001u, 0x04010c08u, 0xe00c2000u, 0x80000201u,
-    0xbf8c3f70u, 0xe01c2000u, 0x80010201u, 0xbf810000u,
-};
+// r28/r30 (sections 314, 317). The exact-match guard for the substitution. The public
+// tree carries only a fingerprint of those 32 bytes (64-bit FNV-1a over the dwords in
+// little-endian byte order), not the bytes themselves; the guard is unchanged in effect.
+static constexpr uint64_t kAppleBlitKernelFnv = 0x5fe70be325ab2aabull;
+static uint64_t apple_blit_fnv(const uint32_t *d) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint32_t i = 0; i < 8; i++)
+        for (uint32_t b = 0; b < 4; b++) { h ^= (d[i] >> (8u * b)) & 0xFFu; h *= 0x100000001b3ull; }
+    return h;
+}
 static constexpr uint64_t kBlitShaderOffset = 0xfb00; // shader VA minus resource VA (section 311)
 
 // 0.0.206 — the substitutable kernels, indexed by `kernsub <mode>`. Modes 2 and 3
@@ -979,7 +984,7 @@ static uint32_t substitute_blit_kernel_at(uint64_t vramAt, uint32_t mode, uint32
     bool alreadyOurs = true;
     for (uint32_t i = 0; i < nd; i++) if (cur[i] != k[i]) { alreadyOurs = false; break; }
     if (alreadyOurs) return 2;
-    for (uint32_t i = 0; i < 8; i++)  if (cur[i] != kAppleBlitKernel[i]) { *reason = 3; return 0; }
+    if (apple_blit_fnv(cur) != kAppleBlitKernelFnv)                     { *reason = 3; return 0; }
     for (uint32_t i = 8; i < nd; i++) if (cur[i] != 0)                   { *reason = 3; return 0; }
     uint32_t buf[kSubMaxDwords];
     for (uint32_t i = 0; i < nd; i++) buf[i] = k[i];
