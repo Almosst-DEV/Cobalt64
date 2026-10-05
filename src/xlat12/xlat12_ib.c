@@ -1,7 +1,12 @@
 /* xlat12_ib - IB-level driver around xlat12_translate. Contract: xlat12_ib.h. */
 #include "xlat12_ib.h"
+/* The two control streams below are captured Apple IBs and are NOT in the public tree. Without
+ * -DXLAT12_APPLE_FIXTURES (and tests/fixture_r30_blit_ib.h, tests/fixture_r44_drawinj.h) the self-tests
+ * return an incomplete result, which every caller treats as a failure and REFUSES. */
+#ifdef XLAT12_APPLE_FIXTURES
 #include "tests/fixture_r30_blit_ib.h"   /* Apple's real blit IB, the self-test control */
 #include "tests/fixture_r44_drawinj.h"   /* Apple's real drawinj render stream, the draw control */
+#endif
 /* 0.0.224: our programs by exact code identity (tools/gfx-shader-ids.py).
  *: XLAT12_SHADER_IDS_HEADER is an OFFLINE-ONLY compile-time switch. Undefined - the kext build
  * and every existing test - it is exactly the shipped table below. tools/m4-xlat/replay.c compiles a SECOND copy of this
@@ -424,6 +429,7 @@ uint32_t xlat12_ib_selftest(void)
             if (xlat12_translate(&ctx, clr, 2, o, 64, &n, &st) == XLAT12_ERR_MEMLOADED) bits |= 8u;
         }
     }
+#ifdef XLAT12_APPLE_FIXTURES   /* control IB captured from Apple: absent from the public tree, bits 16/32/64 then stay 0 and the self-test FAILS (callers refuse) */
     {
         xlat12_ib_census c;
         xlat12_ib_census_run(kR30BlitIb, 128, &c);
@@ -442,6 +448,7 @@ uint32_t xlat12_ib_selftest(void)
         if (xlat12_ib_translate(&cx, kR30BlitIb, 128, t2, 256, &len, &xs, &eop) == 0u && len == 125u &&
             xlat12_ib_pad(t2, len, 128) == 0u && xlat12_ib_walk(t2, 128) == 128u) bits |= 64u;
     }
+#endif
     return bits;
 }
 
@@ -5350,6 +5357,7 @@ void xlat12_attr_ring_descriptor(uint64_t va, uint32_t size, uint32_t desc[4])
     desc[3] = XLAT12_ATTR_DESC_WORD3;
 }
 
+#ifdef XLAT12_APPLE_FIXTURES
 uint32_t xlat12_ib_draw_selftest(void)
 {
     static uint32_t o[1022], mod[1022];
@@ -5552,3 +5560,6 @@ uint32_t xlat12_ib_draw_selftest(void)
     }
     return bits;
 }
+#else  /* !XLAT12_APPLE_FIXTURES: no captured control stream in the public tree - the self-test cannot pass, so callers REFUSE */
+uint32_t xlat12_ib_draw_selftest(void) { return 0u; }
+#endif

@@ -2135,23 +2135,30 @@ done:
 // E1 (0.0.418, notes/design/BUILD-0.0.418.md) — THE SDMA0_DCC_CNTL CLEAR IS THE DEFAULT.
 //
 // THE SITE, cited: SDMA0's QUEUE0 ring is up when `sdma_init_full` returns in the ladder's SDMAInit stage
-// (src/amd/amdgpu_init.cpp, the BringupStage::SDMAInit case, immediately after `r = sdma_init_full(...)`). This
-// function is called from `Navi48Bringup::runStages` at the first kext-layer point after that stage, once
-// `ctx.reached >= BringupStage::SDMAInit`. It is therefore BEFORE Apple's accelerator loads, but it is NOT before
-// all of our own SDMA use: the bring-up ladder's OWN SDMA copy test and sweep already ran earlier in that same
-// stage, on the boot default (`0x0000aabe`, compression ON) - harmless, exactly as on every earlier boot, because
-// neither was the tiled pipeshim copy the grid came from. What E1 changes from this point on: `fire`,
-// the boot chain, `scanout` and the pipe guard all run with no-PTE compression OFF for the first time. The
-// comment through 0.0.418 claimed "every SDMA access of ours from then on is raw", which was never true.
+// (src/amd/amdgpu_init.cpp, the BringupStage::SDMAInit case). That case now calls this function IMMEDIATELY after
+// `sdma_init_full` succeeds and BEFORE the ladder's own SDMA copy test and copy_sweep (GitHub issue #1: those two
+// used to run first, on the boot default `0x0000aabe` with no-PTE compression ON, and their results then disagreed
+// from run to run). So from the first SDMA packet of the boot onward, `fire`, the copy test, the sweep, the boot
+// chain, `scanout` and the pipe guard all run with no-PTE compression OFF.
+//
+// The write happens ONCE per boot. `Navi48Bringup::runStages` still calls this function at the first kext-layer
+// point after the stage (`ctx.reached >= BringupStage::SDMAInit`); by then it has run, so that call logs that it
+// already ran and writes nothing (gSdmaDccDefaultDone).
 //
 // It captures the boot value into the SAME RESTORE pair the `sdmadcc` verb uses, writes
 // `n48_sdma_dcc_cleared` of it, reads back, and logs ONE line. `navi48-sdmadcc=0` skips it; absent or nonzero
 // runs it (n48_sdma_dcc_default_on). SDMA1 is never written and no other register is written at all.
 // =====================================================================================================
+static bool gSdmaDccDefaultDone { false };   // the default clear (or its opt-out) has been decided this boot
 void navi48_sdmadcc_default(void) {
+	if (gSdmaDccDefaultDone) {
+		N48LOG("sdmadcc: DEFAULT already handled earlier this boot (right after sdma_init_full, before the copy test) - no second write");
+		return;
+	}
 	uint32_t ba = 0;
 	const uint32_t present = PE_parse_boot_argn("navi48-sdmadcc", &ba, sizeof(ba)) ? 1u : 0u;
 	if (!n48_sdma_dcc_default_on(present, ba)) {
+		gSdmaDccDefaultDone = true;
 		N48LOG("sdmadcc: DEFAULT SKIPPED - navi48-sdmadcc=0 (SDMA0_DCC_CNTL left as it booted)");
 		return;
 	}
@@ -2162,6 +2169,7 @@ void navi48_sdmadcc_default(void) {
 	if (!gSdmaDccCaptured) { gSdmaDccRestore = navi48_reg_read32(reg0); gSdmaDccCaptured = true; }
 	const uint32_t target = n48_sdma_dcc_cleared(gSdmaDccRestore);
 	navi48_reg_write32(reg0, target);
+	gSdmaDccDefaultDone = true;
 	const uint32_t rb = navi48_reg_read32(reg0);
 	N48LOG("sdmadcc: DEFAULT SDMA0_DCC_CNTL %#010x -> %#010x (mask %#x), read back %#010x %s",
 	       gSdmaDccRestore, target, (unsigned)N48_DCC_NOPTE_COMP_EN_MASK, rb,
@@ -6959,8 +6967,9 @@ void Navi48Bringup::runStages(uint32_t target) {
 	if (ctx.reached >= amdgpu::BringupStage::SDMAInit) {
 		setProperty("Navi48,SDMACopyTest", ctx.sdmaCopyPassed ? "passed" : "failed");
 		setProperty("Navi48,SDMACopyMismatched", static_cast<uint64_t>(ctx.sdmaCopy.mismatched), 32);
-		// E1 (0.0.418, notes/design/BUILD-0.0.418.md): SDMA0 is up (the SDMAInit case's `sdma_init_full`), so the
-		// SDMA0_DCC_CNTL no-PTE compression clear is the DEFAULT from here on. `navi48-sdmadcc=0` skips it.
+		// E1 (0.0.418, notes/design/BUILD-0.0.418.md): the SDMA0_DCC_CNTL no-PTE compression clear is the DEFAULT.
+		// The SDMAInit stage already applied it right after `sdma_init_full` (before its own copy test and sweep);
+		// this call is then a logged no-op. `navi48-sdmadcc=0` skips it.
 		navi48_sdmadcc_default();
 	}
 	publishPDB0On(this, ctx);
