@@ -192,7 +192,7 @@ typedef struct {
      * leak into the next; READ ONLY under XLAT12_EXTRA_FILL_COLOR, and NONE means "do not retarget". APPENDED, so the
      * positional initialiser in xlat12_ib_m2tri_profile keeps every other field's position. */
     uint32_t ps_id;
-    /* D4' (notes/design/D4-PRIME.md item 2): THE xlat12_readset.h ROW of the identity bound HERE - index + 1 into
+    /* D4' (an internal design note item 2): THE xlat12_readset.h ROW of the identity bound HERE - index + 1 into
      * kXlat12Readset, 0 = no row (UNKNOWN, never "declares none"). ps_readset1 for the fragment stage, vs_readset1
      * for the vertex stage; filled by xlat12_ib_profile_stage/_for beside ps_table_abi1/vs_abi_ptr1, cleared exactly
      * as they are, READ ONLY under XLAT12_EXTRA_READSET. APPENDED at the very end, so the positional initialiser in
@@ -210,7 +210,7 @@ typedef struct {
  * row with `nsamp` over this is refused as malformed (XLAT12_TDESC_TOO_MANY) rather than silently truncated. */
 #define XLAT12_TDESC_TABLE_MAX_SAMP 2u
 
-/* D4' (notes/design/D4-PRIME.md item 4/G): the ACCUMULATED read-set's own storage caps - the segment-wide union over
+/* D4' (an internal design note item 4/G): the ACCUMULATED read-set's own storage caps - the segment-wide union over
  * every draw can legitimately be larger than one draw's XLAT12_DRAW_IN_MAX/XLAT12_ABI_PTR_MAX (a multi-draw segment
  * binding several distinct readset-covered programs). These are xlat12's own headroom; the kext's own caps
  * (gfx_cp_build.h's N48_CP_D4_IN_MAX/N48_CP_D4_PTR_MAX) are the ones the RULE enforces and match these exactly. */
@@ -304,7 +304,7 @@ typedef struct {
      * written beside in_va and cleared with it (d_in_clear); nothing in the translator reads it, and no output dword, return
      * code or other counter depends on it. */
     uint32_t in_idx[XLAT12_DRAW_IN_MAX];
-    /* build 0.0.554 (notes/design/ADMIT-STALE-112.md section 3): bit i set = input i's tiled T# was NOT proven by
+    /* build 0.0.554 (an internal design note section 3): bit i set = input i's tiled T# was NOT proven by
      * the caller's asks and was ADMITTED by xlat12_draw_extra.desc_stale_ok (its in_proven[i] is then 1). Written beside in_proven
      * and cleared with it (d_in_clear). EXPORT ONLY: no rung of the translator reads it. 0 whenever desc_stale_ok is NULL. */
     uint32_t in_admit;
@@ -365,7 +365,7 @@ typedef struct {
      * because a resolver call refused or the relocation address was structurally invalid. A stage whose PGM_LO write
      * is absent or zero is neither resolved nor counted: it simply keeps the base value. APPENDED. */
     uint32_t pair_pre_resolved, pair_pre_unresolved;
-    /* D4' (notes/design/D4-PRIME.md item 3, notes/design/R1-MEMDST.md Q5/Q6) — THE PER-DRAW READ-SET, ACCUMULATED
+    /* D4' (an internal design note item 3, an internal design note Q5/Q6) — THE PER-DRAW READ-SET, ACCUMULATED
      * OVER EVERY DRAW OF THE SEGMENT, NEVER CLEARED PER DRAW (contrast in_*, which d_in_clear empties at each draw -
      * the fail-open Finding 4 named). Written ONLY under XLAT12_EXTRA_READSET; all zero on every default build.
      * `rs_declined` 1 = at least one draw's PS or VS program had no admitted xlat12_readset.h row, so the caller must
@@ -400,7 +400,7 @@ typedef struct {
      * desc_dcc_ok did not prove (the draw refused PROVENANCE); and DCC records (xlat12_desc_has_dcc) the step refused -
      * outside the accept shape, or refused by the port after the strip. Zero unless the flag is set. APPENDED. */
     uint32_t dcc_stripped, dcc_unproven, dcc_refused;
-    /* build 0.0.487 (XLAT12_EXTRA_CS_ELIDE, switch 57; notes/design/COMPUTE-N.md Q6/Q7): DISPATCH_DIRECT packets the
+    /* build 0.0.487 (XLAT12_EXTRA_CS_ELIDE, switch 57; an internal design note Q6/Q7): DISPATCH_DIRECT packets the
      * elision branch examined (`cs_seen`), replaced by a same-length NOP (`cs_elided`), and refused, by the FIRST predicate
      * part that failed (P2 state, P3 packet, P4 program, P5 DCC bind; a refused one then falls through to UNLISTED exactly
      * as with the flag off). All zero unless the flag is set. APPENDED. */
@@ -409,7 +409,7 @@ typedef struct {
      * (gfx12's BR is inclusive), and those it REFUSED XLAT12_ERR_SCISSOR (a BR component of 0). No flag: always on.
      * APPENDED. */
     uint32_t scissor_adjusted, scissor_refused;
-    /* build 0.0.500 (XLAT12_EXTRA_DRAW_ELIDE, switch 66; notes/design/DRAW-ELIDE.md Q4): draws replaced by a same-length
+    /* build 0.0.500 (XLAT12_EXTRA_DRAW_ELIDE, switch 66; an internal design note Q4): draws replaced by a same-length
      * NOP (`draw_elided`, never above XLAT12_DRAW_ELIDE_MAX), the PROVENANCE refusals the elide examined (`de_seen`), and
      * those it left refused, by the FIRST predicate part that failed: not on the row's last texture with every earlier one
      * proven (`de_not_last`), the in-force fragment program not an enabled row (`de_not_row`: `de_nr_ndw`/`de_nr_fnv` name
@@ -633,7 +633,7 @@ typedef struct {
      * ours), anything else refuses. Required (non-NULL) under the flag - XLAT12_ERR_ARG otherwise. APPENDED. */
     void *cs_ctx;
     int (*cs_is_n)(void *ctx, uint64_t va);
-    /* build 0.0.486 (switch 59, notes/design/STATIC-RETILE.md Q3): THE T#-AWARE ASK. When non-NULL it is called INSTEAD of
+    /* build 0.0.486 (switch 59, an internal design note Q3): THE T#-AWARE ASK. When non-NULL it is called INSTEAD of
      * desc_tiled_ok, at the same two sites (the table step and XLAT12_EXTRA_INLINE_DESC), with the same first four arguments
      * plus `g10`, the raw gfx10 record being placed (read-only), and `clamp`: a yes (1) with *clamp 1 makes the translator set
      * MAX_MIP and LAST_LEVEL to 0 in ITS OWN translated copy (xlat12_tdesc_clamp_mip0), before the table step's shadow compare,
@@ -697,7 +697,7 @@ static inline void xlat12_tdesc_clamp_mip0(uint32_t *g12)
  * above the ring-offsets descriptor page: [+0xA81000, +0xA8F000) = 56 KiB inside leaf 168, which `ringmap` already builds and
  * maps R/W/X (ringmap_leaf sets EXECUTABLE). PGM_LO holds VA >> 8, so a relocated program must be 256-byte aligned.
  *
- * 0.0.413 (notes/design/FENCE-OWNED-SLOT.md): the arena SHRINKS from 0xF000 to 0xE000 (60 -> 56 KiB) so
+ * 0.0.413 (an internal design note): the arena SHRINKS from 0xF000 to 0xE000 (60 -> 56 KiB) so
  * that its LAST 4 KiB, [+0xA8F000, +0xA90000), can hold the fence828 owned slot array (1024 four-byte slots, one per
  * commit ordinal). `XLAT12_FENCE_PAGE_OFF/BYTES` name that page here because the arena and the fence page must never
  * overlap; a host test asserts the arithmetic. */
@@ -860,12 +860,12 @@ uint32_t xlat12_ib_seg_probe(const uint32_t *in, uint32_t n, uint32_t *first_at,
  * OFF, not one output dword, counter or return code changes: d_pair_pre() is never called and d_synth still takes
  * `pf` exactly as it did through 0.0.408. */
 #define XLAT12_EXTRA_PAIR_PRE 0x800u
-/* D4' (notes/design/D4-PRIME.md item 3, notes/design/R1-MEMDST.md Q5): XLAT12_EXTRA_READSET - DEFAULT OFF; nothing in
+/* D4' (an internal design note item 3, an internal design note Q5): XLAT12_EXTRA_READSET - DEFAULT OFF; nothing in
  * the kext sets it unless `accel gfxneuter 40 | 1 << 8` is ON. ON, at EVERY draw the translator resolves the in-force
  * PS and VS identities' src/xlat12/xlat12_readset.h rows (xlat12_draw_profile.ps_readset1 / vs_readset1, filled by
  * xlat12_ib_profile_stage/_for from the SAME identity match ps_table_abi1/vs_abi_ptr1 already use) and ACCUMULATES
  * every admitted pointer and admitted inline image into xlat12_draw_stats' rs_* fields, and every INDEX_BASE VA seen
- * in the stream (already a recognised, cheaply-decoded pass-through opcode; notes/design/R1-MEMDST.md Q6) into
+ * in the stream (already a recognised, cheaply-decoded pass-through opcode; an internal design note Q6) into
  * rs_ptr[] - ACROSS EVERY DRAW OF THE SEGMENT, NEVER CLEARED PER DRAW (unlike in_*, which d_in_clear empties at each
  * draw - the fix for 0.0.438's Finding-4 interim refusal, for the programs this row set covers). A draw whose PS or
  * VS program has no row, or whose row's proof bits do not admit it (proof_depth1_data_only != 1, or an image op
@@ -873,7 +873,7 @@ uint32_t xlat12_ib_seg_probe(const uint32_t *in, uint32_t n, uint32_t *first_at,
  * never "no pointers" (xlat12_readset.h's own banner). OFF, not one output dword, counter or return code changes:
  * d_readset_accum is never called and every rs_* field stays zero. */
 #define XLAT12_EXTRA_READSET 0x1000u
-/* build 0.0.448 item 1 (notes/design/MIB-A1-PATH.md Q1, "B2/B3 WITHIN ONE TRANSLATION, no cross-segment
+/* build 0.0.448 item 1 (an internal design note Q1, "B2/B3 WITHIN ONE TRANSLATION, no cross-segment
  * carry"), build 0.0.449 item 1 (F1 fix - the carry moved off a file-scope static): XLAT12_EXTRA_UD_REEMIT
  * - DEFAULT OFF; nothing in the kext sets it unless `accel gfxneuter 44 | 1 << 8` is ON. REQUIRES
  * XLAT12_EXTRA_TABLE_DESC (refused with ERR_ARG otherwise - the mechanism has nothing to re-emit INTO without the
@@ -983,7 +983,7 @@ uint32_t xlat12_ib_seg_probe(const uint32_t *in, uint32_t n, uint32_t *first_at,
  * counted in `vs_known_n`. OFF, not one output dword, counter or return code changes: d_vs_slot_known's flag check
  * fails first, so every site below evaluates to EXACTLY its pre-0.0.455 expression. */
 #define XLAT12_EXTRA_VS_KNOWN 0x10000u
-/* build 0.0.480 (notes/design/CONTINUATION-UNITS.md Q11, contract items C2 and C4; switch 55 in the kext) —
+/* build 0.0.480 (an internal design note Q11, contract items C2 and C4; switch 55 in the kext) —
  * XLAT12_EXTRA_UNIT - DEFAULT OFF; nothing in the kext sets it unless `accel gfxneuter 55 | 1 << 8` is ON, and then ONLY
  * for a CONTINUATION UNIT of two or more constituents (gfx_mib.h n48_mib_units: one non-continuation encoder segment
  * plus every continuation that follows it in the SAME IB). Requires a non-NULL `ex->unit` (XLAT12_ERR_ARG otherwise:
@@ -1018,7 +1018,7 @@ uint32_t xlat12_ib_seg_probe(const uint32_t *in, uint32_t n, uint32_t *first_at,
  *                  would otherwise leave Apple's value where separate translation re-emitted ours).
  * OFF, not one output dword, counter or return code changes: every site tests U (the flag's own pointer) first. */
 #define XLAT12_EXTRA_UNIT 0x20000u
-/* build 0.0.487 (notes/design/COMPUTE-N.md Q6 items 1-2, contract C2; switch 57 in the kext) — XLAT12_EXTRA_CS_ELIDE
+/* build 0.0.487 (an internal design note Q6 items 1-2, contract C2; switch 57 in the kext) — XLAT12_EXTRA_CS_ELIDE
  * - DEFAULT OFF; nothing in the kext sets it unless `accel gfxneuter 57 | 1 << 8` is ON. Requires `ex->cs_is_n`
  * (XLAT12_ERR_ARG otherwise). ON, a DISPATCH_DIRECT is replaced IN PLACE by a same-length PACKET3 NOP
  * (XLAT12_CS_ELIDE_NOP and four zero dwords) ONLY when it is PROVEN to be Apple's compute clear N (BufferClear_CS, the
@@ -1092,7 +1092,7 @@ typedef struct xlat12_unit_s {
     void *cons_ctx;
     xlat12_unit_cons_fn cons_fn;               /* NULL = no per-constituent feed */
     uint32_t pend_cap;                         /* deferred placements allowed, 0 = XLAT12_UNIT_PEND_MAX (never above it) */
-    /* build 0.0.501 (notes/design/UNIT-ROOM.md Q3 C1, ; switch 67 in the kext) - PACK. 0 = today: every
+    /* build 0.0.501 (an internal design note Q3 C1, ; switch 67 in the kext) - PACK. 0 = today: every
      * deferred block is its own PACKET3(NOP). 1 = PACK: every block placed in one free run (the unit's own runs, or one
      * frame-pool run) goes inside ONE PACKET3(NOP) opened by that run's first block; later blocks are appended at their own
      * alignment inside it and the header's count is rewritten after every append (pad dwords written 0). Journal, undo,
@@ -1160,7 +1160,7 @@ enum {
  * 0x100 | the generated translator's code. *dropped: bit 0 LLC_NOALLOC dropped, bit 1 ITERATE_256 dropped.
  * build 0.0.488: exactly xlat12_table_img_desc_ex(in, out, dropped, 0) - never strips (the readset's inline use). */
 uint32_t xlat12_table_img_desc(const uint32_t in[8], uint32_t out[8], uint32_t *dropped);
-/* build 0.0.488 (notes/design/DCC-DESC.md Q2 option (A) and Q4; switch 60 in the kext) — XLAT12_EXTRA_DCC_STRIP,
+/* build 0.0.488 (an internal design note Q2 option (A) and Q4; switch 60 in the kext) — XLAT12_EXTRA_DCC_STRIP,
  * DEFAULT OFF; valid only together with XLAT12_EXTRA_TABLE_DESC (ERR_ARG otherwise: it acts only in the table step).
  * Nothing in the kext sets it unless `accel gfxneuter 60 | 1 << 8` (= 316) is ON.
  *
@@ -1186,7 +1186,7 @@ uint32_t xlat12_table_img_desc(const uint32_t in[8], uint32_t out[8], uint32_t *
  * XLAT12_TDESC_PROVENANCE naming its surface exactly as a tiled T# does. Counted in dcc_stripped / dcc_unproven /
  * dcc_refused. OFF, not one output dword, counter or return code changes: the strip is not reached. */
 #define XLAT12_EXTRA_DCC_STRIP 0x80000u
-/* build 0.0.500 (notes/design/DRAW-ELIDE.md Q4, ; switch 66 in the kext) — XLAT12_EXTRA_DRAW_ELIDE,
+/* build 0.0.500 (an internal design note Q4, ; switch 66 in the kext) — XLAT12_EXTRA_DRAW_ELIDE,
  * DEFAULT OFF; valid only together with XLAT12_EXTRA_TABLE_DESC and with `ex->draw_elide_rows` a non-empty subset of
  * XLAT12_DE_CLASS_UY | XLAT12_DE_CLASS_AO | XLAT12_DE_CLASS_GLASS (XLAT12_ERR_ARG otherwise; build 0.0.552: or of those
  * and ONE of XLAT12_DE_CLASS_AN / XLAT12_DE_CLASS_AN_SHADOW, below). Nothing in the kext sets it unless
@@ -1563,7 +1563,7 @@ uint32_t    xlat12_shader_id_max_ndw(void);
 uint32_t    xlat12_shader_id_over_cap(uint32_t cap, uint32_t i, const char **name, uint32_t *ndw);
 const char *xlat12_shader_id_name(int id);
 int         xlat12_shader_id_match(uint32_t stage, const uint32_t *code, uint32_t n);
-/* 0.0.434 (notes/design/PGMID-COPYGUARD.md Part 1): a BY-INDEX view of the private identity table
+/* 0.0.434 (an internal design note Part 1): a BY-INDEX view of the private identity table
  * (kXlat12ShaderIds, xlat12_shader_ids.h, included only by xlat12_ib.c), for a caller like gfx_pgmid.h's
  * n48_pgm_need to build its own (stage, head, ndw) row array without this module exposing the table's layout or
  * its private header. i < xlat12_shader_id_count() fills stage, ndw and head[0..3] from the SAME row
@@ -1620,7 +1620,7 @@ const char *xlat12_desc_class_name(uint32_t cls);
  * row is unconditional, exactly as before this item; `abi1 == 0` (no row) answers 0. P's own answer is unchanged
  * by the generalisation. */
 int         xlat12_table_abi_is_gated(uint32_t abi1);
-/* build 0.0.470 (notes/design/NO-SAMPLER-CLASS10.md section 3) — 1 iff `abi1` names a kDTableAbi row of one of the
+/* build 0.0.470 (an internal design note section 3) — 1 iff `abi1` names a kDTableAbi row of one of the
  * two shapes this build adds: NO SAMPLER (samp and samptbl both 0xff, no class-10 pointer) or CLASS 10 (a texture-INDEX
  * table pointer, textbl1 != 0). Derived from the row's own fields. The kext's gfxsrc_pgm_profile zeroes such a row's
  * ps_table_abi1 unless its switch 51 is ON (after switch 43's own gate: every such row is ALSO in the 43 list), so these

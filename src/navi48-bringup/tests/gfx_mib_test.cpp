@@ -1,4 +1,4 @@
-// gfx_mib_test.cpp — 0.0.421 (notes/design/MIB-COMMIT.md binding B10). THE MIB-0 CENSUS'S HOST PROOF.
+// gfx_mib_test.cpp — 0.0.421 (an internal design note binding B10). THE MIB-0 CENSUS'S HOST PROOF.
 //
 // The classifier is the only part of MIB-0 that can be wrong without a hardware run: it turns an IB body's first dwords
 // into HEAD / NOP-HEAD / MID / UNREAD, and's whole 50/27/29 boundary split depends on it. So this suite drives the
@@ -801,7 +801,7 @@ static void mib_source_pins(const char *path)
               strstr(src, segDecl) < strstr(src, segNote)) ? 1u : 0u, 1u);
     // 0.0.430: THE PHASE TIMERS ARE WIRED. One place enters the phase timing, one folds the phases and
     // counts the run, and both report lines are called from the gfxneuter report beside the census.
-    // 0.0.434 (notes/design/PGMID-COPYGUARD.md Part 1): re-baselined for gfxsrc_policy's edit that lets the
+    // 0.0.434 (an internal design note Part 1): re-baselined for gfxsrc_policy's edit that lets the
     // SAME timing also feed nib >= 2 passes into a second n48_mib_pol - `polSingle`'s literal on/off flag became
     // `polTarget`, a pointer at whichever accumulator (or neither) this pass belongs to, and the fold now writes
     // through that pointer rather than naming `gMibPol` directly, so it serves gMibPol2 identically.
@@ -1140,7 +1140,7 @@ static void mibseg_source_pins(const char *path)
     std::free(src);
 }
 
-// build 0.0.480 (notes/design/CONTINUATION-UNITS.md Q10/Q11): the continuation-unit checks, over decide44's real bytes
+// build 0.0.480 (an internal design note Q10/Q11): the continuation-unit checks, over decide44's real bytes
 // in the kext's order (segment, unit, translate, fence, provenance, gate). `N48_U480_PRINT=1` prints each measured value.
 #include "gfx_mib_units_checks.h"
 #include "gfx_mib_xib_checks.h"   // build 0.0.505 (CROSS-IB.md T1-T8)

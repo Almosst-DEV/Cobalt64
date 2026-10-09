@@ -8,7 +8,7 @@
 //  the same instead of hardcoding segment bases.
 //
 //  Freestanding like AtomBios: no IOKit, no allocation, reads from a caller
-//  buffer. Verified against firmware/Sapphire.RX9070XT.16384.241213.rom
+//  buffer. Verified against a board ROM image
 //  (binary v1.3 at 0x34900, IPDS version 3, 1 die, 46 IPs — GC v12.0.1,
 //  DMU/DCN v4.1.0, NBIF v6.3.1) and cross-checked with Linux
 //  drivers/gpu/drm/amd/include/discovery.h and amdgpu_discovery.c.

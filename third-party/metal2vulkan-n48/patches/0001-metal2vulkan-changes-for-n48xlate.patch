@@ -1,0 +1,1328 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index fa8aa2e..074fc15 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ## Unreleased
+ 
++### Added
++
++- `Validation::{External, Skip}` and `translate_sanitized_native_reflected_unvalidated`: the reflected
++  carrier with the external `spirv-val` gate skipped, for callers that cannot start a process. The two
++  structural rejects that follow the validator (`reject_function_constant_erased_effects`,
++  `reject_imageblock_only_effects`) still run. The command-line tool keeps `External`; its output is
++  byte-identical to the previous commit over a 1539-module corpus.
++- Workspace crate `n48xlate` (cdylib, LGPL-3.0-or-later): a C ABI (`n48x_abi_version`, `n48x_translate`,
++  `n48x_free`) that turns AIR text into SPIR-V plus the trimmed reflection, in process, for the Navi48
++  Metal bundle.
++- `n48xlate` ABI 2: `n48x_translate_linked` resolves an entry's direct visible-function references
++  (`.MTL_VISIBLE_FN_REF`) to the exact authored dependencies the caller passes (each sanitised like the
++  entry, only those the entry reaches transitively are used, a reference nobody authored is refused by
++  name) through `specialize_linked_module` before the unvalidated reflected translation. `n48x_translate`
++  is unchanged (an entry that names a visible function is still refused).
++
+ ### Fixed
+ 
+ - A texture argument the pipeline variant does not provide is no longer answered by the module's
+diff --git a/Cargo.toml b/Cargo.toml
+index 73d792c..4e98dc9 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,5 +1,5 @@
+ [workspace]
+-members = ["validation"]
++members = ["validation", "n48xlate"]
+ resolver = "2"
+ 
+ [package]
+diff --git a/src/lib.rs b/src/lib.rs
+index d1e1e51..c8f332d 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -54,6 +54,21 @@ use crate::spirv_module::{load_bytes as load_owned_module, Module};
+ use std::borrow::Cow;
+ use std::path::Path;
+ 
++/// How the single finished module is checked for Vulkan validity before it is returned.
++///
++/// `External` is the product behaviour: the module is passed to the `spirv-val` tool and its
++/// verdict is returned. `Skip` is for callers that cannot start a process (an in-process
++/// translator inside a sandboxed application) and that have established validity some other way
++/// (a byte-identical translation that was validated once, offline). The validator is a pure
++/// pass/fail gate and cannot select another representation, so skipping it returns exactly the
++/// bytes `External` would return for every module the validator accepts. The structural rejects
++/// that run after the validator are NOT part of the gate and run in both modes.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Validation {
++    External,
++    Skip,
++}
++
+ /// Detect the shader stage from the AIR's own `!air.vertex`/`!air.fragment`/`!air.kernel` metadata
+ /// (which SPIR-V emission later drops). This lets callers translate an AIR blob without separately
+ /// carrying its stage. Supplying the wrong stage can mis-map stage-interface roles, so prefer this
+@@ -487,6 +502,7 @@ pub fn translate_sanitized_native_specialized_reflected_with_options(
+         tmp,
+         options,
+         datalayout,
++        Validation::External,
+     )
+ }
+ 
+@@ -679,11 +695,40 @@ pub fn translate_reflected_with_options(
+         tmp,
+         options,
+         parsed_datalayout,
++        Validation::External,
+     )?;
+     reflection.datalayout = datalayout;
+     Ok((spv, reflection))
+ }
+ 
++/// [`translate_reflected_with_options`] for already-sanitized LLVM IR, with the external `spirv-val`
++/// gate skipped ([`Validation::Skip`]) and no file, process or `tmp` use on the way.
++///
++/// `datalayout` is the value `tools::sanitize_ll_text_with_datalayout` returned with `san_ll`.
++/// Everything else is the reflected carrier the command-line tool runs, including the two
++/// structural rejects that follow the validator (`reject_function_constant_erased_effects`,
++/// `reject_imageblock_only_effects`), so the returned module and reflection are exactly the ones
++/// the command-line tool writes for every module `spirv-val` accepts.
++pub fn translate_sanitized_native_reflected_unvalidated(
++    san_ll: &str,
++    stage: passes::Stage,
++    tmp: &Path,
++    options: passes::TransformOptions,
++    datalayout: Option<&str>,
++) -> Result<(Vec<u8>, reflect::ShaderReflection), String> {
++    let parsed_datalayout = datalayout.map(layout::AirDataLayout::parse).transpose()?;
++    let (spv, mut reflection) = translate_sanitized_native_reflected_with_layout(
++        san_ll,
++        stage,
++        tmp,
++        options,
++        parsed_datalayout,
++        Validation::Skip,
++    )?;
++    reflection.datalayout = datalayout.map(str::to_string);
++    Ok((spv, reflection))
++}
++
+ /// Reflect sanitized AIR without requiring its executable lowering to be supported yet.
+ ///
+ /// Authored dependency validation uses this for link-time resources such as function tables: their
+@@ -767,7 +812,14 @@ pub fn translate_sanitized_native_reflected(
+     options: passes::TransformOptions,
+ ) -> Result<(Vec<u8>, reflect::ShaderReflection), String> {
+     let datalayout = layout::AirDataLayout::from_ir(san_ll)?;
+-    translate_sanitized_native_reflected_with_layout(san_ll, stage, tmp, options, datalayout)
++    translate_sanitized_native_reflected_with_layout(
++        san_ll,
++        stage,
++        tmp,
++        options,
++        datalayout,
++        Validation::External,
++    )
+ }
+ 
+ fn translate_sanitized_native_reflected_with_layout(
+@@ -776,6 +828,7 @@ fn translate_sanitized_native_reflected_with_layout(
+     tmp: &Path,
+     options: passes::TransformOptions,
+     datalayout: Option<layout::AirDataLayout>,
++    validation: Validation,
+ ) -> Result<(Vec<u8>, reflect::ShaderReflection), String> {
+     let lowered = lower_air_text_if_enabled(san_ll);
+     let san_ll = lowered.as_ref();
+@@ -806,6 +859,7 @@ fn translate_sanitized_native_reflected_with_layout(
+         tmp,
+         options,
+         datalayout,
++        validation,
+     )?;
+     // The emitter decides whether the constructed pointer graph needs an address table; reflection
+     // no longer predicts that from the AIR text when a module is in hand to be read.
+@@ -1325,7 +1379,16 @@ fn translate_sanitized_with_meta(
+     // prevalidated core below.
+     passes::validate_kernel_dispatch_options(stage, options)?;
+     translate_sanitized_with_meta_prevalidated_carrier(
+-        san_ll, stage, frag, vert, kern, entry_name, tmp, options, datalayout,
++        san_ll,
++        stage,
++        frag,
++        vert,
++        kern,
++        entry_name,
++        tmp,
++        options,
++        datalayout,
++        Validation::External,
+     )
+     .map(|finished| finished.bytes)
+ }
+@@ -1343,6 +1406,7 @@ fn translate_sanitized_with_meta_prevalidated_carrier(
+     tmp: &Path,
+     options: passes::TransformOptions,
+     datalayout: Option<layout::AirDataLayout>,
++    validation: Validation,
+ ) -> Result<FinishedModule, String> {
+     let retry_debug_on = env_vars::retry_debug();
+     if retry_debug_on {
+@@ -1392,7 +1456,9 @@ fn translate_sanitized_with_meta_prevalidated_carrier(
+         if let Some(path) = env_vars::retry_dump() {
+             let _ = std::fs::write(path, &constructed.bytes);
+         }
+-        tools::spirv_val_bytes(&constructed.bytes, tmp)?;
++        if validation == Validation::External {
++            tools::spirv_val_bytes(&constructed.bytes, tmp)?;
++        }
+         reject_function_constant_erased_effects(san_ll, &constructed.module)?;
+         reject_imageblock_only_effects(san_ll, &constructed.module)?;
+         if retry_debug_on {
+diff --git a/src/native/emitter/body/calls.rs b/src/native/emitter/body/calls.rs
+index 24c87d6..80fb9b9 100644
+--- a/src/native/emitter/body/calls.rs
++++ b/src/native/emitter/body/calls.rs
+@@ -610,6 +610,7 @@ impl Emitter {
+                     ));
+                 }
+             }
++            self.refuse_undelivered_raw_cursor(&call.callee, &param_name, &param_ty, &arg)?;
+             ids.push(self.value_id_in(&arg.value, &arg.ty, instructions)?);
+         }
+         for value in &nullness_args {
+@@ -618,6 +619,45 @@ impl Emitter {
+         Ok(ids)
+     }
+ 
++    /// The last gate before a pointer argument is passed as its ordinary SSA value. A
++    /// descriptor-backed (`device`/`constant`) pointer that carries a non-zero constant or a dynamic
++    /// byte cursor has, as its ordinary value, only the bare buffer root or a placeholder: the cursor
++    /// lives in `raw_offsets`, which is emitter state. If the callee reads or writes through the
++    /// parameter, handing that value over addresses the wrong bytes without any diagnostic, so
++    /// refuse. The AIR-text retry inlines the recorded call site, which removes the boundary.
++    fn refuse_undelivered_raw_cursor(
++        &mut self,
++        callee: &str,
++        param_name: &str,
++        param_ty: &LlType,
++        arg: &TypedValue,
++    ) -> Result<(), String> {
++        let (LlValue::Local(arg_name), LlType::Ptr(param_addrspace @ (1 | 2))) =
++            (&arg.value, self.resolve_type(param_ty)?)
++        else {
++            return Ok(());
++        };
++        let Some(raw) = self.raw_offsets.get(arg_name) else {
++            return Ok(());
++        };
++        let carries_cursor = raw.const_off != 0 || !raw.dyn_terms.is_empty();
++        if !carries_cursor
++            || raw.unmodelable
++            || raw.device_addr_base.is_some()
++            || raw.addrspace != param_addrspace
++            || !self.ir.param_is_dereferenced(callee, param_name)
++        {
++            return Ok(());
++        }
++        self.cursor_call_sites
++            .insert((callee.to_string(), arg_name.clone()));
++        Err(format!(
++            "native emitter: helper @{callee} parameter {param_name} is passed a descriptor-backed \
++             pointer with a byte cursor that cannot cross the call; the callee would address the \
++             start of the buffer where Metal reaches the cursor"
++        ))
++    }
++
+     fn data_buffer_array_call_arg_id(
+         &mut self,
+         callee: &str,
+@@ -877,6 +917,20 @@ impl Emitter {
+                 ));
+             }
+         } else {
++            if raw.const_off != 0 && self.started_functions.contains(callee) {
++                // The callee body was already lowered with a zero cursor (it precedes this caller
++                // in emission order). Passing the bare root would silently drop the offset, so
++                // refuse; the AIR-text retry inlines exactly this call.
++                if let LlValue::Local(arg_name) = &arg.value {
++                    self.cursor_call_sites
++                        .insert((callee.to_string(), arg_name.clone()));
++                }
++                return Err(format!(
++                    "native emitter: helper @{callee} parameter {param_name} is passed a byte \
++                     cursor of {} but the helper was already emitted without it",
++                    raw.const_off
++                ));
++            }
+             let mut parameter_raw = raw;
+             parameter_raw.root = param_name.to_string();
+             self.raw_call_param_offsets.insert(key, parameter_raw);
+diff --git a/src/native/emitter/body/core_inst.rs b/src/native/emitter/body/core_inst.rs
+index 287fb69..1c3b824 100644
+--- a/src/native/emitter/body/core_inst.rs
++++ b/src/native/emitter/body/core_inst.rs
+@@ -529,6 +529,17 @@ impl Emitter {
+         Ok(true)
+     }
+ 
++    /// Whether `raw` is rooted at a helper parameter that `bind_inline_parameter` already rooted
++    /// at a descriptor (its `raw_offsets` entry names itself as the root). Such a root is a
++    /// forwarded descriptor cursor, not an arbitrary pointer.
++    fn raw_root_is_inline_param(&self, raw: &RawBufferOffset) -> bool {
++        self.direct_param_values.contains(&raw.root)
++            && self
++                .raw_offsets
++                .get(&raw.root)
++                .is_some_and(|root| root.root == raw.root)
++    }
++
+     fn bind_inline_parameter(
+         &mut self,
+         name: &str,
+@@ -579,6 +590,13 @@ impl Emitter {
+         // to that placeholder silently turns helper writes into Private writes.  Root the inline
+         // substitution at the descriptor instead and carry the cursor onto the parameter; the
+         // callee's existing raw load/store lowering then reapplies the offset structurally.
++        //
++        // The cursor must also survive a SECOND hop: a helper that merely stores the pointer into
++        // an aggregate and returns it (e.g. `_ci_sampler_builder`) leaves the pointer rooted at
++        // that helper's own inline parameter, and the next helper receives it by extracting the
++        // field. The callee parameter's own use is only visible there as a typed access, so
++        // `is_raw_buffer_param(name)` cannot see it; instead the argument being rooted at an
++        // already-inlined raw parameter (which itself stands for a descriptor) is the evidence.
+         let inline_raw = match (&argument.value, &resolved_ty) {
+             (LlValue::Local(source), LlType::Ptr(addrspace)) => self
+                 .raw_offsets
+@@ -586,7 +604,9 @@ impl Emitter {
+                 .cloned()
+                 .filter(|raw| {
+                     !raw.unmodelable
+-                        && ((self.is_raw_buffer_param(name) && matches!(raw.addrspace, 1 | 2))
++                        && (((self.is_raw_buffer_param(name)
++                            || self.raw_root_is_inline_param(raw))
++                            && matches!(raw.addrspace, 1 | 2))
+                             || (self.bda_device_pointers && raw.device_addr_base.is_some()))
+                 })
+                 .or_else(|| {
+@@ -700,9 +720,11 @@ impl Emitter {
+             if let Some(nullness) = nullness {
+                 self.record_pointer_nullness(name.to_string(), nullness);
+             }
+-            if let Some(mut raw) = inline_raw
+-                .filter(|raw| self.is_raw_buffer_param(name) || raw.device_addr_base.is_some())
+-            {
++            if let Some(mut raw) = inline_raw.filter(|raw| {
++                self.is_raw_buffer_param(name)
++                    || self.raw_root_is_inline_param(raw)
++                    || raw.device_addr_base.is_some()
++            }) {
+                 raw.root = name.to_string();
+                 self.raw_offsets.insert(name.to_string(), raw);
+                 if let Some(storage) = inline_raw_storage {
+diff --git a/src/native/emitter/body/vector_store.rs b/src/native/emitter/body/vector_store.rs
+index d3b343b..510ce9c 100644
+--- a/src/native/emitter/body/vector_store.rs
++++ b/src/native/emitter/body/vector_store.rs
+@@ -1178,7 +1178,28 @@ impl Emitter {
+                     if bitcast_width(&vector_ty).is_some()
+                         && bitcast_width(&vector_ty) == bitcast_width(result_ty)
+             );
+-        if !direct && !bitcast {
++        // Narrowing case: the result reads only the LOW bytes of the leading vector (e.g. a
++        // `<4 x half>` read at offset 0 of a `{ <4 x float>, ... }` union whose second arm is not in
++        // the type). Little-endian, so those bytes are the first `k` whole lanes: load the leading
++        // vector, keep lanes `0..k`, and bitcast them to the result. Only when the result covers a
++        // whole number of leading lanes and is strictly narrower; anything else stays refused.
++        let narrow_lanes = match (&vector_ty, result_ty) {
++            (LlType::Vector(elem, lanes), LlType::Vector(..)) if !direct && !bitcast => {
++                match (bitcast_width(elem), bitcast_width(result_ty)) {
++                    (Some(elem_bits), Some(result_bits))
++                        if bitcast_width(&vector_ty).is_some()
++                            && result_bits > 0
++                            && result_bits < elem_bits * *lanes
++                            && result_bits % elem_bits == 0 =>
++                    {
++                        Some((elem.as_ref().clone(), result_bits / elem_bits))
++                    }
++                    _ => None,
++                }
++            }
++            _ => None,
++        };
++        if !direct && !bitcast && narrow_lanes.is_none() {
+             return Ok(false);
+         }
+ 
+@@ -1211,6 +1232,42 @@ impl Emitter {
+                 Some(result),
+                 vec![Operand::IdRef(vector_ptr)],
+             ));
++        } else if let Some((elem_ty, keep)) = narrow_lanes {
++            let vector_type = self.type_id(&vector_ty)?;
++            let loaded = self.fresh();
++            instructions.push(Self::inst(
++                Op::Load,
++                Some(vector_type),
++                Some(loaded),
++                vec![Operand::IdRef(vector_ptr)],
++            ));
++            let low = self.fresh();
++            if keep == 1 {
++                let elem_type = self.type_id(&elem_ty)?;
++                instructions.push(Self::inst(
++                    Op::CompositeExtract,
++                    Some(elem_type),
++                    Some(low),
++                    vec![Operand::IdRef(loaded), Operand::LiteralBit32(0)],
++                ));
++            } else {
++                let low_ty = LlType::Vector(Box::new(elem_ty), keep);
++                let low_type = self.type_id(&low_ty)?;
++                let mut shuffle = vec![Operand::IdRef(loaded), Operand::IdRef(loaded)];
++                shuffle.extend((0..keep).map(Operand::LiteralBit32));
++                instructions.push(Self::inst(
++                    Op::VectorShuffle,
++                    Some(low_type),
++                    Some(low),
++                    shuffle,
++                ));
++            }
++            instructions.push(Self::inst(
++                Op::Bitcast,
++                Some(result_type),
++                Some(result),
++                vec![Operand::IdRef(low)],
++            ));
+         } else {
+             // Load the leading vector in its own type, then bitcast lane-for-lane to the result.
+             let vector_type = self.type_id(&vector_ty)?;
+diff --git a/src/native/emitter/functions.rs b/src/native/emitter/functions.rs
+index 6272be6..509fcb5 100644
+--- a/src/native/emitter/functions.rs
++++ b/src/native/emitter/functions.rs
+@@ -356,6 +356,7 @@ pub(in crate::native) fn opaque_resource_pointer_values_by_function(
+ 
+ impl Emitter {
+     pub(super) fn emit_function(&mut self, f: &LlFunction) -> Result<(), String> {
++        self.started_functions.insert(f.name.clone());
+         self.values.clear();
+         self.fast_float_products.clear();
+         self.fast_contract_adds.clear();
+diff --git a/src/native/emitter/memory/device_addr.rs b/src/native/emitter/memory/device_addr.rs
+index 3f32076..9101222 100644
+--- a/src/native/emitter/memory/device_addr.rs
++++ b/src/native/emitter/memory/device_addr.rs
+@@ -18,6 +18,23 @@ impl Emitter {
+             let ty = self.resolve_type(ty)?;
+             return self.emit_device_addr_load(result, &ty, raw, instructions);
+         }
++        self.emit_raw_value_load(result, ty, raw, 0, access_align, instructions)
++    }
++
++    /// Load a (possibly aggregate) value of `ty` from `raw` + `base_byte`: scalars through
++    /// `emit_raw_scalar_load`, vectors lane-wise, and arrays element-wise at the LLVM allocation
++    /// stride (`raw_type_size_align`: element size rounded up to the element alignment), each
++    /// element recursively, reassembled with `OpCompositeConstruct`. Structural: keyed only on the
++    /// loaded type (e.g. a by-value `[4 x <4 x float>]` kernel argument read from a constant buffer).
++    pub(in crate::native::emitter) fn emit_raw_value_load(
++        &mut self,
++        result: Word,
++        ty: &LlType,
++        raw: &RawBufferOffset,
++        base_byte: u64,
++        access_align: Option<u64>,
++        instructions: &mut Vec<Instruction>,
++    ) -> Result<(), String> {
+         match self.resolve_type(ty)? {
+             LlType::Vector(elem, lanes) => {
+                 let elem = self.resolve_type(&elem)?;
+@@ -29,7 +46,7 @@ impl Emitter {
+                         lane_id,
+                         &elem,
+                         raw,
+-                        lane as u64 * elem_size,
++                        base_byte + lane as u64 * elem_size,
+                         access_align,
+                         instructions,
+                     )?;
+@@ -43,9 +60,42 @@ impl Emitter {
+                     lane_ids.into_iter().map(Operand::IdRef).collect(),
+                 ));
+             }
+-            scalar => {
+-                self.emit_raw_scalar_load(result, &scalar, raw, 0, access_align, instructions)?
++            LlType::Array(elem, len) => {
++                if len == 0 {
++                    return Err("native emitter: raw load of a zero-length array".into());
++                }
++                let elem = self.resolve_type(&elem)?;
++                let (elem_size, elem_align) = self.raw_type_size_align(&elem)?;
++                let stride = elem_size.div_ceil(elem_align) * elem_align;
++                let mut element_ids = Vec::with_capacity(len as usize);
++                for index in 0..len {
++                    let element_id = self.fresh();
++                    self.emit_raw_value_load(
++                        element_id,
++                        &elem,
++                        raw,
++                        base_byte + u64::from(index) * stride,
++                        access_align,
++                        instructions,
++                    )?;
++                    element_ids.push(element_id);
++                }
++                let result_type = self.type_id(&LlType::Array(Box::new(elem), len))?;
++                instructions.push(Self::inst(
++                    Op::CompositeConstruct,
++                    Some(result_type),
++                    Some(result),
++                    element_ids.into_iter().map(Operand::IdRef).collect(),
++                ));
+             }
++            scalar => self.emit_raw_scalar_load(
++                result,
++                &scalar,
++                raw,
++                base_byte,
++                access_align,
++                instructions,
++            )?,
+         }
+         Ok(())
+     }
+diff --git a/src/native/emitter/mod.rs b/src/native/emitter/mod.rs
+index bb23406..e4db826 100644
+--- a/src/native/emitter/mod.rs
++++ b/src/native/emitter/mod.rs
+@@ -194,6 +194,9 @@ pub(super) struct Emitter {
+     /// `(callee, parameter)`. The emitted-helper inliner can then keep a non-zero caller GEP rooted
+     /// in the real StorageBuffer instead of the ordinary Private placeholder value.
+     raw_call_param_offsets: HashMap<(String, String), RawBufferOffset>,
++    /// Functions whose emission has started. A cursor recorded for a parameter of one of these is
++    /// too late: the callee body has already been lowered with a zero cursor.
++    started_functions: HashSet<String>,
+     /// `(callee, caller-local argument name)` for every helper call refused because its
+     /// descriptor-relative byte cursor cannot cross the call. See `EmissionFailure`.
+     cursor_call_sites: HashSet<(String, String)>,
+@@ -543,6 +546,11 @@ impl Emitter {
+         ir.fold_static_initializer_constants();
+         ir.prune_unreachable_function_bodies();
+         ir.inline_ordinary_leaf_helpers();
++        // Inlining a single-block helper exposes pointer flows that were hidden behind its call
++        // (a pointer packed into a returned aggregate and extracted by the caller). The parse-time
++        // call-edge propagation could not see them, so a helper that still receives such a pointer
++        // would not be known to need the raw byte model and would be handed the bare buffer root.
++        ir.propagate_raw_buffer_params();
+         let opaque_resource_pointer_values =
+             functions::opaque_resource_pointer_values_by_function(&ir);
+         let air_data_layout = ir.air_data_layout.clone();
+@@ -632,6 +640,7 @@ impl Emitter {
+             inline_parameter_substitutions: Vec::new(),
+             raw_buffer_params: HashSet::new(),
+             raw_call_param_offsets: HashMap::new(),
++            started_functions: HashSet::new(),
+             cursor_call_sites: HashSet::new(),
+             agreeing_constant_call_cursors: None,
+             data_buffer_params: HashSet::new(),
+@@ -2838,6 +2847,7 @@ impl Emitter {
+         // Consume the analysis copy one function at a time. Keeping the complete cloned AIR module
+         // alive while the equally large SPIR-V module grows made peak memory proportional to both
+         // representations; each source body can be released immediately after its own emission.
++        let functions = self.callers_before_raw_callees(functions);
+         for f in functions {
+             attempt!(self.emit_function(&f));
+         }
+@@ -2885,6 +2895,92 @@ impl Emitter {
+         Ok(self)
+     }
+ 
++    /// Order function emission so a caller is emitted before any helper it hands a raw-buffer
++    /// pointer to.
++    ///
++    /// A descriptor-relative byte cursor travels to a helper parameter through
++    /// `raw_call_param_offsets`, which is filled while the CALLER's call is lowered and read while
++    /// the CALLEE's parameters are bound. A helper that precedes its caller in module order would
++    /// otherwise be lowered with a zero cursor, silently reading the start of the buffer.
++    ///
++    /// Only calls that can carry a cursor create an ordering constraint: a raw callee parameter
++    /// that receives a local pointer other than an entry function's own (offset-free) parameter.
++    /// The sort is stable with module order as priority, so a module whose order already satisfies
++    /// every constraint is emitted in exactly its original order. A call cycle falls back to the
++    /// original order (recursion is not supported by the target anyway).
++    fn callers_before_raw_callees(&self, functions: Vec<LlFunction>) -> Vec<LlFunction> {
++        let index_of: HashMap<&str, usize> = functions
++            .iter()
++            .enumerate()
++            .map(|(index, function)| (function.name.as_str(), index))
++            .collect();
++        let mut successors: Vec<HashSet<usize>> = vec![HashSet::new(); functions.len()];
++        for (caller_index, caller) in functions.iter().enumerate() {
++            let caller_is_entry = self.ir.entry_functions.contains(&caller.name);
++            for inst in caller.carrier_insts() {
++                let Some(call) = inst.alias_call() else {
++                    continue;
++                };
++                let Some(&callee_index) = index_of.get(call.callee.as_str()) else {
++                    continue;
++                };
++                if callee_index == caller_index {
++                    continue;
++                }
++                let callee = &functions[callee_index];
++                let carries_cursor =
++                    call.args
++                        .iter()
++                        .zip(&callee.params)
++                        .any(|(argument, (parameter, _))| {
++                            let LlValue::Local(name) = &argument.value else {
++                                return false;
++                            };
++                            matches!(argument.ty, LlType::Ptr(1 | 2))
++                                && self
++                                    .ir
++                                    .raw_buffer_params
++                                    .contains(&(callee.name.clone(), parameter.clone()))
++                                && !(caller_is_entry
++                                    && caller.params.iter().any(|(param, _)| param == name))
++                        });
++                if carries_cursor {
++                    successors[caller_index].insert(callee_index);
++                }
++            }
++        }
++        let mut indegree = vec![0usize; functions.len()];
++        for targets in &successors {
++            for &target in targets {
++                indegree[target] += 1;
++            }
++        }
++        let mut ready: std::collections::BTreeSet<usize> = indegree
++            .iter()
++            .enumerate()
++            .filter(|(_, degree)| **degree == 0)
++            .map(|(index, _)| index)
++            .collect();
++        let mut order = Vec::with_capacity(functions.len());
++        while let Some(next) = ready.pop_first() {
++            order.push(next);
++            for &target in &successors[next] {
++                indegree[target] -= 1;
++                if indegree[target] == 0 {
++                    ready.insert(target);
++                }
++            }
++        }
++        if order.len() != functions.len() || order.iter().enumerate().all(|(i, &o)| i == o) {
++            return functions;
++        }
++        let mut slots: Vec<Option<LlFunction>> = functions.into_iter().map(Some).collect();
++        order
++            .into_iter()
++            .map(|index| slots[index].take().expect("each function is placed once"))
++            .collect()
++    }
++
+     fn rewrite_scalar_pointer_arithmetic_access_chains(&mut self) {
+         let mut pointer_storage = HashMap::new();
+         let aggregate_types = self
+diff --git a/src/native/emitter/types.rs b/src/native/emitter/types.rs
+index e36cc30..903d20e 100644
+--- a/src/native/emitter/types.rs
++++ b/src/native/emitter/types.rs
+@@ -572,6 +572,11 @@ impl Emitter {
+             },
+             LlValue::Float32Bits(bits) => match self.resolve_type(ty)? {
+                 LlType::Float => self.const_float32_bits(*bits),
++                // The parser maps type-agnostic `+qnan`/`+inf`/`0x...` spellings to f32 bits; in
++                // half-precision code they mean the same IEEE value in binary16.
++                LlType::Half => {
++                    self.const_float16_bits(f32_to_f16_bits(f32::from_bits(*bits)))
++                }
+                 other => Err(format!(
+                     "native emitter: float32 bit literal f0x{bits:08x} used as non-float type {other:?}"
+                 )),
+diff --git a/src/native/ir/mod.rs b/src/native/ir/mod.rs
+index 407e0a5..bb393da 100644
+--- a/src/native/ir/mod.rs
++++ b/src/native/ir/mod.rs
+@@ -289,6 +289,17 @@ fn pointer_param_alias_roots(f: &LlFunction) -> HashMap<String, String> {
+         .filter(|&(_name, ty)| matches!(ty, LlType::Ptr(_)))
+         .map(|(name, _ty)| (name.clone(), name.clone()))
+         .collect();
++    // Pointers stored into an aggregate by `insertvalue` and read back by `extractvalue` are still
++    // the same address (a helper that packs a pointer into a struct and returns it, once inlined,
++    // leaves exactly this chain in its caller). Track, per aggregate local, which constant index
++    // paths currently hold a pointer with a known parameter root.
++    let mut aggregate_fields: HashMap<String, Vec<(Vec<u32>, String)>> = HashMap::new();
++    let operand_local = |inst: &crate::native::tir::TirInst, index: usize| -> Option<String> {
++        match inst.operands.get(index)? {
++            crate::native::tir::TirOperand::Value { name, .. } => Some(name.clone()),
++            _ => None,
++        }
++    };
+     let mut changed = true;
+     while changed {
+         changed = false;
+@@ -305,6 +316,55 @@ fn pointer_param_alias_roots(f: &LlFunction) -> HashMap<String, String> {
+             let Some(res) = &inst.result else {
+                 continue;
+             };
++            if inst.opcode == "metal2vulkan.inline_parameter" {
++                // An inlined helper's parameter proxy IS its argument.
++                if let Some(root) = operand_local(inst, 0).and_then(|v| roots.get(&v).cloned()) {
++                    if roots.insert(res.clone(), root).is_none() {
++                        changed = true;
++                    }
++                }
++                continue;
++            }
++            if inst.opcode == "insertvalue" {
++                if let Some(indices) = inst.aggregate_indices().clone() {
++                    let mut fields = operand_local(inst, 0)
++                        .and_then(|base| aggregate_fields.get(&base).cloned())
++                        .unwrap_or_default();
++                    // Overwriting a path replaces it and everything nested under it (and a write
++                    // to a sub-path of a tracked pointer field can no longer be that pointer).
++                    fields.retain(|(path, _)| {
++                        !(path.starts_with(&indices) || indices.starts_with(path))
++                    });
++                    if let Some(root) = operand_local(inst, 1).and_then(|v| roots.get(&v).cloned())
++                    {
++                        fields.push((indices, root));
++                    }
++                    fields.sort();
++                    if !fields.is_empty() && aggregate_fields.get(res) != Some(&fields) {
++                        aggregate_fields.insert(res.clone(), fields);
++                        changed = true;
++                    }
++                }
++                continue;
++            }
++            if inst.opcode == "extractvalue" {
++                if let Some(indices) = inst.aggregate_indices() {
++                    let root = operand_local(inst, 0)
++                        .and_then(|agg| aggregate_fields.get(&agg))
++                        .and_then(|fields| {
++                            fields
++                                .iter()
++                                .find(|(path, _)| path == indices)
++                                .map(|(_, root)| root.clone())
++                        });
++                    if let Some(root) = root {
++                        if roots.insert(res.clone(), root).is_none() {
++                            changed = true;
++                        }
++                    }
++                }
++                continue;
++            }
+             if let Some(gep) = &inst.gep() {
+                 let LlValue::Local(base) = &gep.base.value else {
+                     continue;
+diff --git a/src/native/tests/buffers.rs b/src/native/tests/buffers.rs
+index 03022b4..9a064b5 100644
+--- a/src/native/tests/buffers.rs
++++ b/src/native/tests/buffers.rs
+@@ -13970,3 +13970,425 @@ no:
+         "no store may land in Private scratch when the placeholder is never dereferenced"
+     );
+ }
++
++// A `<4 x half>` read at offset 0 of a struct whose leading member is `<4 x float>` (the Apple
++// uniform union whose second arm is not in the type) reads the LOW eight bytes: lanes 0..2 of the
++// float vector, bitcast. Previously refused as "non-bitcastable pointee Struct".
++#[test]
++fn a_narrower_vector_load_reads_the_low_lanes_of_the_leading_vector() {
++    let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++%struct.Wide = type { <4 x float>, [16 x i8] }
++
++define void @low_half4(<4 x float> %f) {
++entry:
++  %s = alloca %struct.Wide, align 16
++  %fp = getelementptr inbounds %struct.Wide, ptr %s, i64 0, i32 0
++  store <4 x float> %f, ptr %fp, align 16
++  %h = load <4 x half>, ptr %s, align 16
++  %e = extractelement <4 x half> %h, i32 3
++  ret void
++}
++"#;
++    let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
++    assert!(asm.contains("OpVectorShuffle"), "{asm}");
++    assert!(asm.contains("OpBitcast"), "{asm}");
++    assert!(!asm.contains("non-bitcastable pointee"), "{asm}");
++}
++
++// A by-value `[N x <4 x float>]` read from a byte-typed constant buffer (the Core Image
++// `transform.coerce` shape): the raw load walks the array at the LLVM allocation stride (a
++// `<3 x float>` element is 16 bytes), loading every lane from its own byte offset. Previously
++// refused as "raw scalar load of Array(Vector(Float, 4), 4) is not covered yet".
++#[test]
++fn a_raw_aggregate_array_of_vectors_load_is_built_element_wise() {
++    let ll = r#"
++source_filename = "case.metal"
++
++define void @k(ptr addrspace(2) readonly %cb, ptr addrspace(1) %out) {
++entry:
++  %p = getelementptr i8, ptr addrspace(2) %cb, i64 16
++  %m = load [4 x <4 x float>], ptr addrspace(2) %p, align 16
++  %p3 = getelementptr i8, ptr addrspace(2) %cb, i64 112
++  %n = load [3 x <3 x float>], ptr addrspace(2) %p3, align 16
++  %last = extractvalue [4 x <4 x float>] %m, 3
++  %col2 = extractvalue [3 x <3 x float>] %n, 2
++  %s = extractelement <3 x float> %col2, i32 0
++  %v = insertelement <4 x float> %last, float %s, i32 0
++  store <4 x float> %v, ptr addrspace(1) %out, align 16
++  ret void
++}
++
++!air.kernel = !{!0}
++!0 = !{ptr @k, !1, !2}
++!1 = !{}
++!2 = !{!3, !4}
++!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"cb"}
++!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
++"#;
++    let tmp = std::env::temp_dir().join(format!(
++        "metal2vulkan_native_raw_array_of_vectors_{}",
++        std::process::id()
++    ));
++    let _ = std::fs::create_dir_all(&tmp);
++    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
++    let asm = disassemble(&spv).expect("disassemble");
++    // 4 + 3 elements, each rebuilt with one OpCompositeConstruct per vector (lanes) and per array.
++    assert!(
++        asm.matches("OpCompositeConstruct").count() >= 7 + 2,
++        "{asm}"
++    );
++    if std::process::Command::new("spirv-val")
++        .arg("--version")
++        .output()
++        .is_ok()
++    {
++        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
++    }
++    let _ = std::fs::remove_dir_all(&tmp);
++}
++
++/// A helper that only stores a byte-offset raw buffer pointer into an aggregate and returns it
++/// (the Core Image `_ci_sampler_builder` shape), whose consumer extracts the field and reads
++/// through typed GEPs, must keep the pointer's byte cursor across both inline hops. The entry's own
++/// raw reads (bytes 16 and 144) are what make the consumer's typed parameter use look non-raw.
++fn raw_pointer_through_aggregate_helper_ll(byte_offset: u32) -> String {
++    format!(
++        r#"
++target triple = "spirv-unknown-vulkan1.2"
++%tex = type {{ ptr addrspace(1) }}
++%smp = type {{ ptr addrspace(2) }}
++%S = type {{ %tex, %smp, ptr addrspace(2), <2 x float> }}
++%mat = type {{ [2 x <4 x float>] }}
++define void @k(ptr addrspace(2) %buffer0, ptr addrspace(1) %out) {{
++entry:
++  %o16 = getelementptr inbounds i8, ptr addrspace(2) %buffer0, i64 16
++  %l16 = load <4 x float>, ptr addrspace(2) %o16, align 16
++  %o144 = getelementptr i8, ptr addrspace(2) %buffer0, i64 144
++  %l144 = load float, ptr addrspace(2) %o144, align 4
++  %cursor = getelementptr i8, ptr addrspace(2) %buffer0, i64 {byte_offset}
++  %alias = bitcast ptr addrspace(2) %cursor to ptr addrspace(2)
++  %built = call fastcc %S @build(ptr addrspace(1) %out, ptr addrspace(2) %buffer0, ptr addrspace(2) %alias, <2 x float> zeroinitializer)
++  %f0 = extractvalue %S %built, 0
++  %f1 = extractvalue %S %built, 1
++  %f2 = extractvalue %S %built, 2
++  %f3 = extractvalue %S %built, 3
++  %v = call fastcc <4 x float> @consume(%tex %f0, %smp %f1, ptr addrspace(2) %f2, <2 x float> %f3)
++  %first0 = extractelement <4 x float> %v, i64 0
++  %e = extractelement <4 x float> %l16, i64 1
++  %fs = fadd float %first0, %e
++  %first = fadd float %fs, %l144
++  store float %first, ptr addrspace(1) %out, align 4
++  ret void
++}}
++define internal fastcc %S @build(ptr addrspace(1) %a, ptr addrspace(2) %b, ptr addrspace(2) %p, <2 x float> %c) {{
++entry:
++  %i0 = insertvalue %S poison, ptr addrspace(1) %a, 0, 0
++  %i1 = insertvalue %S %i0, ptr addrspace(2) %b, 1, 0
++  %i2 = insertvalue %S %i1, ptr addrspace(2) %p, 2
++  %i3 = insertvalue %S %i2, <2 x float> %c, 3
++  ret %S %i3
++}}
++define internal fastcc <4 x float> @consume(%tex %t, %smp %s, ptr addrspace(2) %p, <2 x float> %c) {{
++entry:
++  %c0 = getelementptr inbounds %mat, ptr addrspace(2) %p, i64 0, i32 0, i64 0
++  %v0 = load <4 x float>, ptr addrspace(2) %c0, align 16
++  %c1 = getelementptr inbounds %mat, ptr addrspace(2) %p, i64 0, i32 0, i64 1
++  %v1 = load <4 x float>, ptr addrspace(2) %c1, align 16
++  %v = fadd <4 x float> %v0, %v1
++  ret <4 x float> %v
++}}
++!air.kernel = !{{!0}}
++!0 = !{{ptr @k, !1, !2}}
++!1 = !{{}}
++!2 = !{{!3, !4}}
++!3 = !{{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"buffer0"}}
++!4 = !{{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}}
++"#
++    )
++}
++
++fn raw_pointer_through_aggregate_helper_words(byte_offset: u32) -> Vec<String> {
++    let ll = raw_pointer_through_aggregate_helper_ll(byte_offset);
++    let tmp = std::env::temp_dir().join(format!(
++        "metal2vulkan_raw_ptr_aggregate_helper_{}_{byte_offset}",
++        std::process::id()
++    ));
++    let _ = std::fs::create_dir_all(&tmp);
++    let spv = crate::translate_sanitized_native(&ll, Stage::Kernel, &tmp).expect("translate");
++    let asm = disassemble(&spv).expect("disassemble");
++    assert!(!asm.contains(" Private"), "{asm}");
++    if std::process::Command::new("spirv-val")
++        .arg("--version")
++        .output()
++        .is_ok()
++    {
++        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
++    }
++    let _ = std::fs::remove_dir_all(&tmp);
++    // Each constant word index of every `uint` storage-buffer access chain, in program order.
++    let words = |line: &str| {
++        line.split_whitespace()
++            .map(str::to_string)
++            .collect::<Vec<_>>()
++    };
++    let uint_ty = asm
++        .lines()
++        .map(words)
++        .find(|w| {
++            w.get(2).is_some_and(|op| op == "OpTypeInt")
++                && w.get(3..) == Some(&["32".into(), "0".into()][..])
++        })
++        .map(|w| w[0].clone())
++        .expect("uint type");
++    let uint_ptrs = asm
++        .lines()
++        .map(words)
++        .filter(|w| {
++            w.get(2).is_some_and(|op| op == "OpTypePointer")
++                && w.get(3).is_some_and(|sc| sc == "StorageBuffer")
++                && w.get(4) == Some(&uint_ty)
++        })
++        .map(|w| w[0].clone())
++        .collect::<Vec<_>>();
++    let constants = asm
++        .lines()
++        .map(words)
++        .filter(|w| w.get(2).is_some_and(|op| op == "OpConstant") && w.get(3) == Some(&uint_ty))
++        .map(|w| (w[0].clone(), w[4].clone()))
++        .collect::<HashMap<_, _>>();
++    asm.lines()
++        .map(words)
++        .filter(|w| {
++            w.get(2).is_some_and(|op| op.ends_with("AccessChain")) && uint_ptrs.contains(&w[3])
++        })
++        .filter_map(|w| constants.get(w.last()?).cloned())
++        .collect()
++}
++
++#[test]
++fn native_raw_pointer_offset_survives_aggregate_helper_round_trip() {
++    // 80 bytes = word 20: the two float4 columns read through the typed `%mat` GEPs are
++    // words 20..=23 and 24..=27 (after the entry's own reads of words 4..=7 and 36).
++    assert_eq!(
++        raw_pointer_through_aggregate_helper_words(80),
++        ["4", "5", "6", "7", "36", "20", "21", "22", "23", "24", "25", "26", "27"]
++    );
++    // A different non-zero cursor must move the reads with it (not a fixed 80).
++    assert_eq!(
++        raw_pointer_through_aggregate_helper_words(208),
++        ["4", "5", "6", "7", "36", "52", "53", "54", "55", "56", "57", "58", "59"]
++    );
++}
++
++/// How the call site in [`raw_call_offset_ll`] derives the byte cursor it hands to the helper.
++#[derive(Clone, Copy)]
++enum RawCallCursor {
++    /// `getelementptr i8, %buffer0, N` (N constant).
++    Const(u32),
++    /// `getelementptr i8, %buffer0, %w` with `%w` loaded from the buffer at run time.
++    Dynamic,
++}
++
++/// A kernel that hands a byte-offset constant-space pointer to a multi-block (LOOP) helper which
++/// reads the second column of a typed `%mat` through it. `helper_first` places the helper BEFORE the
++/// kernel in module order (the Core Image shape); `via_builder` routes the pointer through a
++/// single-block aggregate builder first, instead of passing it directly.
++fn raw_call_offset_ll(cursor: RawCallCursor, helper_first: bool, via_builder: bool) -> String {
++    let cursor_def = match cursor {
++        RawCallCursor::Const(n) => format!("  %cursor = getelementptr i8, ptr addrspace(2) %buffer0, i64 {n}"),
++        RawCallCursor::Dynamic => "  %w = load i32, ptr addrspace(2) %o148, align 4\n  %wi = zext i32 %w to i64\n  %cursor = getelementptr i8, ptr addrspace(2) %buffer0, i64 %wi".to_string(),
++    };
++    let call = if via_builder {
++        r#"  %built = call fastcc %S @build(ptr addrspace(1) %out, ptr addrspace(2) %buffer0, ptr addrspace(2) %alias, <2 x float> zeroinitializer)
++  %f0 = extractvalue %S %built, 0
++  %f1 = extractvalue %S %built, 1
++  %f2 = extractvalue %S %built, 2
++  %f3 = extractvalue %S %built, 3
++  %v = call fastcc <4 x float> @consume(%tex %f0, %smp %f1, ptr addrspace(2) %f2, <2 x float> %f3)"#
++    } else {
++        "  %v = call fastcc <4 x float> @consume(%tex zeroinitializer, %smp zeroinitializer, ptr addrspace(2) %alias, <2 x float> zeroinitializer)"
++    };
++    let kernel = format!(
++        r#"define void @k(ptr addrspace(2) %buffer0, ptr addrspace(1) %out) {{
++entry:
++  %o144 = getelementptr i8, ptr addrspace(2) %buffer0, i64 144
++  %l144 = load float, ptr addrspace(2) %o144, align 4
++  %o148 = getelementptr i8, ptr addrspace(2) %buffer0, i64 148
++{cursor_def}
++  %alias = bitcast ptr addrspace(2) %cursor to ptr addrspace(2)
++{call}
++  %first0 = extractelement <4 x float> %v, i64 0
++  %first = fadd float %first0, %l144
++  store float %first, ptr addrspace(1) %out, align 4
++  ret void
++}}
++"#
++    );
++    let helpers = r#"define internal fastcc %S @build(ptr addrspace(1) %a, ptr addrspace(2) %b, ptr addrspace(2) %p, <2 x float> %c) {
++entry:
++  %i0 = insertvalue %S poison, ptr addrspace(1) %a, 0, 0
++  %i1 = insertvalue %S %i0, ptr addrspace(2) %b, 1, 0
++  %i2 = insertvalue %S %i1, ptr addrspace(2) %p, 2
++  %i3 = insertvalue %S %i2, <2 x float> %c, 3
++  ret %S %i3
++}
++define internal fastcc <4 x float> @consume(%tex %t, %smp %s, ptr addrspace(2) %p, <2 x float> %c) {
++entry:
++  br label %loop
++loop:
++  %i = phi i32 [ 0, %entry ], [ %n, %loop ]
++  %acc = phi <4 x float> [ zeroinitializer, %entry ], [ %v, %loop ]
++  %c1 = getelementptr inbounds %mat, ptr addrspace(2) %p, i64 0, i32 0, i64 1
++  %v1 = load <4 x float>, ptr addrspace(2) %c1, align 16
++  %v = fadd <4 x float> %acc, %v1
++  %n = add i32 %i, 1
++  %done = icmp eq i32 %n, 4
++  br i1 %done, label %exit, label %loop
++exit:
++  ret <4 x float> %v
++}
++"#;
++    let (first, second) = if helper_first {
++        (helpers.to_string(), kernel)
++    } else {
++        (kernel, helpers.to_string())
++    };
++    format!(
++        r#"
++target triple = "spirv-unknown-vulkan1.2"
++%tex = type {{ ptr addrspace(1) }}
++%smp = type {{ ptr addrspace(2) }}
++%S = type {{ %tex, %smp, ptr addrspace(2), <2 x float> }}
++%mat = type {{ [2 x <4 x float>] }}
++{first}
++{second}
++!air.kernel = !{{!0}}
++!0 = !{{ptr @k, !1, !2}}
++!1 = !{{}}
++!2 = !{{!3, !4}}
++!3 = !{{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"buffer0"}}
++!4 = !{{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}}
++"#
++    )
++}
++
++/// Translate `ll` and return every constant word index of every `uint` storage-buffer access
++/// chain in program order, or the translation error.
++fn raw_call_offset_words(ll: &str, tag: &str) -> Result<Vec<String>, String> {
++    let tmp = std::env::temp_dir().join(format!(
++        "metal2vulkan_raw_call_offset_{}_{tag}",
++        std::process::id()
++    ));
++    let _ = std::fs::create_dir_all(&tmp);
++    let result = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp);
++    let _ = std::fs::remove_dir_all(&tmp);
++    let spv = result.map_err(|e| format!("{e}"))?;
++    let asm = disassemble(&spv).expect("disassemble");
++    assert!(!asm.contains(" Private"), "{asm}");
++    let words = |line: &str| {
++        line.split_whitespace()
++            .map(str::to_string)
++            .collect::<Vec<_>>()
++    };
++    let uint_ty = asm
++        .lines()
++        .map(words)
++        .find(|w| {
++            w.get(2).is_some_and(|op| op == "OpTypeInt")
++                && w.get(3..) == Some(&["32".into(), "0".into()][..])
++        })
++        .map(|w| w[0].clone())
++        .expect("uint type");
++    let uint_ptrs = asm
++        .lines()
++        .map(words)
++        .filter(|w| {
++            w.get(2).is_some_and(|op| op == "OpTypePointer")
++                && w.get(3).is_some_and(|sc| sc == "StorageBuffer")
++                && w.get(4) == Some(&uint_ty)
++        })
++        .map(|w| w[0].clone())
++        .collect::<Vec<_>>();
++    let constants = asm
++        .lines()
++        .map(words)
++        .filter(|w| w.get(2).is_some_and(|op| op == "OpConstant") && w.get(3) == Some(&uint_ty))
++        .map(|w| (w[0].clone(), w[4].clone()))
++        .collect::<HashMap<_, _>>();
++    Ok(asm
++        .lines()
++        .map(words)
++        .filter(|w| {
++            w.get(2).is_some_and(|op| op.ends_with("AccessChain")) && uint_ptrs.contains(&w[3])
++        })
++        .filter_map(|w| constants.get(w.last()?).cloned())
++        .collect())
++}
++
++fn expect_raw_call_offset_words(cursor_bytes: u32, helper_first: bool, via_builder: bool) {
++    let ll = raw_call_offset_ll(
++        RawCallCursor::Const(cursor_bytes),
++        helper_first,
++        via_builder,
++    );
++    let tag = format!("c{cursor_bytes}_{helper_first}_{via_builder}");
++    let first_col = cursor_bytes / 4 + 4;
++    let want = ["36"]
++        .into_iter()
++        .map(str::to_string)
++        .chain((first_col..first_col + 4).map(|w| w.to_string()))
++        .collect::<Vec<_>>();
++    match raw_call_offset_words(&ll, &tag) {
++        Ok(words) => assert_eq!(
++            words, want,
++            "cursor {cursor_bytes} helper_first {helper_first} builder {via_builder}"
++        ),
++        Err(e) => {
++            panic!("cursor {cursor_bytes} helper_first {helper_first} builder {via_builder}: {e}")
++        }
++    }
++}
++
++#[test]
++fn native_raw_call_offset_reaches_loop_helper_defined_before_kernel() {
++    // 112 bytes + the second column (16 bytes) = words 32..=35; the helper's own typed offset 16
++    // must never collapse to the bare buffer's words 4..=7.
++    expect_raw_call_offset_words(112, true, true);
++}
++
++#[test]
++fn native_raw_call_offset_reaches_loop_helper_defined_after_kernel() {
++    expect_raw_call_offset_words(112, false, true);
++}
++
++#[test]
++fn native_raw_call_offset_reaches_loop_helper_passed_directly() {
++    expect_raw_call_offset_words(112, true, false);
++    expect_raw_call_offset_words(112, false, false);
++}
++
++#[test]
++fn native_raw_call_offset_80_reaches_loop_helper() {
++    expect_raw_call_offset_words(80, true, true);
++    expect_raw_call_offset_words(80, true, false);
++}
++
++#[test]
++fn native_raw_call_offset_is_delivered_or_refused_never_dropped() {
++    // A dynamic cursor, or any cursor the callee cannot receive, must either reach the helper's
++    // reads (a run-time-dependent access chain, never constant words 4..=7 of the bare buffer) or
++    // fail translation. It must never silently address the bare root.
++    for helper_first in [true, false] {
++        for via_builder in [true, false] {
++            let ll = raw_call_offset_ll(RawCallCursor::Dynamic, helper_first, via_builder);
++            let tag = format!("dyn_{helper_first}_{via_builder}");
++            if let Ok(words) = raw_call_offset_words(&ll, &tag) {
++                assert!(
++                    !["4", "5", "6", "7"].iter().all(|w| words.iter().any(|x| x == w)),
++                    "dynamic cursor dropped (helper_first {helper_first}, builder {via_builder}): {words:?}"
++                );
++            }
++        }
++    }
++}
+diff --git a/src/native/tests/types.rs b/src/native/tests/types.rs
+index 6392360..02179d8 100644
+--- a/src/native/tests/types.rs
++++ b/src/native/tests/types.rs
+@@ -3198,3 +3198,26 @@ define void @tp(ptr addrspace(1) readonly captures(none) %0, ptr addrspace(1) ca
+         crate::translate_sanitized_native(&opaque, Stage::Kernel, &tmp).expect("opaque pointers");
+     assert_eq!(from_typed, from_opaque);
+ }
++
++// `+qnan`/`+inf`/`-inf` are type-agnostic spellings the parser stores as f32 bits; used as
++// `half` operands they must become the binary16 NaN/Inf, not be rejected.
++#[test]
++fn f32_bit_special_literals_in_half_code_become_binary16() {
++    let ll = r#"
++target triple = "spirv-unknown-vulkan1.2"
++
++define half @half_specials(half %x) {
++entry:
++  %a = fadd half %x, +qnan
++  %b = fadd half %a, +inf
++  %c = fadd half %b, -inf
++  ret half %c
++}
++"#;
++    let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
++    // binary16 0x7e00 / 0x7c00 / 0xfc00; the disassembler prints them as NaN / inf / -inf.
++    assert!(asm.contains("  NaN\n"), "{asm}");
++    assert!(asm.contains("  inf\n"), "{asm}");
++    assert!(asm.contains("  -inf\n"), "{asm}");
++    assert!(!asm.contains("used as non-float type"), "{asm}");
++}
+diff --git a/src/passes/resources/collapse.rs b/src/passes/resources/collapse.rs
+index 28291b6..18b9cf0 100644
+--- a/src/passes/resources/collapse.rs
++++ b/src/passes/resources/collapse.rs
+@@ -1405,7 +1405,20 @@ pub(in crate::passes) fn collapse_resource_wrappers(
+                     if resource_values.contains(object) {
+                         direct_resource_inserts.push((result, *base, *object));
+                     }
+-                    let mut result_paths = paths.get(base).cloned().unwrap_or_default();
++                    // Start from the entry the emitter's sidecar facts already seeded for this
++                    // result (it records every resource pointer the aggregate carries), then
++                    // layer the base's and the inserted object's paths on top. Rebuilding from
++                    // the base alone would overwrite the seeded entry and lose resources the
++                    // base chain does not carry (e.g. a texture at [0,0] when the sampler is
++                    // inserted at [1,0]).
++                    let mut result_paths = paths.get(&result).cloned().unwrap_or_default();
++                    if let Some(base_paths) = paths.get(base) {
++                        for (existing, resource) in base_paths {
++                            if path_suffix(existing, &path).is_none() {
++                                result_paths.entry(existing.clone()).or_insert(*resource);
++                            }
++                        }
++                    }
+                     insert_resource_path(
+                         &mut result_paths,
+                         &path,
+@@ -1867,6 +1880,117 @@ mod tests {
+     use super::*;
+     use crate::spirv_module::ModuleHeader;
+ 
++    /// Builds `base -> insert A at path_a -> insert B at path_b -> insert plain at [3]`, where each
++    /// resource insert carries an opaque placeholder object (as the emitter does, with the real
++    /// resource only in the aggregate-pointer sidecar facts), then extracts both resource fields
++    /// through the nested `[i]` / `[0]` extract chain and stores them. Returns the stored ids.
++    fn two_resource_struct_stored_ids(sampler_first: bool) -> (Vec<Word>, Word, Word) {
++        let (texture, sampler) = (20, 21);
++        let (placeholder, plain) = (30, 31);
++        let (base, ins_a, ins_b, ins_plain) = (10, 11, 12, 13);
++        let (ext_t, ext_t_leaf, ext_s, ext_s_leaf) = (40, 41, 42, 43);
++        let (path_tex, path_smp) = (vec![0, 0], vec![1, 0]);
++        let (first_path, second_path) = if sampler_first {
++            (path_smp.clone(), path_tex.clone())
++        } else {
++            (path_tex.clone(), path_smp.clone())
++        };
++        let lits = |path: &[u32]| {
++            path.iter()
++                .copied()
++                .map(Operand::LiteralBit32)
++                .collect::<Vec<_>>()
++        };
++        let insert = |result: Word, object: Word, composite: Word, path: &[u32]| {
++            let mut operands = vec![Operand::IdRef(object), Operand::IdRef(composite)];
++            operands.extend(lits(path));
++            Instruction::new(Op::CompositeInsert, Some(1), Some(result), operands)
++        };
++        let extract = |result: Word, composite: Word, path: &[u32]| {
++            let mut operands = vec![Operand::IdRef(composite)];
++            operands.extend(lits(path));
++            Instruction::new(Op::CompositeExtract, Some(2), Some(result), operands)
++        };
++        let mut module = Module::new();
++        module.header = Some(ModuleHeader::new(100));
++        module.functions.push(Function {
++            def: None,
++            parameters: vec![],
++            blocks: vec![Block {
++                label: Some(Instruction::new(Op::Label, None, Some(50), vec![])),
++                instructions: vec![
++                    insert(ins_a, placeholder, base, &first_path),
++                    insert(ins_b, placeholder, ins_a, &second_path),
++                    insert(ins_plain, plain, ins_b, &[3]),
++                    extract(ext_t, ins_plain, &[0]),
++                    extract(ext_t_leaf, ext_t, &[0]),
++                    extract(ext_s, ins_plain, &[1]),
++                    extract(ext_s_leaf, ext_s, &[0]),
++                    Instruction::new(
++                        Op::Store,
++                        None,
++                        None,
++                        vec![Operand::IdRef(60), Operand::IdRef(ext_t_leaf)],
++                    ),
++                    Instruction::new(
++                        Op::Store,
++                        None,
++                        None,
++                        vec![Operand::IdRef(61), Operand::IdRef(ext_s_leaf)],
++                    ),
++                ],
++            }],
++            end: None,
++        });
++        let mut ctx = Ctx::new(module);
++        // Sidecar facts exactly as `emit_insertvalue_typed` records them: every insert result lists
++        // every resource pointer its aggregate carries so far.
++        let (first_res, second_res) = if sampler_first {
++            (sampler, texture)
++        } else {
++            (texture, sampler)
++        };
++        let fact = |aggregate: Word, source: Word, indices: &[u32]| {
++            crate::emit_sidecar::AggregatePointerValue {
++                aggregate,
++                source,
++                indices: indices.to_vec(),
++            }
++        };
++        ctx.emit_sidecar.aggregate_pointer_values.extend([
++            fact(ins_a, first_res, &first_path),
++            fact(ins_b, first_res, &first_path),
++            fact(ins_b, second_res, &second_path),
++            fact(ins_plain, first_res, &first_path),
++            fact(ins_plain, second_res, &second_path),
++        ]);
++
++        let _ = collapse_resource_wrappers(&mut ctx, 0, &HashSet::from([texture, sampler]));
++
++        let stores = ctx.module.functions[0].blocks[0]
++            .instructions
++            .iter()
++            .filter(|inst| inst.class.opcode == Op::Store)
++            .map(|inst| match inst.operands[1] {
++                Operand::IdRef(id) => id,
++                ref other => panic!("unexpected store operand {other:?}"),
++            })
++            .collect();
++        (stores, texture, sampler)
++    }
++
++    #[test]
++    fn resource_wrapper_collapse_keeps_both_resources_in_a_mixed_struct_texture_first() {
++        let (stored, texture, sampler) = two_resource_struct_stored_ids(false);
++        assert_eq!(stored, [texture, sampler]);
++    }
++
++    #[test]
++    fn resource_wrapper_collapse_keeps_both_resources_in_a_mixed_struct_sampler_first() {
++        let (stored, texture, sampler) = two_resource_struct_stored_ids(true);
++        assert_eq!(stored, [texture, sampler]);
++    }
++
+     #[test]
+     fn resource_wrapper_collapse_remaps_dynamic_field_fact_root() {
+         let mut module = Module::new();

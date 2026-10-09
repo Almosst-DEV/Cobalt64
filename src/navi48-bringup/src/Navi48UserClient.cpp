@@ -8,6 +8,9 @@
 #include "amd/native_disp.h"    // 0.0.613: the display verbs 83..87 open only with boot-arg navi48-metal-disp=1
 #include "amd/native_disp_pure.h"
 #include "amd/native_s1c.h"   // 0.0.601: n1c_refuse_legacy
+#include "amd/native_g1_pure.h"   // 0.0.623 (G1): the hang-recovery verbs 100..102 open only with boot-arg navi48-g1=1
+#include "amd/native_g2_pure.h"   // 0.0.627 (G2): the session stat verb 103 opens only with boot-arg navi48-multisession=1
+#include "amd/native_g4_pure.h"   // 0.0.640 (G4): the allow-list verb 104 opens only with boot-args navi48-apps=1 + navi48-multisession=1
 #include "amd/amdgpu_cp.h"
 #include "amd/amdgpu_gmc.h"
 #include "amd/amdgpu_pm4.h"
@@ -573,10 +576,24 @@ IOReturn Navi48UserClient::doAccelExperiment(IOExternalMethodArguments *args) {
 	//      in the transaction lifecycle, and route B readiness that sets pipe+0x298 without running AMD's binding code).
 	// 72 = emcensus (0.0.291, : the event-machine census policy toggle - 1 arm, 2 disarm, 0/none read - that
 	//      disarms only the accel+0x380 pass-through counters to isolate cause 2 of).
-	// 82 = sdmadcc (0.0.417, notes/design/SDMA-DCC-NOPTE.md, D1: SDMA0_DCC_CNTL's no-PTE read decompression /
+	// 82 = sdmadcc (0.0.417, an internal design note, D1: SDMA0_DCC_CNTL's no-PTE read decompression /
 	//      write compression - 0 read SDMA0+SDMA1, 1 capture-then-clear SDMA0 only, 2 restore; other args refused).
 	//      83..87 = pipeadopt / pipearm / pipestat / pipestamps / pipeshortcut, 88 = pipeagdc (0.0.614), 89 = pipevbl (0.0.618), 90 = pipereload (0.0.619) (0.0.613, #11 11h.2: the display pipe; OPEN only with boot-arg navi48-metal-disp=1 latched, else the bound is 82 as before).
+	//      91 = ddcread, 92 = dmubring, 93 = dispcensus (0.0.622, multi-monitor stage M1: HDMI DDC EDID read, DMUB state / ring decode, display register census; same latch, same bound n48disp::kLastAction).
+	//      94 = region4read (0.0.624, stage M1.5: READ-ONLY dump of the DMUB REGION4 window in VRAM through the MM_INDEX reader; same latch, same bound).
+	//      95 = dmubsend, 96 = dmubmode, 97 = dmubctx (0.0.625, stages M2 / M3: the first verbs that SEND to the display firmware; same latch and bound, and each refuses N48DR_CMD_OFF unless boot-arg navi48-dmubcmd=1 as well).
+	//      98 = disp2 (0.0.631, stage M4d: OTG1 -> DIG2 test pattern; same latch and bound, and it refuses N48D2_OFF unless boot-arg navi48-disp2=1 as well).
+	//      99 = scdcread (0.0.633, multi-monitor: READ-ONLY SCDC status read from the HDMI sink over the DC_I2C engine; same latch and bound n48disp::kLastAction).
+	//      100..102 = hangtest / hangrecover / hangstat (0.0.623, GPU-apps G1: OPEN only with boot-arg navi48-g1=1 latched; amd/native_g1_pure.h). Every other action meets the bound below unchanged.
+	//      103 = sessstat (0.0.627, GPU-apps G2: OPEN only with boot-arg navi48-multisession=1 latched; amd/native_g2_pure.h; read-only).
+	//      108 = vramstat (0.0.663, ReBAR + Stage 2 review S3: same latch as 83..90 and 106/107 - n48disp::action_admitted; READ-ONLY allocator / BAR0 report).
+	//      104 = appallow (0.0.640, GPU-apps G4: OPEN only with boot-args navi48-apps=1 AND navi48-multisession=1 latched; amd/native_g4_pure.h; this client is root-only).
+	if (n48native::g4::action_admitted(amdgpu::n1c_apps_enabled(), action)) {
+		// 104 is admitted: it skips the old bound below (the verb's own argument check is n48native::g4::native_exempt in accelExperiment)
+	} else
+	if (!n48native::g1::action_admitted(amdgpu::n1c_g1_latched_on(), action) && !n48native::g2::action_admitted(amdgpu::n1c_multi_latched_on(), action)) {
 	if (action > 82 && !n48disp::action_admitted(n48disp_latched_on(), action)) return kIOReturnBadArgument;   // 0 status, 1 fire, 2 memenable, 3 synctables, 4 enablerings, 5 startengines
+	}
 	uint64_t installed = 0, calls = 0, firstUnsup = 0;
 	uint64_t extra[Navi48Bringup::kAccelExtraScalars] = { 0 };
 	// 0.0.194: scalarInput[1] is an optional verb argument (vmib's VA). An older

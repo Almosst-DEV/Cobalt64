@@ -1,0 +1,16 @@
+#!/bin/bash
+# fake ssh: runs the remote command LOCALLY in a fake root (SIM_FR), with the fake PC commands (rbin) on PATH and the fake home. Virtual time: 120 ms per call.
+tick() { local ms; ms=$(cat "$SIM_DIR/vclock_ms" 2>/dev/null || echo 0); echo $(( ms + $1 )) >"$SIM_DIR/vclock_ms"; }
+while [ "${1:-}" = "-o" ]; do shift 2; done
+host=$1; shift
+cmd="$*"
+now=$(( $(cat "$SIM_DIR/vclock_ms") / 1000 ))
+if [ -f "$SIM_DIR/cfg/unreach_abs" ] && [ "$now" -ge "$(cat "$SIM_DIR/cfg/unreach_abs")" ]; then exit 255; fi
+if [ -f "$SIM_DIR/cfg/unreach_after_restart" ]; then r=$(cat "$SIM_DIR/kv/restart_epoch" 2>/dev/null || echo -1); if [ "$r" -ge 0 ] && [ $(( 1791470000 + now - r )) -ge "$(cat "$SIM_DIR/cfg/unreach_after_restart")" ]; then exit 255; fi; fi
+tick 120
+[ "$cmd" = true ] && exit 0
+rw() { sed -e "s#/private/tmp/#@PT@#g" -e "s#/tmp/#$SIM_FR/tmp/#g" -e "s#@PT@#$SIM_FR/private/tmp/#g" -e "s#/var/tmp/#$SIM_FR/var/tmp/#g" -e "s#/Library/#$SIM_FR/Library/#g"; }
+export HOME="$SIM_HOME" PATH="$SIM_RBIN:$SIM_BIN:/usr/bin:/bin:/usr/sbin:/sbin" SIM_DIR SIM_FR SIM_FAKECLI SIM_BIN SIM_RBIN
+if [ "$cmd" = "bash -s" ]; then rw | bash -s; exit $?; fi
+rcmd=$(printf '%s' "$cmd" | rw)
+bash -c "$rcmd"

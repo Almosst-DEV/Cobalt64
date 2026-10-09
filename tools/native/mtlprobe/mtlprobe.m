@@ -558,6 +558,23 @@ static id<MTLLibrary> g2_lib(id<MTLDevice> dev) {
     perr("newLibraryWithSource (g2)", err);
     return lib;
 }
+
+// bundle 9 (app crash study item 2): cube texture oracle.  A 64x64 BGRA8 cube with one colour per face (replaceRegion...slice:), sampled in the six axis directions into a 6x1 target.
+// Metal's face order is +X, -X, +Y, -Y, +Z, -Z = slices 0..5; a direction along an axis hits the centre of its face, so the expected pixel k is face k's colour whatever the face orientation.
+static const char *kCubeSrc =
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct CubeO { float4 pos [[position]]; };\n"
+"vertex CubeO cube_vs(uint vid [[vertex_id]]) { float2 c = float2(float(vid & 1u), float(vid >> 1)); CubeO o; o.pos = float4(c * 2.0 - 1.0, 0.0, 1.0); return o; }\n"
+"fragment float4 cube_fs(CubeO in [[stage_in]], texturecube<float> t [[texture(0)]], sampler s [[sampler(0)]]) {\n"
+"    uint i = uint(in.pos.x);\n"
+"    float3 d = i == 0u ? float3(1.0, 0.0, 0.0) : i == 1u ? float3(-1.0, 0.0, 0.0) : i == 2u ? float3(0.0, 1.0, 0.0) : i == 3u ? float3(0.0, -1.0, 0.0) : i == 4u ? float3(0.0, 0.0, 1.0) : float3(0.0, 0.0, -1.0);\n"
+"    return t.sample(s, d); }\n";
+static id<MTLLibrary> cube_lib(id<MTLDevice> dev) {
+    NSError *err = nil; id<MTLLibrary> lib = [dev newLibraryWithSource:@(kCubeSrc) options:nil error:&err];
+    perr("newLibraryWithSource (cube)", err);
+    return lib;
+}
 static int write_png_wh(const char *path, const uint8_t *bgra, int w, int h) {
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, bgra, (size_t)w * h * 4, NULL);
@@ -851,16 +868,292 @@ static int cmd_sysdraw(uint64_t rid, int haveRid, const char *out) {
     return diff == 0 ? 0 : 1;
 }
 
+// mtlprobe cube [--registry-id N]: bundle 9.  Create, upload per face, read back per face, sample in six directions (6 pixels, exact).
+static const uint8_t cube_col[6][4] = { { 15, 220, 30, 255 }, { 60, 190, 70, 255 }, { 105, 160, 110, 255 }, { 150, 130, 150, 255 }, { 195, 100, 190, 255 }, { 240, 70, 230, 255 } };   // B, G, R, A per face
+static int cmd_cube(uint64_t rid, int haveRid, const char *out) {
+    id<MTLDevice> dev = pick_device(rid, haveRid); if (!dev) return 2;
+    int fails = 0;
+    #define CUBE_CHECK(tag, cond, ...) do { int ok_ = (cond) ? 1 : 0; printf("mtlprobe: cube %s: %s: ", ok_ ? "ok  " : "FAIL", tag); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
+    MTLTextureDescriptor *td = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm size:64 mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead; td.storageMode = N_MANAGED;
+    id<MTLTexture> cube = [dev newTextureWithDescriptor:td];
+    CUBE_CHECK("create 64x64 BGRA8 cube", cube != nil, "type %lu", td.textureType);
+    if (!cube) { printf("mtlprobe: FAIL cube (no texture; VectorKit aborts on this)\n"); return 1; }
+    CUBE_CHECK("properties", cube.textureType == MTLTextureTypeCube && cube.width == 64 && cube.height == 64 && cube.arrayLength == 1 && cube.depth == 1 && cube.pixelFormat == MTLPixelFormatBGRA8Unorm && cube.mipmapLevelCount == 1,
+               "type %lu %lux%lu array %lu depth %lu mips %lu", (unsigned long)cube.textureType, (unsigned long)cube.width, (unsigned long)cube.height, (unsigned long)cube.arrayLength, (unsigned long)cube.depth, (unsigned long)cube.mipmapLevelCount);
+    static uint8_t face[64 * 64 * 4], back[64 * 64 * 4];
+    for (int k = 0; k < 6; k++) { for (int i = 0; i < 64 * 64; i++) memcpy(face + i * 4, cube_col[k], 4);
+        [cube replaceRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0 slice:k withBytes:face bytesPerRow:64 * 4 bytesPerImage:64 * 64 * 4]; }
+    int badFaces = 0;
+    for (int k = 0; k < 6; k++) { memset(back, 0, sizeof back); [cube getBytes:back bytesPerRow:64 * 4 bytesPerImage:64 * 64 * 4 fromRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0 slice:k];
+        int bad = 0; for (int i = 0; i < 64 * 64; i++) if (memcmp(back + i * 4, cube_col[k], 4)) { bad = 1; break; } badFaces += bad; }
+    CUBE_CHECK("per-face replaceRegion / getBytes", badFaces == 0, "%d of 6 faces differ (each face holds its own colour)", badFaces);
+    id<MTLLibrary> lib = cube_lib(dev); id<MTLFunction> vs = lib ? [lib newFunctionWithName:@"cube_vs"] : nil, fs = lib ? [lib newFunctionWithName:@"cube_fs"] : nil;
+    CUBE_CHECK("library + functions", vs && fs, "vs %s fs %s", vs ? "ok" : "NIL", fs ? "ok" : "NIL");
+    if (!vs || !fs) { printf("mtlprobe: FAIL cube\n"); return 2; }
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = vs; pd.fragmentFunction = fs; pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    NSError *err = nil; id<MTLRenderPipelineState> pso = [dev newRenderPipelineStateWithDescriptor:pd error:&err]; perr("newRenderPipelineState (cube)", err);
+    CUBE_CHECK("pipeline", pso != nil, "%s", pso ? "non-nil" : "NIL");
+    MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest; sd.sAddressMode = sd.tAddressMode = sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
+    id<MTLSamplerState> ss = [dev newSamplerStateWithDescriptor:sd];
+    id<MTLTexture> tgt = n_tex(dev, MTLPixelFormatBGRA8Unorm, 6, 1, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, MTLStorageModePrivate);
+    if (!pso || !ss || !tgt) { printf("mtlprobe: FAIL cube (alloc)\n"); return 2; }
+    id<MTLCommandQueue> q = [dev newCommandQueue]; id<MTLCommandBuffer> cb = [q commandBuffer];
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = tgt; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore; rp.colorAttachments[0].clearColor = MTLClearColorMake(1, 0, 1, 1);
+    id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+    [re setRenderPipelineState:pso]; [re setViewport:(MTLViewport){ 0, 0, 6, 1, 0, 1 }]; [re setScissorRect:(MTLScissorRect){ 0, 0, 6, 1 }];
+    [re setFragmentTexture:cube atIndex:0]; [re setFragmentSamplerState:ss atIndex:0];
+    [re drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4]; [re endEncoding];
+    if (!n_run(cb, "cube")) { printf("mtlprobe: FAIL cube (command buffer)\n"); return 2; }
+    NSData *got = n_readback(dev, q, tgt, 6, 1, 4); if (!got) { printf("mtlprobe: FAIL cube (readback)\n"); return 2; }
+    static uint8_t exp[6 * 4]; for (int k = 0; k < 6; k++) memcpy(exp + k * 4, cube_col[k], 4);
+    int diff = 0; const uint8_t *g = got.bytes; const char *dn[6] = { "+X", "-X", "+Y", "-Y", "+Z", "-Z" };
+    for (int k = 0; k < 6; k++) { int ok = !memcmp(g + k * 4, exp + k * 4, 4); diff += !ok;
+        printf("mtlprobe: cube sample %s: got B%u G%u R%u A%u expected B%u G%u R%u A%u %s\n", dn[k], g[k*4], g[k*4+1], g[k*4+2], g[k*4+3], exp[k*4], exp[k*4+1], exp[k*4+2], exp[k*4+3], ok ? "ok" : "MISMATCH"); }
+    CUBE_CHECK("six axis-direction samples", diff == 0, "%d of 6 pixels differ", diff);
+    (void)out;
+    printf(fails == 0 ? "mtlprobe: PASS cube (6 of 6 pixels exact)\n" : "mtlprobe: FAIL cube (%d)\n", fails);
+    return fails ? 1 : 0;
+}
+
+
+// bundle 10 (depth/stencil and MSAA): oracles for `mtlprobe depth` and `mtlprobe msaa`.  Both draw triangles from vertex_id + setVertexBytes: (ox, oy, sx, sy) place the unit right triangle
+// (0,0) (1,0) (0,1) of "uv" space (u right, v UP, so row = (1 - v) * 16 in the 16x16 target) at uv = (ox,oy) + c * (sx,sy), and z is the clip depth.  Every expectation was checked on an Apple-silicon Mac first.
+static const char *kDepthSrc =
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct DepO { float4 pos [[position]]; };\n"
+"vertex DepO dep_vs(uint vid [[vertex_id]], constant float4 &r [[buffer(0)]], constant float &z [[buffer(1)]]) {\n"
+"    float2 c = vid == 0u ? float2(0.0, 0.0) : vid == 1u ? float2(1.0, 0.0) : float2(0.0, 1.0);\n"
+"    DepO o; o.pos = float4((r.xy + c * r.zw) * 2.0 - 1.0, z, 1.0); return o; }\n"
+"fragment float4 dep_fs(DepO in [[stage_in]], constant float4 &col [[buffer(0)]]) { return col; }\n";
+static id<MTLLibrary> dep_lib(id<MTLDevice> dev) {
+    NSError *err = nil; id<MTLLibrary> lib = [dev newLibraryWithSource:@(kDepthSrc) options:nil error:&err];
+    perr("newLibraryWithSource (depth)", err);
+    return lib;
+}
+static void dep_tri(id<MTLRenderCommandEncoder> re, float ox, float oy, float sx, float sy, float z, const float col[4]) {
+    float r[4] = { ox, oy, sx, sy }; [re setVertexBytes:r length:sizeof r atIndex:0]; [re setVertexBytes:&z length:sizeof z atIndex:1]; [re setFragmentBytes:col length:16 atIndex:0];
+    [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+}
+static id<MTLDepthStencilState> dep_dss(id<MTLDevice> dev, MTLCompareFunction cmp, BOOL write, MTLCompareFunction scmp, MTLStencilOperation pass) {
+    MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new]; d.depthCompareFunction = cmp; d.depthWriteEnabled = write;
+    if (scmp != MTLCompareFunctionAlways || pass != MTLStencilOperationKeep) { MTLStencilDescriptor *sd = [MTLStencilDescriptor new]; sd.stencilCompareFunction = scmp; sd.depthStencilPassOperation = pass; sd.readMask = 0xFF; sd.writeMask = 0xFF; d.frontFaceStencil = sd; d.backFaceStencil = sd; }
+    return [dev newDepthStencilStateWithDescriptor:d];
+}
+// the BGRA8 pixel (B, G, R, A) at uv (u, v) of a 16x16 readback
+static const uint8_t *dep_px(NSData *g, float u, float v) { int x = (int)(u * 16.0f), y = 15 - (int)(v * 16.0f); return (const uint8_t *)g.bytes + (y * 16 + x) * 4; }
+static int cmd_depth(uint64_t rid, int haveRid) {
+    id<MTLDevice> dev = pick_device(rid, haveRid); if (!dev) return 2;
+    int fails = 0;
+    #define DEP_CHECK(tag, cond, ...) do { int ok_ = (cond) ? 1 : 0; printf("mtlprobe: depth %s: %s: ", ok_ ? "ok  " : "FAIL", tag); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
+    printf("mtlprobe: depth note: isDepth24Stencil8PixelFormatSupported = %d (the bundle must answer 0), supportsTextureSampleCount 1/2/4/8 = %d/%d/%d/%d\n", (int)dev.isDepth24Stencil8PixelFormatSupported,
+           (int)[dev supportsTextureSampleCount:1], (int)[dev supportsTextureSampleCount:2], (int)[dev supportsTextureSampleCount:4], (int)[dev supportsTextureSampleCount:8]);
+    // formats: Depth16Unorm, Depth32Float, Stencil8, Depth32Float_Stencil8 as Private RenderTarget|ShaderRead 2D textures
+    static const MTLPixelFormat pfs[4] = { MTLPixelFormatDepth16Unorm, MTLPixelFormatDepth32Float, MTLPixelFormatStencil8, MTLPixelFormatDepth32Float_Stencil8 }; static const char *pfn[4] = { "Depth16Unorm", "Depth32Float", "Stencil8", "Depth32Float_Stencil8" };
+    for (int k = 0; k < 4; k++) { id<MTLTexture> t = n_tex(dev, pfs[k], 32, 32, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, MTLStorageModePrivate);
+        DEP_CHECK("create", t != nil && t.pixelFormat == pfs[k] && t.width == 32 && t.textureType == MTLTextureType2D && t.sampleCount == 1, "%s Private RenderTarget|ShaderRead 32x32: %s", pfn[k], t ? "ok" : "NIL"); }
+    id<MTLTexture> shared = n_tex(dev, MTLPixelFormatDepth32Float, 32, 32, MTLTextureUsageRenderTarget, MTLStorageModeShared);
+    printf("mtlprobe: depth note: Depth32Float with Shared storage -> %s (the bundle refuses it; an Apple GPU may accept it)\n", shared ? "texture" : "nil");
+    id<MTLLibrary> lib = dep_lib(dev); id<MTLFunction> vs = lib ? [lib newFunctionWithName:@"dep_vs"] : nil, fs = lib ? [lib newFunctionWithName:@"dep_fs"] : nil;
+    DEP_CHECK("library + functions", vs && fs, "vs %s fs %s", vs ? "ok" : "NIL", fs ? "ok" : "NIL");
+    if (!vs || !fs) { printf("mtlprobe: FAIL depth\n"); return 2; }
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    const float RED[4] = { 1, 0, 0, 1 }, GREEN[4] = { 0, 1, 0, 1 };
+    // ---- part 1: two overlapping triangles, depth test LESS.  A (far, z 0.7, red): uv (0,0) (1,0) (0,1).  B (near, z 0.3, green): the same triangle shifted to (0.3, 0.3).  Drawn in BOTH orders. ----
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = vs; pd.fragmentFunction = fs; pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm; pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    NSError *err = nil; id<MTLRenderPipelineState> pso = [dev newRenderPipelineStateWithDescriptor:pd error:&err]; perr("newRenderPipelineState (depth)", err);
+    DEP_CHECK("pipeline with depthAttachmentPixelFormat = Depth32Float", pso != nil, "%s", pso ? "non-nil" : "NIL");
+    id<MTLDepthStencilState> less = dep_dss(dev, MTLCompareFunctionLess, YES, MTLCompareFunctionAlways, MTLStencilOperationKeep);
+    if (!pso || !less) { printf("mtlprobe: FAIL depth (no pipeline / state)\n"); return 2; }
+    for (int order = 0; order < 2; order++) {
+        id<MTLTexture> tgt = n_tex(dev, MTLPixelFormatBGRA8Unorm, 16, 16, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, MTLStorageModePrivate), dtex = n_tex(dev, MTLPixelFormatDepth32Float, 16, 16, MTLTextureUsageRenderTarget, MTLStorageModePrivate);
+        if (!tgt || !dtex) { printf("mtlprobe: FAIL depth (targets)\n"); return 2; }
+        id<MTLCommandBuffer> cb = [q commandBuffer]; MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = tgt; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore; rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+        rp.depthAttachment.texture = dtex; rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.storeAction = MTLStoreActionStore; rp.depthAttachment.clearDepth = 1.0;
+        id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp]; [re setRenderPipelineState:pso]; [re setDepthStencilState:less]; [re setViewport:(MTLViewport){ 0, 0, 16, 16, 0, 1 }];
+        if (order == 0) { dep_tri(re, 0, 0, 1, 1, 0.7f, RED); dep_tri(re, 0.3f, 0.3f, 1, 1, 0.3f, GREEN); } else { dep_tri(re, 0.3f, 0.3f, 1, 1, 0.3f, GREEN); dep_tri(re, 0, 0, 1, 1, 0.7f, RED); }
+        [re endEncoding];
+        if (!n_run(cb, "depth")) { printf("mtlprobe: FAIL depth (command buffer)\n"); return 2; }
+        NSData *g = n_readback(dev, q, tgt, 16, 16, 4); if (!g) { printf("mtlprobe: FAIL depth (readback)\n"); return 2; }
+        const uint8_t *ov = dep_px(g, 0.40f, 0.40f), *ra = dep_px(g, 0.10f, 0.10f), *gb = dep_px(g, 0.80f, 0.70f), *bg = dep_px(g, 0.92f, 0.92f);   // overlap, A only, B only, neither
+        printf("mtlprobe: depth order %s: overlap B%u G%u R%u, farther-only B%u G%u R%u, nearer-only B%u G%u R%u, outside B%u G%u R%u\n", order ? "near-then-far" : "far-then-near", ov[0], ov[1], ov[2], ra[0], ra[1], ra[2], gb[0], gb[1], gb[2], bg[0], bg[1], bg[2]);
+        DEP_CHECK(order ? "overlap (near drawn first)" : "overlap (far drawn first)", ov[1] == 255 && ov[2] == 0 && ov[0] == 0, "the NEARER green wins at the overlap pixel whatever the draw order");
+        DEP_CHECK(order ? "farther only (near drawn first)" : "farther only (far drawn first)", ra[2] == 255 && ra[1] == 0, "the farther red shows where the nearer triangle is not");
+        DEP_CHECK(order ? "nearer only (near drawn first)" : "nearer only (far drawn first)", gb[1] == 255 && gb[2] == 0, "the nearer green shows outside the farther triangle");
+        DEP_CHECK(order ? "outside both (near drawn first)" : "outside both (far drawn first)", bg[0] == 0 && bg[1] == 0 && bg[2] == 0, "the clear colour remains outside both");
+    }
+    // ---- part 1b: depth write OFF - the first (near) triangle writes no depth, so the later (far) one is not rejected by it ----
+    { id<MTLDepthStencilState> nw = dep_dss(dev, MTLCompareFunctionLess, NO, MTLCompareFunctionAlways, MTLStencilOperationKeep);
+      id<MTLTexture> tgt = n_tex(dev, MTLPixelFormatBGRA8Unorm, 16, 16, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, MTLStorageModePrivate), dtex = n_tex(dev, MTLPixelFormatDepth32Float, 16, 16, MTLTextureUsageRenderTarget, MTLStorageModePrivate);
+      id<MTLCommandBuffer> cb = [q commandBuffer]; MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+      rp.colorAttachments[0].texture = tgt; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore; rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+      rp.depthAttachment.texture = dtex; rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.storeAction = MTLStoreActionStore; rp.depthAttachment.clearDepth = 1.0;
+      id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp]; [re setRenderPipelineState:pso]; [re setDepthStencilState:nw]; [re setViewport:(MTLViewport){ 0, 0, 16, 16, 0, 1 }];
+      dep_tri(re, 0.3f, 0.3f, 1, 1, 0.3f, GREEN); dep_tri(re, 0, 0, 1, 1, 0.7f, RED); [re endEncoding];
+      if (!n_run(cb, "depth-nowrite")) { printf("mtlprobe: FAIL depth (command buffer, write off)\n"); return 2; }
+      NSData *g = n_readback(dev, q, tgt, 16, 16, 4); if (!g) { printf("mtlprobe: FAIL depth (readback)\n"); return 2; }
+      const uint8_t *ov = dep_px(g, 0.40f, 0.40f); DEP_CHECK("depth write off", ov[2] == 255 && ov[1] == 0, "with depth writes off the later farther red is not rejected (overlap B%u G%u R%u, expected red)", ov[0], ov[1], ov[2]); }
+    // ---- part 2: stencil on Depth32Float_Stencil8.  A writes stencil 1 (compare Always, pass Replace, reference 1; depth write off); a full-screen-ish green triangle draws only where stencil == 1. ----
+    { MTLRenderPipelineDescriptor *p2 = [MTLRenderPipelineDescriptor new]; p2.vertexFunction = vs; p2.fragmentFunction = fs; p2.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      p2.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8; p2.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+      NSError *e2 = nil; id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:p2 error:&e2]; perr("newRenderPipelineState (stencil)", e2);
+      id<MTLDepthStencilState> wr = dep_dss(dev, MTLCompareFunctionAlways, NO, MTLCompareFunctionAlways, MTLStencilOperationReplace), eq = dep_dss(dev, MTLCompareFunctionAlways, NO, MTLCompareFunctionEqual, MTLStencilOperationKeep);
+      DEP_CHECK("stencil pipeline (Depth32Float_Stencil8 for depth and stencil)", ps != nil && wr && eq, "%s", ps ? "non-nil" : "NIL");
+      id<MTLTexture> tgt = n_tex(dev, MTLPixelFormatBGRA8Unorm, 16, 16, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, MTLStorageModePrivate), dst = n_tex(dev, MTLPixelFormatDepth32Float_Stencil8, 16, 16, MTLTextureUsageRenderTarget, MTLStorageModePrivate);
+      if (ps && wr && eq && tgt && dst) {
+        id<MTLCommandBuffer> cb = [q commandBuffer]; MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = tgt; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore; rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+        rp.depthAttachment.texture = dst; rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.storeAction = MTLStoreActionStore; rp.depthAttachment.clearDepth = 1.0;
+        rp.stencilAttachment.texture = dst; rp.stencilAttachment.loadAction = MTLLoadActionClear; rp.stencilAttachment.storeAction = MTLStoreActionStore; rp.stencilAttachment.clearStencil = 0;
+        id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp]; [re setRenderPipelineState:ps]; [re setViewport:(MTLViewport){ 0, 0, 16, 16, 0, 1 }];
+        [re setDepthStencilState:wr]; [re setStencilReferenceValue:1]; dep_tri(re, 0, 0, 1, 1, 0.5f, RED);                       // stencil := 1 inside A
+        [re setDepthStencilState:eq]; [re setStencilReferenceValue:1]; dep_tri(re, 0, 0, 2, 2, 0.5f, GREEN);                     // a larger triangle, drawn only where stencil == 1
+        [re endEncoding];
+        if (!n_run(cb, "stencil")) { printf("mtlprobe: FAIL depth (command buffer, stencil)\n"); return 2; }
+        NSData *g = n_readback(dev, q, tgt, 16, 16, 4); if (!g) { printf("mtlprobe: FAIL depth (readback)\n"); return 2; }
+        const uint8_t *in = dep_px(g, 0.20f, 0.20f), *out = dep_px(g, 0.70f, 0.60f);   // inside A (stencil 1) / inside the larger triangle but outside A
+        printf("mtlprobe: depth stencil: inside A B%u G%u R%u, outside A B%u G%u R%u\n", in[0], in[1], in[2], out[0], out[1], out[2]);
+        DEP_CHECK("stencil replace + equal", in[1] == 255 && in[2] == 0 && out[0] == 0 && out[1] == 0 && out[2] == 0, "the stencil-equal draw appears only where stencil was replaced with 1 (inside A green, outside A the clear colour)"); } }
+    printf(fails == 0 ? "mtlprobe: PASS depth\n" : "mtlprobe: FAIL depth (%d)\n", fails);
+    return fails ? 1 : 0;
+}
+// mtlprobe msaa: a 4-sample BGRA8 target (2DMultisample, Private), the unit triangle with a diagonal edge x == y, resolved into a 1-sample texture by the render pass (MultisampleResolve,
+// StoreAndMultisampleResolve, and Unknown + setColorStoreAction:).  The interior (x < y) is exact, the exterior (x > y) is the clear colour, and the 16 diagonal pixels are intermediate.
+static int msaa_one(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLRenderPipelineState> pso, const char *name, int variant, int *fails) {
+    #define MS_CHECK(tag, cond, ...) do { int ok_ = (cond) ? 1 : 0; printf("mtlprobe: msaa %s %s: %s: ", name, ok_ ? "ok  " : "FAIL", tag); printf(__VA_ARGS__); printf("\n"); if (!ok_) (*fails)++; } while (0)
+    MTLTextureDescriptor *td = [MTLTextureDescriptor new]; td.textureType = MTLTextureType2DMultisample; td.pixelFormat = MTLPixelFormatBGRA8Unorm; td.width = 16; td.height = 16; td.sampleCount = 4; td.usage = MTLTextureUsageRenderTarget; td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> ms = [dev newTextureWithDescriptor:td], rs = n_tex(dev, MTLPixelFormatBGRA8Unorm, 16, 16, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, MTLStorageModePrivate);
+    MS_CHECK("multisample texture", ms && ms.textureType == MTLTextureType2DMultisample && ms.sampleCount == 4 && rs, "%s sampleCount %lu", ms ? "created" : "NIL", ms ? (unsigned long)ms.sampleCount : 0UL);
+    if (!ms || !rs) return 0;
+    id<MTLCommandBuffer> cb = [q commandBuffer]; MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = ms; rp.colorAttachments[0].resolveTexture = rs; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    rp.colorAttachments[0].storeAction = variant == 0 ? MTLStoreActionMultisampleResolve : variant == 1 ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionUnknown;
+    id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp]; [re setRenderPipelineState:pso]; [re setViewport:(MTLViewport){ 0, 0, 16, 16, 0, 1 }];
+    if (variant == 2) [re setColorStoreAction:MTLStoreActionMultisampleResolve atIndex:0];
+    const float RED[4] = { 1, 0, 0, 1 }; dep_tri(re, 0, 0, 1, 1, 0.5f, RED); [re endEncoding];
+    if (!n_run(cb, "msaa")) { printf("mtlprobe: FAIL msaa (command buffer)\n"); return 0; }
+    NSData *g = n_readback(dev, q, rs, 16, 16, 4); if (!g) { printf("mtlprobe: FAIL msaa (readback)\n"); return 0; }
+    const uint8_t *px = g.bytes; int inner = 0, innerOk = 0, outer = 0, outerOk = 0, edge = 0, edgeMid = 0;
+    for (int y = 0; y < 16; y++) for (int x = 0; x < 16; x++) { const uint8_t *p = px + (y * 16 + x) * 4;   // B G R A
+        if (x < y) { inner++; innerOk += p[2] == 255 && p[1] == 0 && p[0] == 0; } else if (x > y) { outer++; outerOk += p[2] == 0 && p[1] == 0 && p[0] == 0; } else { edge++; edgeMid += p[2] > 10 && p[2] < 245 && p[1] == 0 && p[0] == 0; } }
+    printf("mtlprobe: msaa %s: diagonal R values:", name); for (int i = 0; i < 16; i++) printf(" %u", px[(i * 16 + i) * 4 + 2]); printf("\n");
+    MS_CHECK("interior", innerOk == inner, "%d of %d interior pixels (x < y) are exactly the triangle colour", innerOk, inner);
+    MS_CHECK("exterior", outerOk == outer, "%d of %d exterior pixels (x > y) are exactly the clear colour", outerOk, outer);
+    MS_CHECK("edge", edgeMid >= edge - 2, "%d of %d diagonal pixels hold an intermediate value (the resolve averaged the samples)", edgeMid, edge);
+    return 1;
+}
+static int cmd_msaa(uint64_t rid, int haveRid) {
+    id<MTLDevice> dev = pick_device(rid, haveRid); if (!dev) return 2;
+    int fails = 0;
+    printf("mtlprobe: msaa note: supportsTextureSampleCount 1/2/4/8 = %d/%d/%d/%d\n", (int)[dev supportsTextureSampleCount:1], (int)[dev supportsTextureSampleCount:2], (int)[dev supportsTextureSampleCount:4], (int)[dev supportsTextureSampleCount:8]);
+    if (![dev supportsTextureSampleCount:4]) { printf("mtlprobe: FAIL msaa (the device does not support 4 samples)\n"); return 1; }
+    id<MTLLibrary> lib = dep_lib(dev); id<MTLFunction> vs = lib ? [lib newFunctionWithName:@"dep_vs"] : nil, fs = lib ? [lib newFunctionWithName:@"dep_fs"] : nil;
+    if (!vs || !fs) { printf("mtlprobe: FAIL msaa (library)\n"); return 2; }
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = vs; pd.fragmentFunction = fs; pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm; pd.rasterSampleCount = 4;
+    NSError *err = nil; id<MTLRenderPipelineState> pso = [dev newRenderPipelineStateWithDescriptor:pd error:&err]; perr("newRenderPipelineState (msaa)", err);
+    printf("mtlprobe: msaa %s: pipeline with rasterSampleCount 4: %s\n", pso ? "ok  " : "FAIL", pso ? "non-nil" : "NIL"); if (!pso) return 1;
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    static const char *nm[3] = { "MultisampleResolve", "StoreAndMultisampleResolve", "Unknown+setColorStoreAction" };
+    for (int v = 0; v < 3; v++) if (!msaa_one(dev, q, pso, nm[v], v, &fails)) return 2;
+    printf(fails == 0 ? "mtlprobe: PASS msaa\n" : "mtlprobe: FAIL msaa (%d)\n", fails);
+    return fails ? 1 : 0;
+}
+
+// bundle 19 (missing menus, NATIVE-S8-MENUS.md): oracle for `mtlprobe rg16uint`.  Core Animation's large-shadow pass (brim_init / brim_jump / brim_outline) ping-pongs two RG16Uint targets
+// (pixel format 63): a uint2 fragment output, an integer read() of the previous pass, and an integer clear.  The shaders below have the same shape.
+// Metal's integer clear (measured on an Apple-silicon Mac, bundle 19): clearColor doubles are TRUNCATED toward zero and SATURATED to [0, 65535] per channel (NaN -> 0): (1.5, 2.5) -> (1, 2), (-5, 70000) -> (0, 65535), (255.9999, ..) -> 255.
+static const char *kRgSrc =
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct RgO { float4 pos [[position]]; };\n"
+"vertex RgO rg_vs(uint vid [[vertex_id]]) { float2 c = float2(float(vid & 1u), float(vid >> 1)); RgO o; o.pos = float4(c * 2.0 - 1.0, 0.0, 1.0); return o; }\n"
+"fragment uint2 rg_init(RgO in [[stage_in]]) { return uint2(uint(in.pos.x), uint(in.pos.y)); }\n"
+"fragment uint2 rg_jump(RgO in [[stage_in]], texture2d<uint, access::read> src [[texture(0)]]) {\n"
+"    uint2 p = uint2(uint(in.pos.x), uint(in.pos.y));\n"
+"    uint2 v = src.read(uint2((p.x + 1u) & 255u, p.y)).xy;\n"
+"    return uint2(v.y + 100u, v.x + 1000u); }\n";
+static id<MTLLibrary> rg_lib(id<MTLDevice> dev) {
+    NSError *err = nil; id<MTLLibrary> lib = [dev newLibraryWithSource:@(kRgSrc) options:nil error:&err];
+    perr("newLibraryWithSource (rg16uint)", err);
+    return lib;
+}
+static BOOL rg_clear_only(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLTexture> t, double a, double b) {
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = t; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore; rp.colorAttachments[0].clearColor = MTLClearColorMake(a, b, 0, 0);
+    id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp]; [re endEncoding];
+    return n_run(cb, "rg16uint clear");
+}
+static int rg_count(NSData *d, int n, uint16_t x, uint16_t y) { const uint16_t *p = d.bytes; int bad = 0; for (int i = 0; i < n; i++) if (p[i * 2] != x || p[i * 2 + 1] != y) bad++; return bad; }
+// mtlprobe rg16uint [--registry-id N]: bundle 19.  256x256 private RG16Uint targets; exact readback of (a) clear (12345, 65535), (b) a saturating / truncating clear (255.9999, 70000) -> (255, 65535),
+// (c) a uint2(x, y) shader output, (d) a read() ping-pong pass: out(x, y) = (src(x+1 & 255, y).y + 100, src(...).x + 1000) = (y + 100, ((x+1) & 255) + 1000).
+static int cmd_rg16uint(uint64_t rid, int haveRid) {
+    id<MTLDevice> dev = pick_device(rid, haveRid); if (!dev) return 2;
+    int fails = 0;
+    #define RG_CHECK(tag, cond, ...) do { int ok_ = (cond) ? 1 : 0; printf("mtlprobe: rg16uint %s: %s: ", ok_ ? "ok  " : "FAIL", tag); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
+    const MTLTextureUsage U = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    id<MTLTexture> A = n_tex(dev, MTLPixelFormatRG16Uint, 256, 256, U, MTLStorageModePrivate), B = n_tex(dev, MTLPixelFormatRG16Uint, 256, 256, U, MTLStorageModePrivate);
+    id<MTLTexture> C = n_tex(dev, MTLPixelFormatRG16Uint, 256, 256, U, MTLStorageModePrivate), D = n_tex(dev, MTLPixelFormatRG16Uint, 256, 256, U, MTLStorageModePrivate);
+    RG_CHECK("create four 256x256 private RG16Uint targets", A && B && C && D, "%s", (A && B && C && D) ? "non-nil" : "NIL (pixel format 63 refused)");
+    if (!(A && B && C && D)) { printf("mtlprobe: FAIL rg16uint (no texture)\n"); return 1; }
+    RG_CHECK("properties", A.pixelFormat == MTLPixelFormatRG16Uint && A.width == 256 && A.height == 256, "pf %lu %lux%lu", (unsigned long)A.pixelFormat, (unsigned long)A.width, (unsigned long)A.height);
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    if (!rg_clear_only(dev, q, C, 12345, 65535)) { printf("mtlprobe: FAIL rg16uint (clear)\n"); return 2; }
+    NSData *gc = n_readback(dev, q, C, 256, 256, 4); if (!gc) { printf("mtlprobe: FAIL rg16uint (readback)\n"); return 2; }
+    int bc = rg_count(gc, 65536, 12345, 65535);
+    RG_CHECK("clear (12345, 65535)", bc == 0, "%d of 65536 pixels differ; first = (%u, %u)", bc, ((const uint16_t *)gc.bytes)[0], ((const uint16_t *)gc.bytes)[1]);
+    if (!rg_clear_only(dev, q, D, 255.9999, 70000)) { printf("mtlprobe: FAIL rg16uint (clear 2)\n"); return 2; }
+    NSData *gd = n_readback(dev, q, D, 256, 256, 4); if (!gd) { printf("mtlprobe: FAIL rg16uint (readback)\n"); return 2; }
+    int bd = rg_count(gd, 65536, 255, 65535);
+    RG_CHECK("clear (255.9999, 70000) truncates and saturates", bd == 0, "%d of 65536 pixels differ; first = (%u, %u) expected (255, 65535)", bd, ((const uint16_t *)gd.bytes)[0], ((const uint16_t *)gd.bytes)[1]);
+    id<MTLLibrary> lib = rg_lib(dev); id<MTLFunction> vs = lib ? [lib newFunctionWithName:@"rg_vs"] : nil, f0 = lib ? [lib newFunctionWithName:@"rg_init"] : nil, f1 = lib ? [lib newFunctionWithName:@"rg_jump"] : nil;
+    RG_CHECK("library + functions", vs && f0 && f1, "vs %s init %s jump %s", vs ? "ok" : "NIL", f0 ? "ok" : "NIL", f1 ? "ok" : "NIL");
+    if (!vs || !f0 || !f1) { printf("mtlprobe: FAIL rg16uint\n"); return 2; }
+    NSError *err = nil; id<MTLRenderPipelineState> p0 = nil, p1 = nil;
+    for (int k = 0; k < 2; k++) {
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = vs; pd.fragmentFunction = k ? f1 : f0; pd.colorAttachments[0].pixelFormat = MTLPixelFormatRG16Uint;
+        id<MTLRenderPipelineState> pso = [dev newRenderPipelineStateWithDescriptor:pd error:&err]; perr(k ? "newRenderPipelineState (rg_jump)" : "newRenderPipelineState (rg_init)", err);
+        if (k) p1 = pso; else p0 = pso;
+    }
+    RG_CHECK("pipelines with an RG16Uint colour attachment", p0 && p1, "init %s jump %s", p0 ? "non-nil" : "NIL", p1 ? "non-nil" : "NIL");
+    if (!p0 || !p1) { printf("mtlprobe: FAIL rg16uint\n"); return 2; }
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    for (int k = 0; k < 2; k++) {
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = k ? B : A; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore; rp.colorAttachments[0].clearColor = MTLClearColorMake(12345, 65535, 0, 0);
+        id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
+        [re setRenderPipelineState:k ? p1 : p0]; [re setViewport:(MTLViewport){ 0, 0, 256, 256, 0, 1 }]; [re setScissorRect:(MTLScissorRect){ 0, 0, 256, 256 }];
+        if (k) [re setFragmentTexture:A atIndex:0];
+        [re drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4]; [re endEncoding];
+    }
+    if (!n_run(cb, "rg16uint ping-pong")) { printf("mtlprobe: FAIL rg16uint (command buffer)\n"); return 2; }
+    NSData *ga = n_readback(dev, q, A, 256, 256, 4), *gb = n_readback(dev, q, B, 256, 256, 4); if (!ga || !gb) { printf("mtlprobe: FAIL rg16uint (readback)\n"); return 2; }
+    const uint16_t *pa = ga.bytes, *pb = gb.bytes; int badA = 0, badB = 0;
+    for (int y = 0; y < 256; y++) for (int x = 0; x < 256; x++) {
+        if (pa[(y * 256 + x) * 2] != x || pa[(y * 256 + x) * 2 + 1] != y) badA++;
+        if (pb[(y * 256 + x) * 2] != y + 100 || pb[(y * 256 + x) * 2 + 1] != ((x + 1) & 255) + 1000) badB++; }
+    RG_CHECK("uint2(x, y) fragment output", badA == 0, "%d of 65536 pixels differ; (3,5) = (%u, %u) expected (3, 5)", badA, pa[(5 * 256 + 3) * 2], pa[(5 * 256 + 3) * 2 + 1]);
+    RG_CHECK("read() ping-pong pass", badB == 0, "%d of 65536 pixels differ; (3,5) = (%u, %u) expected (105, 1004); (255,7) = (%u, %u) expected (107, 1000)", badB, pb[(5 * 256 + 3) * 2], pb[(5 * 256 + 3) * 2 + 1], pb[(7 * 256 + 255) * 2], pb[(7 * 256 + 255) * 2 + 1]);
+    printf(fails == 0 ? "mtlprobe: PASS rg16uint (exact)\n" : "mtlprobe: FAIL rg16uint (%d)\n", fails);
+    return fails ? 1 : 0;
+}
+
 // mtlprobe dumpair <dir>: compile the 11e sources and write every function's bitcodeData to <dir>/<sha256>.air with
 // <sha256>.txt (name, stage) so the host Mac can translate them (tools/native/navi48metal/add-air.py).
 static int cmd_dumpair(const char *dir, uint64_t rid, int haveRid) {
     id<MTLDevice> dev = pick_device(rid, haveRid); if (!dev) return 2;
     id<MTLLibrary> lib0 = n_lib(dev); if (!lib0) return 2;
     id<MTLLibrary> lib1 = g2_lib(dev);   // m11h9: the texture-oracle shaders too
+    id<MTLLibrary> lib2 = cube_lib(dev); // bundle 9: the cube oracle
+    id<MTLLibrary> lib3 = dep_lib(dev);  // bundle 10: the depth / msaa oracle
+    id<MTLLibrary> lib4 = rg_lib(dev);   // bundle 19: the RG16Uint oracle
     mkdir(dir, 0777);
     SEL bsel = NSSelectorFromString(@"bitcodeData"); int n = 0;
-    for (int li = 0; li < 2; li++) for (NSString *nm in (li ? lib1 : lib0).functionNames) {
-        id<MTLLibrary> lib = li ? lib1 : lib0;
+    for (int li = 0; li < 5; li++) for (NSString *nm in (li == 4 ? lib4 : li == 3 ? lib3 : li == 2 ? lib2 : li ? lib1 : lib0).functionNames) {
+        id<MTLLibrary> lib = li == 4 ? lib4 : li == 3 ? lib3 : li == 2 ? lib2 : li ? lib1 : lib0;
         id<MTLFunction> fn = [lib newFunctionWithName:nm];
         NSData *bc = fn && [(id)fn respondsToSelector:bsel] ? ((NSData *(*)(id, SEL))objc_msgSend)(fn, bsel) : nil;
         if (!bc.length) { printf("dumpair: %s no bitcode\n", [nm UTF8String]); continue; }
@@ -1401,7 +1694,7 @@ static void io_expect_blend(uint8_t *exp, int w, int h, const uint8_t clear[4] /
     }
 }
 
-// ---- S5.2a: dispflip (native #12, notes/design/NATIVE-S5-FLIP.md). A 2560x1440 BGRA IOSurface render target with moving bands, rendered on the Navi48 device; the bundle's D-copy
+// ---- S5.2a: dispflip (native #12, an internal design note). A 2560x1440 BGRA IOSurface render target with moving bands, rendered on the Navi48 device; the bundle's D-copy
 // identifies it as a display surface (N48M_TEST_DISPFLIP=1 waives the CoreDisplay backtrace signal; root + N48M_ALLOW=1 only), copies it into a scanout slot after each command buffer
 // and presents. Reports latched/s from the kernel status (via the bundle's n48ScanoutStats selector: the N48N client is exclusive, mtlprobe cannot open a second one).
 // On any other device (an Apple-silicon Mac's AGX) the selector is absent and the command REFUSES cleanly (exit 3). Needs the PC with WindowServer NOT holding N48N: see NATIVE-S5-FLIP.md "S5.2a build".
@@ -1695,6 +1988,84 @@ static void sc_proto(const char *oname, id obj, const char *pname) {
         }
         free(md);
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// build 16 (app-fix round 1, P1 + F1): `mtlprobe ioalias`.
+//  (1) Preview's "image disappears": in ONE command buffer a blit writes wrapper A of an IOSurface, a second blit reads wrapper B (a NEW texture object over the same surface) into a buffer, and the buffer must hold exactly
+//      the pattern A wrote. Before build 16 a path (b) wrapper B uploaded the surface's stale pages (zero for a fresh surface). Run it natural and with N48M_IOS_PATH=b (forces the copy path).
+//  (2) CLOBBER: A writes pattern 1, a second wrapper C of the same surface writes pattern 2 after it, same command buffer: the surface's pages must end as pattern 2 (the older image of A must not be copied over them).
+//  (3) a re-read: B reads again after C wrote (B was touched before): must see pattern 2.
+//  (4) F1 (only when N48M_TEST_IMPORT_FAIL_EVERY is set, root + N48M_ALLOW=1): newTexture(iosurface) must return a texture, not nil, when the import is refused (the content is blank, the process stays up).
+// Apple's Metal passes (1)-(3) trivially (verified on the host Mac); on our driver (1)-(3) are the P1 check, run as root on the PC with N48M_ALLOW=1 and the process treated as an application (build 16: aliasing acts in applications only).
+// ---------------------------------------------------------------------------------------------------------------
+static void io_blit_write(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> t, int w, int h, int seed) {
+    id<MTLBuffer> src = [dev newBufferWithLength:(NSUInteger)w * h * 4 options:MTLResourceStorageModeShared]; uint8_t *p = src.contents;
+    for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { uint8_t *q = p + (y * w + x) * 4; q[0] = (uint8_t)(3 * x + 5 * y + seed); q[1] = (uint8_t)y; q[2] = (uint8_t)x; q[3] = (uint8_t)(255 - ((x ^ y) & 127)); }
+    id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+    [be copyFromBuffer:src sourceOffset:0 sourceBytesPerRow:(NSUInteger)w * 4 sourceBytesPerImage:(NSUInteger)w * h * 4 sourceSize:MTLSizeMake(w, h, 1) toTexture:t destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [be endEncoding];
+}
+static int io_blit_read_check(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> t, int w, int h, id<MTLBuffer> __strong *outBuf) {
+    id<MTLBuffer> dst = [dev newBufferWithLength:(NSUInteger)w * h * 4 options:MTLResourceStorageModeShared]; memset(dst.contents, 0xEE, (size_t)w * h * 4);
+    id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+    [be copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1) toBuffer:dst destinationOffset:0 destinationBytesPerRow:(NSUInteger)w * 4 destinationBytesPerImage:(NSUInteger)w * h * 4];
+    [be endEncoding]; *outBuf = dst; return 0;
+}
+static int io_buf_matches(id<MTLBuffer> b, int w, int h, int seed) {
+    const uint8_t *p = b.contents; int bad = 0;
+    for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) { const uint8_t *q = p + (y * w + x) * 4; uint8_t e[4] = { (uint8_t)(3 * x + 5 * y + seed), (uint8_t)y, (uint8_t)x, (uint8_t)(255 - ((x ^ y) & 127)) }; if (memcmp(q, e, 4)) bad++; }
+    return bad;
+}
+static int cmd_ioalias(uint64_t rid, int haveRid) {
+    id<MTLDevice> dev = pick_device(rid, haveRid); if (!dev) return 2;
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    const int IW = 64, IH = 64, S1 = 11, S2 = 77; int fails = 0;
+    const char *force = getenv("N48M_IOS_PATH");
+    printf("mtlprobe: ioalias: %dx%d BGRA IOSurface, N48M_IOS_PATH=%s\n", IW, IH, force ? force : "(natural)");
+    // (1) write via A, read via B, one command buffer
+    IOSurfaceRef s = io_make(IW, IH); if (!s) { printf("mtlprobe: FAIL ioalias IOSurfaceCreate\n"); return 2; }
+    io_fill(s, IW, IH, 0);
+    id<MTLTexture> a = io_tex(dev, s, IW, IH, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget), b = io_tex(dev, s, IW, IH, MTLTextureUsageShaderRead);
+    if (!a || !b) { printf("mtlprobe: FAIL ioalias wrappers (%p %p)\n", (__bridge void *)a, (__bridge void *)b); return 2; }
+    {
+        id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLBuffer> got = nil;
+        io_blit_write(dev, cb, a, IW, IH, S1); io_blit_read_check(dev, cb, b, IW, IH, &got);
+        if (!n_run(cb, "ioalias (1)")) { printf("mtlprobe: FAIL ioalias (1) command buffer\n"); return 2; }
+        int bad = io_buf_matches(got, IW, IH, S1); printf("mtlprobe: ioalias (1) write via wrapper A, read via wrapper B in one command buffer: %d of %d pixels differ\n", bad, IW * IH); fails += bad != 0;
+    }
+    // (2) clobber: A wrote pattern S1 (above); now A writes S1b and a NEW wrapper C writes S2 after it, same command buffer
+    id<MTLTexture> c = io_tex(dev, s, IW, IH, MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget);
+    {
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        io_blit_write(dev, cb, a, IW, IH, S1 + 1); io_blit_write(dev, cb, c, IW, IH, S2);
+        if (!n_run(cb, "ioalias (2)")) { printf("mtlprobe: FAIL ioalias (2) command buffer\n"); return 2; }
+        NSData *cpu = io_read(s, IW, IH); int bad = 0; const uint8_t *p = cpu.bytes;
+        for (int y = 0; y < IH; y++) for (int x = 0; x < IW; x++) { const uint8_t *qq = p + (y * IW + x) * 4; uint8_t e[4] = { (uint8_t)(3 * x + 5 * y + S2), (uint8_t)y, (uint8_t)x, (uint8_t)(255 - ((x ^ y) & 127)) }; if (memcmp(qq, e, 4)) bad++; }
+        printf("mtlprobe: ioalias (2) CLOBBER: wrapper A then wrapper C write the same surface: the CPU sees pattern 2 in %d of %d pixels wrong\n", bad, IW * IH); fails += bad != 0;
+    }
+    // (3) B was touched before; C wrote after: B reads again and must see pattern S2
+    {
+        id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLBuffer> got = nil;
+        io_blit_read_check(dev, cb, b, IW, IH, &got);
+        if (!n_run(cb, "ioalias (3)")) { printf("mtlprobe: FAIL ioalias (3) command buffer\n"); return 2; }
+        int bad = io_buf_matches(got, IW, IH, S2); printf("mtlprobe: ioalias (3) a wrapper used earlier reads the surface again after another wrapper wrote: %d of %d pixels differ\n", bad, IW * IH); fails += bad != 0;
+    }
+    // (3b) the same, inside one command buffer: C writes pattern 3, B (touched before) reads
+    {
+        id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLBuffer> got = nil;
+        io_blit_write(dev, cb, c, IW, IH, S2 + 5); io_blit_read_check(dev, cb, b, IW, IH, &got);
+        if (!n_run(cb, "ioalias (3b)")) { printf("mtlprobe: FAIL ioalias (3b) command buffer\n"); return 2; }
+        int bad = io_buf_matches(got, IW, IH, S2 + 5); printf("mtlprobe: ioalias (3b) write via C then read via an earlier-used B in one command buffer: %d of %d pixels differ\n", bad, IW * IH); fails += bad != 0;
+    }
+    // (4) F1
+    const char *fe = getenv("N48M_TEST_IMPORT_FAIL_EVERY");
+    if (fe && atoi(fe) > 0) {
+        int nilc = 0; for (int i = 0; i < 8; i++) { IOSurfaceRef s2 = io_make(IW, IH); id<MTLTexture> t = io_tex(dev, s2, IW, IH, MTLTextureUsageShaderRead); if (!t) nilc++; }
+        printf("mtlprobe: ioalias (4) F1: N48M_TEST_IMPORT_FAIL_EVERY=%s, 8 textures over fresh surfaces: %d nil\n", fe, nilc); fails += nilc != 0;
+    } else printf("mtlprobe: ioalias (4) F1 skipped (N48M_TEST_IMPORT_FAIL_EVERY not set)\n");
+    printf(fails == 0 ? "mtlprobe: PASS ioalias\n" : "mtlprobe: FAIL ioalias (%d)\n", fails);
+    return fails != 0;
 }
 static int cmd_selcensus(uint64_t rid, int haveRid) {
     id<MTLDevice> dev = pick_device(rid, haveRid); if (!dev) return 2;
@@ -3442,7 +3813,7 @@ int main(int argc, char **argv) {
             }
             return argv[1][0] == 'f' ? cmd_frames(rid, haveRid, N, inflight) : cmd_timeout(rid, haveRid, N);
         }
-        if (!strcmp(argv[1], "quad") || !strcmp(argv[1], "blend") || !strcmp(argv[1], "compute") || !strcmp(argv[1], "sysdraw") || !strcmp(argv[1], "dumpair") || !strcmp(argv[1], "skydraw") || !strcmp(argv[1], "cull") || !strcmp(argv[1], "extra") || !strcmp(argv[1], "passbreak") || !strcmp(argv[1], "fbfetch") || !strcmp(argv[1], "fbsover") || !strcmp(argv[1], "fbcopy") || !strcmp(argv[1], "rndprobe") || !strcmp(argv[1], "fbwithin") || !strcmp(argv[1], "iosurface")) {
+        if (!strcmp(argv[1], "quad") || !strcmp(argv[1], "blend") || !strcmp(argv[1], "compute") || !strcmp(argv[1], "sysdraw") || !strcmp(argv[1], "dumpair") || !strcmp(argv[1], "skydraw") || !strcmp(argv[1], "cull") || !strcmp(argv[1], "extra") || !strcmp(argv[1], "passbreak") || !strcmp(argv[1], "fbfetch") || !strcmp(argv[1], "fbsover") || !strcmp(argv[1], "fbcopy") || !strcmp(argv[1], "rndprobe") || !strcmp(argv[1], "fbwithin") || !strcmp(argv[1], "iosurface") || !strcmp(argv[1], "ioalias") || !strcmp(argv[1], "cube") || !strcmp(argv[1], "depth") || !strcmp(argv[1], "msaa") || !strcmp(argv[1], "rg16uint")) {
             uint64_t rid = 0; int haveRid = 0; const char *out = NULL; char defout[64];
             for (int i = 2; i < argc; i++) {
                 if (!strcmp(argv[i], "--registry-id") && i + 1 < argc) { rid = strtoull(argv[++i], NULL, 0); haveRid = 1; }
@@ -3451,7 +3822,12 @@ int main(int argc, char **argv) {
             }
             if (!strcmp(argv[1], "dumpair")) { if (!out) { fprintf(stderr, "usage: mtlprobe dumpair <dir> [--registry-id N]\n"); return 64; } return cmd_dumpair(out, rid, haveRid); }
             if (!out) { snprintf(defout, sizeof defout, "%s-metal.png", argv[1]); out = defout; }
+            if (!strcmp(argv[1], "cube")) return cmd_cube(rid, haveRid, out);
+            if (!strcmp(argv[1], "depth")) return cmd_depth(rid, haveRid);
+            if (!strcmp(argv[1], "msaa")) return cmd_msaa(rid, haveRid);
+            if (!strcmp(argv[1], "rg16uint")) return cmd_rg16uint(rid, haveRid);
             if (!strcmp(argv[1], "iosurface")) return cmd_iosurface(rid, haveRid);
+            if (!strcmp(argv[1], "ioalias")) return cmd_ioalias(rid, haveRid);
             if (!strcmp(argv[1], "fbwithin")) return cmd_fbwithin(rid, haveRid, out);
             if (!strcmp(argv[1], "rndprobe")) return cmd_rndprobe(rid, haveRid);
             if (!strcmp(argv[1], "fbfetch")) return cmd_fbfetch(rid, haveRid, out);

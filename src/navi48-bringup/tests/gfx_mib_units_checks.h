@@ -1,4 +1,4 @@
-// gfx_mib_units_checks.h — build 0.0.480 (notes/design/CONTINUATION-UNITS.md Q10/Q11): THE CONTINUATION-UNIT CHECKS,
+// gfx_mib_units_checks.h — build 0.0.480 (an internal design note Q10/Q11): THE CONTINUATION-UNIT CHECKS,
 // included by gfx_mib_test.cpp (so they run in the `gfx_mib` suite, which already links xlat12_ib.c and reads
 // AppleHardwareHook.cpp for its pins). Everything here drives the REAL code in the KEXT'S ORDER over decide44's real bytes
 // (tests/fixture_units_decide44.h): the segment stage (n48_mib_segment / xlat12_ib_segments), the unit stage
@@ -1151,7 +1151,7 @@ static void checks491()
 }
 
 // =====================================================================================================================
-// build 0.0.501 (notes/design/UNIT-ROOM.md Q3) — SWITCH 67, PACK, IN THE KEXT'S ORDER over decide44's
+// build 0.0.501 (an internal design note Q3) — SWITCH 67, PACK, IN THE KEXT'S ORDER over decide44's
 // real bytes (the 481 mechanics: gHide491 = 1): run_frame latches `pack` into the unit state once per frame, as the kext
 // latches gUnitState.pack once per pass, so every unit AND switch 56's retry (n48_mib_retry_single, the same gU) run it.
 // =====================================================================================================================

@@ -1,0 +1,20 @@
+#!/bin/bash
+# fake `log show`: --last Nm / --start 'DATE' windows; the WindowServer predicate prints the compositor lines, the scanout predicates print the generated bundle log
+now=$(( 1791470000 + $(cat "$SIM_DIR/vclock_ms") / 1000 ))
+t0=0; t1=$now; pred=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --last) v=$2; shift; case "$v" in *m) t0=$(( now - ${v%m} * 60 )) ;; *s) t0=$(( now - ${v%s} )) ;; esac ;;
+    --start) t0=$(/bin/date -j -f '%Y-%m-%d %H:%M:%S' "$2" +%s 2>/dev/null || echo 0); shift ;;
+    --predicate) pred=$2; shift ;;
+  esac
+  shift
+done
+case "$pred" in
+  *'process == "WindowServer"'*)
+    np=$(cat "$SIM_DIR/cfg/nopipe_lines" 2>/dev/null || echo 0); na=$(cat "$SIM_DIR/cfg/compositor_lines" 2>/dev/null || echo 3)
+    i=0; while [ $i -lt ${np%.*} ]; do echo "2026-10-08 13:00:01.000 Df WindowServer[200:1] Unable to find display pipe for display $i"; i=$((i+1)); done
+    i=0; while [ $i -lt ${na%.*} ]; do echo "2026-10-08 13:00:02.000 Df WindowServer[200:1] compositor activated for display $i"; i=$((i+1)); done ;;
+  *) "$SIM_FAKECLI" --genlog "$t0" "$t1" ;;
+esac
+exit 0

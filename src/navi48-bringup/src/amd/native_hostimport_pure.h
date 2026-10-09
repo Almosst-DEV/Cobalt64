@@ -1,12 +1,12 @@
 //
-//  native_hostimport_pure.h - the pure half of BoImportHost (ABI 1.9, kext 0.0.612, milestone #11 step 11c; notes/design/NATIVE-S4-M11.md sections 3 (Q2) and 4 (Q3)). No kernel
+//  native_hostimport_pure.h - the pure half of BoImportHost (ABI 1.9, kext 0.0.612, milestone #11 step 11c; an internal design note sections 3 (Q2) and 4 (Q3)). No kernel
 //  header: tests/native_hostimport_test.cpp compiles this very file and drives it; n1c_bo_import_host / bo_release in native_s1c.cpp are the callers.
 //
 //  What BoImportHost is: the caller (WindowServer, through the bundle) hands the kernel a page-aligned range of ITS OWN address space (an IOSurface's base address); the kernel wires
 //  it (IOMemoryDescriptor::withAddressRange(task) + prepare()), records the physical page list (scattered: one entry per 4 KiB page) and maps those pages into VMID 8 as SYSTEM entries.
 //  Mapping is done either by the ordinary GemVa MAP on the returned handle (the path RADV's buffer_from_ptr takes: RADV owns the VA space) or, when the caller passes a GPU VA, at import.
 //
-//  Limits (the brief): host va and size 4 KiB aligned, size non-zero, size <= 64 MiB per BO, total imported <= 2 GiB per client (0.0.620; was 256 MiB: WindowServer's IOSurface backing stores reached it in normal use; a cap SEPARATE from the 512 MiB GTT cap).
+//  Limits (the brief): host va and size 4 KiB aligned, size non-zero, size <= 64 MiB per BO, total imported <= 4 GiB per client (0.0.621; 2 GiB in 0.0.620, 256 MiB before: WindowServer's IOSurface backing stores reached it in normal use; a cap SEPARATE from the 512 MiB GTT cap).
 //
 #pragma once
 #include <stdint.h>
@@ -17,7 +17,7 @@ namespace n48native {
 namespace s1c {
 
 constexpr uint64_t kImportMaxBo   = 64ull << 20;                 // per BO
-constexpr uint64_t kImportCap     = 2048ull << 20;               // per client, 2 GiB (0.0.620), separate from kGttCap (512 MiB)
+constexpr uint64_t kImportCap     = 4096ull << 20;               // per client, 4 GiB (0.0.621; 2 GiB in 0.0.620), separate from kGttCap (512 MiB)
 constexpr uint64_t kImportUserMax = 1ull << 47;                  // the x86-64 user half: a host range must end at or below it
 constexpr uint32_t kImportMaxPages = (uint32_t)(kImportMaxBo / kPage);   // 16384: the page list of one BO (128 KiB)
 // The flags word is the GemVa vm-flags subset that matters for a leaf: R / W / X and the MTYPE. Non-zero only together with a GPU VA (map at import).

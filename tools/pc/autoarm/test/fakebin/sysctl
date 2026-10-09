@@ -1,0 +1,2 @@
+#!/bin/bash
+case "$2" in kern.bootargs) echo "${FAKE_BOOTARGS:?}" ;; kern.boottime) echo "{ sec = ${FAKE_BOOTSEC:-1791470000}, usec = 0 } Thu Oct  8 16:00:00 2026" ;; esac

@@ -1,7 +1,7 @@
 // rootwrite_guards_test.cpp — prove every guard G1..G6 REFUSES.
 //
 // The brief for milestone 3 increment (iii) requires each guard "proven to REFUSE
-// in a host test, not merely to pass", and notes/M3-ROOT-WRITE-REVIEW.md.4 says
+// in a host test, not merely to pass", and notes/an internal review note.4 says
 // why: G1, G2, G3 and the teardown's G7 all fail SILENTLY and OFF-TARGET. On
 // hardware their failure looks identical to their success — nothing visibly
 // happens, and another process's page table is quietly wrong. A passing hardware

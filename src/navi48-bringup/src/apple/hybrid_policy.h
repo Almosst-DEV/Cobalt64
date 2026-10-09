@@ -1,4 +1,4 @@
-// hybrid_policy.h — build 0.0.503 (notes/design/HYBRID.md and step H1): WHO MAY OPEN THE ACCELERATOR.
+// hybrid_policy.h — build 0.0.503 (an internal design note and step H1): WHO MAY OPEN THE ACCELERATOR.
 // Pure C, host-tested by tests/gfx_copyguard_test.cpp section T22 (with planted breaks); the kext compiles the SAME header.
 //
 // THE HYBRID. WindowServer composites on the GPU; every other process draws on the CPU. The door every Metal, GL, 2D and

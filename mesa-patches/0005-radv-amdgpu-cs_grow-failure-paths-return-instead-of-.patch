@@ -1,7 +1,7 @@
 From 6ed3cdc10c15e683c2b43c5436e0ebf60216cebb Mon Sep 17 00:00:00 2001
 From: Navi48-MacOS contributors <noreply@example.invalid>
 Date: Thu, 1 Jan 2026 00:00:00 +0000
-Subject: [PATCH 5/5] radv/amdgpu: cs_grow failure paths return instead of
+Subject: [PATCH 5/9] radv/amdgpu: cs_grow failure paths return instead of
  writing before the IB (Navi48 P1)
 
 An IB allocation or map failure fell through into the chain_ib writes at

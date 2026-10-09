@@ -1,4 +1,4 @@
-// gfx_fs85_test.cpp — build 0.0.530 (notes/design/SRCFILL85.md items 1-8, its replay, tests and planted breaks; apple/gfx_fs85.h):
+// gfx_fs85_test.cpp — build 0.0.530 (an internal design note items 1-8, its replay, tests and planted breaks; apple/gfx_fs85.h):
 // switch 85 "SOURCE FILLS" (S1 twin member, S2 retire on any non-live reserve, S3 one source fill in the plane window).
 //     clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //         -I src/navi48-bringup/src/apple -I src/navi48-bringup/tests src/navi48-bringup/tests/gfx_fs85_test.cpp -o /tmp/fs85 && \
@@ -738,7 +738,7 @@ static void checks_geo(const std::string &src)
 
 int main(int argc, char **argv)
 {
-    std::printf("== gfx_fs85: switch 85 SOURCE FILLS (notes/design/SRCFILL85.md)\n");
+    std::printf("== gfx_fs85: switch 85 SOURCE FILLS (an internal design note)\n");
     checks_off_identity();
     checks_s1();
     checks_s2();

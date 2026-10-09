@@ -42,7 +42,7 @@ static int collect(void *ctx, const sc_census_item *it)
 }
 
 // =============================================================================================================
-// build 0.0.484 (notes/design/GLASS.md Q2 K1/K2 + the substitution cap, Q6 test (c)). The kext's own shader-cache
+// build 0.0.484 (an internal design note Q2 K1/K2 + the substitution cap, Q6 test (c)). The kext's own shader-cache
 // library (shadercache.c, the object the kext links) over fixture_glass_bd_be.h's blobs:
 //   K1  the residency writer's sc_subst_render into a buffer of kScMaxSubstBytes (N48_SC_MAX_SUBST_BYTES) renders each
 //       glass value to its full 5376 bytes - and refuses SC_E_CAPACITY at the OLD 2048 (glass could never be written).

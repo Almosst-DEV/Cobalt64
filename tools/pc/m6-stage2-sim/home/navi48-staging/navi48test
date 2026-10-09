@@ -1,0 +1,43 @@
+#!/bin/bash
+# fake navi48test on the fake PC: the verbs the kit parses go to fakecli (the REAL CLI printf bodies over the simulated kernel); the rest print canned text with the real CLI's wording.
+tick() { local ms; ms=$(cat "$SIM_DIR/vclock_ms" 2>/dev/null || echo 0); echo $(( ms + $1 )) >"$SIM_DIR/vclock_ms"; }
+now=$(( 1791470000 + $(cat "$SIM_DIR/vclock_ms") / 1000 ))
+r=$(cat "$SIM_DIR/kv/restart_epoch" 2>/dev/null || echo -1); ts=-1; [ "$r" -ge 0 ] && ts=$((now - r))
+cfgn() { local v; v=$(cat "$SIM_DIR/cfg/$1" 2>/dev/null) || v=$2; echo "${v%.*}"; }
+tick 60
+case "${1:-}" in
+  reg) if [ "$(cfgn raster_fallback 0)" = 1 ]; then echo "reg[0x4fea] = 0x00000897"; else echo "reg[0x4fea] = 0x00000a9f"; fi; exit 0 ;;
+  log) if [ "$ts" -ge "$(cfgn leak_at 1000000000)" ] && [ "$r" -ge 0 ]; then echo "N48: LEAKED BO 0x7 (instance 1) after an unverified restore"; fi; echo "N48: driver log (sim)"; exit 0 ;;
+  accel) shift ;;
+  *) echo "sim: unhandled navi48test $*" >&2; exit 2 ;;
+esac
+verb=${1:-status}
+dpw() { echo "  DP plane watch ($1): all 15 registers unchanged (row 14 is the kext's rule)"; }
+case "$verb" in
+  m6stat|m6xstat|vramstat) exec "$SIM_FAKECLI" accel "$@" ;;
+  disp2)
+    op=${2:-}; inst=${3:-}
+    case "$op" in
+      crc) tick 250; exec "$SIM_FAKECLI" accel "$@" ;;
+      status|plane|show|fbhold) exec "$SIM_FAKECLI" accel "$@" ;;
+      timing|timing1440|connect)
+        if [ -e "$SIM_DIR/kv/held_$inst" ]; then echo "accel disp2 $op $inst: status 21 (the plane is HELD)"; exit 3; fi
+        if [ "$(cfgn disturb_chain 0)" = 1 ] && [ "$inst" = 1 ]; then echo "accel disp2 $op $inst: status 15 (DP_DISTURBED)"; echo "  monitor B watch: CHANGED (row 4, DET2 current; the kext rolled the monitor A op back)"; exit 4; fi
+        echo "accel disp2 $op $inst: status 0 (OK)"; dpw "$op"; echo "  monitor B watch: unchanged"; exit 0 ;;
+      *) echo "sim: disp2 $op not simulated" >&2; exit 2 ;;
+    esac ;;
+  dmubsend)
+    if [ -e "$SIM_DIR/kv/held_1" ] || [ -e "$SIM_DIR/kv/held_2" ]; then echo "accel dmubsend $2 $3: REFUSED (a plane is HELD)"; echo "  status                  : 6 (refused)"; exit 3; fi
+    echo "accel dmubsend $2 $3 (template sim): slot 00000000 (sim)"; echo "  status                  : 0 (OK)"; echo "  command sent            : yes (WPTR moved)"; dpw "dmubsend $2 $3"; exit 0 ;;
+  scdcread) echo "accel scdcread: line 3 off 0x40"; echo "  the sink LOCKS onto our TMDS (SCDC 0x40 bit 1 set: scrambling on)"; exit 0 ;;
+  fbpublish) echo $now >"$SIM_DIR/kv/fbpub$2"; echo "accel fbpublish $2: status 0 (OK: the display nub is published (Navi48DisplayIndex 1 for \`fbpublish 2\` = the monitor B, 2 for \`fbpublish 1\` = the monitor A); the aux framebuffer may now match it)"; exit 0 ;;
+  pipeadopt) echo 1 >"$SIM_DIR/kv/adopted"; p=$(cfgn pipes_adopt 3); echo "accel pipeadopt: hook installed = no"; echo "  status                  : 0 (OK)"; echo "  flags                   : 0x3b"; echo "  aux traces: pipes ours / all, display-machine starts / PCI substituted: $p / $p, 1 / 1 (last walk provider 0xffffff86d099a800)"; exit 0 ;;
+  pipeagdc) echo "accel pipeagdc: hook installed = no"; echo "  agdc status             : 0 (PUBLISHED)"; echo "  published / start ok    : 1 / 1"; echo "  registry ID             : 0x100000744"; exit 0 ;;
+  fbname) echo "accel fbname: hook installed = no"; echo "  class name NOW          : AMDRDNA4"; exit 0 ;;
+  pipearm) echo 1 >"$SIM_DIR/kv/armed"; echo "  accel+0xccf now         : 1 (255 = not readable)"; exit 0 ;;
+  pipereload) echo "  restart window          : OPEN (15 s)"; exit 0 ;;
+  pipestat) echo "  stamps written (txn+0x178 / +0x188)                    : 0"; exit 0 ;;
+  sessstat) h=0; [ "$ts" -ge "$(cfgn hung_at 1000000000)" ] && [ "$r" -ge 0 ] && h=1; echo "accel sessstat 4:"; echo "  open / DEAD slots / HUNG: 1 / 0 / $h"; exit 0 ;;
+  status) echo "accel status (sim)"; exit 0 ;;
+  *) echo "sim: accel $verb not simulated" >&2; exit 2 ;;
+esac

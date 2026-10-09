@@ -109,14 +109,14 @@ static inline const char *n48_fs_geo_name(uint32_t geo)
 
 /*a item 2, CUT BY: the reservation expires after this many judged frames since the arm. 200 was the spec's
  * number; ruled it too long and cut it to 60. 60 judged frames is NOT about a second: MEASURED it is about 5 s
- * (notes/design/SRCFILL85.md Fact 1, run11i/j/l/m), because judged frames arrive far slower than 60 Hz during start-up
+ * (an internal design note Fact 1, run11i/j/l/m), because judged frames arrive far slower than 60 Hz during start-up
  * (build 0.0.530: comment corrected, value unchanged). Long enough for the start-up burst (f1 and f13-18) and
  * short enough that a boot whose twin fill never comes falls back to today's rule
  * rather than refusing the plane until the window's own end. The RETIREMENT below is what rescues arm22's f35 in the
  * window; expiry is the backstop for a boot where no reserved fill even reaches the gate. */
 #define N48_FS_EXPIRE_JUDGED 60u
 
-/* 0.0.420 (notes/design/STEP10-PLAN.md P1) — THE SECOND WINDOW: HOLD A SHOT FOR THE PLANE.'s
+/* 0.0.420 (an internal design note P1) — THE SECOND WINDOW: HOLD A SHOT FOR THE PLANE.'s
  * retirement closes the FILL window once every member is committed or retired, and the NEXT eligible frame under today's
  * rule is whatever comes first: arm29 and arm31 measured a "second pair" - two non-plane frames drawing
  * into the same two surfaces (IB `0x400750000`, PS `0x400595600`) - taking the shots the plane frame needed, so NO plane
@@ -440,7 +440,7 @@ static inline uint32_t n48_fs_retire_withdrawn(n48_fs *f, uint64_t cb0, uint32_t
     return 0u;
 }
 
-/* build 0.0.532 item 11 (a) (; notes/design/HW72M3.md): REPORT ONLY. The commit hook's EXIT 3 saw the walk NOT
+/* build 0.0.532 item 11 (a) (; an internal design note): REPORT ONLY. The commit hook's EXIT 3 saw the walk NOT
  * spare token seq `seq` (any answer but SPARED). A member COMMITTED with that seq is marked walk-NOPed in a SEPARATE record (n48_fs
  * keeps 0.0.529's layout: gfx_fs85_test asserts it), which the arm's open resets with the window. Committed stays committed: a
  * walk-NOPed member counted as retired would change the window's and S3's semantics (its own review). The mark is printed on its

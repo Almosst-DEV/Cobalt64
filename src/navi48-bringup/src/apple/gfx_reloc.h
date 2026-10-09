@@ -38,7 +38,7 @@
 //     root slot 511, with ringmap_leaf() setting EXECUTABLE | READABLE | WRITEABLE. Apple's tables point at none of it; we
 //     allocated it, we wrote the page tables, and the geometry engine already fetches its rings from it. The tail above the
 //     ring-offsets descriptor page, [+0xA81000, +0xA8F000) = 56 KiB since 0.0.413 (it was 60 KiB before the last 4 KiB,
-//     [+0xA8F000, +0xA90000), became the fence828 owned slot page — notes/design/FENCE-OWNED-SLOT.md), is reserved for
+//     [+0xA8F000, +0xA90000), became the fence828 owned slot page — an internal design note), is reserved for
 //     exactly this (XLAT12_RELOC_ARENA_OFF/BYTES). CHOSEN.
 // LIFETIME. The arena lives and dies with the ringmap carve: it is valid only while `built` and it is emptied whenever the
 // region is rebuilt. 0.0.399: a placement records the VA base it was made under and a MOVE of that base empties

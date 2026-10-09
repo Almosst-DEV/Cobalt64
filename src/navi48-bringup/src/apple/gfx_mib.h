@@ -1,4 +1,4 @@
-// gfx_mib.h — 0.0.421 (notes/design/MIB-COMMIT.md binding B10). THE MIB-0 READ-ONLY CENSUS.
+// gfx_mib.h — 0.0.421 (an internal design note binding B10). THE MIB-0 READ-ONLY CENSUS.
 //
 // Pure C++ (static inline), so the kext and its host suite (tests/gfx_mib_test.cpp) compile the SAME classifier and
 // the SAME report format. NOTHING here changes a byte, gates a decision, takes a lock or writes a register: every
@@ -110,7 +110,7 @@ typedef struct {
     uint64_t runs;        /* single-IB policy passes that contributed to every counter above */
 } n48_mib_pol;
 
-/* 0.0.426 (notes/design/MIB-COMMIT.md binding B2) — THE SEGMENT'S CLIENT VA IN A CONCATENATED FRAME.
+/* 0.0.426 (an internal design note binding B2) — THE SEGMENT'S CLIENT VA IN A CONCATENATED FRAME.
  *
  * In the multi-IB commit the IBs are read into ONE buffer at off_k = sum(len_j, j < k) and each IB is translated on its own,
  * so the translator's `ib_va` for a segment must be that IB's own VA plus 4 dwords for each dword the segment starts past
@@ -179,7 +179,7 @@ static inline uint32_t n48_mib_want(uint32_t len, uint32_t off, uint32_t cap)
  * about - which either finds no further head (this IB is one segment, and the probe's own walk must reach the IB's
  * end cleanly or the whole disguise is refused: a truncated walk is never silently accepted as "no more segments"),
  * or finds the next segment's real, UNDISGUISED head, from which the ordinary `xlat12_ib_segments` takes over. */
-/* build 0.0.505 (notes/design/CROSS-IB.md, owed item (6)): `exact` 1 replaces the length-10 rung with
+/* build 0.0.505 (an internal design note, owed item (6)): `exact` 1 replaces the length-10 rung with
  * `h == N48_MIB_NOP_HEAD` - the one dword Apple writes, 0xC0081000, predicate and shader-type bits included (a header
  * with the same opcode and count but any other low bit is refused). Only switch 69's path passes 1 (n48_mib_segment
  * with `xib` != 0, for IB 0 AND for IB k >= 1); `exact` 0 is the 0.0.504 rule, byte for byte, so switch 69 OFF is
@@ -244,7 +244,7 @@ static inline void n48_mib_seg_draws(const uint32_t *ib, uint32_t from, uint32_t
 }
 
 /* =====================================================================================================================
- * build 0.0.505 (notes/design/CROSS-IB.md Q4 C1; switch 69, DEFAULT OFF, requires 36) — THE CROSS-IB RULES.
+ * build 0.0.505 (an internal design note Q4 C1; switch 69, DEFAULT OFF, requires 36) — THE CROSS-IB RULES.
  *
  * `xib` is switch 69's M, latched once per pass: bit 0 (N48_MIB_XIB_DISG0) offers the disguised head to IB 0 as well
  * (CROSS-IB Q1: IB 0 opens NOP-HEAD in 12 of 43 captured multi-IB zero-segment frames, so the "no previous IB" premise
@@ -436,7 +436,7 @@ static inline uint32_t n48_mib_segment(const uint32_t *ib, uint32_t nib,
 }
 
 /* =====================================================================================================================
- * build 0.0.480 (notes/design/CONTINUATION-UNITS.md Q1 and Q11 contract item C1; switch 55) — CONTINUATION UNITS.
+ * build 0.0.480 (an internal design note Q1 and Q11 contract item C1; switch 55) — CONTINUATION UNITS.
  *
  * A segment CONTINUES the one before it when it draws into the colour target an earlier segment of the SAME IB set up:
  * a packet walk of [start, first draw) finds no SET_CONTEXT_REG covering gfx10 CB_COLOR0_VIEW (0x28c6c, context dword
@@ -856,7 +856,7 @@ static inline uint32_t n48_mib0_cap32(uint64_t v)
     n48_mib0_cap32((p)->desc_ns / 1000ull), \
     n48_mib0_cap32((p)->runs)
 
-/* 0.0.434 (notes/design/PGMID-COPYGUARD.md Part 1): the SAME five phases (N48_MIB0_POL_ARGS is already
+/* 0.0.434 (an internal design note Part 1): the SAME five phases (N48_MIB0_POL_ARGS is already
  * generic over any n48_mib_pol*), accumulated separately for nib >= 2 passes and printed on its own line so the
  * single-IB figure above is never read as describing a population it was never about. */
 #define N48_MIB0_POL2_FMT \

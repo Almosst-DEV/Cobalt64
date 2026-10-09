@@ -1,4 +1,4 @@
-// gfx_mmprio.h — 0.0.433 (notes/design/MM-PRIORITY.md). MM-WINDOW PRIORITY, THE PURE DECISION LOGIC.
+// gfx_mmprio.h — 0.0.433 (an internal design note). MM-WINDOW PRIORITY, THE PURE DECISION LOGIC.
 //
 // decide36b measured single-IB policy runs at 19.25 ms/run, with descriptor reads alone 11.7 ms/run
 // (60.7% of it) — and 0.0.433's design memo established that cost is ~99% WAITING for gVramMmLock, not reading

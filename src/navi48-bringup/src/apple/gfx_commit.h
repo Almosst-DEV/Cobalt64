@@ -71,13 +71,13 @@ enum {
      * `ws_B_ColorFill`) whose CB0 is a set member not yet committed; it passes and may spend a shot. This rung REFUSES
      * ONLY; it never writes and never widens another rung. See n48_cm_gate's own comment. */
     N48_CM_RESERVED_FOR_FILL, /* switch 33 on, the fill-set window is open, and this frame is not a reservable fill */
-    /* 0.0.418 (notes/design/BUILD-0.0.418.md, E3) — REGION-MOVED. Appended, never inserted, for the same reason as the
+    /* 0.0.418 (an internal design note, E3) — REGION-MOVED. Appended, never inserted, for the same reason as the
      * rungs above. Set ONLY by the kext's commit-try (not by n48_cm_gate): the fence828 candidate was placed against a
      * ring region that has since been rebuilt or moved, so the frame is NEUTERED at source. Through 0.0.417 that path
      * dropped the candidate but left the verdict at COMMIT, and the executed, un-promoted fence then pinned every later
      * candidate at SLOT-PRE. The frame-level answer is a refusal, exactly as every other gate refusal neuters. */
     N48_CM_FENCE_REGION_MOVED,
-    /* 0.0.420 (notes/design/STEP10-PLAN.md P1) — RESERVED-FOR-PLANE. Appended, never inserted, for the same
+    /* 0.0.420 (an internal design note P1) — RESERVED-FOR-PLANE. Appended, never inserted, for the same
      * reason as the rungs above. Set ONLY by n48_cm_gate's appended second-window rung. PRESENT ONLY WHILE `gfxneuter 35`
      * IS ON: with `fp_switch` 0 the rung is unreachable and the gate is 0.0.419's, dword for dword. With the switch on,
      * and only while the arm's SECOND window is open (gfx_fillset.h's n48_fs_plane_win_open — the fill window has closed,
@@ -85,13 +85,13 @@ enum {
      * plane-shaped (in-force PS identity `ws_D_GPUPass`) is refused here. A plane-shaped frame passes and may spend a shot.
      * This rung REFUSES ONLY; it never writes and never widens another rung. */
     N48_CM_RESERVED_FOR_PLANE,
-    /* R1 (notes/design/R1-MEMDST.md Q2) — MEMORY-DESTINATION. APPENDED AT THE TAIL, never inserted,
+    /* R1 (an internal design note Q2) — MEMORY-DESTINATION. APPENDED AT THE TAIL, never inserted,
      * for the SAME reason as every rung above (the reason numbers are printed in `byReason[]` and quoted in the
      * record). The design names its GATE-FUNCTION check order as "after TOKEN, before DEP_STALE" - see
      * n48_cm_gate's own placement of the `if` below, which is where that order lives; the ENUM's numeric value
      * stays at the tail, matching this file's own append-only discipline for every prior addition. */
     N48_CM_MEMDST,         /* switch 42 ENFORCE, and n48_md_judge did not answer N48_MD_OK for this candidate */
-    /* C5 part 1 (notes/design/C5-CONTINUOUS.md Q1, gfx_flightring.h) — THE FLIGHT RING IS FULL. APPENDED AT THE TAIL,
+    /* C5 part 1 (an internal design note Q1, gfx_flightring.h) — THE FLIGHT RING IS FULL. APPENDED AT THE TAIL,
      * never inserted, for the same reason as every rung above (the reason numbers are printed in `byReason[]` and
      * quoted in the record). Checked ONLY here — the primary gate is the caller's `live` predicate
      * (gfxsrc_commit_try), which folds in `!n48_fr_full(&gKsRing)` exactly as it already does for md_ok/dep_ok; this
@@ -106,17 +106,17 @@ enum {
      * dependency (both are answered from `mib`/`nib` alone, before anything about the rewrite is known) — so the one
      * armed shot this switch guards can only ever land on a frame with two or more IBs. */
     N48_CM_MIB_REQUIRED,   /* switch 53 on, and this frame is not mib (or has fewer than 2 IBs) */
-    /* C5 part 2 (notes/design/C5-CONTINUOUS.md Q2, build 0.0.460) — FENCE REQUIRED IN CONTINUOUS MODE. Appended at the
+    /* C5 part 2 (an internal design note Q2, build 0.0.460) — FENCE REQUIRED IN CONTINUOUS MODE. Appended at the
      * tail, never inserted, for the same reason as every rung above (the reason numbers are printed in `byReason[]`
      * and quoted in the record). Present ONLY while THIS shot is a CONTINUOUS one (`cont_on`); with `cont_on` 0 (every
      * one-shot arm, and the default) the rung is unreachable and the gate is 0.0.451's, dword for dword — a fence-less
-     * commit under a one-shot is unaffected (C5-RING-REVIEW.md "10a: acceptable once the push is fixed... Require a
+     * commit under a one-shot is unaffected (an internal review note "10a: acceptable once the push is fixed... Require a
      * fence in continuous mode" is what this rung is). Checked as a WORLD rung, beside RING_FULL: `cont_fence_ok` is
      * the caller's OWN pre-write reading of whether THIS frame carries an owned-slot fence candidate
      * (`gXdF828Pending`, sampled BEFORE the write, never recomputed here). The caller's `live` predicate folds in the
      * SAME reading first (gfxsrc_commit_try), exactly as RING_FULL's own redundant-second-check shape above. */
     N48_CM_CONT_NO_FENCE,  /* continuous mode, and this commit carries no owned-slot fence candidate */
-    /* build 0.0.487 (notes/design/COMPUTE-N.md Q4 "A latent fail-open", Q6 item 5, contract C3) — COMPUTE-ELIDE-R1.
+    /* build 0.0.487 (an internal design note Q4 "A latent fail-open", Q6 item 5, contract C3) — COMPUTE-ELIDE-R1.
      * APPENDED AT THE TAIL, never inserted, for the same reason as every rung above (the reason numbers are printed in
      * `byReason[]` and quoted in the record). A frame in which switch 57 elided ANY of Apple's compute clears N
      * (`cs_elided` > 0, the policy's own count) commits ONLY with switch 42 on ENFORCE (`md_switch`) AND R1 clean
@@ -126,7 +126,7 @@ enum {
      * predicate (gfxsrc_commit_try, n48_cm_live) carries the SAME clause first, so the write never happens; this is the
      * redundant second check every "world" rung has. */
     N48_CM_CS_ELIDE_R1,    /* switch 57 elided a dispatch, and 42 is not ENFORCE or R1 did not answer clean */
-    /* build 0.0.500 (notes/design/DRAW-ELIDE.md Q4) — DRAW-ELIDE-R1. APPENDED AT THE TAIL, never inserted, for the same
+    /* build 0.0.500 (an internal design note Q4) — DRAW-ELIDE-R1. APPENDED AT THE TAIL, never inserted, for the same
      * reason as every rung above. A frame in which switch 66 elided ANY draw (`draw_elided` > 0, the policy's own sum of
      * xlat12's `draw_elided`) commits ONLY with switch 42 on ENFORCE (`md_switch`) AND R1 clean (`md_ok`), exactly
      * COMPUTE-ELIDE-R1's rule: an elided draw makes reachable a frame whose memory-destination packets only R1 judges.
@@ -207,7 +207,7 @@ static inline const char *n48_cm_kind_name(uint32_t k)
  * 0.0.426 (MIB-COMMIT B9): `%u IB(s)` is added so the line names a multi-IB frame's count; `%u dw` is already the
  * frame's TOTAL dwords (`c.n` is sum(ib_n) for a MIB frame), so nib + total is what B9 asks the line to carry.
  * args: gate reason name, token seq, VA, dwords, nib, segments, seg_kind name, budget, spent, left, the budget sentence */
-/* C5 part 1 (hygiene, notes/design/C5-CONTINUOUS.md Q3) — THE OLD ENDING WAS A LIAR AT BUDGET > 1. Through 0.0.442 it
+/* C5 part 1 (hygiene, an internal design note Q3) — THE OLD ENDING WAS A LIAR AT BUDGET > 1. Through 0.0.442 it
  * read "The arm level stays COMMIT only until this frame's submission returns", which is true only while `left == 0`
  * after this spend — at budget > 1 with budget left the arm level is put back to COMMIT for the NEXT frame the
  * instant this one's submission returns (xd_shot_finish only moves SPENT -> DONE, and n48_cm_shot_level only hands
@@ -221,7 +221,7 @@ static inline const char *n48_cm_kind_name(uint32_t k)
 #define N48_CM_SPENT_MORE "A FURTHER FRAME MAY STILL BE HANDED COMMIT: the budget is NOT exhausted."
 #define N48_CM_SPENT_DONE "The budget is exhausted, so no other frame can be handed COMMIT from this moment."
 
-/* C5 part 2 (notes/design/C5-CONTINUOUS.md Q3, build 0.0.460) — THE THREE CONTINUOUS-MODE LOG LINES, HERE FOR THE
+/* C5 part 2 (an internal design note Q3, build 0.0.460) — THE THREE CONTINUOUS-MODE LOG LINES, HERE FOR THE
  * SAME REASON N48_CM_SPENT_FMT IS: so the host test can bound them against n48log's 512-byte cap ('s
  * lesson) before a run ever prints one.
  *   N48_CM_CONT_START_FMT — the ONE line printed at the first plane commit (n48_cm_shot_cont_start's own 1).
@@ -291,7 +291,7 @@ static inline const char *n48_cm_kind_name(uint32_t k)
  * xlat12_ib_translate_draw_ex's, `out_len` is the dwords it produced. */
 typedef struct { uint32_t head, start, end, status, out_len; } n48_cm_seg;
 
-/* 0.0.426 (notes/design/MIB-COMMIT.md binding B7) — THE FRAME IDENTITY OVER EVERY IB.
+/* 0.0.426 (an internal design note binding B7) — THE FRAME IDENTITY OVER EVERY IB.
  *
  * Through 0.0.425 the token carried IB 0's VA and length alone, so a multi-IB frame's identity was re-established over one
  * entry of four: the hook compared THIS submission's IB 0 with the rewritten frame's IB 0 and nothing checked IBs 1..3. With
@@ -402,7 +402,7 @@ typedef struct {
     uint32_t fp_switch;
     uint32_t fp_open;
     uint32_t fp_reserve;
-    /* 0.0.426 (notes/design/MIB-COMMIT.md binding B5) — THE PER-IB FRAME. All zero-initialised and read ONLY when `mib` is
+    /* 0.0.426 (an internal design note binding B5) — THE PER-IB FRAME. All zero-initialised and read ONLY when `mib` is
      * 1, so a caller that leaves them all 0 gets 0.0.425's gate exactly (every rung below branches on `mib`).
      *   mib         1 when this frame's IBs were read into ONE concatenated buffer, each translated on its own.
      *   ib_n[k]     IB k's DECLARED dwords. LEN requires n == sum(ib_n[0..nib)).
@@ -419,7 +419,7 @@ typedef struct {
     uint32_t got_ib[N48_XV_MAX_IBS];
     uint32_t back_sys_pages_ib[N48_XV_MAX_IBS];
     uint32_t mismatch_ib[N48_XV_MAX_IBS];
-    /* R1 (notes/design/R1-MEMDST.md Q2) — THE MEMORY-DESTINATION RUNG'S OWN ANSWER, exactly the dep_ok pattern
+    /* R1 (an internal design note Q2) — THE MEMORY-DESTINATION RUNG'S OWN ANSWER, exactly the dep_ok pattern
      * above: `md_switch` is 1 only under ENFORCE (gMdMode 1; SHADOW and OFF leave it 0, so this rung is
      * unreachable and the gate is 0.0.439's, dword for dword); `md_ok` is gXdBuild.md_ok, the caller's OWN reading
      * from n48_md_judge - never recomputed here. The PRIMARY gate is the caller's `live &= (!md_switch || md_ok)`
@@ -438,7 +438,7 @@ typedef struct {
      * is needed beyond this one flag. Zero-initialised means "switch off", and 0 makes the rung unreachable, exactly
      * as every other switch field in this struct already behaves. */
     uint32_t mib_req_switch;
-    /* C5 part 2 (notes/design/C5-CONTINUOUS.md Q2) — THE CONTINUOUS-MODE FENCE REQUIREMENT'S OWN TWO FLAGS, exactly
+    /* C5 part 2 (an internal design note Q2) — THE CONTINUOUS-MODE FENCE REQUIREMENT'S OWN TWO FLAGS, exactly
      * the ring_full/md_ok pattern: `cont_on` is 1 only while THIS shot (gXdShot) is a continuous arm — the caller's
      * OWN reading of `gXdShot.cont`, never recomputed here; `cont_fence_ok` is 1 only when this frame's OWN fence828
      * candidate was pending before the write (`gXdF828Pending`, sampled by the caller). Both 0 by default, so a
@@ -459,7 +459,7 @@ typedef struct {
      * the policy's own sum of xlat12's `draw_elided`, cleared at both pass tops). The caller's OWN reading; 0 (switch 66 OFF)
      * leaves the rung unreachable. APPENDED. */
     uint32_t draw_elided;
-    /* build 0.0.505 (notes/design/CROSS-IB.md C3) — bit k = IB k's first segment is a LEAD (switch 69: translated from
+    /* build 0.0.505 (an internal design note C3) — bit k = IB k's first segment is a LEAD (switch 69: translated from
      * its first dword, start == head). The caller's OWN copy of the segment stage's answer (gXdBuild.leadMask, set only
      * from n48_mib_segment's *lead_mask and only with a non-zero answer); 0 (switch 69 OFF) makes every lead rung
      * unreachable and the tiling loop 0.0.504's, dword for dword. APPENDED. */
@@ -621,11 +621,11 @@ static inline uint32_t n48_cm_gate(const n48_cm_frame *c, uint32_t *detail)
      * not of the rewrite, so it belongs with the other "world" rungs at the tail rather than among the per-frame
      * ones above. Unconditional (no switch): the ring exists whenever this gate does. */
     if (c->ring_full) return N48_CM_RING_FULL;
-    /* C5 part 2 (notes/design/C5-CONTINUOUS.md Q2) — FENCE REQUIRED IN CONTINUOUS MODE, placed beside RING_FULL for
+    /* C5 part 2 (an internal design note Q2) — FENCE REQUIRED IN CONTINUOUS MODE, placed beside RING_FULL for
      * the same reason: both are properties of the WORLD this commit would run in, not of the rewrite, unconditional
      * on nothing but the caller's own `cont_on` reading (no separate switch rung — `cont_on` IS the gate). */
     if (c->cont_on && !c->cont_fence_ok) return N48_CM_CONT_NO_FENCE;
-    /* R1 (notes/design/R1-MEMDST.md Q2) — MEMORY-DESTINATION, PLACED HERE (after TOKEN, before DEP_STALE) BY THE
+    /* R1 (an internal design note Q2) — MEMORY-DESTINATION, PLACED HERE (after TOKEN, before DEP_STALE) BY THE
      * DESIGN'S OWN ORDER. Present only under ENFORCE (`md_switch`); SHADOW and OFF leave it 0 and this rung is
      * unreachable, so the gate is 0.0.439's, dword for dword. The PRIMARY gate is the caller's `live` predicate
      * (gfxsrc_commit_try); this is the redundant second check, exactly as N48_CM_DEP_STALE below is for dep_ok. */
@@ -980,7 +980,7 @@ enum {
     N48_CM_SHOT_STATES
 };
 
-/* C5 part 1 (hygiene, notes/design/C5-CONTINUOUS.md Q3) — CHECKED AGAINST BUDGET > 1. "ARMED (one-shot)" and "SPENT
+/* C5 part 1 (hygiene, an internal design note Q3) — CHECKED AGAINST BUDGET > 1. "ARMED (one-shot)" and "SPENT
  * (one frame committed, in flight)" were true only at budget 1: with a budget of 2-4, ARMED may still accept MORE
  * than one frame before it moves to SPENT (n48_cm_shot_spend only moves the state once `spent >= budget`), and SPENT
  * means the budget is EXHAUSTED, not that exactly one frame was ever handed COMMIT this arm. Reworded to be true at
@@ -1024,7 +1024,7 @@ static inline const char *n48_cm_shot_name(uint32_t s)
  * it. The verb refuses an out-of-range N outright; this is the second of the two guards, not the first. */
 #define N48_CM_SHOT_BUDGET_MAX 4u
 
-/* C5 part 2 (notes/design/C5-CONTINUOUS.md Q2, build 0.0.460) — THE CONTINUOUS ARM'S OWN CEILINGS. N (the frame
+/* C5 part 2 (an internal design note Q2, build 0.0.460) — THE CONTINUOUS ARM'S OWN CEILINGS. N (the frame
  * budget) up to 1022 (build 0.0.530 item 9, : approved raising 600 to the 10-bit field's top;
  * 1023 = 0x3FF is switch 41's CLEAR sentinel, so 1022 is the largest settable N) and T (the deadline, in 10-ms units) up to 500 (5.000 s) are the USER'S OWN DECISION for the 10a
  * run (N = 60, T = 5 s); the ceilings are the verb's second guard, exactly as N48_CM_SHOT_BUDGET_MAX is the one-
@@ -1129,12 +1129,12 @@ static inline n48_cm_sw41 n48_cm_sw102_decode(uint64_t arg)
  * is not left waiting minutes for a run that was never going to produce a plane. */
 #define N48_CM_PREPLANE_BOUND_US 30000000ull
 
-/* C5 part 2 (notes/design/C5-CONTINUOUS.md Q2) — WHY THE CONTINUOUS ARM STOPPED. 0 (NONE) is the only value a
+/* C5 part 2 (an internal design note Q2) — WHY THE CONTINUOUS ARM STOPPED. 0 (NONE) is the only value a
  * standing ARMED shot ever carries; every other value is written ONCE, by n48_cm_shot_spend (N reached, the SAME
  * transition point a one-shot's budget exhaustion already uses) or by n48_cm_shot_stop (every other cause), at the
  * SAME instant the state moves ARMED -> SPENT, and it is never cleared except by a fresh arm or a disarm — so DONE
  * and SPENT both carry the true reason for as long as the shot stands, for xd_shot_finish's own stop line. Appended
- * order matches the WORK item's own list (notes/design/C5-CONTINUOUS.md Q2 "Disarm conditions"); the numeric values
+ * order matches the WORK item's own list (an internal design note Q2 "Disarm conditions"); the numeric values
  * are never printed anywhere but this shot's own report line (unlike N48_CM_REASONS, nothing else quotes them), so
  * there is no append-only constraint here — this is a fresh enum for a fresh build. */
 enum {
@@ -1184,7 +1184,7 @@ typedef struct {
     uint32_t budget;           /* frames this arm may spend. Set AT the arm and never afterwards */
     uint32_t spent;            /* frames charged so far. 0 <= spent <= budget */
     uint32_t last_seq;         /* the token seq of the LAST accepted spend - the per-seq idempotence key */
-    /* C5 part 2 (notes/design/C5-CONTINUOUS.md Q2, build 0.0.460) — THE CONTINUOUS ARM. All five fields are 0 on a
+    /* C5 part 2 (an internal design note Q2, build 0.0.460) — THE CONTINUOUS ARM. All five fields are 0 on a
      * one-shot arm (n48_cm_shot_arm zeroes them, and a disarmed/zero-initialised shot already reads 0), which is the
      * WHOLE of the OFF identity: nothing below reads any of these unless `cont` is 1.
      *   cont            1 while this shot is a CONTINUOUS arm (n48_cm_shot_arm_cont set it); 0 is a one-shot.
@@ -1296,7 +1296,7 @@ static inline uint32_t n48_cm_shot_arm(n48_cm_shot *sh, const n48_cm_ws_mark *no
     return 1u;
 }
 
-/* C5 part 2 (notes/design/C5-CONTINUOUS.md Q2) — THE CONTINUOUS ARM. Mirrors n48_cm_shot_arm exactly (same
+/* C5 part 2 (an internal design note Q2) — THE CONTINUOUS ARM. Mirrors n48_cm_shot_arm exactly (same
  * ARMED/ws/armed_at_us fields, same idempotence-key reset) except `budget` is left 0 (unused: n48_cm_shot_budget_of
  * reads `cont_n` while `cont` is set) and the five continuous fields above are filled instead. Refuses (0, no-op) on
  * an out-of-range N or T, exactly as the verb's own two guards intend — this is the header's OWN second guard,
@@ -1505,7 +1505,7 @@ static inline uint32_t n48_cm_shot_spend(n48_cm_shot *sh, uint32_t seq)
     return 1u;
 }
 
-/* C5 part 2 (notes/design/C5-CONTINUOUS.md Q2, item 3 "THE STOPS") — EVERY STOP THAT IS NOT "N REACHED". Moves
+/* C5 part 2 (an internal design note Q2, item 3 "THE STOPS") — EVERY STOP THAT IS NOT "N REACHED". Moves
  * ARMED -> SPENT, NEVER TO OFF — an in-flight frame keeps its ring-walk exemption exactly as a budget-exhausted
  * one-shot's does, because n48_cm_shot_level hands out COMMIT only in ARMED and SPENT already stops the next frame;
  * xd_shot_finish (the kext's own SPENT -> DONE, unchanged by this build) is what then writes DECIDE, at the next
@@ -1522,7 +1522,7 @@ static inline uint32_t n48_cm_shot_stop(n48_cm_shot *sh, uint32_t why)
     return 1u;
 }
 
-/* C5 part 2 — THE FIRST PLANE COMMIT STARTS T (notes/design/C5-CONTINUOUS.md Q2: "T starts at the first plane
+/* C5 part 2 — THE FIRST PLANE COMMIT STARTS T (an internal design note Q2: "T starts at the first plane
  * commit", the reviewer's own correction in  over "from armed_at_us", which arm35/arm32 measured as
  * ~10.2-10.4 s too early). Answers 1 the ONE time it actually sets `cont_start_us`, so the caller can print a
  * "continuous start" line exactly once; every other call — cont off, T already started, or this frame was not
@@ -1646,11 +1646,11 @@ static inline uint32_t n48_cm_shot_cancel(n48_cm_shot *sh)
  * build 0.0.485 adds a fifteenth: switch 58 (per-draw colour-target pages and the re-shape REPLACE in the producer
  * ledger, gfx_desc_port.h) joins for the same reason - it reshapes what the ledger can prove to a later frame's provenance
  * ask.
- * build 0.0.487 adds a sixteenth: switch 57 (the compute-N elide, notes/design/COMPUTE-N.md) joins for the same reason
+ * build 0.0.487 adds a sixteenth: switch 57 (the compute-N elide, an internal design note) joins for the same reason
  * - it reshapes what a segment carrying Apple's compute clear translates to, and which frames the gate may commit.
- * build 0.0.488 adds a seventeenth: switch 60 (the DCC T# strip, notes/design/DCC-DESC.md) joins for the same reason - it
+ * build 0.0.488 adds a seventeenth: switch 60 (the DCC T# strip, an internal design note) joins for the same reason - it
  * reshapes which table records a draw's descriptor step translates and what it asks the ledger to prove.
- * build 0.0.486 adds switch 59 (the backing-sourced static textures, notes/design/STATIC-RETILE.md) for the same reason -
+ * build 0.0.486 adds switch 59 (the backing-sourced static textures, an internal design note) for the same reason -
  * it reshapes which residency entries a draw's T# ask can be answered by, and what the placed T# says.
  * MERGE 0.0.489: the union of every build's entry (0.0.485's 58, 0.0.487's 57, 0.0.488's 60, 0.0.486's 59).
  * build 0.0.490 adds switch 42 (R1, the memory-destination rung): its mode decides whether md_ok gates
@@ -1670,7 +1670,7 @@ static inline uint32_t n48_cm_shot_cancel(n48_cm_shot *sh)
  * arm (PIN SWITCH-GUARD:64).
  * build 0.0.498 adds switch 65 (end of pipe asked at the deferral's expiry): it changes whether an
  * expired deferral withdraws or retires a finished flight, so it is changed only before an arm (PIN SWITCH-GUARD:65).
- * build 0.0.500 (notes/design/DRAW-ELIDE.md Q4) adds switch 66 (the draw elide): it changes which draws a candidate
+ * build 0.0.500 (an internal design note Q4) adds switch 66 (the draw elide): it changes which draws a candidate
  * carries, so it is changed only before an arm (PIN SWITCH-GUARD:66).
  *
  *   switch_no  the verb's own selector. Only 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
@@ -1717,10 +1717,10 @@ static inline uint32_t n48_cm_cont_switch_guarded(uint32_t switch_no)
     case 63u:   /* build 0.0.496: the residency copy through SDMA (PIN SWITCH-GUARD:63) */
     case 64u:   /* build 0.0.497: the keystone's bounded wait + fill-member retirement (PIN SWITCH-GUARD:64) */
     case 65u:   /* build 0.0.498: end of pipe asked at the deferral's expiry (PIN SWITCH-GUARD:65) */
-    case 66u:   /* build 0.0.500 (notes/design/DRAW-ELIDE.md Q4): the draw elide for U/Y (and AO) (PIN SWITCH-GUARD:66) */
-    case 67u:   /* build 0.0.501 (notes/design/UNIT-ROOM.md Q3): PACK, deferred records one NOP per free run (PIN SWITCH-GUARD:67) */
-    case 68u:   /* build 0.0.503 (notes/design/HYBRID.md H1): the hybrid newUserClient refusal (PIN SWITCH-GUARD:68) */
-    case 69u:   /* build 0.0.505 (notes/design/CROSS-IB.md C1): the IB-0 disguise and the lead segments (PIN SWITCH-GUARD:69) */
+    case 66u:   /* build 0.0.500 (an internal design note Q4): the draw elide for U/Y (and AO) (PIN SWITCH-GUARD:66) */
+    case 67u:   /* build 0.0.501 (an internal design note Q3): PACK, deferred records one NOP per free run (PIN SWITCH-GUARD:67) */
+    case 68u:   /* build 0.0.503 (an internal design note H1): the hybrid newUserClient refusal (PIN SWITCH-GUARD:68) */
+    case 69u:   /* build 0.0.505 (an internal design note C1): the IB-0 disguise and the lead segments (PIN SWITCH-GUARD:69) */
     case 70u:   /* build 0.0.506 ( (1), gfx_unitdefer.h): the deferred room retry (PIN SWITCH-GUARD:70) */
     case 71u:   /* build 0.0.508 (, gfx_fence828.h): the last-candidate fence rule (PIN SWITCH-GUARD:71) */
     case 72u:   /* build 0.0.510 ( (b), gfx_heapgen.h): the copy waits for a committed frame's walk (PIN SWITCH-GUARD:72) */
@@ -1730,16 +1730,16 @@ static inline uint32_t n48_cm_cont_switch_guarded(uint32_t switch_no)
     case 76u:   /* build 0.0.522 (, gfx_spill.h): the kext spill tier for descriptor records (PIN SWITCH-GUARD:76) */
     case 77u:   /* build 0.0.523 (, gfx_rnforgive.h): the ring-neuter forgiveness (PIN SWITCH-GUARD:77) */
     case 78u:   /* build 0.0.523 (, gfx_copyguard.h): the copy-guard redo (PIN SWITCH-GUARD:78) */
-    case 79u:   /* build 0.0.524 (notes/design/T0SRC.md, gfx_t0src.h): S's texture-0 source, read-only (PIN SWITCH-GUARD:79) */
-    case 80u:   /* build 0.0.525 (notes/design/CYCLE80.md, gfx_cycle80.h): cycle completeness, ON / SHADOW (PIN SWITCH-GUARD:80) */
+    case 79u:   /* build 0.0.524 (an internal design note, gfx_t0src.h): S's texture-0 source, read-only (PIN SWITCH-GUARD:79) */
+    case 80u:   /* build 0.0.525 (an internal design note, gfx_cycle80.h): cycle completeness, ON / SHADOW (PIN SWITCH-GUARD:80) */
     case 81u:   /* build 0.0.526: flip kept through a keystone withdrawal, M3, M4 (PIN SWITCH-GUARD:81) */
-    case 82u:   /* build 0.0.527 (notes/design/SKIP82.md, gfx_sk82.h): the byte-identical re-copy skip, MEASURE / SKIP (PIN SWITCH-GUARD:82) */
+    case 82u:   /* build 0.0.527 (an internal design note, gfx_sk82.h): the byte-identical re-copy skip, MEASURE / SKIP (PIN SWITCH-GUARD:82) */
     case 83u:   /* build 0.0.528 (, gfx_tlb83.h): the TLB ack spin poll and its leaf lock (PIN SWITCH-GUARD:83) */
-    case 84u:   /* build 0.0.529 (notes/design/CG84.md, gfx_cg84.h): the granule copy guard + delta write (PIN SWITCH-GUARD:84) */
-    case 85u:   /* build 0.0.530 (notes/design/SRCFILL85.md, gfx_fs85.h): source fills, S1 twin / S2 / S3 (PIN SWITCH-GUARD:85) */
+    case 84u:   /* build 0.0.529 (an internal design note, gfx_cg84.h): the granule copy guard + delta write (PIN SWITCH-GUARD:84) */
+    case 85u:   /* build 0.0.530 (an internal design note, gfx_fs85.h): source fills, S1 twin / S2 / S3 (PIN SWITCH-GUARD:85) */
     case 86u:   /* build 0.0.531 ( lever 1, gfx_p86.h): the present-time retirement re-check (PIN SWITCH-GUARD:86) */
     case 87u:   /* build 0.0.531 item 4b: the text-element T# log, read-only (PIN SWITCH-GUARD:87) */
-    case 88u:   /* build 0.0.533 (, notes/design/HG88.md, gfx_heapgen.h): the range-precise heap-gen judge (PIN SWITCH-GUARD:88) */
+    case 88u:   /* build 0.0.533 (, an internal design note, gfx_heapgen.h): the range-precise heap-gen judge (PIN SWITCH-GUARD:88) */
     case 89u:   /* build 0.0.534 ( item 1, fastcopy89.h): the fast copy's full verify by an SDMA read-back (PIN SWITCH-GUARD:89) */
     case 90u:   /* build 0.0.534 ( item 2, gfx_ks90.h): the expiry check defers on a busy gXdLock (PIN SWITCH-GUARD:90) */
     case 91u:   /* build 0.0.535 ( fix 1, xlat12_ib.h XLAT12_EXTRA_NCLEAR): N's zero fill (PIN SWITCH-GUARD:91) */
@@ -1824,7 +1824,7 @@ static inline uint32_t n48_cm_shot_disarm(n48_cm_shot *sh)
 }
 
 /* =====================================================================================================================
- * build 0.0.487 (notes/design/COMPUTE-N.md Q6 P4, Q7; contract C3) — SWITCH 57, THE COMPUTE-N ELIDE: the kext's two
+ * build 0.0.487 (an internal design note Q6 P4, Q7; contract C3) — SWITCH 57, THE COMPUTE-N ELIDE: the kext's two
  * pure pieces, here so tests/gfx_commit_test.cpp runs the SAME code the kext does.
  *
  * n48_cm_cs_is_n — THE PROGRAM ANSWER (xlat12's `ex->cs_is_n`, predicate part P4). 1 ONLY when THIS frame's own gather
@@ -1979,7 +1979,7 @@ static inline uint32_t n48_pws93_segtext(char *b, uint32_t cap, const uint16_t *
     return wrote;
 }
 
-/* build 0.0.500 (notes/design/DRAW-ELIDE.md Q4) — SWITCH 66's VALUES. `66 | M << 8`: M 1 (= 322) the U/Y rows (the clock
+/* build 0.0.500 (an internal design note Q4) — SWITCH 66's VALUES. `66 | M << 8`: M 1 (= 322) the U/Y rows (the clock
  * composite), M 3 (= 834) the U/Y rows AND the AO row (the login panel material), M 2 (= 578) OFF (the default and the boot
  * value), bare `66` reads. The answer is the translator's row-class mask (xlat12_ib.h XLAT12_DE_CLASS_UY / _AO); 0 = OFF.
  * n48_cm_de_set: 1 and *rows set for M 1/2/3, 0 (unchanged) for anything else. Pure. */
@@ -2006,7 +2006,7 @@ static inline uint32_t n48_cm_de_backstop(uint32_t out_draws, uint32_t draws, ui
  * PROVENANCE refusals examined, elided, refused not-last / not-row / no-dcc / write-set / cap, backstop refusals, frames
  * with an elision and of those refused DRAW-ELIDE-R1 ("DE-R1"). The census line: four (ndw, fnv, count) of programs
  * refused not-row (the usable-OS view). */
-/* build 0.0.501 (notes/design/UNIT-ROOM.md Q3 C3) — THE unitpack67 REPORT LINE (one line per
+/* build 0.0.501 (an internal design note Q3 C3) — THE unitpack67 REPORT LINE (one line per
  * `gfxneuter 67` verb; bounded under the 491-byte log body by tests/gfx_mib_units_checks.h at 20-digit counters). `67 | M << 8`: M 1 ON
  * (= 323), M 2 OFF (= 579, the default and the boot value), bare `67` reads (gfx_rasterarm.h n48_ra_set). args: ON/OFF, how,
  * the note (INERT without 55: the translator reads `pack` only under XLAT12_EXTRA_UNIT), and over units/retried singles that

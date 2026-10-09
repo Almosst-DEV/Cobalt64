@@ -257,6 +257,7 @@ kern_return_t nbif_v6_3_1_enable_doorbell_selfring_aperture(DeviceContext &dev,
         if (!nbif_begin(dev, kRegSelfringBaseLow, aLow, beforeLow))
             return kIOReturnNoDevice;
         const uint32_t low = (uint32_t)(bar2Phys & 0xFFFFFFFFull);
+        NBIF_LOG("enable_doorbell_selfring_aperture: writing BASE_LOW %#010x (BAR2 phys %#llx; the high half is written next)", low, (unsigned long long)bar2Phys);   // 0.0.663 (ReBAR item 7)
         kern_return_t k = nbif_commit(dev, kRegSelfringBaseLow, aLow, beforeLow, low,
                                       0xFFFFFFFFu);
         if (k != kIOReturnSuccess) kr = k;
@@ -266,13 +267,19 @@ kern_return_t nbif_v6_3_1_enable_doorbell_selfring_aperture(DeviceContext &dev,
         if (!nbif_begin(dev, kRegSelfringBaseHigh, aHigh, beforeHigh))
             return kIOReturnNoDevice;
         const uint32_t high = (uint32_t)(bar2Phys >> 32);
+        NBIF_LOG("enable_doorbell_selfring_aperture: writing BASE_HIGH %#010x%s", high, high != 0u ? " (NON-ZERO: BAR2 is above 4 GiB; first time this value is written on hardware)" : " (BAR2 is below 4 GiB)");   // 0.0.663 (ReBAR item 7)
         k = nbif_commit(dev, kRegSelfringBaseHigh, aHigh, beforeHigh, high,
                         0xFFFFFFFFu);
         if (k != kIOReturnSuccess) kr = k;
     }
 
+    // 0.0.664 (F2): the aperture is switched ON only when BASE_LOW and BASE_HIGH both read back what was written. A mismatch writes CNTL = 0 (off) and returns the error: an aperture
+    // that points at a half-written address must never be enabled.
+    const bool selfringOn = enable && kr == kIOReturnSuccess;
+    if (enable && !selfringOn)
+        NBIF_LOG("enable_doorbell_selfring_aperture: BASE_LOW / BASE_HIGH did not read back (%#x) -- NOT enabling the self-ring aperture (CNTL = 0)", (unsigned)kr);
     uint32_t tmp = 0;
-    if (enable) {
+    if (selfringOn) {
         tmp = REG_SET_FIELD(tmp, BIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_CNTL,
                             DOORBELL_SELFRING_GPA_APER_EN, 1u) |
               REG_SET_FIELD(tmp, BIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_CNTL,

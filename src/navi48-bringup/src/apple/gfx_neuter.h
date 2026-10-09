@@ -241,7 +241,7 @@ static inline const char *n48_gfxn_ex_name(uint32_t r)
     return r < N48_GFXN_EX_REASONS ? n[r] : "?";
 }
 
-/* 0.0.426 (notes/design/MIB-COMMIT.md binding B8) — a multi-IB committed frame's exemption record carries EVERY IB, not
+/* 0.0.426 (an internal design note binding B8) — a multi-IB committed frame's exemption record carries EVERY IB, not
  * just IB 0. `N48_GFXN_EX_MAX_IBS` is the same 4 the submission shape allows (N48_XV_MAX_IBS); the ring walk's own cap is
  * N48_GFXN_MAX_IBS above, which is larger, so a recorded frame's positions always fit. OFF (mib 0) the arrays are neither
  * filled nor read and every clause above is byte for byte 0.0.425's. */

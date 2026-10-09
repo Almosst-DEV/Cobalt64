@@ -341,7 +341,7 @@ static void checks(EvalFn ev, PermitFn pm, BucketFn bk, DeferFn df)
             ck("F1 MARKER: ...and it refuses even the ALREADY case", ev(&m2), N48_KS_WITHDRAWING);
         }
 
-        // 0.0.418 (E4, notes/design/BUILD-0.0.418.md) — THE MARKER IS A COUNTER, NOT A FLAG. Two overlapping unmaps of
+        // 0.0.418 (E4, an internal design note) — THE MARKER IS A COUNTER, NOT A FLAG. Two overlapping unmaps of
         // one context are possible on hook_unmapVA's lock-free clear -> Apple's unmapVA -> re-arm span; as a flag the
         // first to finish cleared the second's marker and the keystone was let into that second call's window. The
         // arithmetic is driven through the substitutable decrement, so D17 (the flag's own clear) is caught here.
@@ -1007,7 +1007,7 @@ static void pfa_checks()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
-// C5 part 2 (build 0.0.460, notes/design/C5-CONTINUOUS.md Q6) — H2 EXTENDED TO TWO COMMITS PLUS A REFUSAL.
+// C5 part 2 (build 0.0.460, an internal design note Q6) — H2 EXTENDED TO TWO COMMITS PLUS A REFUSAL.
 //
 // h2_checks/pfa_checks above drive gfx_keystone.h's own SINGLE-RECORD primitives (n48_ks_flight,
 // n48_ks_flight_save/_restore_ok) — the pre-ring mechanism this file keeps exercising for the reasons
@@ -1580,7 +1580,7 @@ static void source_pins(const char *path)
     const char *clr    = "ks_withdraw_leave_atomic(&e->ksWithdrawing);";
     const char *dec    = "n48_ks_withdraw_leave(cur)";
     const char *ld     = "__atomic_load_n(&e->ksWithdrawing, __ATOMIC_SEQ_CST)";
-    // C5 part 1 (notes/design/C5-CONTINUOUS.md Q1) — the single gKsFlight read is gone; hook_unmapVA's own read of
+    // C5 part 1 (an internal design note Q1) — the single gKsFlight read is gone; hook_unmapVA's own read of
     // the flight ring is this call, the first (and only, in this function) call to n48_fr_defer_verdict.
     const char *flight = "kdv = n48_fr_defer_verdict(&gKsRing";
     const char *early  = "if (!e || e->state != 1)";
@@ -1632,7 +1632,7 @@ static void source_pins(const char *path)
        strstr(src, guardHold) && strstr(src, entryrd) && strstr(src, guardHold) < strstr(src, entryrd), 1u);
     ck("PIN: the `if (held)` EXIT release is after the re-arm branch",
        strstr(src, guardHeld) && strstr(src, rearm) && strstr(src, guardHeld) > strstr(src, rearm), 1u);
-    // C5 part 1 (notes/design/C5-CONTINUOUS.md Q1, item 2) — THE FLIGHT RING REPLACES 0.0.431's STASH/RESTORE.
+    // C5 part 1 (an internal design note Q1, item 2) — THE FLIGHT RING REPLACES 0.0.431's STASH/RESTORE.
     // A keystone refusal now frees ONLY its own entry; there is no shared record left for a later stamp to
     // clobber, so there is nothing to restore. These pins prove: the push happens exactly once, at the gate stamp,
     // BEFORE the keystone runs; a refusal frees its own entry (by `here.seq`, the SAME seq the push used) exactly
@@ -1673,7 +1673,7 @@ static void source_pins(const char *path)
        pin_count(src, "n48_ks_flight_restore_ok(gKsFlightSaved"), 0u);
 
     // =====================================================================================================
-    // 0.0.444 (C5-RING-REVIEW.md (B)) — THE PART-2 FIXES' OWN WIRING, PINNED THE SAME WAY.
+    // 0.0.444 (an internal review note (B)) — THE PART-2 FIXES' OWN WIRING, PINNED THE SAME WAY.
     // =====================================================================================================
     // Item 1: the fence handoff is the PURE function, not a stale re-read of gXdF828Pending, at the push site.
     const char *handoffCall = "n48_f828_ring_handoff(gXdF828GateOk, gXdF828GateSeq, gXdCmToken.seq";
@@ -1684,7 +1684,7 @@ static void source_pins(const char *path)
        pin_count(src, "gXdF828Pending ? gXdF828Cand.ordinal"), 0u);
 
     // Item 2: hook_unmapVA's ring presence scan runs BEFORE the clock read that feeds n48_fr_defer_verdict.
-    // C5 part 2 (build 0.0.460, notes/design/C5-CONTINUOUS.md Q2): the scan's own return is now CAPTURED
+    // C5 part 2 (build 0.0.460, an internal design note Q2): the scan's own return is now CAPTURED
     // (`kdAnyLiveAtScan`), not discarded, for the continuous build's "a withdrawal inside a flight" stop - the
     // scan statement itself did not move, only its exact text (the anchor below is re-pinned to that text, not
     // weakened: it is still a literal, ordered pair of strings that must both be present and in this order).

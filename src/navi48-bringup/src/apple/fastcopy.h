@@ -1,4 +1,4 @@
-// fastcopy.h — build 0.0.496 (notes/design/FAST-PAGEIN.md): THE RESIDENCY COPY THROUGH SDMA, switch 63.
+// fastcopy.h — build 0.0.496 (an internal design note): THE RESIDENCY COPY THROUGH SDMA, switch 63.
 //
 // WHY. Every residency copy (pageTexture, system memory -> VRAM) runs through the MM window at 1.87 MB/s (: run10g 1,327
 // copies, 167.7 MB in 89.8 s; ~2.07 us per dword, SUSPECTED ~90% of it the per-batch MM read-back). The hybrid desktop needs

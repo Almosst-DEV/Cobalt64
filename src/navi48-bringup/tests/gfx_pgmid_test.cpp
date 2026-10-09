@@ -1,4 +1,4 @@
-// gfx_pgmid_test.cpp — 0.0.436 (notes/design/PGMID-COPYGUARD.md Part 1, design "2. M"). PROGRAM-IDENTITY
+// gfx_pgmid_test.cpp — 0.0.436 (an internal design note Part 1, design "2. M"). PROGRAM-IDENTITY
 // COST'S HOST PROOF, for switch 38's modes OFF / T (1) / T+M (2) / SHADOW (3).
 //
 // T1 drives the REAL n48_pgm_need (gfx_pgmid.h) over the REAL identity table (xlat12_ib.h's by-index
@@ -924,7 +924,7 @@ static void test_T7(const char *ahhPath)
 }
 
 // =============================================================================================================
-// T11 — 0.0.444 (C5-RING-REVIEW.md (B) item J): THE DESCRIPTOR RUNG'S EVIDENCE MUST USE THE GATED
+// T11 — 0.0.444 (an internal review note (B) item J): THE DESCRIPTOR RUNG'S EVIDENCE MUST USE THE GATED
 // `out->ps_table_abi1`, NOT THE UNGATED `xlat12_shader_id_desc_table(id, ...)`, FOR A FRAGMENT PROGRAM.
 //
 // (CONFIRMED): switch 43 gates `ps_table_abi1` back to 0 when it is OFF (xlat12_table_abi_is_gated(row) &&
@@ -986,7 +986,7 @@ static void test_T11_desc_rung_gated(const char *ahhPath)
 }
 
 // =============================================================================================================
-// G — build 0.0.484 (notes/design/GLASS.md Q2 K1-K7, Q6 test (a)): glass_background_lph's REAL 5376-byte
+// G — build 0.0.484 (an internal design note Q2 K1-K7, Q6 test (a)): glass_background_lph's REAL 5376-byte
 // images (fixture_glass_bd_be.h, generated from the GLASS v3 .pal.o objects) through the REAL read, the REAL "is
 // this ours" compare, the REAL identity table and the REAL memo rule - the kext's own code from gfx_subst_caps.h /
 // gfx_pgmid.h, never a copy.

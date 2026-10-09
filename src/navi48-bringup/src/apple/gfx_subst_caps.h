@@ -1,4 +1,4 @@
-// gfx_subst_caps.h — build 0.0.484 (notes/design/GLASS.md Q2 K1-K7, Q6). THE PROGRAM AND IMAGE LIMITS OF THE
+// gfx_subst_caps.h — build 0.0.484 (an internal design note Q2 K1-K7, Q6). THE PROGRAM AND IMAGE LIMITS OF THE
 // SOURCE HOOK'S PROGRAM IDENTIFICATION, IN ONE PLACE, AND THE PURE HALF OF WHAT THEY SIZE.
 //
 // WHY THIS FILE EXISTS. glass_background_lph (BD 0x597b70b28759e040, BE 0x5abbb918af0075b7) blocks the login screen's

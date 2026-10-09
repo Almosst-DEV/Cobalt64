@@ -1,0 +1,32 @@
+metal2vulkan (Navi48 changes)
+=============================
+
+This directory is SEPARATE from the rest of this repository. Everything else here is
+under the MIT licence (see the top-level LICENSE). The files in THIS directory are a
+derivative work of metal2vulkan and are licensed under the GNU Lesser General Public
+License, version 3 or (at your option) any later version (see COPYING).
+
+Upstream:   https://github.com/steelbrain/metal2vulkan   (LGPL-3.0-or-later,
+            Copyright Anees Iqbal and contributors)
+Based on:   upstream commit 43c46ac8a24adf1a6e872b8a52c706ec9614fad0
+
+Contents
+  n48xlate/    a new crate: an in-process C ABI (cdylib libn48xlate.dylib) around the
+               translator, so a sandboxed process can turn AIR text into SPIR-V without
+               a helper daemon. New files; licence LGPL-3.0-or-later (SPDX headers).
+  patches/     our changes to upstream's own files (six upstream-relative changes in
+               one diff): raw-buffer byte-offset delivery to called helpers, resource
+               path fixes, an "validation skipped" carrier for the in-process path, and
+               the workspace member entry. Apply with `git apply` or `patch -p1` on
+               top of the upstream commit above.
+  COPYING      the LGPL-3.0 text, as shipped by upstream.
+
+How it is used: tools/native/navi48metal loads Resources/libn48xlate.dylib at run time
+(tools/native/navi48metal/n48_xlate.h). No LGPL code is compiled or linked into the kext,
+the Mesa patches or the MIT-licensed bundle sources; the library is a separate shared
+object loaded dynamically. Anyone who builds and distributes libn48xlate.dylib must
+follow the LGPL for that library (offer its source, including these changes).
+
+No build outputs and no test data derived from Apple software are included. The test
+programs in n48xlate/tests need a corpus directory you generate yourself
+(N48X_CORPUS, see tests/corpus.rs); without it they do nothing and pass.

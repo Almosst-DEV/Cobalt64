@@ -108,6 +108,7 @@
 #include <IOKit/IOLib.h>
 
 #include "amdgpu_gmc.h"
+#include "rebar_pure.h"   // 0.0.663: visible_size / pool_sizes (pure, host-tested)
 #include "amdgpu_log.h"
 #include "amdgpu_field_defs.h"
 #include "amdgpu_sdma.h"   // 0.0.193: sdma_ib_copy_linear_test for the vmfrag self-test
@@ -163,6 +164,7 @@ constexpr uint32_t kGMCGartPTBytes      = 512 * 1024;
 // Replaces the reference's kPspReservedTopBytes heuristic with the fixed
 // layout above (Deviation 3).
 constexpr uint64_t kGMCVRAMAllocOffset  = 0x01800000;
+static_assert(kGMCVRAMAllocOffset == n48rebar::kVisAllocOffset, "rebar_pure.h's layout check must use the allocator's own offset");
 
 // ---- GFXHUB VMID-0 PDB0 (option B'; Navi48Bringup addition) ------------
 //
@@ -213,12 +215,8 @@ gmc_mc_init(DeviceContext &dev, GMCContext &gmc)
     // (RCC_CONFIG_MEMSIZE, already shifted) — see Deviation 4.
     gmc.real_vram_size = dev.vramSizeBytes;
 
-    if (dev.bar0Size > 0 && (gmc.real_vram_size == 0 ||
-                             dev.bar0Size <= gmc.real_vram_size)) {
-        gmc.visible_vram_size = dev.bar0Size;
-    } else {
-        gmc.visible_vram_size = kFallbackVisibleVRAM;
-    }
+    // 0.0.663 (ReBAR item 3): the CPU-visible size is vramLimit (the planned, clamped window), never the 256 MiB fallback merely because the BAR exceeds VRAM.
+    gmc.visible_vram_size = n48rebar::visible_size(dev.vramLimit, dev.bar0Size, gmc.real_vram_size, kFallbackVisibleVRAM);
 
     // Read the VBIOS/SOS-programmed FB_LOCATION_BASE + FB_OFFSET from
     // MMHUB so vram_start/fb_start/vram_base_offset reflect REAL MC space
@@ -361,7 +359,8 @@ gmc_vram_alloc_init(DeviceContext &dev, GMCContext &gmc)
                 (unsigned long long)alloc_vram_off);
         return kIOReturnNoMemory;
     }
-    const uint64_t alloc_size = dev.vramLimit - alloc_vram_off;
+    const n48rebar::Pools pools = n48rebar::pool_sizes(dev.vramBase, kGMCVRAMAllocOffset, dev.vramLimit, dev.vramSizeBytes, kVramHiTotalReserve);
+    const uint64_t alloc_size = pools.visSize;                      // 0.0.663: the pure rule (rebar_pure.h), the same arithmetic as before: vramLimit - (vramBase + 24 MiB)
     const uint64_t alloc_base_mc = gmc.vram_start + alloc_vram_off;
 
     gmc.vram_alloc.init(alloc_base_mc, alloc_size, nullptr);
@@ -373,9 +372,9 @@ gmc_vram_alloc_init(DeviceContext &dev, GMCContext &gmc)
     //   kVramHiTailReserve      the PSP TMR and the IP discovery table
     //   kAppleArenaCarveReserve the region Apple carves DOWNWARD from the hiTop
     //                           our Navi48Ttl::getLocalMemoryInfo reports
-    if (dev.vramSizeBytes > dev.vramLimit + kVramHiTotalReserve) {
-        gmc.vram_hi_base = dev.vramLimit;
-        gmc.vram_hi_size = dev.vramSizeBytes - kVramHiTotalReserve - gmc.vram_hi_base;
+    if (pools.hi) {
+        gmc.vram_hi_base = pools.hiBase;
+        gmc.vram_hi_size = pools.hiSize;
         gmc.vram_alloc_hi.init(gmc.vram_start + gmc.vram_hi_base, gmc.vram_hi_size, nullptr);
         GMC_LOG("vram_alloc_hi: MC [%#llx..%#llx) = vram+[%#llx..%#llx) size=%llu MB "
                 "(device-only — CPU reaches it through MM_INDEX, not BAR0; top %llu MB "

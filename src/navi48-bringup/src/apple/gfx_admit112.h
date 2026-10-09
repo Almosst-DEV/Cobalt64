@@ -1,4 +1,4 @@
-/* gfx_admit112.h - build 0.0.554 (; notes/design/ADMIT-STALE-112.md): SWITCH 112 "admit112", ADMIT STALE.
+/* gfx_admit112.h - build 0.0.554 (; an internal design note): SWITCH 112 "admit112", ADMIT STALE.
  *
  * `112 | M << 8`: M 1 ON (= 368), M 2 OFF (= 624, the default and the boot value), M 3 SHADOW (= 880); bare `112` reads. INERT unless
  * switches 10, 11, 18, 21 and 45 are ALL ON (nothing is fed, nothing is asked, the callback is not wired). The verb refuses 112 ON

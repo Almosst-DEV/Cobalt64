@@ -1,0 +1,15 @@
+#!/bin/bash
+now=$(( 1791470000 + $(cat "$SIM_DIR/vclock_ms") / 1000 ))
+dl=$(cat "$SIM_DIR/cfg/fb_delay" 2>/dev/null || echo 3); dl=${dl%.*}
+p2=$(cat "$SIM_DIR/kv/fbpub2" 2>/dev/null || echo -1); p1=$(cat "$SIM_DIR/kv/fbpub1" 2>/dev/null || echo -1)
+swap=$(cat "$SIM_DIR/cfg/fbid_swap" 2>/dev/null || echo 0)
+id2=0x100000681; id1=0x100000689; [ "$swap" = 1 ] && { id2=0x100000689; id1=0x100000681; }
+lines=""
+[ "$p2" -ge 0 ] && [ $((now-p2)) -ge "$dl" ] && lines="$lines+-o Navi48Framebuffer  <class Navi48Framebuffer, id $id2, registered, matched, active, busy 0 (0 ms), retain 10>
+"
+[ "$p1" -ge 0 ] && [ $((now-p1)) -ge "$dl" ] && lines="$lines+-o Navi48Framebuffer  <class Navi48Framebuffer, id $id1, registered, matched, active, busy 0 (0 ms), retain 10>
+"
+case "$*" in
+  *Navi48Framebuffer*) printf '%s' "$lines" ;;
+  *) echo "+-o RDNA4FB  <class RDNA4FB, id 0x10000052e, registered, matched, active, busy 0 (13 ms), retain 18>"; printf '%s' "$lines" ;;
+esac

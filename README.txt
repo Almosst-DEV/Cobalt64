@@ -18,7 +18,7 @@ What this repo contains
   tools/pc, tools/dcn41, tools/conductor
                        PC-side test CLI and run scripts, display-register tooling, test
                        suite runners and "planted break" mutation tests.
-  mesa-patches         RADV (Mesa Vulkan) Darwin port as five patches on a pinned Mesa
+  mesa-patches         RADV (Mesa Vulkan) Darwin port as nine patches on a pinned Mesa
                        commit; see mesa-patches/README.txt.
 
 Status
@@ -47,7 +47,9 @@ External projects and dependencies (not vendored; clone them yourself)
   mac-amdgpu   https://github.com/lemonade-sdk/mac-amdgpu  (Navi 48 bring-up on macOS)
   USBToolBox   https://github.com/USBToolBox/tool          (USB port mapping, optional)
   metal2vulkan https://github.com/steelbrain/metal2vulkan  (Metal AIR -> SPIR-V translator,
-               LGPL-3.0-or-later; used as an external tool by tools/native, not included)
+               LGPL-3.0-or-later; upstream is not included. Our changes and the n48xlate
+               in-process wrapper are in third-party/metal2vulkan-n48/, LGPL-3.0, separate
+               from the MIT code here; see its NOTICE)
   Mesa         https://gitlab.freedesktop.org/mesa/mesa    (RADV, MIT; see mesa-patches/)
   linux-firmware (AMD firmware blobs, own licence; see above)
 

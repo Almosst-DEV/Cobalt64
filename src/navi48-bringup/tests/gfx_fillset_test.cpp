@@ -362,7 +362,7 @@ static void checks_k2(K2DriveFn drive)
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// 0.0.420 (notes/design/STEP10-PLAN.md P1) — THE SECOND WINDOW: HOLD A SHOT FOR THE PLANE. Once the fill
+// 0.0.420 (an internal design note P1) — THE SECOND WINDOW: HOLD A SHOT FOR THE PLANE. Once the fill
 // window closes ('s retirement, both members committed, or expiry), a TRANSLATE-eligible frame that is NOT
 // plane-shaped (in-force PS `ws_D_GPUPass`) is refused until one plane frame commits or 60 judged frames pass. These are
 // the plan's two named scenarios - arm29's order (fills seq 1/5, the "second pair" refused, a plane admitted) and arm32's

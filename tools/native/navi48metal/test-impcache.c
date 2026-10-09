@@ -105,6 +105,19 @@ int main(void) {
     CHECK("classify: bounded to 64 ids, LRU evicted (1001 gone, the touched 1000 and the new 2000 stay)",
           !n48cc_lookup(&cc, 1001, 0x1000, 1024, 768, 4096, 3145728, &v) && n48cc_lookup(&cc, 1000, 0x1000, 1024, 768, 4096, 3145728, &v) && n48cc_lookup(&cc, 2000, 0x1000, 1024, 768, 4096, 3145728, &v) && n48cc_lookup(&cc, 1063, 0x1000, 1024, 768, 4096, 3145728, &v), "ok");
 
+    // ---- 4. build 16: F2 default, F1 decision, the failure-injection hook -------------------------------------------------------------
+    CHECK("F2: the cache is ON by default (no kill file)", n48ic_default_on(0) == 1, "on");
+    CHECK("F2: the kill file turns it off", n48ic_default_on(1) == 0, "off");
+    {   n48ic_cache d; n48ic_init(&d, n48ic_default_on(0)); void *mm;
+        n48ic_add(&d, 5, 0x1000, MIB, M(0xC1), M(0xD1));
+        CHECK("F2: a default-initialised cache shares the import of one surface between two wrappers", d.on && n48ic_acquire(&d, 5, 0x1000, MIB, 1, 0, &mm) && mm == M(0xC1) && d.reused == 1, "on %d reused %llu", d.on, (unsigned long long)d.reused);
+        n48ic_cache o; n48ic_init(&o, n48ic_default_on(1));
+        CHECK("F2: with the kill file the cache is off (the glue then imports per wrapper as before) and trim/flush do nothing", o.on == 0 && n48ic_flush(&o, 0) == 0, "on %d", o.on);
+    }
+    CHECK("F1: an imported texture goes on", n48f1_action(0) == N48F1_GO, "go");
+    CHECK("F1: ANY refused import falls back to the GPU-only image, never to nil", n48f1_action(-2) == N48F1_FALLBACK && n48f1_action(-1) == N48F1_FALLBACK && n48f1_action(-1000072003) == N48F1_FALLBACK, "fallback");
+    { unsigned long c = 0; int hits = 0; for (int i = 0; i < 100; i++) hits += n48f1_inject(4, &c);
+      CHECK("F1 hook: every 4th attempt fails (25 of 100), 0 = never", hits == 25 && (c = 0, n48f1_inject(0, &c) == 0 && c == 0), "hits %d", hits); }
     printf("%s (%d failure%s)\n", fails ? "FAILED" : "ALL PASSED", fails, fails == 1 ? "" : "s");
     return fails != 0;
 }

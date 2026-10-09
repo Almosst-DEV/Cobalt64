@@ -1,4 +1,4 @@
-// gfx_flightring_test.cpp — C5 part 1 (0.0.443, notes/design/C5-CONTINUOUS.md Q1): THE FLIGHT RING'S SAFETY PROOF.
+// gfx_flightring_test.cpp — C5 part 1 (0.0.443, an internal design note Q1): THE FLIGHT RING'S SAFETY PROOF.
 //
 // Every clause of gfx_flightring.h is exercised, each with a PLANTED BREAK that must be CAUGHT (the project's own
 // non-vacuity rule): a test no mutation can break is not testing anything.
@@ -380,7 +380,7 @@ static void report_format_bound()
 }
 
 // =========================================================================================================
-// 0.0.444 (C5-RING-REVIEW.md (B) item 2) — Q1's TWO RACES, EACH PLANTED AS A BREAK. `old_defer_verdict`
+// 0.0.444 (an internal review note (B) item 2) — Q1's TWO RACES, EACH PLANTED AS A BREAK. `old_defer_verdict`
 // reproduces 0.0.443's function EXACTLY (ring-wide TORN on ANY at_us==0 or ANY future stamp, checked before any
 // blocking is computed) so each scenario can be run through BOTH and the difference asserted.
 // =========================================================================================================
@@ -476,7 +476,7 @@ static void item2_race_planted_breaks()
 }
 
 // =========================================================================================================
-// 0.0.444 (C5-RING-REVIEW.md (B) item 4) — TOKEN MISMATCH: PENDING -> NOT_RUN, NOT FREE.
+// 0.0.444 (an internal review note (B) item 4) — TOKEN MISMATCH: PENDING -> NOT_RUN, NOT FREE.
 // =========================================================================================================
 static void item4_token_mismatch_not_run()
 {
@@ -510,7 +510,7 @@ static void item4_token_mismatch_not_run()
 }
 
 // =========================================================================================================
-// 0.0.444 (C5-RING-REVIEW.md (B) item 6/7) — EXPIRED, RECLAMATION, AND NOW_EOP AFTER RECLAMATION.
+// 0.0.444 (an internal review note (B) item 6/7) — EXPIRED, RECLAMATION, AND NOW_EOP AFTER RECLAMATION.
 // =========================================================================================================
 static void item6_expire_reclaim()
 {
@@ -586,7 +586,7 @@ static void item6_expire_reclaim()
 }
 
 // =========================================================================================================
-// 0.0.444 (C5-RING-REVIEW.md (B) item 8) — OUT-OF-ORDER EXCLUDES NOT_RUN AND EXPIRED; COMPARES BY ORDINAL,
+// 0.0.444 (an internal review note (B) item 8) — OUT-OF-ORDER EXCLUDES NOT_RUN AND EXPIRED; COMPARES BY ORDINAL,
 // NEVER BY SLOT INDEX (proven with a reclaimed-and-reused slot).
 // =========================================================================================================
 static void item8_out_of_order_excludes()
@@ -637,7 +637,7 @@ static void item8_out_of_order_excludes()
 }
 
 // =========================================================================================================
-// 0.0.444 (C5-RING-REVIEW.md (B) item 5(ii)) — NO ENTRY, NO KEYSTONE, NO RUN. hook_gfxCommitIB's TRANSLATE branch
+// 0.0.444 (an internal review note (B) item 5(ii)) — NO ENTRY, NO KEYSTONE, NO RUN. hook_gfxCommitIB's TRANSLATE branch
 // gates `commit_keystone_arm` on `tokMatch && n48_fr_find(&gKsRing, here.seq, &idx) && gKsRing.e[idx].state ==
 // N48_FR_PENDING` - reproduced here as `fr_has_pending_entry` so the exact boolean the kext evaluates is
 // host-tested against the SAME ring primitives, driven through the real push -> (concurrent free) -> gate sequence
@@ -1297,7 +1297,7 @@ static void x_checks()
 
 int main()
 {
-    printf("gfx_flightring_test — C5 part 1 (notes/design/C5-CONTINUOUS.md Q1); C5-RING-REVIEW.md (B), 0.0.444\n\n");
+    printf("gfx_flightring_test — C5 part 1 (an internal design note Q1); an internal review note (B), 0.0.444\n\n");
     // B1's own planted break (the "only the newest entry is asked" model) is printed FROM INSIDE
     // multi_entry_earlier_defers(), alongside the real checks it falsifies - both are folded into the totals below.
     basics();

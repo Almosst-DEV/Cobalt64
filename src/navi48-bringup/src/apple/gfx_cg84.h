@@ -1,4 +1,4 @@
-// gfx_cg84.h — build 0.0.529 (notes/design/CG84.md items 1-12): SWITCH 84, THE GRANULE COPY GUARD AND THE
+// gfx_cg84.h — build 0.0.529 (an internal design note items 1-12): SWITCH 84, THE GRANULE COPY GUARD AND THE
 // DELTA RESIDENCY WRITE. THE PURE HALF (the reader half - granule masks, n48_cg_rec_hit, n48_cg_check_fx - is gfx_copyguard.h's).
 // Here: the selector, the counted-verdict rule and its counters, and the writer's keys: eligibility, the G0 plan, the post-close
 // update, the invalidations, the diff, the delta scope and the delta write loop. No register, no page table, nothing of Apple's;

@@ -159,8 +159,8 @@ plant 51 $SR/Navi48NativeClient.cpp "the selector shape is wrong (2 scalars)" 's
 plant 52 $SR/amd/native_s1c.cpp "the selector body ignores non-zero flags" '    if ((flags & ~(uint64_t)N48N_MODE_TF_MASK) != 0ull || out == nullptr) return kIOReturnBadArgument;   // 0.0.606: the flags word carries N48N_MODE_TF_* (0.0.605 required 0)
     return (IOReturn)n48dcn::modeTrial(row, dwellMs, flags, out);' '    if (out == nullptr) return kIOReturnBadArgument;
     return (IOReturn)n48dcn::modeTrial(row, dwellMs, flags, out);'
-plant 53 $SR/amd/native_s1c.h "the kext build number is stale" 'kN1cKextBuild = 620;' 'kN1cKextBuild = 606;'
-plant 54 $SR/Navi48NativeABI.h "the ABI minor is not bumped" '#define N48N_ABI_MINOR     9u' '#define N48N_ABI_MINOR     4u'
+plant 53 $SR/amd/native_s1c.h "the kext build number is stale" 'kN1cKextBuild = 664;' 'kN1cKextBuild = 606;'
+plant 54 $SR/Navi48NativeABI.h "the ABI minor is not bumped" '#define N48N_ABI_MINOR     12u' '#define N48N_ABI_MINOR     4u'
 plant 55 $SR/amd/smu_dal_pure.h "the DID table: divider of DID 0x40..0x5F is 4-stepped" 'did < 0x60u ? 64u + 2u * (did - 0x40u)' 'did < 0x60u ? 64u + 4u * (did - 0x40u)'
 plant 56 tools/native/n48mode.c "the tool does not print the watch warning" '; WATCH THE MONITOR)' ')'
 
@@ -436,19 +436,19 @@ plant 228 $D 'hold: the runner runs row 50 instead of 120' 'N48N_MODE_ROW_120, c
 plant 229 $D 'hold: the ModeRelease wait does not wait for the runner' '	if (n48mt::hold_request_release(gMt)) N48LOG("mode-hold: RELEASE requested");
 	for (uint32_t i = 0; i < 4000u; i++) {' '	if (n48mt::hold_request_release(gMt)) N48LOG("mode-hold: RELEASE requested");
 	for (uint32_t i = 0; i < 0u; i++) {'
-plant 230 $SR/amd/native_s1c.cpp 'hold: the client'\''s close tells the hold BEFORE the console plane is back' '    { uint64_t tr[2]; scan_teardown(s, how, tr); }     // 0.0.603: the console plane FIRST - before the idle wait, before the HUNG decision, before anything is freed or leaked
-    { const uint32_t seq = __atomic_load_n(&gSessSeq, __ATOMIC_SEQ_CST); __atomic_store_n(&gSessSeq, 0u, __ATOMIC_SEQ_CST); n48dcn::modeHoldSessionClosed(seq); }   // 0.0.609: a row-120 hold owned by this session ends (or, HANDOFF, passes on) - AFTER the plane is back; atomic words only
-' '    { const uint32_t seq = __atomic_load_n(&gSessSeq, __ATOMIC_SEQ_CST); __atomic_store_n(&gSessSeq, 0u, __ATOMIC_SEQ_CST); n48dcn::modeHoldSessionClosed(seq); }   // 0.0.609: a row-120 hold owned by this session ends (or, HANDOFF, passes on) - AFTER the plane is back; atomic words only
-    { uint64_t tr[2]; scan_teardown(s, how, tr); }     // 0.0.603: the console plane FIRST - before the idle wait, before the HUNG decision, before anything is freed or leaked
+plant 230 $SR/amd/native_s1c.cpp 'hold: the client'\''s close tells the hold BEFORE the console plane is back' '    if (!multi || __atomic_load_n(&gScanOwner, __ATOMIC_ACQUIRE) == s->id) { uint64_t tr[2]; scan_teardown(s, how, tr); if (multi) __atomic_store_n(&gScanOwner, 0u, __ATOMIC_RELEASE); }
+    n48dcn::modeHoldSessionClosed(s->id);   // 0.0.609: a row-120 hold owned by this session ends (or, HANDOFF, passes on) - AFTER the plane is back; atomic words only
+' '    n48dcn::modeHoldSessionClosed(s->id);   // 0.0.609: a row-120 hold owned by this session ends (or, HANDOFF, passes on) - AFTER the plane is back; atomic words only
+    if (!multi || __atomic_load_n(&gScanOwner, __ATOMIC_ACQUIRE) == s->id) { uint64_t tr[2]; scan_teardown(s, how, tr); if (multi) __atomic_store_n(&gScanOwner, 0u, __ATOMIC_RELEASE); }
 '
-plant 231 $SR/amd/native_s1c.cpp 'hold: the client'\''s close never tells the hold' '    { const uint32_t seq = __atomic_load_n(&gSessSeq, __ATOMIC_SEQ_CST); __atomic_store_n(&gSessSeq, 0u, __ATOMIC_SEQ_CST); n48dcn::modeHoldSessionClosed(seq); }   // 0.0.609: a row-120 hold owned by this session ends (or, HANDOFF, passes on) - AFTER the plane is back; atomic words only
+plant 231 $SR/amd/native_s1c.cpp 'hold: the client'\''s close never tells the hold' '    n48dcn::modeHoldSessionClosed(s->id);   // 0.0.609: a row-120 hold owned by this session ends (or, HANDOFF, passes on) - AFTER the plane is back; atomic words only
 ' ''
-plant 232 $SR/amd/native_s1c.cpp 'hold: Acquire passes no session id' 'n48dcn::scanAcquire(out, __atomic_load_n(&gSessSeq, __ATOMIC_SEQ_CST))' 'n48dcn::scanAcquire(out, 0u)'
-plant 233 $SR/amd/native_s1c.cpp 'hold: n1c_mode_release takes the client lock' 'IOReturn n1c_mode_release(uint64_t flags, n48n_mode_result *out) {
-    if (!sess_hello()) return kIOReturnNotReady;' 'IOReturn n1c_mode_release(uint64_t flags, n48n_mode_result *out) {
-    if (!sess_hello()) return kIOReturnNotReady;
+plant 232 $SR/amd/native_s1c.cpp 'hold: Acquire passes no session id' 'n48dcn::scanAcquire(out, s->id)' 'n48dcn::scanAcquire(out, 0u)'
+plant 233 $SR/amd/native_s1c.cpp 'hold: n1c_mode_release takes the client lock' 'IOReturn n1c_mode_release(const N1cRef &ref, uint64_t flags, n48n_mode_result *out) {
+    if (!sess_hello(ref)) return kIOReturnNotReady;' 'IOReturn n1c_mode_release(const N1cRef &ref, uint64_t flags, n48n_mode_result *out) {
+    if (!sess_hello(ref)) return kIOReturnNotReady;
     IOLockLock(gCliLock); IOLockUnlock(gCliLock);'
-plant 234 $SR/amd/native_s1c.cpp 'hold: every open gets the same session id' '__atomic_store_n(&gSessSeq, ++gSessSeqCounter, __ATOMIC_SEQ_CST);' '__atomic_store_n(&gSessSeq, 1u, __ATOMIC_SEQ_CST);'
+plant 234 $SR/amd/native_s1c.cpp 'hold: every open gets the same session id' '__atomic_store_n(&s->id, ++gSessSeqCounter, __ATOMIC_SEQ_CST);' '__atomic_store_n(&s->id, 1u, __ATOMIC_SEQ_CST);'
 plant 235 $SR/Navi48NativeClient.cpp 'hold: selector 17 is dispatched without a shape check' 'case N48N_SEL_MODE_HOLD:
 		if (!shape(2, 0, 0, sizeof(n48n_mode_result))) return kIOReturnBadArgument;' 'case N48N_SEL_MODE_HOLD:'
 plant 236 tools/native/n48mode.c 'hold: n48mode --run keeps its (exclusive) session open while the command runs' '        IOServiceClose(c);

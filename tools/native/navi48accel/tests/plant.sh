@@ -1,11 +1,11 @@
 #!/bin/zsh
-# plant.sh - planted breaks for tests/host_test.cpp (Navi48Accel aux kext 0.0.3). For each plant: copy the real sources into a scratch tree, apply the break (exact-once
+# plant.sh - planted breaks for tests/host_test.cpp (Navi48Accel aux kext, 0.0.7). For each plant: copy the real sources into a scratch tree, apply the break (exact-once
 # replacements; the script first proves each replaced text occurs exactly once), compile the real test against the scratch tree and demand that it FAILS. A plant the suite
 # lets through is a hole: the script exits non-zero and says which. The CONTROL (no break) must pass.
-#   tools/native/navi48accel/tests/plant.sh [first last]     (BRING_ROOT=<bring-up tree root> to compare the two Navi48MetalOps.h copies; default ~/navi48-native/wt-s1)
+#   tools/native/navi48accel/tests/plant.sh [first last]     (BRING_ROOT=<bring-up tree root> to compare the two Navi48MetalOps.h copies; default: the tree this script lives in)
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-BRING="${BRING_ROOT:-$HOME/navi48-native/wt-s1}"
+BRING="${BRING_ROOT:-$(cd "$HERE/../../.." && pwd)}"
 SCR="${TMPDIR:-/tmp}/n48accel-plant.$$"
 trap 'rm -rf "$SCR"' EXIT
 escaped=0; total=0
@@ -16,6 +16,7 @@ fresh() {
   cp -R "$HERE/src" "$SCR/src"; cp -R "$HERE/gates" "$SCR/gates"; mkdir -p "$SCR/build/gen"; cp "$HERE/build/gen/n48_tramp.inc" "$SCR/build/gen/" 2>/dev/null
   cp "$HERE/Info.plist" "$HERE/Makefile" "$SCR/"
   cp "$HERE/tests/host_test.cpp" "$SCR/tests/"
+  cp "$HERE/INSTALL.md" "$SCR/"; mkdir -p "$SCR/ioaccel"; cp "$HERE/../ioaccel-layout/vtables/IOFramebuffer.tsv" "$SCR/ioaccel/"     # aux 0.0.4: the INSTALL.md pins and the KC vtable listing the framebuffer tests read
 }
 build_run() {
   local out
@@ -103,7 +104,16 @@ plant 24 $P "FAIL-OPEN: a refused config is kept" 'inline bool config_keep(bool 
 plant 25 $P "FAIL-OPEN: the factory mask is ignored" 'inline bool factory_allowed(bool opsOk, uint32_t mask, uint32_t bit) { return opsOk && (mask & bit) != 0u; }' 'inline bool factory_allowed(bool opsOk, uint32_t mask, uint32_t bit) { (void)mask; (void)bit; return opsOk; }'
 plant 26 $P "the memory-map hook result is ignored" 'inline bool mm_result(bool opsOk, bool haveHook, int rc) { return opsOk && haveHook && rc == 0; }' 'inline bool mm_result(bool opsOk, bool haveHook, int rc) { (void)rc; return opsOk && haveHook; }'
 plant 28 $S "the sys-memory factory ignores the bring-up kext's mask" '	return ok ? OSTypeAlloc(Navi48SysMemory) : nullptr;' '	return OSTypeAlloc(Navi48SysMemory);'
-plant 29 $S "ops are fetched with waitForFunction=true" 'callPlatformFunction(fn, /*waitForFunction=*/false,' 'callPlatformFunction(fn, /*waitForFunction=*/true,'
+plant 29 $S "ops are fetched with waitForFunction=true" 'callPlatformFunction(fn, /*waitForFunction=*/false, (void *)&o, nullptr, nullptr, nullptr);
+	fn->release();
+	if (rc != kIOReturnSuccess) { N48_LOG' 'callPlatformFunction(fn, /*waitForFunction=*/true, (void *)&o, nullptr, nullptr, nullptr);
+	fn->release();
+	if (rc != kIOReturnSuccess) { N48_LOG'
+plant 119 $S "the display ops are fetched with waitForFunction=true" 'callPlatformFunction(fn, /*waitForFunction=*/false, (void *)&o, nullptr, nullptr, nullptr);
+	fn->release();
+	return rc == kIOReturnSuccess ? o : nullptr;' 'callPlatformFunction(fn, /*waitForFunction=*/true, (void *)&o, nullptr, nullptr, nullptr);
+	fn->release();
+	return rc == kIOReturnSuccess ? o : nullptr;'
 plant 30 $S "an unacceptable ops table is kept" '	if (v != kOpsOk) { N48_LOG("ops: refused (verdict %u)", (unsigned)v); return nullptr; }' '	if (v != kOpsOk) { N48_LOG("ops: refused (verdict %u)", (unsigned)v); }'
 # ---- event machine ----
 plant 31 $P "the stamp base is set even when Fast2 init failed" '    if (!superInitOk) return p;
@@ -136,9 +146,9 @@ plant 42 Info.plist "an IOResources personality (runs at every boot)" '<key>IOPr
 			<string>IOKit</string>
 			<key>IOProbeScore</key>'
 plant 43 Info.plist "the version is not bumped (one field)" '<key>CFBundleVersion</key>
-	<string>0.0.3</string>' '<key>CFBundleVersion</key>
-	<string>0.0.2</string>'
-plant 44 src/kmod_info.c "kmod version differs from the plist" 'KMOD_EXPLICIT_DECL(com.navi48.accelprobe, "0.0.3", _start, _stop)' 'KMOD_EXPLICIT_DECL(com.navi48.accelprobe, "0.0.2", _start, _stop)'
+	<string>0.0.7</string>' '<key>CFBundleVersion</key>
+	<string>0.0.3</string>'
+plant 44 src/kmod_info.c "kmod version differs from the plist" 'KMOD_EXPLICIT_DECL(com.navi48.accelprobe, "0.0.7", _start, _stop)' 'KMOD_EXPLICIT_DECL(com.navi48.accelprobe, "0.0.3", _start, _stop)'
 plant 45 Info.plist "another bundle id (would need a new Allow approval)" '<string>com.navi48.accelprobe</string>
 	<key>CFBundleInfoDictionaryVersion</key>' '<string>com.navi48.accelprobe2</string>
 	<key>CFBundleInfoDictionaryVersion</key>'
@@ -148,7 +158,7 @@ plant 46 Info.plist "IOMatchCategory changes" '<key>IOMatchCategory</key>
 plant 47 Info.plist "the kext is required at boot" '<key>OSBundleLibraries</key>' '<key>OSBundleRequired</key>
 	<string>Local-Root</string>
 	<key>OSBundleLibraries</key>'
-plant 48 src/Navi48MetalOps.h "the ops header differs from the bring-up kext's copy" '#define N48_METAL_ABI         2u' '#define N48_METAL_ABI         2u
+plant 48 src/Navi48MetalOps.h "the ops header differs from the bring-up kext's copy" '#define N48_METAL_ABI         3u' '#define N48_METAL_ABI         3u
 /* drift */'
 plant 49 Makefile "make does not run the gates" 'python3 gates/gate_link.py $(EXEC) $(BUILD)/accel.o
 	python3 gates/layout_gate_host.py $(EXEC)' 'true'
@@ -192,8 +202,169 @@ plant 78 $S "slot 277 has no kill switch" '	N48_AUX_ENTER((uint64_t)0);
 	uint64_t a[6] = { (uint64_t)(uintptr_t)txn' '	uint64_t a[6] = { (uint64_t)(uintptr_t)txn'
 plant 79 $S "slot 277 falls back to the wrong family slot" 'n48_ztvfam_IOAccelDisplayPipe[2 + 277]' 'n48_ztvfam_IOAccelDisplayPipe[2 + 276]'
 plant 80 gates/leaves.py "the display trampolines are generated against the generic vhook" "{267: 'base', 278: 'base', 279: 'base'}, 'n48_disp_vhook')" "{267: 'base', 278: 'base', 279: 'base'})"
-plant 81 gates/leaves.py "the expected gate total is not raised for the pipe" "EXPECT_SLOTS = 2370" "EXPECT_SLOTS = 2064"
+plant 81 gates/leaves.py "the expected gate total is not raised for the pipe and the framebuffer" "EXPECT_SLOTS = 2720" "EXPECT_SLOTS = 2064"
 plant 82 gates/leaves.py "slot 277 is generated instead of hand written (its declaration is a placeholder)" "HAND = {'Navi48EventMachine': [35], 'Navi48DisplayPipe': [277]}" "HAND = {'Navi48EventMachine': [35]}"
+
+# ---- aux 0.0.4 (M5): Navi48Framebuffer ----
+plant 83 $S 'Navi48Framebuffer::start has no kill switch' 'bool Navi48Framebuffer::start(IOService *provider) {
+	N48_AUX_ENTER(false);
+' 'bool Navi48Framebuffer::start(IOService *provider) {
+'
+plant 84 $S 'the framebuffer starts with navi48-metal-ws present' 'fb_start_verdict(n48_aux_on(), metalWs, isNub, layoutOk, ov, rc, sv)' 'fb_start_verdict(n48_aux_on(), false, isNub, layoutOk, ov, rc, sv)'
+plant 85 $S 'the framebuffer starts under any provider' 'fb_start_verdict(n48_aux_on(), metalWs, isNub, layoutOk, ov, rc, sv)' 'fb_start_verdict(n48_aux_on(), metalWs, true, layoutOk, ov, rc, sv)'
+plant 86 $S 'the framebuffer ignores the ops verdict' 'fb_start_verdict(n48_aux_on(), metalWs, isNub, layoutOk, ov, rc, sv)' 'fb_start_verdict(n48_aux_on(), metalWs, isNub, layoutOk, (uint32_t)N48_DOV_OK, rc, sv)'
+plant 87 $S 'the framebuffer does not validate the snapshot' 'const uint32_t sv = rc == 0 ? fb_snap_for_index(&s, pidx) : (uint32_t)N48_DSV_NULL;' 'const uint32_t sv = (uint32_t)N48_DSV_OK;'
+plant 88 $S 'the framebuffer starts even when the verdict refuses' '	if (v != kFbStartOk) return false;
+' '	if (false) return false;
+'
+plant 89 $S 'getApertureRange serves any aperture' 'fb_aperture(&snap, aperture == kIOFBSystemAperture, &phys, &len)' 'fb_aperture(&snap, true, &phys, &len)'
+plant 90 $S 'isConsoleDevice is overridden (the monitor B would become the console)' '	bool start(IOService *provider) override;
+	IODeviceMemory *getApertureRange(IOPixelAperture aperture) override;' '	bool start(IOService *provider) override;
+	bool isConsoleDevice() override { return true; }
+	IODeviceMemory *getApertureRange(IOPixelAperture aperture) override;'
+plant 91 $S 'the framebuffer declares a new virtual' '	void initForPM();                 // RDNA4FB' '	virtual void initForPM();                 // RDNA4FB'
+plant 92 $S 'initForPM lacks the system-sleep veto' '	for (auto &state : powerStates) state.capabilityFlags |= kIOPMPreventSystemSleep;
+' ''
+plant 93 $S 'setAttribute(power) is left to super' '	if (!fb_power_attr((uint32_t)attribute)) return IOFramebuffer::setAttribute(attribute, value);
+' '	return IOFramebuffer::setAttribute(attribute, value);
+'
+plant 94 $P 'the cursor attribute reports a hardware cursor' 'if (attribute == kFbAttrCursor) { r.rc = kFbRcSuccess; r.hasValue = true; r.value = 0u; }' 'if (attribute == kFbAttrCursor) { r.rc = kFbRcSuccess; r.hasValue = true; r.value = 1u; }'
+plant 95 $P 'the pixel masks are swapped (BGR)' 'o->masks[0] = 0x00FF0000u; o->masks[1] = 0x0000FF00u; o->masks[2] = 0x000000FFu;' 'o->masks[0] = 0x000000FFu; o->masks[1] = 0x0000FF00u; o->masks[2] = 0x00FF0000u;'
+plant 96 $P 'the pixel format string is BGR' 'static const char fmt[] = "--------RRRRRRRRGGGGGGGGBBBBBBBB";' 'static const char fmt[] = "--------BBBBBBBBGGGGGGGGRRRRRRRR";'
+plant 97 $P 'the row bytes are width x 3' 'o->bytesPerRow = s->pitchBytes;' 'o->bytesPerRow = s->w * 3u;'
+plant 98 $P 'setDisplayMode accepts depth 1' 'return mode == kFbModeId && depth == 0u; }' 'return mode == kFbModeId && depth <= 1u; }'
+plant 99 $P 'any aperture is served' 'if (!s || !phys || !len || !systemAperture || s->aperPhys == 0u || s->aperLen == 0u) return false;' 'if (!s || !phys || !len || s->aperPhys == 0u || s->aperLen == 0u) return false;'
+plant 100 $P 'start verdict: the provider is judged before navi48-metal-ws' '    if (metalWsPresent) return kFbStartMetalWs;
+    if (!providerIsNub) return kFbStartNotNub;' '    if (!providerIsNub) return kFbStartNotNub;
+    if (metalWsPresent) return kFbStartMetalWs;'
+plant 101 $P 'start verdict ignores navi48-metal-ws' '    if (metalWsPresent) return kFbStartMetalWs;
+' ''
+plant 102 $P 'start verdict ignores the kill switch' '    if (!auxOn) return kFbStartAuxOff;
+' ''
+plant 103 $P 'start verdict ignores a refused snapshot hook' 'if (snapRc != 0 || snapVerdict != N48_DSV_OK) return kFbStartSnapshot;' 'if (snapVerdict != N48_DSV_OK) return kFbStartSnapshot;'
+plant 104 $P 'HLDDC sense succeeds without an EDID' 'r.rc = (s && s->edidLen != 0u) ? kFbRcSuccess : kFbRcUnsupported;' 'r.rc = kFbRcSuccess;'
+plant 105 $P 'the DDC blocks are 0-based' '*src = s->edid + (uint64_t)(blockNumber - 1u) * kFbDdcBlock;' '*src = s->edid + (uint64_t)blockNumber * kFbDdcBlock;'
+plant 106 $P 'the mode reports 60.00 Hz' 'o->refresh1616 = s->refresh1616;' 'o->refresh1616 = 60u << 16;'
+plant 107 Info.plist 'the framebuffer personality has no IOPropertyMatch' '			<key>IOPropertyMatch</key>
+			<dict>
+				<key>Navi48DisplayIndex</key>
+				<integer>1</integer>
+			</dict>
+' ''
+plant 108 Info.plist 'the framebuffer personality matches a PCI device' '			<key>IOProviderClass</key>
+			<string>Navi48DisplayNub</string>
+			<key>IOPropertyMatch</key>
+			<dict>
+				<key>Navi48DisplayIndex</key>
+				<integer>1</integer>' '			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<key>IOPropertyMatch</key>
+			<dict>
+				<key>Navi48DisplayIndex</key>
+				<integer>1</integer>'
+plant 168 Info.plist 'the monitor A personality matches a PCI device' '			<key>IOProviderClass</key>
+			<string>Navi48DisplayNub</string>
+			<key>IOPropertyMatch</key>
+			<dict>
+				<key>Navi48DisplayIndex</key>
+				<integer>2</integer>' '			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<key>IOPropertyMatch</key>
+			<dict>
+				<key>Navi48DisplayIndex</key>
+				<integer>2</integer>'
+plant 111 INSTALL.md 'INSTALL.md recommends kmutil install --update-all' 'NEVER `kmutil install --update-all` (see step 4b).' 'Run `kmutil install --update-all` (see step 4b).'
+plant 112 gates/leaves.py 'the framebuffer'\''s override list forgets getDDCBlock' 'FB_EXTRA = [184, 310, 311, 319, 322, 325, 326, 330, 331, 332, 344, 345]' 'FB_EXTRA = [184, 310, 311, 319, 322, 325, 326, 330, 331, 332, 344]'
+plant 114 gates/leaves.py 'the framebuffer leaf is not gated' '    ('\''Navi48Framebuffer'\'',   '\''IOFramebuffer'\'',            FB_EXTRA),
+' ''
+plant 115 $S 'getDDCBlock serves any block type' 'blockType == kIODDCBlockTypeEDID' 'true'
+plant 116 $S 'setDisplayMode accepts everything' '	return (depth >= 0 && fb_mode_ok((uint32_t)displayMode, (uint32_t)depth)) ? kIOReturnSuccess : kIOReturnUnsupported;      // only (1, 0)' '	return kIOReturnSuccess;'
+plant 117 $S 'enableController does not register power management' '	initForPM();
+	if (dops && dops->trace) dops->trace(N48_DTR_ENABLE' '	if (dops && dops->trace) dops->trace(N48_DTR_ENABLE'
+plant 118 $S 'getStartupDisplayMode answers mode 0' '	if (displayMode) *displayMode = (IODisplayModeID)kFbModeId;      // the base getter returns 0xE00002C7' '	if (displayMode) *displayMode = 0;      // the base getter returns 0xE00002C7'
+
+plant 120 $S "the framebuffer starts without running the layout gate (on an fb2 boot no accelerator probe ever runs it)" 'const bool layoutOk = !metalWs && isNub && n48_layout_gate();' 'const bool layoutOk = !metalWs && isNub;'
+plant 121 $S "the framebuffer ignores the layout gate's verdict" 'fb_start_verdict(n48_aux_on(), metalWs, isNub, layoutOk, ov, rc, sv)' 'fb_start_verdict(n48_aux_on(), metalWs, isNub, true, ov, rc, sv)'
+plant 122 $P "start verdict ignores the layout gate" '    if (!layoutOk) return kFbStartLayout;
+' ''
+plant 123 $P "start verdict judges the layout gate before the provider" '    if (!providerIsNub) return kFbStartNotNub;
+    if (!layoutOk) return kFbStartLayout;' '    if (!layoutOk) return kFbStartLayout;
+    if (!providerIsNub) return kFbStartNotNub;'
+
+# ---- aux 0.0.5 (G6): the 'N48N' user client on the accelerator (slot 239) ----
+L=gates/leaves.py
+plant 130 $S "AN 'N48N' OPEN FALLS THROUGH TO THE FAMILY when the plan says unsupported (the family would hand out a generic IOAccelContext2)" '	if (plan != kNucNative) return kIOReturnUnsupported;' '	if (plan != kNucNative) return IOGraphicsAccelerator2::newUserClient(owningTask, securityID, type, handler);'
+plant 131 $P "nuc_plan: an unusable 'N48N' (kill switch, gate, device, table) is the family's" '    if (!auxOn || !gatePass || !haveDevice || !native_open_usable(o)) return kNucUnsupported;' '    if (!auxOn || !gatePass || !haveDevice || !native_open_usable(o)) return kNucFamily;'
+plant 132 $S "the kill switch lets an 'N48N' open through to the family" 'N48_AUX_ENTER(type == N48_METAL_UC_N48N ? kIOReturnUnsupported : IOGraphicsAccelerator2::newUserClient(owningTask, securityID, type, handler));' 'N48_AUX_ENTER(IOGraphicsAccelerator2::newUserClient(owningTask, securityID, type, handler));'
+plant 133 $P "AN IOReturn IS READ AS A BOOL (nuc_result): any non-zero refusal counts as handled" 'return rc != kIoSuccess ? rc : (haveClient ? kIoSuccess : kIoInternalError);' 'return rc ? kIoSuccess : (haveClient ? kIoSuccess : kIoInternalError);'
+plant 134 $S "AN IOReturn IS READ AS A BOOL (the aux returns 0 = failed / 1 = handled)" '	return (IOReturn)out;' '	return (IOReturn)(out != 0 ? 0 : 1);'
+plant 135 $P "native_open_usable ignores the capability bit" '    return o && o->abi >= 3u && o->size >= N48_METAL_OPS_V3 && cap_has(o, N48_CAP_NATIVE_OPEN) && o->native_open != nullptr;' '    return o && o->abi >= 3u && o->size >= N48_METAL_OPS_V3 && o->native_open != nullptr;'
+plant 136 $P "native_open_usable does not check the table size (reads past a 144-byte table)" '    return o && o->abi >= 3u && o->size >= N48_METAL_OPS_V3 && cap_has(o, N48_CAP_NATIVE_OPEN) && o->native_open != nullptr;' '    return o && o->abi >= 3u && cap_has(o, N48_CAP_NATIVE_OPEN) && o->native_open != nullptr;'
+plant 137 $P "native_open_usable ignores the ABI" '    return o && o->abi >= 3u && o->size >= N48_METAL_OPS_V3 && cap_has(o, N48_CAP_NATIVE_OPEN) && o->native_open != nullptr;' '    return o && o->size >= N48_METAL_OPS_V3 && cap_has(o, N48_CAP_NATIVE_OPEN) && o->native_open != nullptr;'
+plant 138 $S "the hook is called without a live device" 'nuc_plan(type, true, gGateState == 1, gOps, ctx != nullptr && ctx == gCtx)' 'nuc_plan(type, true, gGateState == 1, gOps, true)'
+plant 139 $S "the hook is called although the layout gate did not pass" 'nuc_plan(type, true, gGateState == 1, gOps, ctx != nullptr && ctx == gCtx)' 'nuc_plan(type, true, true, gOps, ctx != nullptr && ctx == gCtx)'
+plant 140 $S "the hook gets no accelerator identity" 'gOps->native_open(ctx, this, (void *)owningTask' 'gOps->native_open(ctx, nullptr, (void *)owningTask'
+plant 141 $S "*handler is written on a refusal" '	if (out == kIoSuccess) *handler = uc;
+	else if (uc) { uc->release(); uc = nullptr; }' '	*handler = uc;'
+plant 142 $L "slot 239 is not in the expected override list" "[183, 184, 18, 322, 348, 329, 239])" "[183, 184, 18, 322, 348, 329])"
+plant 143 $P "the type constant is not N48N" 'if (type != N48_METAL_UC_N48N) return kNucFamily;' 'if (type != 0x4E34384Fu) return kNucFamily;'
+plant 144 Info.plist "the short version stays 0.0.4" '<key>CFBundleShortVersionString</key>
+	<string>0.0.7</string>' '<key>CFBundleShortVersionString</key>
+	<string>0.0.4</string>'
+plant 145 INSTALL.md "the install path is the old one" '/Library/Extensions/Navi48Accel-0.0.5.kext && sudo chown' '/Library/Extensions/Navi48Accel-0.0.4.kext && sudo chown'
+plant 146 INSTALL.md "the 0.0.5 section suggests kmutil install --update-all" '    Kill switch at any time: boot-arg `navi48-aux=0` (an '"'"'N48N'"'"' open on the accelerator then returns kIOReturnUnsupported).' '    sudo kmutil install --update-all'
+plant 147 src/Navi48MetalOps.h "the ops header drifts from the bring-up copy (a changed offset comment)" '/* 144 */
+};' '/* 148 */
+};'
+plant 148 $S "newUserClient forgets to set the trace (the open leaves no line)" '	n48_trace(N48_TR_NATIVE_OPEN, (uint64_t)(uint32_t)out, (uint64_t)(uintptr_t)uc);
+' ''
+plant 149 $S "a NULL handler is dereferenced after the plan said native" '	if (!handler) return kIOReturnBadArgument;
+	IOUserClient *uc = nullptr;' '	IOUserClient *uc = nullptr;'
+
+# ---- aux 0.0.6 (Run B): the monitor A as display index 2 (a second personality of the same class; ops ABI 2; the per-index geometry)
+plant 150 $S 'the framebuffer does not read its nub index (the snapshot is judged for any index)' 'const uint32_t sv = rc == 0 ? fb_snap_for_index(&s, pidx) : (uint32_t)N48_DSV_NULL;' 'const uint32_t sv = rc == 0 ? n48disp_snap_valid(&s) : (uint32_t)N48_DSV_NULL;'
+plant 151 $S 'the ops check ignores the index (an ABI-1 bring-up kext could serve the monitor A)' 'layoutOk ? n48disp_ops_check_for(o, pidx)' 'layoutOk ? n48disp_ops_check(o)'
+plant 152 src/n48accel_pure.h 'the snapshot may carry another index than its nub' 'return s->index == providerIndex ? (uint32_t)N48_DSV_OK : (uint32_t)N48_DSV_INDEX;' 'return (uint32_t)N48_DSV_OK;'
+plant 153 src/n48accel_pure.h 'any provider index is accepted' 'value == N48_DISP_INDEX || value == N48_DISPA_INDEX' 'value != 0'
+plant 154 src/Navi48DisplayOps.h 'the shared validator accepts any aperture length' 's->pixHz != g.pixHz || s->aperLen != g.aperLen) return N48_DSV_GEOMETRY;' 's->pixHz != g.pixHz) return N48_DSV_GEOMETRY;'
+plant 155 src/Navi48DisplayOps.h 'the monitor A geometry has another refresh (not exactly 60 Hz)' '#define N48_DISPA_REFRESH1616 0x3C0000u' '#define N48_DISPA_REFRESH1616 0x3BFFFFu'
+plant 156 src/Navi48DisplayOps.h 'the monitor A geometry keeps the monitor B DDC line' 'g->otg = N48_DISPA_OTG; g->ddcLine = N48_DISPA_DDC_LINE;' 'g->otg = N48_DISPA_OTG; g->ddcLine = N48_DISP_DDC_LINE;'
+plant 157 src/Navi48DisplayOps.h 'an ABI-1 table is accepted for index 2' 'return o->abi >= N48_DISP_ABI_MULTI ? N48_DOV_OK : N48_DOV_ABI;' 'return N48_DOV_OK;'
+plant 158 src/Navi48DisplayOps.h 'the monitor B row is changed (the pitch)' 'g->w = N48_DISP_W; g->h = N48_DISP_H; g->pitchBytes = N48_DISP_PITCH;' 'g->w = N48_DISP_W; g->h = N48_DISP_H; g->pitchBytes = N48_DISPA_PITCH;'
+plant 159 Info.plist 'the monitor A personality matches index 1 (two framebuffers on one nub)' '<key>Navi48DisplayIndex</key>
+				<integer>2</integer>' '<key>Navi48DisplayIndex</key>
+				<integer>1</integer>'
+plant 160 Info.plist 'the monitor A personality is missing' '<key>Navi48Framebuffer2</key>' '<key>Navi48FramebufferX</key>'
+plant 161 Info.plist 'the monitor A personality is another class' '<key>Navi48Framebuffer2</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.navi48.accelprobe</string>
+			<key>IOClass</key>
+			<string>Navi48Framebuffer</string>' '<key>Navi48Framebuffer2</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.navi48.accelprobe</string>
+			<key>IOClass</key>
+			<string>Navi48Accelerator</string>'
+plant 162 INSTALL.md 'the 0.0.6 install path is the old one' '/Library/Extensions/Navi48Accel-0.0.6.kext && sudo chown' '/Library/Extensions/Navi48Accel-0.0.5.kext && sudo chown'
+plant 163 INSTALL.md 'the 0.0.6 section suggests kmutil install --update-all' '    Kill switch at any time: boot-arg `navi48-aux=0` (both framebuffers refuse to start). The framebuffers also refuse to start with boot-arg navi48-metal-ws present.' '    sudo kmutil install --update-all'
+plant 164 $S 'the framebuffer class hard-wires the monitor B mode' 'info->nominalWidth = m.w;' 'info->nominalWidth = 2560;'
+plant 165 $S 'the framebuffer class hard-wires the monitor B aperture' 'IODeviceMemory::withRange((IOPhysicalAddress)phys, (IOPhysicalLength)len);      // a fresh instance' 'IODeviceMemory::withRange((IOPhysicalAddress)phys, (IOPhysicalLength)14745600ull);      // a fresh instance'
+plant 166 src/n48accel_pure.h 'the pixel format hard-wires the monitor B pitch' 'o->bytesPerRow = s->pitchBytes;' 'o->bytesPerRow = 10240u;'
+plant 167 src/Navi48DisplayOps.h 'the aux copy of the ops header differs from the bring-up one' '#define N48_DISPA_PITCH       7680u' '#define N48_DISPA_PITCH       7681u'
+
+# ---- aux 0.0.7 (M6 Stage 1a, R1): the navi48-m6 latch lifts the metal-ws refusal and only that
+plant 168 src/n48accel_pure.h 'the metal-ws refusal ignores the M6 latch' 'constexpr bool fb_metal_ws_blocks(bool metalWsPresent, bool m6On) { return metalWsPresent && !m6On; }' 'constexpr bool fb_metal_ws_blocks(bool metalWsPresent, bool m6On) { (void)m6On; return metalWsPresent; }'
+plant 169 src/n48accel_pure.h 'the M6 latch is on for any value' 'constexpr bool m6_on(bool present, uint32_t value) { return present && value == 1u; }' 'constexpr bool m6_on(bool present, uint32_t value) { (void)value; return present; }'
+plant 170 $S 'start judges metal-ws without the M6 latch' 'const bool metalWs = fb_metal_ws_blocks(metalWsArg, m6On);' 'const bool metalWs = metalWsArg; (void)m6On;'
+plant 171 $S 'start never refuses on metal-ws (latch or not)' 'const bool metalWs = fb_metal_ws_blocks(metalWsArg, m6On);' 'const bool metalWs = false; (void)metalWsArg; (void)m6On;'
+plant 172 $S 'the M6 latch is read under a wrong name' 'PE_parse_boot_argn("navi48-m6", &m6v, sizeof(m6v))' 'PE_parse_boot_argn("navi48-m6x", &m6v, sizeof(m6v))'
+plant 173 src/n48accel_pure.h 'the metal-ws refusal is inverted under the latch' 'return metalWsPresent && !m6On; }' 'return metalWsPresent && m6On; }'
+plant 174 INSTALL.md 'the 0.0.7 install path is the old one' '/Library/Extensions/Navi48Accel-0.0.7.kext && sudo chown' '/Library/Extensions/Navi48Accel-0.0.6.kext && sudo chown'
+plant 175 src/kmod_info.c 'kmod_info still says 0.0.6' '"0.0.7"' '"0.0.6"'
+plant 176 $S 'the M6 latch is read twice in start' 'const bool metalWs = fb_metal_ws_blocks(metalWsArg, m6On);' 'const bool metalWs = fb_metal_ws_blocks(metalWsArg, m6On); uint32_t m6w = 0; (void)PE_parse_boot_argn("navi48-m6", &m6w, sizeof(m6w));'
+plant 177 INSTALL.md 'the 0.0.7 section suggests kmutil install --update-all' '    Kill switch at any time: boot-arg `navi48-aux=0` (both framebuffers refuse to start). With navi48-m6=1 they START' '    sudo kmutil install --update-all
+    Kill switch at any time: boot-arg `navi48-aux=0` (both framebuffers refuse to start). With navi48-m6=1 they START'
 
 echo "plants: $total run, $escaped escaped/failed"
 [ "$escaped" -eq 0 ]

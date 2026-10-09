@@ -1,4 +1,4 @@
-/* gfx_fs85.h — build 0.0.530 (notes/design/SRCFILL85.md items 1-8; ): SWITCH 85 "SOURCE FILLS",
+/* gfx_fs85.h — build 0.0.530 (an internal design note items 1-8; ): SWITCH 85 "SOURCE FILLS",
  * PURE PARTS. Stop armed runs going void at start-up.
  *
  * WHY (the design's Facts 2-4, CONFIRMED on the four boots run11i/j/l/m). In both void runs (Z2 run11i, AB2 run11m) no

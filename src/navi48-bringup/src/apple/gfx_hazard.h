@@ -1,4 +1,4 @@
-/* gfx_hazard.h — 0.0.395, notes/design/R5-REDESIGN.md v2 "Capacity — (a)" and "Keying is PHYSICAL, not VA":
+/* gfx_hazard.h — 0.0.395, an internal design note v2 "Capacity — (a)" and "Keying is PHYSICAL, not VA":
  * THE ARM-SCOPED HAZARD PAGE SET, keyed by the RESOLVED PHYSICAL PAGE.
  *
  * WHY THIS HEADER EXISTS, IN ONE PARAGRAPH. Through 0.0.394 R5's memory-destination question ("did a held-back frame

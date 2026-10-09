@@ -1,4 +1,4 @@
-// gfx_copyguard_test.cpp — 0.0.435 (notes/design/PGMID-COPYGUARD.md Part 2). THE COPY-OVERLAP
+// gfx_copyguard_test.cpp — 0.0.435 (an internal design note Part 2). THE COPY-OVERLAP
 // REFUSAL'S HOST PROOF.
 //
 // Every test drives the REAL pure functions in gfx_copyguard.h - the same header the kext compiles - through a
@@ -7,7 +7,7 @@
 // never real threads: the "test-only hook placed between check steps" the design asks for is simply that each step
 // is its own function call, so any order can be scripted and any single step can be substituted with a MUTANT.
 //
-// SECTION MAP (mirrors the design's own list, notes/design/PGMID-COPYGUARD.md "Tests"):
+// SECTION MAP (mirrors the design's own list, an internal design note "Tests"):
 //   T1  exhaustive interleavings — accept only all-old or all-new, at least one accept of each
 //   T2  planted breaks (each shown CAUGHT then reverted): ring-before-slot, CLOSE-before-END, no-slot-scan,
 //       no-ring-scan, BEGIN-after-WA
@@ -1278,7 +1278,7 @@ static void test_T9(const char *bringupPath, const char *ahhPath, const char *pe
     }
 }
 
-// build 0.0.486 (switch 59, notes/design/STATIC-RETILE.md) - THE LONGER WRITE AND THE COPY GUARD. The backing-sourced
+// build 0.0.486 (switch 59, an internal design note) - THE LONGER WRITE AND THE COPY GUARD. The backing-sourced
 // copy writes a gfx12 image LONGER than res+0x230 (0x19000 for the avatar's 0x15000). Every byte of it must be inside what
 // the pre-flight walked through the VRAM guard and what the copy-guard scope [cgLo, cgHi) covers, so the decision is taken
 // BEFORE the pre-flight and one length (wBytes) drives the pre-flight, the scope and the write loop. The arithmetic and the
@@ -2002,7 +2002,7 @@ static void test_T18p_pins(const char *ahhPath, const char *peerPath, const char
 }
 
 // =============================================================================================================
-// T19 — build 0.0.496 (notes/design/FAST-PAGEIN.md,): SWITCH 63, THE RESIDENCY COPY THROUGH SDMA.
+// T19 — build 0.0.496 (an internal design note,): SWITCH 63, THE RESIDENCY COPY THROUGH SDMA.
 // Every check drives the REAL fastcopy.h (the header the kext compiles) with run10g's real copy lengths
 // (fixture_fastcopy_run10g.h), RUN D's real shader heap (T18's model, overlay included) and a mock engine.
 // The kext's own order is proved by the pins in fc_pins, each with a planted break shown caught.
@@ -2749,7 +2749,7 @@ static void test_T21p_pins(const char *ahhPath, const char *peerPath) {
 
 
 // =============================================================================================================
-// T22 — build 0.0.503 (notes/design/HYBRID.md): SWITCH 68, WHO MAY OPEN THE ACCELERATOR. The REAL
+// T22 — build 0.0.503 (an internal design note): SWITCH 68, WHO MAY OPEN THE ACCELERATOR. The REAL
 // hybrid_policy.h the kext compiles: n48_hy_decide / n48_hy_count / n48_hy_switch_refused, the log formats' bound, and
 // (T22p) the kext's wiring: the slot-239 hook goes into the vtable copy BEFORE the copy is published (inside the
 // accelerator's start(), before it registers), and the hook decides from ONE latched reading of the switch BEFORE Apple.

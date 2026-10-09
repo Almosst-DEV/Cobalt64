@@ -1,6 +1,6 @@
 /* n48_scanabi.h: the scanout structs and flags the bundle needs, copied VERBATIM from
  * ~/navi48-native/mesa-mac/include/darwin/navi48_native_abi.h (kext ABI 1.1, selectors 9..14) so the bundle build needs no Mesa include path.
- * tools/native/navi48metal/build.sh does not check this; the S5.2a section of notes/design/NATIVE-S5-FLIP.md records the line-by-line diff check. */
+ * tools/native/navi48metal/build.sh does not check this; the S5.2a section of an internal design note records the line-by-line diff check. */
 #ifndef N48_SCANABI_H
 #define N48_SCANABI_H
 #include <stdint.h>
@@ -13,6 +13,16 @@
 #define N48N_SCANQ_ACQUIRED   (1u << 2)    /* the plane is taken (by this or an earlier call of this client) */
 #define N48N_SCANQ_GEOM_OK    (1u << 3)    /* linear ARGB8888, no DCC, plausible viewport/pitch: Acquire would proceed */
 #define N48N_SCANQ_DTO_VALID  (1u << 4)    /* refresh derived from the DP DTO; else from the EDID row matching the raster, else 0 */
+#define N48N_SCANQ_M6FLIP     (1u << 6)    /* bundle 13 / kext 0.0.661 (M6 Stage 1b): navi48-m6flip=1 is latched ON as well: ABI 1.11's selectors 22..26 (instance 2, the monitor B) are live */
+#define N48N_SCANQ_M6FLIP1    (1u << 7)    /* bundle 15 / kext 0.0.662 (M6 Stage 2): navi48-m6flip1=1 is latched ON as well (all three latches): ABI 1.12's instance 1 (the monitor A) is live */
+#define N48N_SEL_SCANX_ACQUIRE  22u        /* ABI 1.11: in [0] instance (1 monitor A, 2 monitor B) [1] flags (0); out [0] A [1] frame count [2] M6 table generation [3] free visible VRAM [4] (ABI 1.12) geometry w | h << 16 | pitch_px << 32 */
+#define N48N_SEL_SCANX_REGISTER 23u        /* in [0] instance; struct in n48n_scan_reg; out [0] tagged slot id (0x20|k) [1] MC */
+#define N48N_SEL_SCANX_PRESENT  24u        /* in [0] instance [1] tagged slot id [2] flags (0); out [0] present id [1] target frame [2] 0 */
+#define N48N_SEL_SCANX_STATUS   25u        /* in [0] instance; struct out n48n_scan_status; out [0] M6 table generation [1] reuse_inuse_refused [2] restores|failures<<32 [3] write refusals|failures<<32 */
+#define N48N_SEL_SCANX_RELEASE  26u        /* in [0] instance; out [0] restore of A verified [1] plane MC */
+#define N48N_SCANX_SLOT_TAG   0x20u
+#define N48N_SCANX_SLOT_TAG_MONA 0x10u     /* ABI 1.12: slot ids of instance 1 (the monitor A) are 0x10 | k */
+#define N48N_SCANQ_M6         (1u << 5)    /* bundle 11 / kext 0.0.659 (M6 Stage 1a): boot-arg navi48-m6=1 is latched ON; the shipped Mesa copies the flags word untouched, this bit is the kext header's (src/navi48-bringup/src/Navi48NativeABI.h) */
 /* n48n_scan_slot.flags */
 #define N48N_SCANSLOT_PENDING  (1u << 0)   /* this slot's Present is programmed and has not latched */
 #define N48N_SCANSLOT_INUSE    (1u << 1)   /* HUBP0 EARLIEST_INUSE equals this slot's MC: the hardware is still fetching it */

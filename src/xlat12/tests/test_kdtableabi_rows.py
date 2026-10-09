@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""build 0.0.470 (notes/design/NO-SAMPLER-CLASS10.md section 5, test N5) - EVERY kDTableAbi ROW AGAINST ITS OWN
+"""build 0.0.470 (an internal design note section 5, test N5) - EVERY kDTableAbi ROW AGAINST ITS OWN
 PROGRAM'S ABI JSON, and every such program's xlat12_abi_ptrs.h row against the same JSON.
 
 kDTableAbi (src/xlat12/xlat12_ib.c) is hand-transcribed. A no-sampler row that is wrong about its program (the program

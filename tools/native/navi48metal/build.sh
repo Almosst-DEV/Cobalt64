@@ -8,20 +8,33 @@ D="$(cd "$(dirname "$0")" && pwd)"
 # Work dir is OUTSIDE the repo: the repo lives in a file-provider folder that stamps com.apple.FinderInfo on
 # *.bundle directories, which codesign --verify rejects ("detritus not allowed").  The shippable artefact is
 # build/Navi48Metal.bundle.tar (bsdtar --no-xattrs); extract it on the PC.
-B="$D/build"; W="$(mktemp -d /tmp/navi48metal.XXXXXX)"; APP="$W/Navi48Metal.bundle"
+B="$D/build"; W="$(mktemp -d "${TMPDIR:-/tmp}/navi48metal.XXXXXX")"; APP="$W/Navi48Metal.bundle"
 LAZY="${N48_LAZY:-1}"; F9D="${N48_9D:-1}"
 RADV="${N48_RADV_LIB:-$HOME/navi48-native/mesa-mac/build-x86_64/src/amd/vulkan/libvulkan_radeon.dylib}"   # x86_64 RADV (10a: shipped in Resources)
 [ -f "$RADV" ] || { echo "build.sh: RADV dylib not found: $RADV" >&2; exit 1; }
+# Bundle 14: libn48xlate.dylib (x86_64), the LGPL in-process translator of the fork (NATIVE-S8-INPROC.md). N48_XLATE_LIB takes a prebuilt one; otherwise it is built from the fork
+# (branch n48-inproc of ~/navi48-native/metal2vulkan, or N48_M2V_DIR) with `cargo build --release -p n48xlate --target x86_64-apple-darwin`.
+XL="${N48_XLATE_LIB:-}"
+if [ -z "$XL" ]; then
+  M2V="${N48_M2V_DIR:-$HOME/navi48-native/metal2vulkan}"
+  [ -f "$M2V/n48xlate/Cargo.toml" ] || { echo "build.sh: the fork with n48xlate is not at $M2V (set N48_M2V_DIR or N48_XLATE_LIB)" >&2; exit 1; }
+  ( cd "$M2V" && PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:$PATH" MACOSX_DEPLOYMENT_TARGET=12.0 cargo build --release -p n48xlate --target x86_64-apple-darwin >&2 ) || { echo "build.sh: cargo build of n48xlate failed" >&2; exit 1; }
+  XL="$M2V/target/x86_64-apple-darwin/release/libn48xlate.dylib"
+fi
+[ -f "$XL" ] || { echo "build.sh: libn48xlate.dylib not found: $XL" >&2; exit 1; }
+[ "$(lipo -archs "$XL" 2>/dev/null)" = "x86_64" ] || { echo "build.sh: $XL is not a thin x86_64 library" >&2; exit 1; }
 VKINC="${N48_VK_INC:--I/opt/homebrew/include}"
 rm -rf "$B"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$B/sanity"
 cp "$D/Info.plist" "$APP/Contents/Info.plist"
 cp "$RADV" "$APP/Contents/Resources/libvulkan_radeon.dylib"
+cp "$XL" "$APP/Contents/Resources/libn48xlate.dylib"
 mkdir -p "$APP/Contents/Resources/spvcache"; for f in "$D"/spvcache/*.spv "$D"/spvcache/*.meta.json; do cat "$f" > "$APP/Contents/Resources/spvcache/${f:t}"; done   # cat, not cp: cp(1) hung forever in lseek on spvcache/eee33f36...meta.json   # 10d SPIR-V cache
 clang $VKINC -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc -O2 -Wall -Wextra -Werror \
       -DN48_LAZY=$LAZY -DN48_9D=$F9D -I"$D" -bundle -framework Foundation -framework Metal -framework IOKit -framework IOSurface \
       -o "$APP/Contents/MacOS/Navi48Metal" "$D/Navi48Device.m"
 xattr -cr "$APP"
 codesign --force --sign - "$APP/Contents/Resources/libvulkan_radeon.dylib"
+codesign --force --sign - "$APP/Contents/Resources/libn48xlate.dylib"
 codesign --force --sign - "$APP"
 # arm64 build of the same source: compile/link sanity only (there is no Rosetta here to load x86_64); never install it.
 clang $VKINC -arch arm64 -fobjc-arc -O2 -Wall -Wextra -Werror -DN48_LAZY=$LAZY -DN48_9D=$F9D \

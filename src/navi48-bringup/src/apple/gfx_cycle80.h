@@ -1,4 +1,4 @@
-// gfx_cycle80.h — build 0.0.525 (notes/design/CYCLE80.md): CYCLE COMPLETENESS, SWITCH 80.
+// gfx_cycle80.h — build 0.0.525 (an internal design note): CYCLE COMPLETENESS, SWITCH 80.
 // `80 | M << 8`: M 1 ON (= 336), M 2 OFF (= 592, the default and the boot value), M 3 SHADOW (= 848), bare `80` reads.
 //
 // THE RULE (CYCLE80.md C1-C7). WindowServer double-buffers two LAYERS (run11c: X 0x400800000, X' 0x404800000); each cycle's frames

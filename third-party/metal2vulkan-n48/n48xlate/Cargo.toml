@@ -1,0 +1,23 @@
+[package]
+name = "n48xlate"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "LGPL-3.0-or-later"
+description = "Navi48: in-process AIR-text to Vulkan SPIR-V translation (C ABI), for sandboxed applications"
+publish = false
+
+[lib]
+name = "n48xlate"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+metal2vulkan = { path = "..", features = ["serde"] }
+serde_json = "1"
+
+[features]
+default = []
+# Test-only: an input that begins with the marker comment panics inside translation (and one that
+# begins with the exit marker is a deliberate process exit), so the catch_unwind boundary and the
+# crash guard can be exercised. Never enabled in the shipped library.
+test-hooks = []

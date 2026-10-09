@@ -1,10 +1,10 @@
 //
 //  navi48_modetrial_pure.h - the timed mode trial of native step S2d (kext 0.0.605; 0.0.606 adds the underflow read P1, the DP1 resync P3 and the OTG update lock P2 of
-//  notes/design/NATIVE-S2-120HZ.md): every decision AND the trial / restore / watchdog sequences, written against a small
+//  an internal design note): every decision AND the trial / restore / watchdog sequences, written against a small
 //  hardware interface (struct Hw) so tests/native_s2d_test.cpp compiles this on the host Mac and drives the exact code the kext runs (dcn/navi48_dcn.cpp supplies the Hw callbacks:
 //  the allowlisted display write, the DCN read, the sleep, the lock, the kernel thread). No kernel header is included here.
 //
-//  WHAT A TRIAL DOES (design: notes/design/NATIVE-S2.md S2d rows + the Review; ABI text: the "ABI 1.3 addendum" in Navi48NativeABI.h):
+//  WHAT A TRIAL DOES (design: an internal design note S2d rows + the Review; ABI text: the "ABI 1.3 addendum" in Navi48NativeABI.h):
 //    deny checks (native + S1b POSITIVE PASS, latch, plane not acquired, golden copy, baseline = the 60 Hz census raster, DP1 the one enabled stream, no drift, clocks sufficient
 //    from the DFS readback, step down first) -> 60 Hz baseline rate -> watchdog thread -> write the row's registers in Linux's order (each recorded BEFORE it is written) ->
 //    settle -> 3 s rate / DIO FIFO / stream check -> dwell (stall / stream / DIO watch) -> restore EVERY written register to the golden copy in reverse order -> verify the
@@ -398,7 +398,7 @@ inline uint32_t plan_build(const RowInfo &r, const uint32_t *live, PlanEnt *out,
     return n;
 }
 
-// ============================ 0.0.606: the hardware sequences (design notes/design/NATIVE-S2-120HZ.md P1 / P2 / P3) ==============================================
+// ============================ 0.0.606: the hardware sequences (design an internal design note P1 / P2 / P3) ==============================================
 // Every function with a `_locked` suffix is called with Hw.lock HELD by its caller and sleeps under it (each wait is bounded; see the k*Polls constants): the register writes of a mode
 // trial are exclusive, so the watchdog's restore and the trial thread can never interleave. A write is a read-modify-write of exactly the named field (wr_field); the read-only status bits
 // and the write-1 acknowledges are always written 0. Nothing here writes a clock, a DP0/DP2/DP3 register, DIG_BE, the PHY, the link or the DPCD.

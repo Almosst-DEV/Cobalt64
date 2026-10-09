@@ -1,0 +1,4 @@
+#!/bin/bash
+# the kit runs: sudo -n sh -c 'nohup dtrace ... &'; sleep 6; ... : keep it harmless
+case "$*" in *dtrace*) touch "$SIM_DIR/kv/dtrace"; printf 'ep 0 conn 54179\nep 1 conn 56383\nep 2 conn 57000\n' >"$SIM_FR/tmp/ep.out"; exit 0 ;; esac
+exec /bin/sh "$@"

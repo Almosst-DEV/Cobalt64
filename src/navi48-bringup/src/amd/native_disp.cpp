@@ -24,6 +24,7 @@
 #include "native_s1c.h"      // n1c_hung(): the HUNG latch (0.0.616: the prepared-descriptor cache leaks instead of completing under it)
 #include "amdgpu_log.h"
 #include "Navi48MetalNub.hpp"
+#include "Navi48DisplayNub.hpp"     // 0.0.659 (M6): framebufferOf(index)
 
 #define DLOG(fmt, ...) AMDGPU_LOG("disp", fmt, ##__VA_ARGS__)
 
@@ -34,6 +35,12 @@ namespace {
 
 // ---- the latch ----------------------------------------------------------------------------------------------------------------------------------------
 volatile UInt32 gLatch = n48disp::kLatchUnset;
+volatile uint32_t gM6Latch = n48m6::kLatchUnset;    // 0.0.659 (M6): boot-arg navi48-m6, read ONCE (first writer wins, n48m6::latch_get), default OFF
+volatile uint32_t gM6FlipLatch = n48m6::kLatchUnset;   // 0.0.661 (M6 Stage 1b): boot-arg navi48-m6flip, read ONCE (n48m6::latch_get), default OFF
+volatile uint32_t gM6Flip1Latch = n48m6::kLatchUnset;  // 0.0.662 (M6 Stage 2): boot-arg navi48-m6flip1, read ONCE (n48m6::latch_get), default OFF
+uint8_t gM6Blob[n48m6::kBlobBufBytes];   // 0.0.662 (HW1): sized for the LARGEST blob (v2), not the v1 one
+static_assert(sizeof gM6Blob >= n48m6::kBlobMax2 && sizeof gM6Blob >= n48m6::kBlobMax, "the publish buffer must hold a version-2 blob");
+                  // 0.0.660 (S2): the published table's bytes; written only by the holder of State::m6Pub's gate (n48m6::publish_serialised)
 
 // ---- the state (atomics only: the hooks run on WindowServer's transaction path and take no lock) ------------------------------------------------------------------
 struct State {
@@ -63,6 +70,22 @@ struct State {
     n48disp::CrashGuard guard;                      // 0.0.615 (G1)
     n48disp::MdCache mdc;                           // 0.0.616: the descriptors submit prepared; perform reads ONLY these (zero = all entries Empty)
     uint32_t lastAdopt;
+    // ---- 0.0.659 (M6 Stage 1a): all of it stays zero with the navi48-m6 latch OFF ----
+    n48m6::SurfTable m6Surf;                        // IOSurface ID -> instance, learned in the submit hook
+    n48m6::FbMap     m6Fb;                          // framebuffer pointer -> instance, recorded by adopt from the verified pipes
+    IOService       *m6FbRef[n48m6::kInstCount];    // the references that keep the mapped framebuffers alive (released at withdraw)
+    uint64_t m6Txn[n48m6::kInstCount + 1u];         // submits seen, per pipe instance ([3] = a pipe on no known framebuffer)
+    uint64_t m6NoCopy[n48m6::kInstCount];           // performs completed without any copy, per pipe instance
+    uint64_t m6Route[n48m6::kRouteCount];           // routing-guard verdicts (DP pipe presents)
+    uint64_t m6RouteBad[n48m6::kInstCount + 1u];    // guard refusals, per pipe instance
+    uint64_t m6LearnSkip[n48m6::kSkCount];          // transactions the learn declined to read, by reason
+    uint64_t m6Stamp[n48m6::kInstCount], m6StampFail[n48m6::kInstCount], m6Period[n48m6::kInstCount];     // vblank stamps written / refused per OTG-owning instance, and the last period
+    uint64_t m6Published;                           // times the table property was written
+    n48m6::PubRate m6Rate;                          // 0.0.661 (R5): the publish rate limiter (navi48-m6flip only; ATOMIC since the review M1)
+    volatile uint64_t m6LogNs;                      // 0.0.661 (S-2): the per-learn log line is printed at most once a second
+    n48m6::PubGate m6Pub;                           // 0.0.660 (S2): the one publisher at a time (n48m6::publish_serialised)
+    uint64_t m6LastTxnNs[n48m6::kInstCount];        // 0.0.660 (K1): uptime ns of each pipe's last transaction (0 = none since boot): m6stat page 3 reports the age
+    uint64_t m6Learned;                             // submits whose surface was learned (new, same or ambiguous)
 };
 State gD { };
 
@@ -111,9 +134,9 @@ struct KernelEnv {
     // -- 0.0.619: the operator restart window (flows: native_disp_flow.h reload_*) --
     n48disp::ReloadWin &rw() { return gD.reload; }
     void note_reload(uint32_t ev) {
-        if (ev == n48disp::kRwOpened) DLOG("operator restart window: opened (%llu s); the next WindowServer client close is tolerated and slot-267 calls are not counted until the new client's first slot 267 or expiry", (unsigned long long)(n48disp::kReloadWindowNs / 1000000000ull));
-        else if (ev == n48disp::kRwTolerated) DLOG("operator restart window: client close tolerated (the pipe stays armed)");
-        else if (ev == n48disp::kRwClosed267) DLOG("operator restart window: closed (the new client's first slot 267 seen, the pipe is still armed)");
+        if (ev == n48disp::kRwOpened) DLOG("operator restart window: opened (%llu s); EVERY WindowServer client close is tolerated and slot-267 calls are not counted until the new client's first slot 267 has been seen and %llu s have passed since the last tolerated close, or expiry", (unsigned long long)(n48disp::kReloadWindowNs / 1000000000ull), (unsigned long long)(n48disp::kReloadSettleNs / 1000000000ull));
+        else if (ev == n48disp::kRwTolerated) DLOG("operator restart window: client close tolerated (the pipe stays armed; the settle time restarts)");
+        else if (ev == n48disp::kRwClosed267) DLOG("operator restart window: closed (the new client's slot 267 was seen and the last tolerated close is at least %llu s old, the pipe is still armed)", (unsigned long long)(n48disp::kReloadSettleNs / 1000000000ull));
         else DLOG("operator restart window: expired (%llu s)", (unsigned long long)(n48disp::kReloadWindowNs / 1000000000ull));
     }
     // -- 0.0.618: the vblank timestamps (flow: native_disp_flow.h vbl_stamp_flow) --
@@ -150,6 +173,81 @@ struct KernelEnv {
     }
     bool scan_active() { return n48dcn::scanActive(); }                  // 0.0.617 (K6): one atomic load
     void note_scan_owned_submit() { __atomic_add_fetch(&gD.submitScanSkipped, 1ull, __ATOMIC_RELAXED); }
+    // -- 0.0.659 (M6 Stage 1a): the latch, the framebuffer -> instance map, the surface table, the routing guard's counters (flows: native_disp_flow.h m6_*) --
+    bool m6_on() { return n48m6_latched_on(); }
+    uint32_t pipe_inst(uint64_t pipe) {                                  // pipe+0x98 is the pipe's framebuffer; the map was recorded by adopt from the verified pipes
+        uint64_t fb = 0;
+        if (!rd64(pipe + n48disp::kPipeFb, &fb)) return n48m6::kInstNone;
+        return n48m6::inst_of_fb(gD.m6Fb, fb);
+    }
+    n48m6::Look m6_lookup(uint32_t id) { return n48m6::lookup_surface(gD.m6Surf, id); }
+    // 0.0.660 (S2): the table out as a property of the Metal nub (the bundle reads it). Two pipes' submit hooks can both change the table and both publish: n48m6::publish_serialised lets ONE caller publish at a time
+    // and has it rebuild the blob whenever another change arrived meanwhile, so the LAST property written always carries the newest table (the hook never blocks: a caller that loses returns at once). The ~200-byte
+    // blob is the file-scope gM6Blob (not the hook's stack), owned by the publisher that holds the gate.
+    bool m6flip_on() { return n48m6flip_latched_on(); }
+    void m6_publish_now() {
+        const bool v2 = n48m6flip_latched_on();      // 0.0.661 (R2): blob version 2 carries the generation the build covers (PubGate::curGen, set under the gate); OFF = 0.0.660's version-1 blob, byte for byte
+        (void)n48m6::publish_serialised(gD.m6Pub,
+            [v2]() -> uint32_t { return v2 ? n48m6::blob_build_v2(gD.m6Surf, __atomic_load_n(&gD.m6Pub.curGen, __ATOMIC_ACQUIRE), gM6Blob, sizeof gM6Blob) : n48m6::blob_build(gD.m6Surf, gM6Blob, sizeof gM6Blob); },
+            [](uint32_t n) -> bool { const bool ok = Navi48MetalNub::setPublishedData(N48M6_PROP_SURF, gM6Blob, n); if (ok) __atomic_add_fetch(&gD.m6Published, 1ull, __ATOMIC_RELAXED); return ok; });
+    }
+    // 0.0.661 (R5): with navi48-m6flip the publish is rate-limited (n48m6::kPubPerSec) while the table thrashes; a deferred change is flushed by the next change or by Status2 (n48disp_m6_flush). OFF: every change publishes at once, as 0.0.660.
+    void m6_publish() {
+        if (!n48m6flip_latched_on()) { m6_publish_now(); return; }
+        if (n48m6::pub_rate_admit(gD.m6Rate, now_ns())) m6_publish_now();
+    }
+    // 0.0.661 (review M1): a deferred publish is flushed by ANY path that runs after its gap: every submit of every pipe (here), the DP's 1 s status call (n48disp_m6_flush from n1c_scan_status) and Status2.
+    void m6_flush_deferred() { if (n48m6flip_latched_on()) (void)n48m6::pub_rate_flush(gD.m6Rate, now_ns(), [this]() { m6_publish_now(); }); }
+    uint32_t m6_learn(uint32_t id, uint32_t inst) {
+        m6_flush_deferred();
+        const uint32_t r = n48m6::learn_surface(gD.m6Surf, id, inst, n48m6flip_latched_on());   // 0.0.661 (R3): with navi48-m6flip the eviction victim is the owner's own distance (victim_slot), not `seen`
+        if (n48m6::learn_counted(r)) __atomic_add_fetch(&gD.m6Learned, 1ull, __ATOMIC_RELAXED);
+        if (n48m6::learn_changed(r)) {
+            if (!n48m6flip_latched_on() || n48m6::log_admit(gD.m6LogNs, now_ns())) {   // 0.0.661 (S-2): with navi48-m6flip the per-change line is rate-limited (1/s); OFF: every change logs, as 0.0.660
+            DLOG("m6: surface %u %s on instance %u (table now %u IDs: DP %u, monitor A %u, monitor B %u; %u ambiguous)", id, r == n48m6::kLNew ? "learned" : r == n48m6::kLReplaced ? "RE-LEARNED (its old owner went stale)" : r == n48m6::kLEvicted ? "learned, EVICTING the least recently seen entry" : "SEEN ON TWO PIPES -> AMBIGUOUS", inst, (unsigned)gD.m6Surf.n,
+                 n48m6::count_for_inst(gD.m6Surf, 0), n48m6::count_for_inst(gD.m6Surf, 1), n48m6::count_for_inst(gD.m6Surf, 2), n48m6::count_ambiguous(gD.m6Surf)); }
+            m6_publish();
+        }
+        return r;
+    }
+    void m6_reset() {                                                    // 0.0.660 (S1): the table is emptied (a new WindowServer start allocates its surfaces afresh) and the empty table republished
+        if (!n48m6::reset_table(gD.m6Surf)) { DLOG("m6: the surface table could not be reset (a learn held it); the next arm / restart window retries"); return; }
+        DLOG("m6: surface table RESET (%llu so far); republishing the empty table", (unsigned long long)gD.m6Surf.resets);
+        m6_publish();
+    }
+    void m6_touch(uint32_t id) { (void)n48m6::touch_surface(gD.m6Surf, id); }
+    void m6_note_submit(uint32_t inst) {
+        __atomic_add_fetch(&gD.m6Txn[n48m6::inst_valid(inst) ? inst : n48m6::kInstCount], 1ull, __ATOMIC_RELAXED);
+        if (n48m6::inst_valid(inst)) __atomic_store_n(&gD.m6LastTxnNs[inst], now_ns(), __ATOMIC_RELAXED);        // 0.0.660 (K1)
+    }
+    void m6_note_learn_skip(uint32_t why) {
+        const uint64_t n = __atomic_add_fetch(&gD.m6LearnSkip[why < n48m6::kSkCount ? why : 0u], 1ull, __ATOMIC_RELAXED);
+        if (n <= 3u) DLOG("m6: transaction not learned (reason %u) #%llu", (unsigned)why, (unsigned long long)n);
+    }
+    void m6_note_route(uint32_t verdict, uint32_t pipeInst) {
+        const uint64_t n = __atomic_add_fetch(&gD.m6Route[verdict < n48m6::kRouteCount ? verdict : 0u], 1ull, __ATOMIC_RELAXED);
+        if (verdict != n48m6::kRouteOk) {
+            __atomic_add_fetch(&gD.m6RouteBad[n48m6::inst_valid(pipeInst) ? pipeInst : n48m6::kInstCount], 1ull, __ATOMIC_RELAXED);
+            if (n <= 3u) DLOG("m6: present REFUSED by the routing guard on the pipe of instance %u: %s #%llu", (unsigned)pipeInst, n48m6::route_name(verdict), (unsigned long long)n);
+        }
+    }
+    void m6_note_nocopy(uint32_t pipeInst) { __atomic_add_fetch(&gD.m6NoCopy[pipeInst < n48m6::kInstCount ? pipeInst : 0u], 1ull, __ATOMIC_RELAXED); }
+    void m6_note_stamp(uint32_t inst, uint32_t verdict, uint64_t periodNs) {
+        if (!n48m6::inst_valid(inst)) return;                            // a pipe on no known framebuffer has no OTG to account against
+        const uint32_t i = inst;
+        if (verdict == n48disp::kVblWrote) { __atomic_add_fetch(&gD.m6Stamp[i], 1ull, __ATOMIC_RELAXED); gD.m6Period[i] = periodNs; }
+        else __atomic_add_fetch(&gD.m6StampFail[i], 1ull, __ATOMIC_RELAXED);
+    }
+    bool vbl_sample_inst(uint32_t inst, n48disp::VblSample *s) {          // that instance's OWN OTG (OTG1 = the monitor A, OTG2 = the monitor B); the raster constants come from the per-index geometry table
+        N48DispGeom g;
+        if (!n48disp_geom_for_index(n48m6::index_of_inst(inst), &g)) return false;
+        uint64_t perSec = 0;
+        nanoseconds_to_absolutetime(1000000000ull, &perSec);
+        if (perSec == 0ull || perSec > 0xffffffffull) return false;
+        if (!n48dcn::vblSampleInst(inst, g.w, g.h, g.pixHz, &s->periodNs, &s->delayNs, &s->nowAbs)) return false;
+        s->numer = 1000000000u; s->denom = (uint32_t)perSec;
+        return true;
+    }
     n48disp::Ival &ivl() { return gD.ivl; }
     void clear_autodisarm() { __atomic_store_n(&gD.autoCause, 0u, __ATOMIC_RELEASE); }
     void note_null_pipe() {
@@ -164,6 +262,11 @@ struct KernelEnv {
         __atomic_store_n(&gD.nPipes, 0u, __ATOMIC_RELEASE);
         for (uint32_t i = 0; i < n48disp::kMaxPipes; ++i) __atomic_store_n(&gD.pipes[i], 0ull, __ATOMIC_RELEASE);
         gD.adoptedPipe = 0;
+        for (uint32_t i = 0; i < n48m6::kInstCount; ++i) {                // 0.0.659 (M6): the framebuffer map goes first (every pipe is unknown from now on), then the references
+            __atomic_store_n(&gD.m6Fb.fb[i], 0ull, __ATOMIC_RELEASE);
+            IOService *o = gD.m6FbRef[i]; gD.m6FbRef[i] = nullptr;
+            if (o) o->release();
+        }
     }
 
     // -- perform --
@@ -330,7 +433,46 @@ struct KernelEnv {
             p.backAccel = ok && a == acc;
             p.backDm = ok && d == dm;
         }
+        if (n48m6_latched_on() && p.count >= 1u) m6_probe_ents(&p, acc, dm);      // 0.0.659 (M6): EVERY pipe of the display machine is judged, not dm+0x88[0] only
         return p;
+    }
+    // 0.0.659 (M6 Stage 1a): one entry per pipe the display machine counts. The framebuffer map is read FRESH from the registry (RDNA4FB = instance 0; the framebuffer child of each published display nub =
+    // its instance); a pipe's +0x98 must be one of them, each instance may hold one pipe, and the set of instances must be exactly the published ones plus the DP (n48m6::ents_verdict).
+    // 0.0.660 (S7): the framebuffers are KEPT, not released and looked up again: refs[i] holds the retained service whose address is m->fb[i] (null when the instance has none). The CALLER owns the references
+    // (m6_release_refs, or hands them to gD.m6FbRef), so the pointer in the map is the one that was verified and no raw address is ever re-retained.
+    void m6_collect_fbs(n48m6::FbMap *m, IOService **refs) {
+        for (uint32_t i = 0; i < n48m6::kInstCount; ++i) { m->fb[i] = 0ull; refs[i] = nullptr; }
+        if (IOService *dp = find_fb()) { m->fb[n48m6::kInstDp] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(dp)); refs[n48m6::kInstDp] = dp; }
+        for (uint32_t inst = n48m6::kInstMonA; inst <= n48m6::kInstMonB; ++inst) {
+            if (!n48fb_nub_exists_idx(n48m6::index_of_inst(inst))) continue;
+            if (IOService *f = Navi48DisplayNub::framebufferOf(n48m6::index_of_inst(inst))) { m->fb[inst] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(f)); refs[inst] = f; }
+        }
+    }
+    void m6_release_refs(IOService **refs) { for (uint32_t i = 0; i < n48m6::kInstCount; ++i) if (refs[i]) { refs[i]->release(); refs[i] = nullptr; } }
+    void m6_probe_ents(n48disp::PipeProbe *p, uint64_t acc, uint64_t dm) {
+        n48m6::FbMap map; IOService *refs[n48m6::kInstCount];
+        m6_collect_fbs(&map, refs);
+        p->ents.n = p->count;                                              // more pipes than the table holds fails ents_verdict (kEntsCount)
+        p->ents.expectMask = n48m6::expect_mask(n48fb_nub_exists_idx(n48m6::index_of_inst(n48m6::kInstMonB)), n48fb_nub_exists_idx(n48m6::index_of_inst(n48m6::kInstMonA)));
+        for (uint32_t i = 0; i < p->count && i < n48m6::kMaxEnt; ++i) {
+            n48m6::PipeEnt &e = p->ents.e[i];
+            e = n48m6::PipeEnt {};
+            e.inst = n48m6::kInstNone;
+            uint64_t pp = 0;
+            if (!rd64(dm + n48disp::kDmPipes + 8u * i, &pp)) continue;
+            e.nullp = pp == 0ull;
+            e.have = n48disp::kptr_ok(pp);
+            if (!e.have) continue;
+            e.classOurs = class_is(pp, "Navi48DisplayPipe");
+            e.traced = known_pipe(pp);
+            uint64_t a = 0, d = 0, f = 0;
+            if (rd64(pp + n48disp::kPipeAccel, &a) && rd64(pp + n48disp::kPipeDm, &d) && rd64(pp + n48disp::kPipeFb, &f)) {
+                e.backAccel = a == acc; e.backDm = d == dm; e.fb = f;
+                e.inst = n48m6::inst_of_fb(map, f);
+                e.fbOk = n48m6::inst_valid(e.inst);
+            }
+        }
+        m6_release_refs(refs);                                             // the map only held addresses for the comparison above
     }
     bool request_probe() {
         const IOReturn rc = gD.accel->requestProbe(1);                   // the family's own request: its display machine walks the framebuffers (our start override gives it the PCI device)
@@ -347,10 +489,25 @@ struct KernelEnv {
         if (ok) __atomic_store_n(&gD.capsDone, 1u, __ATOMIC_RELEASE);
         return ok;
     }
+    void m6_record_map() {                                               // the framebuffer -> instance map the hooks use, re-resolved NOW (adopt just verified the same registry state) and kept referenced until withdraw
+        n48m6::FbMap map; IOService *refs[n48m6::kInstCount];
+        m6_collect_fbs(&map, refs);                                        // 0.0.660 (S7): the references come from the collection itself; a slot already recorded gives its fresh reference back
+        for (uint32_t i = 0; i < n48m6::kInstCount; ++i) {
+            if (!refs[i]) continue;
+            if (gD.m6FbRef[i]) { refs[i]->release(); refs[i] = nullptr; continue; }
+            gD.m6FbRef[i] = refs[i];
+            refs[i] = nullptr;
+            __atomic_store_n(&gD.m6Fb.fb[i], map.fb[i], __ATOMIC_RELEASE);
+        }
+        (void)Navi48MetalNub::setPublishedNumber(N48M6_PROP_LATCH, 1ull);   // tells the bundle the latch is ON (its other channel is the scan_query flag)
+        m6_publish();
+        DLOG("m6: framebuffer map recorded: DP %#llx, monitor A %#llx, monitor B %#llx", (unsigned long long)gD.m6Fb.fb[0], (unsigned long long)gD.m6Fb.fb[1], (unsigned long long)gD.m6Fb.fb[2]);
+    }
     void record_adopted(const n48disp::PipeProbe &) {
         uint64_t dm = 0, pipe0 = 0;
         if (rd64(accel_addr() + n48disp::kAccelDm, &dm) && rd64(dm + n48disp::kDmPipes, &pipe0)) gD.adoptedPipe = pipe0;
         if (!gD.scratch) gD.scratch = static_cast<uint8_t *>(IOMalloc(n48disp::kScratchBytes));
+        if (n48m6_latched_on()) m6_record_map();
         __atomic_store_n(&gD.adopted, 1u, __ATOMIC_RELEASE);
         DLOG("pipe adopt: recorded pipe %#llx (Navi48DisplayPipe on RDNA4FB), capabilities published, scratch %s", (unsigned long long)gD.adoptedPipe, gD.scratch ? "ready" : "NOT ALLOCATED");
     }
@@ -395,7 +552,7 @@ struct KernelEnv {
     }
 };
 
-static_assert(n48disp::kPfCount == 21u && n48disp::kPfScanOwned == 20u, "the stat pages cover reasons 0..20: page 0 has 0 and 1, page 1 has 2..11, page 2 has 12..19 (0.0.616: the copy time's minimum moved to the log line), page 3 (0.0.617) has 20 and the submit interval");
+static_assert(n48disp::kPfCount == 23u && n48disp::kPfScanOwned == 20u && n48disp::kPfOtherInst == 21u && n48disp::kPfRouteRefused == 22u, "the stat pages cover reasons 0..20: page 0 has 0 and 1, page 1 has 2..11, page 2 has 12..19 (0.0.616: the copy time's minimum moved to the log line), page 3 (0.0.617) has 20 and the submit interval");
 static_assert(n48disp::kAccelPipeGate < n48disp::kAccelSize && n48disp::kAccelCfgF4 + 4u <= n48disp::kAccelSize, "the accelerator reads and the one write lie inside the object");
 
 // ---- the verb outputs ---------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -418,6 +575,43 @@ bool n48disp_latched_on(void) {
         l = gLatch;
     }
     return n48disp::latch_is_on(l);
+}
+
+// 0.0.659 (M6 Stage 1a): boot-arg navi48-m6 == 1, read and latched ONCE (first writer wins, never re-read). Default OFF: with it absent every M6 branch of the flows is skipped and the code is 0.0.658's.
+bool n48m6_latched_on(void) {
+    return n48m6::latch_is_on(n48m6::latch_get(&gM6Latch, []() -> uint32_t {
+        uint32_t v = 0;
+        const bool present = PE_parse_boot_argn("navi48-m6", &v, sizeof(v));
+        DLOG("boot-arg navi48-m6 %s: the multi-display routing (R1-R5 lifted, the routing guard) is %s for this boot", present ? (v == 1u ? "=1" : "present but not 1") : "absent", n48m6::latch_is_on(n48m6::latch_value(present, v)) ? "ENABLED" : "OFF");
+        return n48m6::latch_value(present, v);
+    }));
+}
+
+// 0.0.661 (M6 Stage 1b): boot-arg navi48-m6flip == 1, read and latched ONCE (first writer wins, never re-read). Default OFF. Every Stage-1b path (selectors 22..26, the flip-side notes, the Stage-1b CLI report) asks this AND navi48-m6.
+bool n48m6flip_latched_on(void) {
+    return n48m6::latch_is_on(n48m6::latch_get(&gM6FlipLatch, []() -> uint32_t {
+        uint32_t v = 0;
+        const bool present = PE_parse_boot_argn("navi48-m6flip", &v, sizeof(v));
+        DLOG("boot-arg navi48-m6flip %s: instance 2's GPU-composited scanout (ABI 1.11 selectors 22..26) is %s for this boot (it also needs navi48-m6=1)", present ? (v == 1u ? "=1" : "present but not 1") : "absent", n48m6::latch_is_on(n48m6::latch_value(present, v)) ? "ENABLED" : "OFF");
+        return n48m6::latch_value(present, v);
+    }));
+}
+// 0.0.662 (M6 Stage 2): boot-arg navi48-m6flip1 == 1, read and latched ONCE (first writer wins, never re-read). Default OFF. INSTANCE 1 (the monitor A's HUBP1 / OTG1 scanout) needs ALL THREE latches (navi48-m6, navi48-m6flip, navi48-m6flip1); with this one OFF a request
+// for instance 1 is answered exactly as 0.0.661 answered it (kIOReturnBadArgument) and nothing of instance 1 exists.
+bool n48m6flip1_latched_on(void) {
+    return n48m6::latch_is_on(n48m6::latch_get(&gM6Flip1Latch, []() -> uint32_t {
+        uint32_t v = 0;
+        const bool present = PE_parse_boot_argn("navi48-m6flip1", &v, sizeof(v));
+        DLOG("boot-arg navi48-m6flip1 %s: instance 1's (the monitor A's) GPU-composited scanout (ABI 1.12) is %s for this boot (it also needs navi48-m6=1 and navi48-m6flip=1)", present ? (v == 1u ? "=1" : "present but not 1") : "absent", n48m6::latch_is_on(n48m6::latch_value(present, v)) ? "ENABLED" : "OFF");
+        return n48m6::latch_value(present, v);
+    }));
+}
+// 0.0.661 (R2): the generation of the LAST PUBLISHED table (PubGate::pubGen), never the request count: Status2 reports it, the bundle compares it with the generation inside the blob it read.
+uint32_t n48disp_m6_gen(void) { return (n48m6_latched_on() && n48m6flip_latched_on()) ? __atomic_load_n(&gD.m6Pub.pubGen, __ATOMIC_ACQUIRE) : 0u; }
+// 0.0.661 (R5, M1): a deferred publish goes out now if its gap has passed (called by Status2 AND by the DP's 1 s status call n1c_scan_status AND by every learn: the last state is always published within a second, with or without instance 2).
+void n48disp_m6_flush(void) {
+    if (!(n48m6_latched_on() && n48m6flip_latched_on())) return;
+    KernelEnv ke; (void)n48m6::pub_rate_flush(gD.m6Rate, now_ns(), [&ke]() { ke.m6_publish_now(); });
 }
 
 uint32_t n48disp_fact_bits(void) { return __atomic_load_n(&gD.factBits, __ATOMIC_ACQUIRE); }
@@ -469,10 +663,10 @@ int n48disp_res62(void *self, const uint64_t *args, uint32_t nargs, uint64_t *re
 
 // 0.0.617 (K1): the native client closed or died (clientClose / stop). Only a client admitted by the uid-88 rule (adminClient false) while the pipe is armed disarms it. Called by the client with NO lock held,
 // BEFORE n1c_close takes gCliLock: the descriptor-cache drain (up to 200 ms per entry) then cannot sit under the client lock, and the gate is shut before the (possibly long) idle wait of the close.
-void n48disp_on_ws_client_closed(bool adminClient) {
+void n48disp_on_ws_client_closed(bool closingIsWsSession) {
     if (!n48disp_latched_on()) return;
     KernelEnv env;
-    (void)n48disp::ws_client_closed_flow(env, adminClient);
+    (void)n48disp::ws_client_closed_flow(env, closingIsWsSession);
 }
 // 0.0.617 (K2): the HUNG latch was set (Navi48MetalNub::hungLatched). Under HUNG the cache teardown leaks instead of draining, so this never spins.
 void n48disp_on_hung(void) {
@@ -490,11 +684,18 @@ void n48disp_on_withdraw(void) {
     DLOG("nub withdrawn: accelerator reference released");
 }
 
+bool n48disp_pipe_adopted(void) { return __atomic_load_n(&gD.adopted, __ATOMIC_ACQUIRE) != 0u; }
+
 uint32_t n48disp_verb(uint32_t action, uint64_t arg, uint64_t *out, unsigned count) {
     for (unsigned i = 0; i < count; ++i) out[i] = 0;
     if (count < 13u || !n48disp::is_pipe_verb(action)) { if (count) out[0] = n48disp::kBadArg; return n48disp::kBadArg; }   // 88 (pipeagdc) is answered by DisplayPipeGuard.cpp, never here
     if (!n48disp::action_admitted(n48disp_latched_on(), action)) { out[0] = n48disp::kOff; return n48disp::kOff; }
     if (!n48disp::verb_args_ok(action, arg)) { out[0] = n48disp::kBadArg; return n48disp::kBadArg; }     // the legal arguments are the exemption table's
+    if (n48disp::fb_interlock_refuses(action, arg, n48fb_nub_exists(), n48m6_latched_on())) {                                // 0.0.652 (M5): a display nub exists: the display machine must never get a pipe (nothing is read or written)
+        out[0] = n48disp::kFbNub;
+        DLOG("pipe verb %u arg %llu REFUSED: %s", action, (unsigned long long)arg, n48disp::status_name(n48disp::kFbNub));
+        return n48disp::kFbNub;
+    }
     KernelEnv env;
     uint32_t st = n48disp::kOk;
     if (action == n48disp::kActAdopt) {
@@ -538,6 +739,58 @@ uint32_t n48disp_verb(uint32_t action, uint64_t arg, uint64_t *out, unsigned cou
              (unsigned long long)gD.reasons[n48disp::kPfScanOwned], (unsigned long long)gD.submitScanSkipped, (int)n48dcn::scanActive(), (unsigned long long)gD.ivl.d.min, (unsigned long long)n48disp::dur_avg(gD.ivl.d), (unsigned long long)gD.ivl.d.max, (unsigned long long)gD.ivl.d.n,
              (unsigned long long)gD.mdc.prepared, (unsigned long long)gD.mdc.hits, (unsigned long long)gD.mdc.misses, (unsigned long long)gD.mdc.prepFail, (unsigned long long)gD.mdc.evicted,
              (unsigned long long)gD.mdc.evictBlocked, (unsigned long long)gD.mdc.full, (unsigned long long)gD.mdc.tornDown, (unsigned long long)gD.mdc.leaked, (unsigned long long)gD.mdc.drainFail);
+    } else if (action == n48disp::kActM6Stat) {                          // 0.0.659 (M6): READ-ONLY - per pipe transactions, surface IDs, ambiguous, refused presents, stamps per OTG
+        const uint32_t on = n48m6_latched_on() ? 1u : 0u;
+        out[1] = (on ? 1u : 0u) | (__atomic_load_n(&gD.adopted, __ATOMIC_ACQUIRE) ? 2u : 0u) | (__atomic_load_n(&gD.armed, __ATOMIC_ACQUIRE) ? 4u : 0u) | ((uint64_t)KernelEnv::cap_n() << 8) | ((uint64_t)gD.m6Surf.n << 16);
+        if (arg == 0ull) {                                                // page 0: the pipes
+            for (unsigned i = 0; i < n48m6::kInstCount; ++i) { out[2 + i] = gD.m6Txn[i]; out[5 + i] = n48m6::count_for_inst(gD.m6Surf, i); }
+            out[8] = n48m6::count_ambiguous(gD.m6Surf);                    // surface IDs seen on two pipes
+            out[9] = gD.m6Route[n48m6::kRouteUnknown] + gD.m6Route[n48m6::kRouteAmbiguous] + gD.m6Route[n48m6::kRouteWrongInst] + gD.m6Route[n48m6::kRouteNoId] + gD.m6Route[n48m6::kRouteBadPipe];   // refused presents (all reasons)
+            out[10] = gD.m6NoCopy[1] + gD.m6NoCopy[2];                    // performs completed without a copy (pipes on the monitor A / the monitor B)
+            out[11] = gD.m6Txn[n48m6::kInstCount];                        // submits on a pipe with no known framebuffer
+            out[12] = gD.m6Route[n48m6::kRouteOk];                        // DP presents the guard let through
+        } else if (arg == 1ull) {                                         // page 1: stamps per OTG, the guard's reasons, and the AGDC answers
+            for (unsigned i = 0; i < n48m6::kInstCount; ++i) { out[2 + i] = gD.m6Stamp[i]; out[5 + i] = gD.m6StampFail[i]; }
+            out[8] = gD.m6Period[0]; out[9] = gD.m6Period[1]; out[10] = gD.m6Period[2];
+            { const uint64_t f[4] = { gD.m6Route[n48m6::kRouteUnknown], gD.m6Route[n48m6::kRouteAmbiguous], gD.m6Route[n48m6::kRouteWrongInst], gD.m6Route[n48m6::kRouteNoId] };
+              out[11] = n48m6::pack_sat(f, n48m6::kPackRoute, 4u); }       // 0.0.660 (N2): each 16-bit field SATURATES (the CLI reads 65535 as "65535 or more")
+        } else if (arg == 4ull) {                                         // page 4 (0.0.662, Stage 2 item 10): the AGDC replies per instance and the endpoint values seen
+            uint64_t a2[12] = { 0 };
+            navi48_agdc_m6_stat2(a2);
+            for (unsigned i = 0; i < n48m6::kInstCount; ++i) { out[2 + i] = a2[i]; out[5 + i] = a2[3 + i]; }     // out[2..4]: 0x921 replies for the DP / monitor A / monitor B endpoints; out[5..7]: 0x711 replies
+            out[8] = a2[6]; out[9] = a2[7]; out[10] = a2[8]; out[11] = a2[9];                                      // endpoint bitmask seen, nfb of the list, out-of-range endpoints, the last endpoint dword
+        } else if (arg == 3ull) {                                         // page 3 (0.0.660, K1): the pipes' clocks and the table's self-healing
+            const uint64_t now = now_ns();
+            for (unsigned i = 0; i < n48m6::kInstCount; ++i) { out[2 + i] = n48m6::txn_age_ms(now, __atomic_load_n(&gD.m6LastTxnNs[i], __ATOMIC_RELAXED)); out[5 + i] = gD.m6Surf.txn[i]; }   // ms since each pipe's last transaction (~0 = none since boot); learned submits since the last reset
+            out[8] = gD.m6Surf.learn[n48m6::kLReplaced]; out[9] = gD.m6Surf.learn[n48m6::kLEvicted];
+            { const uint64_t a[2] = { gD.m6Surf.resets, gD.m6Surf.touches }, b[2] = { gD.m6Pub.published, gD.m6Pub.coalesced };
+              out[10] = n48m6::pack_sat(a, n48m6::kPackResetTouch, 2u);  // table resets (low 16 bits) | routed-present sightings (high 48)
+              out[11] = n48m6::pack_sat(b, n48m6::kPackPair32, 2u); }     // property writes made (low 32) | publishes folded into another publisher's (high 32)
+        } else {                                                          // page 2: the surface IDs themselves (3 per pipe expected) and the learn bookkeeping
+            for (unsigned i = 0; i < n48m6::kInstCount; ++i) {
+                unsigned k = 0;
+                for (uint32_t j = 0; j < gD.m6Surf.n && j < n48m6::kMaxSurf && k < 3u; ++j) if (gD.m6Surf.e[j].inst == i) out[2 + i * 3u + k++] = gD.m6Surf.e[j].id | ((uint64_t)(gD.m6Surf.e[j].flags & 1u) << 32);
+            }
+            out[11] = gD.m6Learned | (gD.m6Published << 32);
+            { const uint64_t f[8] = { gD.m6LearnSkip[n48m6::kSkTxn], gD.m6LearnSkip[n48m6::kSkPipeMismatch], gD.m6LearnSkip[n48m6::kSkPlane], gD.m6LearnSkip[n48m6::kSkClass], gD.m6LearnSkip[n48m6::kSkIdRead],
+                                      gD.m6Surf.learn[n48m6::kLEvicted], gD.m6Surf.learn[n48m6::kLBadInst], gD.m6Surf.learn[n48m6::kLBusy] };      // 0.0.660: the 6th field is now evictions (a full table evicts, it never refuses)
+              out[12] = n48m6::pack_sat(f, n48m6::kPackLearnSkip, 8u); }       // 0.0.660 (N2): each 8-bit field SATURATES at 255
+        }
+        uint64_t ag[8] = { 0 };
+        navi48_agdc_m6_stat(ag);
+        if (arg == 1ull) out[12] = n48m6::pack_sat(ag, n48m6::kPackAgdc, 4u);                              // AGDC: nfb of the last 0x980 reply | 0x921 replies for non-DP endpoints | 0x711 for non-DP | the last endpoint dword seen (each field saturates, 0.0.660)
+        if (arg == 3ull) { const uint64_t o2[2] = { ag[5], ag[6] }; out[12] = n48m6::pack_sat(o2, n48m6::kPackPair32, 2u); }       // AGDC endpoints outside the 0x980 list: how many (low 32) | the last one (high 32)
+        DLOG("m6stat page %llu: latch %u adopted %d armed %d pipes %u table %u IDs (DP %u, monitor A %u, monitor B %u; %u ambiguous); submits DP %llu monitor A %llu monitor B %llu none %llu; guard ok %llu refused %llu (unknown %llu ambiguous %llu wrong-instance %llu no-id %llu bad-pipe %llu); no-copy monitor A %llu monitor B %llu; stamps DP %llu monitor A %llu monitor B %llu (failed %llu/%llu/%llu); AGDC nfb %llu 921-nonDP %llu 711-nonDP %llu",
+             (unsigned long long)arg, on, (int)(__atomic_load_n(&gD.adopted, __ATOMIC_ACQUIRE) != 0u), (int)(__atomic_load_n(&gD.armed, __ATOMIC_ACQUIRE) != 0u), KernelEnv::cap_n(), (unsigned)gD.m6Surf.n,
+             n48m6::count_for_inst(gD.m6Surf, 0), n48m6::count_for_inst(gD.m6Surf, 1), n48m6::count_for_inst(gD.m6Surf, 2), n48m6::count_ambiguous(gD.m6Surf),
+             (unsigned long long)gD.m6Txn[0], (unsigned long long)gD.m6Txn[1], (unsigned long long)gD.m6Txn[2], (unsigned long long)gD.m6Txn[3], (unsigned long long)gD.m6Route[n48m6::kRouteOk],
+             (unsigned long long)(gD.m6Route[1] + gD.m6Route[2] + gD.m6Route[3] + gD.m6Route[4] + gD.m6Route[5]), (unsigned long long)gD.m6Route[n48m6::kRouteUnknown], (unsigned long long)gD.m6Route[n48m6::kRouteAmbiguous],
+             (unsigned long long)gD.m6Route[n48m6::kRouteWrongInst], (unsigned long long)gD.m6Route[n48m6::kRouteNoId], (unsigned long long)gD.m6Route[n48m6::kRouteBadPipe], (unsigned long long)gD.m6NoCopy[1], (unsigned long long)gD.m6NoCopy[2],
+             (unsigned long long)gD.m6Stamp[0], (unsigned long long)gD.m6Stamp[1], (unsigned long long)gD.m6Stamp[2], (unsigned long long)gD.m6StampFail[0], (unsigned long long)gD.m6StampFail[1], (unsigned long long)gD.m6StampFail[2],
+             (unsigned long long)ag[0], (unsigned long long)ag[1], (unsigned long long)ag[2]);
+        if (arg == 3ull) DLOG("m6stat page 3: last-transaction age ms DP %llu monitor A %llu monitor B %llu (%llu = none since boot); learned submits since reset %u/%u/%u; re-learned %llu evicted %llu resets %llu; property writes %llu coalesced %llu; routed-present sightings %llu; AGDC endpoints outside the list %llu (last %llu)",
+                              (unsigned long long)out[2], (unsigned long long)out[3], (unsigned long long)out[4], (unsigned long long)n48m6::kAgeNever, (unsigned)gD.m6Surf.txn[0], (unsigned)gD.m6Surf.txn[1], (unsigned)gD.m6Surf.txn[2],
+                              (unsigned long long)out[8], (unsigned long long)out[9], (unsigned long long)gD.m6Surf.resets, (unsigned long long)gD.m6Pub.published, (unsigned long long)gD.m6Pub.coalesced, (unsigned long long)gD.m6Surf.touches, (unsigned long long)ag[5], (unsigned long long)ag[6]);
     } else if (action == n48disp::kActStamps) {
         (void)env.find_accel();
         n48disp::StampsOut so {};

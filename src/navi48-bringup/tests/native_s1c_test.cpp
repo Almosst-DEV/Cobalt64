@@ -55,6 +55,18 @@ static size_t count_of(const std::string &s, const std::string &needle) {
     while ((p = s.find(needle, p)) != std::string::npos) { n++; p += needle.size(); }
     return n;
 }
+// 0.0.627: the body of the function whose signature starts with `head` (up to the first line that is exactly "}"), and an in-order search.
+static std::string fn_body(const std::string &s, const char *head) {
+    const size_t a = s.find(head);
+    if (a == std::string::npos) return std::string();
+    const size_t b = s.find("\n}\n", a);
+    return b == std::string::npos ? std::string() : s.substr(a, b - a);
+}
+static bool in_order(const std::string &s, std::initializer_list<const char *> parts) {
+    size_t at = 0;
+    for (const char *p : parts) { const size_t f = s.find(p, at); if (f == std::string::npos) return false; at = f + 1; }
+    return true;
+}
 
 // ---------------------------------------------------------------------------------------------------------------------------
 static void u1_abi() {
@@ -584,19 +596,28 @@ static void u12_pins(const std::string &root) {
     expect(g1 < g2 && g2 < g3 && g3 < g4, "ORDER: ladder, S1b POSITIVE PASS, not HUNG, exclusivity");
     expect(eng.find("return kIOReturnExclusiveAccess") != std::string::npos, "a second open returns ExclusiveAccess");
     expect_u("exactly one path opens a native session (one OSCompareAndSwap(0, 1", count_of(eng, "OSCompareAndSwap(0, 1, &gOpenFlag)"), 1);
-    // ring path: one helper, space check before the write, emitted before the doorbell
-    const size_t re = eng.find("static uint32_t ring_emit("), sp = eng.find("ring_has_space(ring_free64(r, gWc, mask), n)", re), wr = eng.find("ring[ring_idx(wc, mask)] = dw[i]", re),
-                 em = eng.find("__atomic_store_n(&gSess.emitted, seq, __ATOMIC_RELEASE)", re), hf = eng.find("amdgpu_hdp_flush(dev)", em), db = eng.find("WDOORBELL64(dev, off, wptr64)", re);
-    expect(re != std::string::npos && sp != std::string::npos && wr != std::string::npos && em != std::string::npos && hf != std::string::npos && db != std::string::npos, "ring_emit's steps are present");
-    expect(re < sp && sp < wr && wr < em && em < hf && hf < db, "ORDER in ring_emit: space check, ring write, emitted++, HDP flush, doorbell");
+    // ring path: one helper, space check before the write, the owner and emitted before the doorbell. 0.0.627 (G2): ring_put_locked (the caller holds gRingLock);
+    // ring_submit assigns the seqno, builds and puts under ONE hold of gRingLock (two sessions can never take the same seqno).
+    const size_t re = eng.find("static uint32_t ring_put_locked("), sp = eng.find("ring_has_space(ring_free64(r, gWc, mask), n)", re), wr = eng.find("ring[ring_idx(wc, mask)] = dw[i]", re),
+                 on = eng.find("n48native::g2::owner_note(gOwners, seq, ownerSlot, ownerId, startWc);", re),
+                 em = eng.find("__atomic_store_n(&gEmitted, seq, __ATOMIC_RELEASE);", re), hf = eng.find("amdgpu_hdp_flush(dev)", em), db = eng.find("WDOORBELL64(dev, off, wptr64)", re);
+    expect(re != std::string::npos && sp != std::string::npos && wr != std::string::npos && on != std::string::npos && em != std::string::npos && hf != std::string::npos && db != std::string::npos, "ring_put_locked's steps are present");
+    expect(re < sp && sp < wr && wr < on && on < em && em < hf && hf < db, "ORDER in ring_put_locked: space check, ring write, owner record, emitted++, HDP flush, doorbell");
     expect_u("the ring is written in exactly one place", count_of(eng, "ring[ring_idx(wc, mask)] = dw[i]"), 1);
+    expect_u("0.0.623: the only other ring stores are G1's NOP fills (the scrub outside the live range, the remap clear) and 0.0.627's recovery scrub", count_of(eng, "ring[i] = cp_p3_nop1();"), 3);
+    { const size_t g1b = eng.find("// ==== 0.0.623: GPU-apps stage G1"), sc = eng.find("static void g2_scrub_locked("), n1 = eng.find("ring[i] = cp_p3_nop1();"), n2 = eng.find("ring[i] = cp_p3_nop1();", n1 + 1);
+      expect(sc != std::string::npos && n1 > sc && n1 < eng.find("\n}\n", sc) && n2 > g1b, "the NOP fills: one in g2_scrub_locked (the recovery), the other two inside the G1 block"); }
     expect_u("the doorbell is rung in exactly one place", count_of(eng, "WDOORBELL64("), 1);
-    expect(eng.find("IOLockLock(gRingLock);", re) < sp, "the ring lock is held over the space check");
-    expect(eng.find("hang_from_wait();", sp) < wr, "a space wait that reaches 2 s latches HUNG before anything is written");
-    expect_u("Submit calls the shared builder and the one ring helper", count_of(eng, "build_submit(gSubmitBuf") + count_of(eng, "ring_emit(gSubmitBuf, n, seq)"), 2);
-    expect(eng.find("resolve_fence(v.fenceHandle") < eng.find("ring_emit(gSubmitBuf, n, seq)"), "the fence target is resolved BEFORE the ring is touched");
-    expect(eng.find("va_exec_covered(s->maps") < eng.find("ring_emit(gSubmitBuf, n, seq)"), "the IB coverage check is BEFORE the ring is touched");
-    expect(eng.find("const uint32_t gate = gpu_gate();", eng.find("IOReturn n1c_submit(")) < eng.find("ring_emit(gSubmitBuf, n, seq)"), "Submit takes the HUNG gate first");
+    { const std::string rs = fn_body(eng, "static uint32_t ring_submit(");
+      expect(!rs.empty() && in_order(rs, { "IOLockLock(gRingLock);", "const uint64_t seq = emitted_now() + 1ull;", "build_submit(gSubmitBuf,", "ring_put_locked(gSubmitBuf, n, seq,", "IOLockUnlock(gRingLock);", "if (er == kTimeout) { (void)stall_from_wait(); return kTimeout; }" }),
+             "ring_submit: the ring lock is held over the seqno, the build and the put (incl. the space check); a 2 s space wait goes to the stall path AFTER the lock is dropped"); }
+    expect(eng.find("return kTimeout;", sp) < wr, "a space wait that reaches 2 s returns before anything is written");
+    expect_u("ring_put_locked is called by ring_submit, the recovery probe and (0.0.650, G5, ON only) ring_submit_app_g5 only", count_of(eng, "ring_put_locked("), 4);
+    expect_u("ONE builder call and ONE put of a built Submit in each of the two submit paths: ring_submit and (0.0.650, G5) ring_submit_app_g5 (0.0.627: G1's hang IB and probe IB go through ring_submit too)", count_of(eng, "build_submit(gSubmitBuf") + count_of(eng, "ring_put_locked(gSubmitBuf, n, seq,"), 4);
+    expect_u("ring_submit callers: Submit (0.0.650: the OFF branch and WindowServer's branch) + G1's hang IB + G1's probe IB", count_of(eng, "ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut)") + count_of(eng, "ring_submit(&gSess, &va, &by, 1u, false, 0ull, &seq)"), 4);
+    expect(eng.find("resolve_fence(s, v.fenceHandle") < eng.find("ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut)"), "the fence target is resolved BEFORE the ring is touched");
+    expect(eng.find("va_exec_covered(s->maps") < eng.find("ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut)"), "the IB coverage check is BEFORE the ring is touched");
+    expect(eng.find("const uint32_t gate = gpu_gate(s);", eng.find("IOReturn n1c_submit(")) < eng.find("ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut)"), "Submit takes the HUNG gate first");
     expect(eng.find("cs_parse(in, size, &v)") < eng.find("IOLockLock(gCliLock);", eng.find("IOReturn n1c_submit(")), "the chunk is parsed before the lock");
     expect(eng.find("wb_bus + kWbOffsetNativeSeq") != std::string::npos, "the seqno slot address is the WB page + the slot offset");
     // WaitSeq takes no lock; QueryInfo / ReadRegs neither
@@ -606,13 +627,14 @@ static void u12_pins(const std::string &root) {
     }
     for (const char *fn : { "IOReturn n1c_hello(", "IOReturn n1c_bo_create(", "IOReturn n1c_bo_free(", "IOReturn n1c_gem_va(", "IOReturn n1c_ctx(", "IOReturn n1c_submit(" }) {
         const size_t a = eng.find(fn), b = eng.find("\n}\n", a);
-        expect(a != std::string::npos && b != std::string::npos && eng.substr(a, b - a).find("IOLockLock(gCliLock)") != std::string::npos, "this selector takes the client lock");
+        expect(a != std::string::npos && b != std::string::npos && eng.substr(a, b - a).find("Session *s = sess_lock(ref, ") != std::string::npos && eng.substr(a, b - a).find("sess_unlock(s);") != std::string::npos,
+               "this selector takes the caller's SESSION lock (0.0.627: the per-session successor of the one client lock)");
     }
-    expect_u("every selector body checks Hello (9 in ABI 1.0 + 6 scanout selectors of ABI 1.1, 0.0.603 + the DAL step of ABI 1.2, 0.0.604 + the mode trial of ABI 1.3, 0.0.605 + the HELD mode's hold / release of ABI 1.7, 0.0.609 + BoImportHost of ABI 1.9, 0.0.612)", count_of(eng, "if (!sess_hello()) return kIOReturnNotReady;"), 20);
+    expect_u("every selector body checks Hello (9 in ABI 1.0 + 6 scanout selectors of ABI 1.1, 0.0.603 + the DAL step of ABI 1.2, 0.0.604 + the mode trial of ABI 1.3, 0.0.605 + the HELD mode's hold / release of ABI 1.7, 0.0.609 + BoImportHost of ABI 1.9, 0.0.612 + the five instance-2 scanout selectors of ABI 1.11, 0.0.661)", count_of(eng, "if (!sess_hello(ref)) return kIOReturnNotReady;"), 25);
     expect_u("every locked selector re-checks the session under the lock (6 + ScanoutAcquire / Register / Release, 0.0.603 + BoImportHost, 0.0.612)", count_of(eng, "closed while we waited for the lock"), 10);
-    expect(eng.find("static Session gSess;") != std::string::npos && eng.find("IOMallocAligned") == std::string::npos && eng.find("IOFreeAligned") == std::string::npos,
-           "SESSION LIFETIME: the session is a static that is never freed");
-    { const size_t a = eng.find("IOReturn n1c_query_info("), b = eng.find("\n}\n", a); expect(eng.substr(a, b - a).find("gS->") == std::string::npos, "the lock-free QueryInfo reads only the static session"); }
+    expect(eng.find("static Session gSess;") != std::string::npos && eng.find("IOFree(ns") == std::string::npos && count_of(eng, "IOMalloc(sizeof(Session))") == 1 && eng.find("IOMallocAligned") == std::string::npos && eng.find("IOFreeAligned") == std::string::npos,
+           "SESSION LIFETIME: slot 0 is a static, slots 1..3 (0.0.627) are allocated once and never freed");
+    { const size_t a = eng.find("IOReturn n1c_query_info("), b = eng.find("\n}\n", a); expect(eng.substr(a, b - a).find("sess_lock(") == std::string::npos && eng.substr(a, b - a).find("Session *s = sess_peek(ref);") != std::string::npos, "the lock-free QueryInfo reads the caller's never-freed session record without a lock"); }
     expect(eng.find("vram_alloc.free(s->blk") == std::string::npos && eng.find("gPtFree[gPtFreeN++] = s->blk[i]") != std::string::npos &&
            count_of(eng, "vram_alloc.alloc(kArenaBlockBytes") == 2, "PAGE TABLES: blocks return to the per-boot reserve, never to vram_alloc (the two allocs are the reserve's growth and the park root)");
     expect(eng.find("if (!regs_allowed(off, count)") != std::string::npos, "ReadRegs is allowlisted");
@@ -620,17 +642,17 @@ static void u12_pins(const std::string &root) {
            count_of(eng, "cp.wptr = ring_idx(wc, mask)") == 1, "the doorbell / wptr shadow carry the full 64-bit counter, initialised once from cp.wptr");
     expect_u("the native path never calls native_s1b_refuse", count_of(eng, "native_s1b_refuse("), 0);
     expect_u("... and does not touch CP_DEBUG", count_of(eng, "0x1e1f"), 0);
-    expect_u("close is idempotent and single-owner: the session pointer is cleared once", count_of(eng, "    __atomic_store_n(&gS, (Session *)nullptr, __ATOMIC_RELEASE);   // gSess itself is static and never freed\n"), 1);
+    expect_u("close is idempotent and single-owner: the session's open flag is cleared once, under its lock (0.0.627)", count_of(eng, "    __atomic_store_n(&s->open, false, __ATOMIC_RELEASE);          // the Session itself is static (slot 0) or never freed (slots 1..3)\n"), 1);
     expect(eng.find("LEAKED (HUNG)") != std::string::npos && eng.find("seqs, freed\"") != std::string::npos, "both close log lines exist");
-    expect(eng.find("if (!leak && !idle_wait()) leak = true;") != std::string::npos, "close waits for idle and leaks when it cannot");
-    expect(eng.find("program_root(gPark.pa)") != std::string::npos && eng.find("program_root(gPark.pa)") < eng.find("bo_release(h, kRelClosing)"), "CONTEXT8 is parked BEFORE any memory is freed");
-    expect(eng.find("if (hung_now()) bo_release(h, kRelLeak);") != std::string::npos, "BoFree under HUNG leaks and succeeds");
+    expect(eng.find("if (!leak && !own_wait(s)) leak = true;") != std::string::npos, "close waits for ITS OWN work (0.0.627) and leaks when it cannot");
+    expect(eng.find("program_root(s->vmid, gPark.pa)") != std::string::npos && eng.find("program_root(s->vmid, gPark.pa)") < eng.find("bo_release(s, h, kRelClosing)"), "the session's context is parked BEFORE any memory is freed");
+    expect(eng.find("if (hung_now()) m = kRelLeak;") != std::string::npos && fn_body(eng, "IOReturn n1c_bo_free(").find("bo_release(s, h, m);") != std::string::npos, "BoFree under HUNG leaks and succeeds");
     // client: exact shapes, nothing inline-refusable slips through
     expect(cli.find("args->structureInputDescriptor != nullptr || args->structureOutputDescriptor != nullptr") != std::string::npos, "out-of-line structs are refused");
-    expect_u("the client dispatches exactly the 21 selectors (9 + the 6 scanout selectors, 0.0.603 + the DAL step, 0.0.604 + the mode trial, 0.0.605 + the HELD mode's hold / release, 0.0.609 + the Metal nub's publish / withdraw, 0.0.610 + BoImportHost, 0.0.612)", count_of(cli, "case N48N_SEL_"), 22);
+    expect_u("the client dispatches exactly the 21 selectors (9 + the 6 scanout selectors, 0.0.603 + the DAL step, 0.0.604 + the mode trial, 0.0.605 + the HELD mode's hold / release, 0.0.609 + the Metal nub's publish / withdraw, 0.0.610 + BoImportHost, 0.0.612 + the five instance-2 scanout selectors, 0.0.661)", count_of(cli, "case N48N_SEL_"), 27);
     expect(cli.find("return kIOReturnBadArgument;   // an unknown selector") != std::string::npos && cli.find("super::externalMethod") == std::string::npos, "an unknown selector never falls through to IOUserClient");
     expect(cli.find("kIOClientPrivilegeAdministrator") != std::string::npos, "root only");
-    expect(cli.find("if (opened) { n48disp_on_ws_client_closed(adminClient); amdgpu::n1c_close(\"clientClose\")") != std::string::npos && cli.find("amdgpu::n1c_close(\"stop\")") != std::string::npos, "close runs from clientClose and stop");
+    expect(cli.find("if (opened) { n48disp_on_ws_client_closed(wsSession); amdgpu::n1c_unmap_for_close(amdgpu::N1cRef{ sessSlot, sessId }, this); amdgpu::n1c_close(amdgpu::N1cRef{ sessSlot, sessId }, \"clientClose\")") != std::string::npos && cli.find("amdgpu::n1c_close(amdgpu::N1cRef{ sessSlot, sessId }, \"stop\")") != std::string::npos, "close runs from clientClose and stop, with this client's session");
     // the bringup switch, and the default path unchanged
     expect(boot.find("if (type == N48N_UC_TYPE) return IOAccelNavi48NativeClient::create(") != std::string::npos, "newUserClient switches on the type");
     expect(boot.find("if (type == N48N_UC_TYPE)") < boot.find("auto *uc = OSTypeAlloc(Navi48UserClient);"), "the switch precedes the legacy allocation");
@@ -652,16 +674,16 @@ static void u12_pins(const std::string &root) {
         expect(eng.find("*memory = md;", fn) == ret + 15 || eng.find("md->retain(); *memory = md;", fn) == ret, "the returned descriptor is the stored one");
     }
     expect_u("the descriptor is released in exactly two places (BoFree path, close path), each nulling the pointer", count_of(eng, "if (b.vmd != nullptr) { b.vmd->release(); b.vmd = nullptr; }"), 2);
-    expect_u("no other release of the descriptor", count_of(eng, "vmd->release()"), 2);
+    expect_u("no other release of the descriptor (0.0.641: plus the close-time unmap sweep's release of its OWN reference, n1c_unmap_for_close, which retains first)", count_of(eng, "vmd->release()"), 3);
     {
-        const size_t bo = eng.find("static void bo_release(uint32_t h, RelMode mode) {"), cl = eng.find("if (mode == kRelClosing) {", bo), nm = eng.find("mode == kRelNormal", bo), lk = eng.find("} else {\n        // Leak:", bo);
+        const size_t bo = eng.find("static void bo_release(Session *s, uint32_t h, RelMode mode) {"), cl = eng.find("if (mode == kRelClosing) {", bo), nm = eng.find("mode == kRelNormal", bo), lk = eng.find("} else {\n        // Leak:", bo);
         const size_t r1 = eng.find("b.vmd->release()", bo), r2 = eng.find("b.vmd->release()", r1 + 1);
         expect(cl < r1 && r1 < nm && nm < r2 && r2 < lk, "one release in the closing branch, one in the normal branch, none in the leak branch (leaked with the BO)");
-        expect(eng.find("b.vmd->release(); b.vmd = nullptr; }   // the descriptor is released once, before the range it names is freed\n        if (b.kind == kBoGtt) sysmem_free(b.sm);", bo) != std::string::npos, "released before the memory it names is freed");
+        expect(eng.find("b.vmd->release(); b.vmd = nullptr; }   // the descriptor is released once, before the range it names is freed\n        if (b.kind == kBoGtt) { sysmem_free(b.sm); sys_release(b); }", bo) != std::string::npos, "released before the memory it names is freed");
     }
     // build plumbing
     expect(mk.find("src/Navi48NativeClient.cpp") != std::string::npos, "the Makefile builds the client");
-    expect(plist.find("<string>0.0.620</string>") != std::string::npos && count_of(plist, "0.0.620") == 2 && plist.find("0.0.605") == std::string::npos, "Info.plist is 0.0.620");
+    expect(plist.find("<string>0.0.664</string>") != std::string::npos && count_of(plist, "0.0.664") == 2 && plist.find("0.0.605") == std::string::npos, "Info.plist is 0.0.664");
     expect(pure.find("kWbOffsetNativeSeq = 0x0C0u") != std::string::npos, "the native seqno slot offset");
     // banned strings in the new files
     const std::string bad1 = std::string("pipe+0x2") + "80", bad2 = std::string("+0x2") + "82", bad3 = std::string("+0x2") + "99";   // built at run time: this file must not contain the tokens

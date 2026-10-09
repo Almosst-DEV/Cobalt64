@@ -1,0 +1,5 @@
+#!/bin/bash
+now=$(( 1791470000 + $(cat "$SIM_DIR/vclock_ms") / 1000 ))
+echo $now >"$SIM_DIR/kv/restart_epoch"
+for i in 1 2; do if [ -e "$SIM_FR/private/tmp/n48m-noflip$i" ]; then echo 1 >"$SIM_DIR/kv/rst_kill$i"; else echo 0 >"$SIM_DIR/kv/rst_kill$i"; fi; rm -f "$SIM_DIR/kv/killed_ts_$i"; done
+exit 0

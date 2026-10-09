@@ -33,6 +33,11 @@
 #include "../../src/navi48-bringup/src/apple/sdma_dcc.h"  /* 0.0.417: the sdmadcc field decode, one source of truth */
 #include "../../src/navi48-bringup/src/apple/scanout_copy.h" /* 0.0.417: N48_TILE_UNIFORM_PIXEL for the `scanout 8` report */
 #include "../../src/navi48-bringup/src/apple/scanout_full.h" /* 0.0.542: `scanout full`'s header, reasons and checks */
+#include "../../src/navi48-bringup/src/dcn/navi48_dispread.h" /* 0.0.622: ddcread / dmubring / dispcensus - statuses, argument packing, the census table, one source of truth with the kext */
+#include "../../src/navi48-bringup/src/dcn/navi48_dmubcmd.h" /* 0.0.625: dmubsend / dmubmode / dmubctx - the allowlist, the slot specs, the argument and result layouts, one source of truth with the kext */
+#include "../../src/navi48-bringup/src/dcn/navi48_disp2.h" /* 0.0.631: disp2 - the ops, the statuses, the result layouts and the status register list, one source of truth with the kext */
+#include "../../src/navi48-bringup/src/Navi48DisplayOps.h" /* 0.0.652 (M5): fbpublish - the status codes and their texts, one source of truth with the kext and the aux framebuffer */
+#include "../../src/navi48-bringup/src/Navi48AppKey.h" /* 0.0.640: appallow - the name -> key function and the argument packing, one source of truth with the kext */
 
 static io_connect_t conn = IO_OBJECT_NULL;
 
@@ -599,6 +604,932 @@ static int scanfull_pull(const char *path, uint64_t wantTotal, uint64_t wantSeq)
     return 0;
 }
 
+
+// ---- 0.0.622 (multi-monitor stage M1): ddcread / dmubring / dispcensus. One IOConnect call per page; the layouts are navi48_dispread.h's (shared with the kext). -----------------------------
+static int dr_call(uint64_t action, uint64_t arg, uint64_t out[16]) {
+    uint64_t in2[2] = { action, arg };
+    uint32_t outCnt = 16;
+    for (int i = 0; i < 16; i++) out[i] = 0;
+    kern_return_t kr = IOConnectCallScalarMethod(conn, kNavi48SelAccelExperiment, in2, 2, out, &outCnt);
+    if (kr != KERN_SUCCESS) {
+        printf("accel: call FAILED (0x%x)%s\n", kr, kr == kIOReturnBadArgument ? " - bad argument, OR the verb is not admitted: it needs boot-arg navi48-metal-disp=1, and a kext/CLI pair that both know verbs 91..99" : "");
+        return -1;
+    }
+    return 0;
+}
+
+static int cmd_ddcread(const char *a1, const char *a2) {
+    if (!a1 || !a2) { fprintf(stderr, "usage: accel ddcread <line 2|3> <block 0..3>   (read-only EDID block over the HDMI DDC line)\n"); return 2; }
+    const uint32_t line = (uint32_t)strtoul(a1, NULL, 0), block = (uint32_t)strtoul(a2, NULL, 0);
+    if (!n48dr_ddc_line_ok(line) || !n48dr_ddc_block_ok(block)) { fprintf(stderr, "accel ddcread: line must be 2 or 3 and block 0..3 (the kext refuses anything else)\n"); return 2; }
+    uint64_t o0[16], o1[16];
+    if (dr_call(N48DR_ACT_DDCREAD, n48dr_ddc_arg(line, block, 0), o0) != 0) return 1;
+    const uint64_t *v0 = o0 + 3;
+    const uint32_t st = (uint32_t)(v0[0] & 0xFF);
+    printf("accel ddcread: line %u block %u\n", line, block);
+    printf("  status                  : %u (%s)\n", st, n48dr_status_name(st));
+    printf("  arbitration last read   : %#010x ; after release %#010x (owner field %u: 0 = given back)\n", (unsigned)(v0[1] & 0xFFFFFFFFu), (unsigned)(v0[0] >> 32), (unsigned)((v0[0] >> 34) & 3u));
+    printf("  DC_I2C_SW_STATUS        : %#010x ; released = %u ; read #%u\n", (unsigned)(v0[1] >> 32), (unsigned)((v0[0] >> 18) & 1u), (unsigned)((v0[0] >> 24) & 0xFFu));
+    if (st != N48DR_OK) return 3;
+    uint8_t edid[N48DR_EDID_BLOCK];
+    n48dr_ddc_extract(v0, 0, edid);
+    if (dr_call(N48DR_ACT_DDCREAD, n48dr_ddc_arg(line, block, 1), o1) != 0) return 1;
+    const uint64_t *v1 = o1 + 3;
+    if ((v1[0] & 0xFF) != N48DR_OK) { printf("  page 2 (bytes 88..127)  : status %u (%s)\n", (unsigned)(v1[0] & 0xFF), n48dr_status_name((uint32_t)(v1[0] & 0xFF))); return 3; }
+    if (((v1[0] >> 24) & 0xFF) != ((v0[0] >> 24) & 0xFF)) { printf("  page 2 belongs to another read (seq %u vs %u): run again\n", (unsigned)((v1[0] >> 24) & 0xFF), (unsigned)((v0[0] >> 24) & 0xFF)); return 3; }
+    n48dr_ddc_extract(v1, 1, edid);
+    for (unsigned row = 0; row < 8; row++) {
+        printf("  %03x:", row * 16);
+        for (unsigned c = 0; c < 16; c++) printf(" %02x", edid[row * 16 + c]);
+        printf("\n");
+    }
+    const uint32_t sum = n48dr_edid_sum(edid);
+    printf("  checksum                : %s (sum of the 128 bytes mod 256 = %u; the kext says %s)\n", sum == 0 ? "OK" : "BAD", sum, ((v0[0] >> 16) & 1) ? "OK" : "BAD");
+    if (block == 0)
+        printf("  EDID header             : %s%s\n", n48dr_edid_header_ok(edid) ? "OK (00 ff ff ff ff ff ff 00)" : "BAD", ((v0[0] >> 17) & 1) == (uint64_t)(n48dr_edid_header_ok(edid) ? 1 : 0) ? "" : " (kext and CLI disagree!)");
+    else
+        printf("  block tag (byte 0)      : %#04x%s\n", edid[0], edid[0] == 0x02 ? " (CTA-861 extension)" : edid[0] == 0x70 ? " (DisplayID extension)" : "");
+    return sum == 0 ? 0 : 3;
+}
+
+// 0.0.633: scdcread <line 2|3> <off 0..0x5f> [len 1..16] - READ-ONLY SCDC status bytes from the HDMI sink (slave 0x54) over the same DC_I2C engine; decodes the registers that say whether the sink locks onto our TMDS.
+static int cmd_scdcread(const char *a1, const char *a2, const char *a3) {
+    if (!a1 || !a2) { fprintf(stderr, "usage: accel scdcread <line 2|3> <offset 0..0x5f> [len 1..16]   (read-only SCDC bytes from the HDMI sink; offset + len <= 0x60; 0x40 = status flags, 0x50..0x56 = error counters)\n"); return 2; }
+    const uint32_t line = (uint32_t)strtoul(a1, NULL, 0), off = (uint32_t)strtoul(a2, NULL, 0), len = a3 ? (uint32_t)strtoul(a3, NULL, 0) : 1u;
+    if (!n48dr_ddc_line_ok(line) || !n48dr_scdc_range_ok(off, len)) { fprintf(stderr, "accel scdcread: line must be 2 or 3, offset 0..0x5f, len 1..16 and offset + len <= 0x60 (the kext refuses anything else)\n"); return 2; }
+    uint64_t o[16];
+    if (dr_call(N48DR_ACT_SCDCREAD, n48dr_scdc_arg(line, off, len), o) != 0) return 1;
+    const uint64_t *v = o + 3;
+    const uint32_t st = (uint32_t)(v[0] & 0xFF);
+    printf("accel scdcread: line %u offset %#04x len %u\n", line, off, len);
+    printf("  status                  : %u (%s)\n", st, n48dr_status_name(st));
+    printf("  arbitration last read   : %#010x ; after release %#010x (owner field %u: 0 = given back)\n", (unsigned)(v[1] & 0xFFFFFFFFu), (unsigned)(v[0] >> 32), (unsigned)((v[0] >> 34) & 3u));
+    printf("  DC_I2C_SW_STATUS        : %#010x ; released = %u ; read #%u\n", (unsigned)(v[1] >> 32), (unsigned)((v[0] >> 16) & 1u), (unsigned)((v[0] >> 24) & 0xFFu));
+    if (st != N48DR_OK) return 3;
+    uint8_t b[N48DR_SCDC_LEN_MAX];
+    n48dr_scdc_extract(v, b);
+    printf("  %#04x:", off);
+    for (uint32_t i = 0; i < len; i++) printf(" %02x", b[i]);
+    printf("\n");
+    for (uint32_t i = 0; i < len; i++) {
+        const uint32_t a = off + i;
+        if (a == N48DR_SCDC_SINK_VERSION) printf("  0x01 Sink_Version       : %u\n", b[i]);
+        else if (a == N48DR_SCDC_TMDS_CONFIG) printf("  0x20 TMDS_Config        : %#04x  scrambling %s, TMDS bit clock ratio %s\n", b[i], n48dr_scdc_scrambling_enabled(b[i]) ? "ENABLED" : "off", n48dr_scdc_ratio_by_40(b[i]) ? "1/40" : "1/10");
+        else if (a == N48DR_SCDC_SCRAMBLER_STATUS) printf("  0x21 Scrambler_Status   : %#04x  sink scrambling %s\n", b[i], n48dr_scdc_scrambling_status(b[i]) ? "ON" : "off");
+        else if (a == N48DR_SCDC_STATUS_FLAGS)
+            printf("  0x40 Status_Flags_0     : %#04x  clock %s, ch0 %s, ch1 %s, ch2 %s%s\n", b[i], n48dr_scdc_clock_detected(b[i]) ? "DETECTED" : "not detected", n48dr_scdc_ch_locked(b[i], 0) ? "LOCKED" : "not locked",
+                   n48dr_scdc_ch_locked(b[i], 1) ? "LOCKED" : "not locked", n48dr_scdc_ch_locked(b[i], 2) ? "LOCKED" : "not locked",
+                   n48dr_scdc_locked(b[i]) ? "  => the sink LOCKS onto our TMDS" : "  => the sink does NOT lock on all three channels");
+    }
+    for (uint32_t ch = 0; ch < 3u; ch++) {      // 0x50/0x51, 0x52/0x53, 0x54/0x55: character error counts (15 bits, valid bit in the high byte)
+        const uint32_t lo = N48DR_SCDC_ERR_DETECT + 2u * ch;
+        if (lo >= off && lo + 1u < off + len) {
+            int valid = 0;
+            const uint32_t n = n48dr_scdc_err_count(b[lo - off], b[lo + 1u - off], &valid);
+            printf("  %#04x Ch%u error count   : %u (%s)\n", lo, ch, n, valid ? "valid" : "not valid");
+        }
+    }
+    if (N48DR_SCDC_ERR_DETECT + 6u >= off && N48DR_SCDC_ERR_DETECT + 6u < off + len) printf("  0x56 Err_Det_Checksum   : %#04x\n", b[N48DR_SCDC_ERR_DETECT + 6u - off]);
+    return 0;
+}
+
+static int cmd_dmubring(const char *a1) {
+    uint64_t o[16];
+    const uint64_t pg = a1 ? strtoull(a1, NULL, 0) : 0;
+    if (!n48dr_dmub_arg_ok(pg)) { fprintf(stderr, "usage: accel dmubring [0 summary | 1..25 one command | 0x80 SCRATCH bank]   (READ-ONLY; no DMUB command is ever sent)\n"); return 2; }
+    if (dr_call(N48DR_ACT_DMUBRING, 0, o) != 0) return 1;
+    const uint64_t *v = o + 3;
+    if (pg == N48DR_DMUB_PAGE_SCRATCH) {
+        if (dr_call(N48DR_ACT_DMUBRING, pg, o) != 0) return 1;
+        v = o + 3;
+        printf("accel dmubring: DMCUB_SCRATCH bank (status %u)\n", (unsigned)(v[0] & 0xFF));
+        for (unsigned i = 0; i < N48DR_DMUB_SCRATCH_COUNT; i++) printf("  SCRATCH%-2u (dword %#06x) = %#010x\n", i, N48DR_DMUB_SCRATCH_FIRST + i, (unsigned)(v[1 + i / 2] >> (32 * (i & 1))));
+        return 0;
+    }
+    const uint32_t st = (uint32_t)(v[0] & 0xFF), flags = (uint32_t)((v[0] >> 24) & 0xFF), ncmd = (uint32_t)(v[0] >> 32);
+    static const char *vn[] = { "ALIVE_IDLE", "ALIVE_BUSY", "NOT_RUNNING", "DMCUB_SOFT_RESET set", "NOT_READY", "RING_INSANE" };
+    static const char *mn[] = { "UNKNOWN", "CW4", "REGION4" };
+    printf("accel dmubring: summary\n");
+    printf("  status                  : %u (%s)\n", st, n48dr_status_name(st));
+    printf("  firmware state          : verdict %u (%s), enabled %u, soft_reset %u, dal_fw %u (0 = the VBIOS-loaded firmware), mailbox_rdy %u\n", (unsigned)((v[0] >> 8) & 0xFF),
+           ((v[0] >> 8) & 0xFF) < 6 ? vn[(v[0] >> 8) & 0xFF] : "?", flags & 1, (flags >> 1) & 1, (flags >> 2) & 1, (flags >> 3) & 1);
+    printf("  DMCUB_CNTL / CNTL2      : %#010x / %#010x ; SEC_CNTL %#010x ; SCRATCH0 (boot status) %#010x\n", (unsigned)v[1], (unsigned)(v[1] >> 32), (unsigned)v[2], (unsigned)(v[2] >> 32));
+    printf("  SCRATCH7 / 14 / 15      : %#010x / %#010x / %#010x ; fault addr %#010x\n", (unsigned)v[10], (unsigned)(v[10] >> 32), (unsigned)v[11], (unsigned)(v[11] >> 32));
+    printf("  firmware version        : NOT readable here: it is in the fw-meta block in VRAM (below REGION4), reachable only through MM_INDEX, which this verb does not use; GPINT GET_FW_VERSION needs a register write. Use RDNA4FB's rdna4-dmubver=1\n");
+    printf("  inbox1                  : base %#010x size %#x WPTR %#x RPTR %#x (%s)\n", (unsigned)v[3], (unsigned)(v[3] >> 32), (unsigned)v[4], (unsigned)(v[4] >> 32), ((flags >> 5) & 1) ? "ring sane" : "ring NOT sane");
+    printf("  ring mapping            : %u (%s) ; REGION4_OFFSET %#010x REGION4_OFFSET_HIGH %#010x\n", (unsigned)((v[0] >> 16) & 0xFF), ((v[0] >> 16) & 0xFF) < 3 ? mn[(v[0] >> 16) & 0xFF] : "?", (unsigned)v[5], (unsigned)(v[5] >> 32));
+    printf("  ring GPU address        : %#llx ; FB base %#llx ; ring VRAM offset %#llx ; BAR0 aperture %#llx bytes\n", (unsigned long long)v[6], (unsigned long long)v[7], (unsigned long long)v[8], (unsigned long long)v[9]);
+    printf("  ring readable via BAR0  : %s ; commands between the ring start and WPTR: %u (decoded: up to %u)\n", ((flags >> 4) & 1) ? "yes" : "NO", ncmd, N48DR_DMUB_MAX_DECODE);
+    unsigned first = pg ? (unsigned)pg : 1, last = pg ? (unsigned)pg : ncmd;
+    if (!pg && !((flags >> 4) & 1)) { printf("  commands                : not decoded - %s\n", n48dr_status_name(st != N48DR_OK ? st : N48DR_RING_UNREACHABLE)); return st == N48DR_OK ? 0 : 3; }
+    for (unsigned p = first; p <= last && p <= N48DR_DMUB_MAX_DECODE; p++) {
+        if (dr_call(N48DR_ACT_DMUBRING, p, o) != 0) return 1;
+        const uint64_t *c = o + 3;
+        const uint32_t cs = (uint32_t)(c[0] & 0xFF);
+        if (cs != N48DR_OK) { printf("  [%02u] status %u (%s)\n", p - 1, cs, n48dr_status_name(cs)); if (pg) return 3; break; }
+        const uint32_t hdr = (uint32_t)c[1];
+        const struct n48dr_dmub_hdr h = n48dr_dmub_decode(hdr);
+        printf("  [%02u] header %#010x type %u (%s) sub_type %u (%s) payload_bytes %u%s%s%s%s\n", p - 1, hdr, h.type, n48dr_dmub_type_name(h.type), h.sub_type, n48dr_dmub_subtype_name(h.type, h.sub_type),
+               h.payload_bytes, h.ret_status ? " ret_status" : "", h.multi_cmd_pending ? " multi_cmd_pending" : "", h.is_reg_based ? " reg_based" : "", h.reserved_bits_clear ? "" : " RESERVED-BITS-SET");
+        printf("       payload[0..31]:");
+        for (unsigned i = 0; i < 4; i++) { printf(" "); for (unsigned j = 0; j < 8; j++) printf("%02x", (unsigned)((c[2 + i] >> (8 * j)) & 0xFF)); }
+        printf("\n");
+    }
+    return st == N48DR_OK ? 0 : 3;
+}
+
+// 0.0.634 (stage M4a, plane census): print one page of n48dr_census4 / n48dr_census5 by NAME (name, BASE_IDX, absolute BAR5 dword, value); READ-ONLY. Returns 0, or non-zero when the call or the page failed.
+static int dc_print_page(uint32_t pg) {
+    uint64_t o[16];
+    printf("accel dispcensus %u (%s)\n", pg, pg == N48DR_CENSUS4_PAGE ? "the DP watch" : pg >= N48DR_CENSUS7_FIRST_PAGE ? "monitor A instance-1 census page" : "plane page");
+    fflush(stdout);       /* a hang on a clock-gated pipe must show which page it was */
+    if (dr_call(N48DR_ACT_DISPCENSUS, pg, o) != 0) return 1;
+    const uint64_t *v = o + 3;
+    const uint32_t st = (uint32_t)(v[0] & 0xFF), n = (uint32_t)((v[0] >> 16) & 0xFF);
+    if (st != N48DR_OK) { printf("  page %u: status %u (%s)\n", pg, st, n48dr_status_name(st)); return 3; }
+    for (uint32_t i = 0; i < n; i++) {
+        const struct n48dr_reg *r = n48dr_census_reg(pg, i);
+        printf("  %-52s (BASE_IDX %u, abs %#07x) = %#010x\n", r->name, r->base_idx, n48dr_census_abs(r->base_idx, r->off), (uint32_t)(v[1 + i / 2] >> (32 * (i & 1))));
+    }
+    fflush(stdout);
+    return 0;
+}
+static int cmd_dispcensus(const char *a1) {
+    uint64_t o[16], o2[16];
+    if (a1 && !strcmp(a1, "mona")) {      /* 0.0.654: the monitor A (instance 1) census = pages 44..59 in order, READ-ONLY */
+        int rc = 0;
+        for (uint32_t p = N48DR_CENSUS7_FIRST_PAGE; p < N48DR_CENSUS_ALL_PAGES && rc == 0; p++) rc = dc_print_page(p);
+        return rc;
+    }
+    if (a1 && (!strcmp(a1, "plane") || !strcmp(a1, "dpwatch"))) {      /* 0.0.634: `plane` = pages 10..43 in order (the DP watch first); `dpwatch` = page 10 only */
+        int rc = 0;
+        const uint32_t last = !strcmp(a1, "dpwatch") ? N48DR_CENSUS4_PAGE : N48DR_CENSUS6_PAGE;
+        for (uint32_t p = N48DR_CENSUS4_PAGE; p <= last && rc == 0; p++) rc = dc_print_page(p);
+        return rc;
+    }
+    const uint64_t pg = a1 ? strtoull(a1, NULL, 0) : 0;
+    if (!n48dr_census_arg_ok(pg) && a1) { fprintf(stderr, "usage: accel dispcensus [0|1|2..59|plane|dpwatch|mona]   (READ-ONLY; no argument = pages 0 and 1; pages 2..7 = the M4a clock / DIG / PHY census, 0.0.628; pages 8..9 = the M4c substitute registers, 0.0.630; page 10 = the DP watch (`dpwatch`), pages 11..42 = the plane registers of M4a (0.0.634); `plane` = pages 10..43; pages 44..59 = the monitor A instance-1 census (0.0.654), `mona` = pages 44..59)\n"); return 2; }
+    if (a1 && pg >= N48DR_CENSUS_PAGES) {      /* 0.0.628 (M4a): one page of the DCCG / DIG / RDPCSTX table; name, absolute BAR5 dword, value */
+        if (dr_call(N48DR_ACT_DISPCENSUS, pg, o) != 0) return 1;
+        const uint64_t *v = o + 3;
+        const uint32_t st = (uint32_t)(v[0] & 0xFF), n = (uint32_t)((v[0] >> 16) & 0xFF);
+        printf("accel dispcensus %u (M4a page)\n", (unsigned)pg);
+        if (st != N48DR_OK) { printf("  page %u: status %u (%s)\n", (unsigned)pg, st, n48dr_status_name(st)); return 3; }
+        for (uint32_t i = 0; i < n; i++) {
+            const struct n48dr_reg *r = n48dr_census_reg((uint32_t)pg, i);
+            printf("  %-38s (BASE_IDX %u, abs %#07x) = %#010x\n", r->name, r->base_idx, n48dr_census_abs(r->base_idx, r->off), (uint32_t)(v[1 + i / 2] >> (32 * (i & 1))));
+        }
+        return 0;
+    }
+    uint32_t vals[N48DR_CENSUS_COUNT];
+    uint32_t fc0[4] = { 0 }, fc1[4] = { 0 };
+    int bad = 0;
+    printf("accel dispcensus\n");
+    for (uint32_t page = 0; page < N48DR_CENSUS_PAGES; page++) {
+        if (a1 && page != pg) continue;
+        if (dr_call(N48DR_ACT_DISPCENSUS, page, o) != 0) return 1;
+        const uint64_t *v = o + 3;
+        const uint32_t st = (uint32_t)(v[0] & 0xFF), n = (uint32_t)((v[0] >> 16) & 0xFF);
+        if (st != N48DR_OK) { printf("  page %u: status %u (%s)\n", page, st, n48dr_status_name(st)); return 3; }
+        for (uint32_t i = 0; i < n; i++) vals[n48dr_census_first(page) + i] = (uint32_t)(v[1 + i / 2] >> (32 * (i & 1)));
+        for (uint32_t i = 0; i < n; i++) printf("  %-30s (BASE_IDX %u, dword %#06x) = %#010x\n", n48dr_census[n48dr_census_first(page) + i].name, n48dr_census[n48dr_census_first(page) + i].base_idx,
+                                               n48dr_census[n48dr_census_first(page) + i].off, vals[n48dr_census_first(page) + i]);
+        if (page == 0) for (unsigned k = 0; k < 4; k++) fc0[k] = vals[16 + k];
+    }
+    if (!a1 || pg == 0) {
+        struct timespec ts = { 0, 60 * 1000 * 1000 };   /* 60 ms: three frames at 60 Hz */
+        nanosleep(&ts, NULL);
+        if (dr_call(N48DR_ACT_DISPCENSUS, 0, o2) != 0) return 1;
+        for (unsigned k = 0; k < 4; k++) fc1[k] = (uint32_t)(o2[3 + 1 + (16 + k) / 2] >> (32 * ((16 + k) & 1)));
+        printf("  OTG frame counters over 60 ms:");
+        for (unsigned k = 0; k < 4; k++) printf(" OTG%u %u -> %u (%s)", k, fc0[k], fc1[k], fc1[k] != fc0[k] ? "COUNTING" : "stopped");
+        printf("\n");
+    }
+    return bad;
+}
+
+// ---- 0.0.624 (multi-monitor stage M1.5): region4read / region4dump. READ-ONLY dumps of the DMUB REGION4 window in VRAM (the first 64 KiB of it). One verb call returns 22 dwords, so a read of n dwords is
+// ceil(n / 22) calls (page 0 reads the memory, pages 1..2 return the kext's stored rest); the layouts and the window rules are navi48_dispread.h's (shared with the kext). ------------------------------
+static int r4_fetch(uint32_t off, uint32_t n, uint32_t *dst, uint64_t *base) {
+    uint64_t o[16];
+    uint32_t seq0 = 0;
+    for (uint32_t pg = 0; pg < n48dr_r4_pages_for(n); pg++) {
+        if (dr_call(N48DR_ACT_REGION4READ, n48dr_r4_arg(off, n, pg), o) != 0) return -1;
+        const uint64_t *v = o + 3;
+        const uint32_t st = (uint32_t)(v[0] & 0xFF);
+        if (st != N48DR_OK) {
+            printf("accel region4read: +%#x x%u page %u: status %u (%s)\n", off, n, pg, st, n48dr_status_name(st));
+            if (st == N48DR_REGION4_BAD) printf("  REGION4 GPU address %#llx ; FB base %#llx ; VRAM size %#llx ; REGION4 enabled %u\n", (unsigned long long)v[1], (unsigned long long)v[2], (unsigned long long)v[3], (unsigned)v[4]);
+            return 3;
+        }
+        if (pg == 0) { seq0 = (uint32_t)((v[0] >> 24) & 0xFF); *base = v[1]; }
+        else if (((v[0] >> 24) & 0xFF) != seq0) { printf("accel region4read: page %u belongs to another read (seq %u vs %u): run again\n", pg, (unsigned)((v[0] >> 24) & 0xFF), seq0); return 3; }
+        const unsigned want = (n - pg * N48DR_R4_PER_PAGE) < N48DR_R4_PER_PAGE ? (n - pg * N48DR_R4_PER_PAGE) : N48DR_R4_PER_PAGE;
+        if (n48dr_r4_extract(v, pg, dst) != want) { printf("accel region4read: page %u carries the wrong dword count\n", pg); return 3; }
+    }
+    return 0;
+}
+static void r4_rows(uint32_t off, const uint32_t *d, uint32_t n) {   /* 4 dwords a row, runs of all-zero rows collapsed */
+    uint32_t zrun = 0;
+    for (uint32_t i = 0; i < n; i += 4) {
+        const uint32_t k = n - i < 4 ? n - i : 4;
+        uint32_t any = 0;
+        for (uint32_t j = 0; j < k; j++) any |= d[i + j];
+        if (!any && k == 4 && i + 4 < n) { zrun++; continue; }
+        if (zrun) { printf("  ... %u row(s) of zeros\n", zrun); zrun = 0; }
+        printf("  +%05x:", off + i * 4);
+        for (uint32_t j = 0; j < k; j++) printf(" %08x", d[i + j]);
+        printf("\n");
+    }
+    if (zrun) printf("  ... %u row(s) of zeros\n", zrun);
+}
+static int cmd_region4read(const char *a1, const char *a2) {
+    if (!a1) { fprintf(stderr, "usage: accel region4read <offset> [dwords 1..64, default 16]   (READ-ONLY; offset a multiple of 4 inside the first 64 KiB of the DMUB REGION4 window; offset + dwords*4 <= 0x10000)\n"); return 2; }
+    const unsigned long long off = strtoull(a1, NULL, 0), n = a2 ? strtoull(a2, NULL, 0) : 16;
+    if (!n48dr_r4_range_ok(off, n)) { fprintf(stderr, "accel region4read: offset must be a multiple of 4, dwords 1..64 and offset + dwords*4 <= 0x10000 (the kext refuses anything else)\n"); return 2; }
+    uint32_t d[N48DR_R4_MAX_DWORDS] = { 0 };
+    uint64_t base = 0;
+    const int rc = r4_fetch((uint32_t)off, (uint32_t)n, d, &base);
+    if (rc != 0) return rc;
+    printf("accel region4read: window base (VRAM offset) %#llx ; +%#llx x %llu dwords\n", (unsigned long long)base, off, n);
+    r4_rows((uint32_t)off, d, (uint32_t)n);
+    return 0;
+}
+static int r4_range(const char *label, uint32_t off, uint32_t n, uint32_t *buf, uint64_t *base) {   /* walks n dwords in 64-dword calls into buf */
+    for (uint32_t i = 0; i < n; i += N48DR_R4_MAX_DWORDS) {
+        const uint32_t k = n - i < N48DR_R4_MAX_DWORDS ? n - i : N48DR_R4_MAX_DWORDS;
+        int rc = r4_fetch(off + i * 4, k, buf + i, base);
+        if (rc != 0) { printf("accel region4dump: %s: stopped at +%#x\n", label, off + i * 4); return rc; }
+    }
+    return 0;
+}
+static int cmd_region4dump(void) {
+    static uint32_t ring[0x2000 / 4], vb[16], mb[128], ctx[0x2000 / 4];
+    uint64_t base = 0;
+    int rc;
+    printf("accel region4dump: READ-ONLY dump of the DMUB REGION4 window (raw; labels and the EDID checksum only)\n");
+    if ((rc = r4_range("VBIOS ring state", 0x3100, 16, vb, &base)) != 0) return rc;
+    printf("window base (VRAM offset) %#llx\n", (unsigned long long)base);
+    printf("VBIOS ring state +0x3100..+0x313f (the VBIOS code reads 0x3104 init flag, 0x3110, 0x3120, 0x311c):\n"); r4_rows(0x3100, vb, 16);
+    if ((rc = r4_range("mode block", 0x4c00, 128, mb, &base)) != 0) return rc;
+    printf("mode block +0x4c00..+0x4dff:\n"); r4_rows(0x4c00, mb, 128);
+    if ((rc = r4_range("display contexts", 0x6000, 0x2000 / 4, ctx, &base)) != 0) return rc;
+    for (uint32_t c = 0; c < 4; c++) {
+        const uint32_t cb = 0x6000 + c * 0x800;
+        const uint32_t *x = ctx + (cb - 0x6000) / 4;
+        uint8_t edid[128];
+        uint32_t sum = 0, nz = 0;
+        for (uint32_t i = 0; i < 128; i++) { edid[i] = (uint8_t)(x[(0x28 + i) / 4] >> (8 * ((0x28 + i) & 3))); sum += edid[i]; nz |= edid[i]; }
+        sum &= 0xFF;
+        printf("context %u at +%#x:\n", c, cb);
+        printf("  +0x04 flags (dword)     : %08x\n", x[0x04 / 4]);
+        printf("  +0x08 flags (dword)     : %08x ; +0x09 byte = %02x\n", x[0x08 / 4], (x[0x08 / 4] >> 8) & 0xFF);
+        printf("  +0x28 EDID (128 bytes)  : checksum %s (sum of the 128 bytes mod 256 = %u)%s\n", sum == 0 ? "OK" : "BAD", sum, nz ? "" : " ; all bytes zero");
+        for (uint32_t row = 0; row < 8; row++) { printf("    %03x:", row * 16); for (uint32_t i = 0; i < 16; i++) printf(" %02x", edid[row * 16 + i]); printf("\n"); }
+        printf("  +0x1a0 status (dword)   : %08x ; bit 1 (detected) = %u\n", x[0x1a0 / 4], (x[0x1a0 / 4] >> 1) & 1);
+        printf("  +0x24c timing list (raw, +0x24c..+0x2ab):\n"); r4_rows(cb + 0x24c, x + 0x24c / 4, 24);
+        printf("  +0x2ac flags (dword)    : %08x\n", x[0x2ac / 4]);
+        printf("  +0x2c8 byte (dword raw) : %08x ; byte = %02x\n", x[0x2c8 / 4], x[0x2c8 / 4] & 0xFF);
+    }
+    if ((rc = r4_range("ring", 0x0, 0x2000 / 4, ring, &base)) != 0) return rc;
+    printf("ring +0x0000..+0x1fff (64-byte commands; zero rows collapsed):\n"); r4_rows(0x0, ring, 0x2000 / 4);
+    printf("accel region4dump: done (4 ranges: VBIOS ring state, mode block, contexts, ring)\n");
+    return 0;
+}
+
+// ---- 0.0.625 (multi-monitor stages M2 / M3): dmubsend / dmubmode / dmubctx. The FIRST verbs that SEND to the display firmware. They need boot-arg navi48-metal-disp=1 AND navi48-dmubcmd=1 (default OFF: the kext answers
+// "boot-arg navi48-dmubcmd is not 1" and touches nothing). The allowlist, the slot specs and the layouts are navi48_dmubcmd.h's (shared with the kext). The CLI checks the allowlist too, but the KEXT is the gate. ------------------
+static const char dm_scripts[] =
+    "  M2 - replay ONE command the firmware has already accepted (detect + EDID on the monitor A's context 0x7000); the DP console must not blink:\n"
+    "    accel dmubring ; accel dispcensus                   pre-check: WPTR == RPTR == 0x700, OTG0 COUNTING, DMCUB enabled\n"
+    "    accel region4read 0x3100 16                         pre-check: +0x3104 = 0, +0x3110 = 0x40, +0x3120 = 0x2000\n"
+    "    accel region4read 0x71a0 1                          pre-check: ctx 0x7000 status +0x1a0 = 0x01020006\n"
+    "    accel dmubctx 0x7000 status 0                       the marker: clear 'detected' (bit 1)\n"
+    "    accel dmubsend detect 0x7000                        slot 04000a80 00007000 at +0x700; WPTR 0x740; RPTR must reach 0x740\n"
+    "    accel region4read 0x71a0 1 ; accel dispcensus       pass: status back to 0x01020006 (bit 1 set), EDID +0x7028 unchanged, OTG0 still counting, OTG1-3 stopped\n"
+    "    on a failed or timed-out send:  accel dmubctx 0x7000 status 0x01020006   (put the marker back by hand; a stuck RPTR needs a cold power-off)\n"
+    "  M3 - light the SINK-B (the user must watch; the DP monitor may go dark; rollback below):\n"
+    "    accel dmubmode save                                 copy +0x4c00..+0x4c1f into the kext (required before any mode write)\n"
+    "    accel dmubmode 0x1a6                                write the 1080p block (04380780 00020780 41a60001 08081008 00000008 3a02007f 0 0), read back\n"
+    "    accel dmubsend begin                                08000680 d1=0 d2=0x101 at +0x740\n"
+    "    accel dmubsend setmode 0x7000                       08000580 d1=0x4c00 d2=0x7000 at +0x780\n"
+    "    accel region4read 0x4c08 1                          pass ONLY if (dword & 0x00002000) == 0  (mode block byte +0x09 bit 0x20 clear); if set STOP, skip enable, roll back\n"
+    "    accel dmubsend enable 0x7000                        04000780 d1=0x7000 at +0x7c0\n"
+    "    accel dmubsend end                                  08000680 d1=0 d2=0 at +0x800\n"
+    "    watch: accel dispcensus (which OTG counts, DIG1/DIG2 back-end enables), the monitor A, the SINK-A\n"
+    "  M3 rollback (the GOP's own DP sequence):\n"
+    "    accel dmubmode restore    (or: accel dmubmode 0x1d4)   write the DP block back (verify with accel region4read 0x4c00 8)\n"
+    "    accel dmubsend begin ; accel dmubsend setmode 0x6800 ; accel dmubsend enable 0x6800 ; accel dmubsend end\n"
+    "  replay (M2, byte-exact): accel dmubsend replay 0x100   copies the existing ring slot at offset 0x100 (64-byte aligned, below WPTR, its header and d1 / d2 on the allowlist) byte for byte into the next slot.\n"
+    "  sub 8 (disable) is untested on this firmware and is allowed ONLY on 0x7000 / 0x7800, never 0x6800 (the live DP: a console kill switch); dmubctx refuses 0x6800; mode / ctx writes need an idle ring; every send waits at most 100 ms (pclk / phyc / digc / phyd / digd: 2 s) and is never retried; pclk / phyc / digc (0.0.630, 0.0.632) and otg2 / phyd / digd (0.0.633, the monitor B) send fixed mainline VBIOS templates by ID only.\n";
+// ---- 0.0.634 (stage M4a item 4): the DP WATCH. READS of the live DP pipe's plane side (0.0.635: FIFTEEN rows; dispcensus page 10 = n48dr_census4 = rows 0..8 of n48d2_dpx_regs and page 43 = n48dr_census6 = rows 10..14 + the HUBP0 primary HIGH
+// dword, both pinned equal by tests/native_disp2_test.cpp; row 9 is HUBP0_DCHUBP_CNTL again with the strict mask), read before and after every disp2 op and every dmubsend template. dp_watch_read returns 0 and fills v[] (masked as n48d2_dpx_regs
+// says; v[15] = the primary HIGH dword), -1 if a kext call or a page failed. dp_watch_report prints before -> after and returns how many of rows 0..13 changed; row 14 (HUBP0's primary address) is a RULE judged by the KEXT (a legitimate desktop flip moves it
+// while the native scanout is acquired), so it is printed, never counted here. HUBP0's underflow bits [30:28] are printed on their own line. Reads only: no write path exists in either function.
+static int dp_watch_page(uint32_t page, uint32_t count, uint32_t *raw) {
+    uint64_t o[16];
+    if (dr_call(N48DR_ACT_DISPCENSUS, page, o) != 0) return -1;
+    const uint64_t *w = o + 3;
+    if ((uint32_t)(w[0] & 0xFF) != N48DR_OK || (uint32_t)((w[0] >> 16) & 0xFF) != count) return -1;
+    for (uint32_t i = 0; i < count; i++) raw[i] = (uint32_t)(w[1 + i / 2] >> (32 * (i & 1)));
+    return 0;
+}
+static int dp_watch_read(uint32_t v[N48D2_DPX_BUF]) {
+    uint32_t r4[N48DR_CENSUS4_COUNT], r6[N48DR_CENSUS6_COUNT];
+    if (dp_watch_page(N48DR_CENSUS4_PAGE, N48DR_CENSUS4_COUNT, r4) != 0 || dp_watch_page(N48DR_CENSUS6_PAGE, N48DR_CENSUS6_COUNT, r6) != 0) return -1;
+    for (uint32_t i = 0; i < N48DR_CENSUS4_COUNT; i++) v[i] = r4[i] & n48d2_dpx_regs[i].mask;
+    v[9] = r4[4] & n48d2_dpx_regs[9].mask;                                   /* row 9 = HUBP0_DCHUBP_CNTL again (page 10's row 4), strict mask */
+    for (uint32_t i = 0; i < 5; i++) v[10 + i] = r6[i] & n48d2_dpx_regs[10 + i].mask;
+    v[N48D2_DPX_BUF - 1u] = r6[5];                                           /* the primary address HIGH dword */
+    return 0;
+}
+static unsigned dp_watch_report(const char *what, const uint32_t a[N48D2_DPX_BUF], const uint32_t b[N48D2_DPX_BUF]) {
+    unsigned changed = 0;
+    for (uint32_t i = 0; i < N48D2_DPX_REGS; i++) {
+        if (i == N48D2_DPX_RULE) {
+            printf("  DP %-24s : %#x:%#010x -> %#x:%#010x  (a RULE: not A / B, inside the scanout window; the kext judges it)\n", n48d2_dpx_regs[i].name, a[N48D2_DPX_BUF - 1u], a[i], b[N48D2_DPX_BUF - 1u], b[i]);
+            continue;
+        }
+        const int ch = a[i] != b[i];
+        changed += (unsigned)ch;
+        printf("  DP %-24s : %#010x -> %#010x%s\n", n48d2_dpx_regs[i].name, a[i], b[i], ch ? "  *** CHANGED ***" : "");
+    }
+    printf("  DP HUBP0 underflow 30:28 : %u -> %u%s\n", (a[4] & N48D2_HUBP_UNDERFLOW_MASK) >> 28, (b[4] & N48D2_HUBP_UNDERFLOW_MASK) >> 28, (a[4] & N48D2_HUBP_UNDERFLOW_MASK) != (b[4] & N48D2_HUBP_UNDERFLOW_MASK) ? "  *** CHANGED ***" : "");
+    if (changed) printf("  *** DP DISTURBED (%s): %u of %u DP plane registers changed; STOP, run the ROLLBACK, do not retry this boot ***\n", what, changed, N48D2_DPX_REGS);
+    else printf("  DP plane watch (%s): all %u registers unchanged (row 14 is the kext's rule)\n", what, N48D2_DPX_REGS);
+    return changed;
+}
+static int dm_usage(const char *verb) {
+    fprintf(stderr, "usage: accel dmubsend detect <ctx>|begin|end|setmode <ctx>|enable <ctx>|disable <0x7000|0x7800>|replay <slot_off>|pclk otg3-on|otg3-off|otg1-on|otg1-off|otg2-on|otg2-off|phyc enable|disable|phyd enable|disable|digc setup|digd setup|1440 words: pclk otg2-1440-on, phyd enable-1440, digd setup-1440   ctx 0x6800 (DFP2, the live DP), 0x7000 (DFP3, the monitor A) or 0x7800 (DFP4, the monitor B); disable never takes 0x6800\n"
+                    "       accel dmubmode save|restore|0x1a6|0x1d4\n"
+                    "       accel dmubctx <0x7000|0x7800> status <value>\n"
+                    "  needs boot-arg navi48-metal-disp=1 AND navi48-dmubcmd=1. The scripts (%s):\n%s", verb, dm_scripts);
+    return 2;
+}
+static int cmd_dmubsend(const char *a1, const char *a2) {
+    uint32_t kind = 0;
+    if (a1 && !strcmp(a1, "replay")) {      // 0.0.626 (F8): copy an existing ring slot byte for byte (the kext judges it)
+        if (!a2) return dm_usage("dmubsend");
+        const unsigned long long off = strtoull(a2, NULL, 0);
+        uint32_t srcOff = 0;
+        if (off > 0xFFFFull || n48dm_replay_unarg(n48dm_replay_arg((uint32_t)off), &srcOff) != 0u) { fprintf(stderr, "accel dmubsend replay: %s\n", n48dr_status_name(N48DR_REPLAY_REFUSED)); return 2; }
+        uint64_t o[16];
+        printf("accel dmubsend replay: the ring slot at offset %#x is copied byte for byte into the next slot (the kext requires its header and d1 / d2 on the allowlist and the offset below WPTR)\n", srcOff);
+        if (dr_call(N48DM_ACT_SEND, n48dm_replay_arg(srcOff), o) != 0) return 1;
+        struct n48dm_send_out r;
+        n48dm_send_unpack(o + 3, &r);
+        printf("  source slot             : %08x %08x %08x\n", r.hdr, r.d1, r.d2);
+        printf("  status                  : %u (%s)\n", r.status, n48dr_status_name(r.status));
+        printf("  command sent            : %s\n", r.sent ? "yes (WPTR moved)" : "NO (WPTR was not written)");
+        printf("  WPTR                    : %#x -> %#x ; RPTR at the start %#x, at the end %#x (%s)\n", r.old_wptr, r.new_wptr, r.rptr_start, r.rptr_end, r.rptr_end == r.new_wptr ? "reached the new WPTR" : "did NOT reach the new WPTR");
+        printf("  polls / elapsed         : %u polls, %u us ; OTG0 frame counter %u -> %u ; VBIOS ring variables %s\n", r.polls, r.elapsed_us, r.frames0, r.frames1, r.vars ? "updated and read back" : "NOT updated");
+        if (r.status == N48DR_POLL_TIMEOUT) printf("  *** RPTR is stuck: nothing was retried; do NOT send more; a cold power-off clears the firmware ***\n");
+        return r.status == N48DR_OK ? 0 : 3;
+    }
+    if (a1 && (!strcmp(a1, "pclk") || !strcmp(a1, "phyc") || !strcmp(a1, "digc") || !strcmp(a1, "phyd") || !strcmp(a1, "digd"))) {      // 0.0.630 (M4c): a mainline VBIOS template (sub 2 SET_PIXEL_CLOCK / sub 1 TRANSMITTER_CONTROL; 0.0.632: sub 0 DIGX_ENCODER_CONTROL), sent by template ID; the CLI never builds a dword
+        uint32_t id = N48DM_TPL_NONE;
+        if (!a2) return dm_usage("dmubsend");
+        if (!strcmp(a1, "digc")) {      // 0.0.632: DIGC stream setup (DVI, 4 lanes, 148.5 MHz) exactly as Linux's dcn401 sends it; Linux has NO encoder-control disable on this path, so `disable` has no template and is refused here
+            if (!strcmp(a2, "disable")) { fprintf(stderr, "accel dmubsend digc disable: refused - Linux sends no DIGX_ENCODER_CONTROL disable for a TMDS stream on dcn401 (no template exists); use `accel disp2 off` and `accel dmubsend phyc disable`\n"); return 2; }
+            id = !strcmp(a2, "setup") ? N48DM_TPL_DIGC_SETUP_DVI : N48DM_TPL_NONE;
+        }
+        else if (!strcmp(a1, "digd")) {      // 0.0.633: the monitor B's DIGD stream setup (DVI, 4 lanes, 148.5 MHz); like digc it has no disable
+            if (!strcmp(a2, "disable")) { fprintf(stderr, "accel dmubsend digd disable: refused - Linux sends no DIGX_ENCODER_CONTROL disable for a TMDS stream on dcn401 (no template exists); use `accel disp2 off 2` and `accel dmubsend phyd disable`\n"); return 2; }
+            id = !strcmp(a2, "setup") ? N48DM_TPL_DIGD_SETUP_DVI : !strcmp(a2, "setup-1440") ? N48DM_TPL_DIGD_SETUP_DVI_1440 : N48DM_TPL_NONE;
+        }
+        else if (!strcmp(a1, "pclk")) id = !strcmp(a2, "otg3-on") ? N48DM_TPL_PCLK_OTG3_ON : !strcmp(a2, "otg3-off") ? N48DM_TPL_PCLK_OTG3_OFF : !strcmp(a2, "otg1-on") ? N48DM_TPL_PCLK_OTG1_ON : !strcmp(a2, "otg1-off") ? N48DM_TPL_PCLK_OTG1_OFF :
+                                         !strcmp(a2, "otg2-on") ? N48DM_TPL_PCLK_OTG2_ON : !strcmp(a2, "otg2-off") ? N48DM_TPL_PCLK_OTG2_OFF : !strcmp(a2, "otg2-1440-on") ? N48DM_TPL_PCLK_OTG2_1440_ON : N48DM_TPL_NONE;
+        else if (!strcmp(a1, "phyd")) id = !strcmp(a2, "enable") ? N48DM_TPL_PHYD_ENABLE_DVI : !strcmp(a2, "disable") ? N48DM_TPL_PHYD_DISABLE : !strcmp(a2, "enable-1440") ? N48DM_TPL_PHYD_ENABLE_DVI_1440 : N48DM_TPL_NONE;
+        else id = !strcmp(a2, "enable") ? N48DM_TPL_PHYC_ENABLE_DVI : !strcmp(a2, "disable") ? N48DM_TPL_PHYC_DISABLE : N48DM_TPL_NONE;
+        const struct n48dm_tpl *tp = n48dm_tpl_get(id);
+        if (!tp) return dm_usage("dmubsend");
+        uint64_t o[16];
+        uint32_t dpw0[N48D2_DPX_BUF], dpw1[N48D2_DPX_BUF];
+        if (dp_watch_read(dpw0) != 0) { printf("accel dmubsend %s %s: REFUSED by the CLI: the DP watch (dispcensus page 10) could not be read; nothing was sent\n", a1, a2); return 1; }
+        printf("accel dmubsend %s %s (template %s): slot %08x %08x %08x %08x %08x (11 zero dwords); waits at most 2 s, never retried\n", a1, a2, tp->name, tp->dw[0], tp->dw[1], tp->dw[2], tp->dw[3], tp->dw[4]);
+        if (dr_call(N48DM_ACT_SEND, n48dm_tpl_arg(id), o) != 0) return 1;
+        struct n48dm_send_out r;
+        n48dm_send_unpack(o + 3, &r);
+        if (dp_watch_read(dpw1) != 0) printf("  *** DP watch AFTER the send could not be read (dispcensus page 10): treat the DP as unchecked ***\n");
+        else (void)dp_watch_report("dmubsend template", dpw0, dpw1);
+        printf("  status                  : %u (%s)\n", r.status, n48dr_status_name(r.status));
+        printf("  command sent            : %s\n", r.sent ? "yes (WPTR moved)" : "NO (WPTR was not written)");
+        printf("  WPTR                    : %#x -> %#x ; RPTR at the start %#x, at the end %#x (%s)\n", r.old_wptr, r.new_wptr, r.rptr_start, r.rptr_end, r.rptr_end == r.new_wptr ? "reached the new WPTR" : "did NOT reach the new WPTR");
+        printf("  polls / elapsed         : %u polls, %u us ; OTG0 frame counter %u -> %u ; VBIOS ring variables %s\n", r.polls, r.elapsed_us, r.frames0, r.frames1, r.vars ? "updated and read back" : "NOT updated");
+        if (r.status == N48DR_POLL_TIMEOUT) printf("  *** RPTR is stuck: nothing was retried; do NOT send more; a cold power-off clears the firmware ***\n");
+        return r.status == N48DR_OK ? 0 : 3;
+    }
+    if (a1 && !strcmp(a1, "detect")) kind = N48DM_K_DETECT;
+    else if (a1 && !strcmp(a1, "begin")) kind = N48DM_K_BEGIN;
+    else if (a1 && !strcmp(a1, "end")) kind = N48DM_K_END;
+    else if (a1 && !strcmp(a1, "setmode")) kind = N48DM_K_SETMODE;
+    else if (a1 && !strcmp(a1, "enable")) kind = N48DM_K_ENABLE;
+    else if (a1 && !strcmp(a1, "disable")) kind = N48DM_K_DISABLE;
+    if (!kind) return dm_usage("dmubsend");
+    const int needCtx = kind != N48DM_K_BEGIN && kind != N48DM_K_END;
+    if (needCtx && !a2) return dm_usage("dmubsend");
+    const uint32_t ctx = needCtx ? (uint32_t)strtoull(a2, NULL, 0) : 0u;
+    uint32_t h = 0, d1 = 0, d2 = 0;
+    if (n48dm_spec(kind, ctx, &h, &d1, &d2) != 0u) return dm_usage("dmubsend");
+    const uint32_t pre = n48dm_slot_check(h, d1, d2);
+    if (pre != 0u || !n48dm_send_encodable(d1, d2)) { fprintf(stderr, "accel dmubsend: %s (the CLI refuses before calling; the kext checks the same list)\n", n48dr_status_name(pre ? pre : (uint32_t)N48DR_PAYLOAD_REFUSED)); return 2; }
+    uint64_t o[16];
+    printf("accel dmubsend %s: slot %08x %08x %08x (13 zero dwords)\n", a1, h, d1, d2);
+    if (dr_call(N48DM_ACT_SEND, n48dm_send_arg(h, d1, d2), o) != 0) return 1;
+    struct n48dm_send_out r;
+    n48dm_send_unpack(o + 3, &r);
+    printf("  status                  : %u (%s)\n", r.status, n48dr_status_name(r.status));
+    printf("  command sent            : %s\n", r.sent ? "yes (WPTR moved)" : "NO (WPTR was not written)");
+    printf("  window base (VRAM off)  : %#llx\n", (unsigned long long)r.base);
+    printf("  WPTR                    : %#x -> %#x ; RPTR at the start %#x, at the end %#x (%s)\n", r.old_wptr, r.new_wptr, r.rptr_start, r.rptr_end, r.rptr_end == r.new_wptr ? "reached the new WPTR" : "did NOT reach the new WPTR");
+    printf("  polls / elapsed         : %u polls (bound %u x %u us = 100 ms), %u us\n", r.polls, N48DM_POLL_MAX, N48DM_POLL_STEP_US, r.elapsed_us);
+    printf("  OTG0 frame counter      : %u -> %u (%s)\n", r.frames0, r.frames1, r.frames1 != r.frames0 ? "COUNTING" : "not counting");
+    printf("  VBIOS ring variables    : %s (+0x3114 = 0x40, +0x3118 = old RPTR, +0x311c = new WPTR)\n", r.vars ? "updated and read back" : "NOT updated");
+    if (r.status == N48DR_POLL_TIMEOUT) printf("  *** RPTR is stuck: nothing was retried and nothing else was written; do NOT send more; a cold power-off clears the firmware ***\n");
+    return r.status == N48DR_OK ? 0 : 3;
+}
+static int cmd_dmubmode(const char *a1) {
+    uint64_t op = 0;
+    if (a1 && !strcmp(a1, "save")) op = N48DM_MODE_SAVE;
+    else if (a1 && !strcmp(a1, "restore")) op = N48DM_MODE_RESTORE;
+    else if (a1) op = strtoull(a1, NULL, 0);
+    if (!a1 || !n48dm_mode_op_ok(op)) return dm_usage("dmubmode");
+    uint64_t o[16];
+    if (dr_call(N48DM_ACT_MODE, op, o) != 0) return 1;
+    const uint64_t *v = o + 3;
+    const uint32_t st = (uint32_t)(v[0] & 0xFF);
+    uint32_t blk[N48DM_MODE_DWORDS], before[N48DM_MODE_DWORDS];
+    n48dm_dwords_unpack(v, 2u, blk, N48DM_MODE_DWORDS);
+    n48dm_dwords_unpack(v, 6u, before, N48DM_MODE_DWORDS);
+    printf("accel dmubmode %s: status %u (%s) ; saved copy %s ; %s\n", a1, st, n48dr_status_name(st), (v[0] >> 24) & 1 ? "held" : "none", (v[0] >> 25) & 1 ? "a mode block was written since the last save / restore" : "window block unmodified by us");
+    printf("  window base (VRAM off)  : %#llx\n", (unsigned long long)v[1]);
+    if (st == N48DR_OK || st == N48DR_READBACK_MISMATCH) {
+        printf("  before the op +0x4c00   :"); for (unsigned i = 0; i < N48DM_MODE_DWORDS; i++) printf(" %08x", before[i]); printf("\n");
+        printf("  %s:", op == N48DM_MODE_SAVE ? "saved copy              " : "read back               "); for (unsigned i = 0; i < N48DM_MODE_DWORDS; i++) printf(" %08x", blk[i]); printf("\n");
+    }
+    return st == N48DR_OK ? 0 : 3;
+}
+static int cmd_dmubctx(const char *a1, const char *a2, const char *a3) {
+    if (!a1 || !a2 || strcmp(a2, "status") != 0 || !a3) return dm_usage("dmubctx");
+    const unsigned long long ctx = strtoull(a1, NULL, 0), val = strtoull(a3, NULL, 0);
+    if (val > 0xFFFFFFFFull || n48dm_ctx_gate(n48dm_ctx_arg((uint32_t)ctx, 0u)) != 0u || ctx > 0xFFFFull) { fprintf(stderr, "accel dmubctx: %s\n", n48dr_status_name(N48DR_CTX_REFUSED)); return 2; }
+    uint64_t o[16];
+    if (dr_call(N48DM_ACT_CTX, n48dm_ctx_arg((uint32_t)ctx, (uint32_t)val), o) != 0) return 1;
+    const uint64_t *v = o + 3;
+    const uint32_t st = (uint32_t)(v[0] & 0xFF);
+    printf("accel dmubctx %#llx status <- %#010llx: status %u (%s) ; window base %#llx ; the dword was %#010x, reads back %#010x\n", ctx, val, st, n48dr_status_name(st), (unsigned long long)v[1], (unsigned)v[3], (unsigned)(v[3] >> 32));
+    return st == N48DR_OK ? 0 : 3;
+}
+
+// ---- 0.0.631 (multi-monitor stage M4d): disp2 timing|connect|off|status - the OTG1 -> DIG2 test pattern on the HDMI display PHY C drives. Needs boot-arg navi48-metal-disp=1 AND navi48-disp2=1 (default OFF:
+// the kext answers "boot-arg navi48-disp2 is not 1" and touches nothing). The ops, the statuses and the layouts are navi48_disp2.h's (shared with the kext). The KEXT is the gate; the CLI adds a second DP check
+// around timing / connect: a `status` before (OTG0 must count) and after (OTG0 must still count and DIG1_DIG_BE_CNTL must be unchanged), and runs `disp2 off` itself if the after-check fails.
+// 0.0.633: every disp2 call names an INSTANCE: `accel disp2 <op> [1|2]`, 1 (the default) = the monitor A (OTG1 / DIG2 / PHY C, exactly as before), 2 = the monitor B SINK-C (OTG2 / DIG3 / PHY D). g_d2_inst is set once by cmd_disp2.
+static uint32_t g_d2_inst = N48D2_INST_MONA;
+/* 0.0.658 Run B: fbhold names its instance EXACTLY (n48d2_arg_ok refuses the default instance 0), so the monitor A's fbhold is packed as 1; every other monitor A op keeps the default-instance packing it was tested with. */
+static uint64_t d2_arg(uint32_t op) { return g_d2_inst == N48D2_INST_MONB ? n48d2_arg_i(op, N48D2_INST_MONB) : op == N48D2_OP_FBHOLD ? n48d2_arg_i(op, N48D2_INST_MONA) : n48d2_arg(op); }
+static int d2_usage(void) {
+    fprintf(stderr, "usage: accel disp2 timing|timing1440|connect|off|status [1|2]   (timing1440 = the monitor B's 2560x1440@60 timing, instance 2 only: `accel disp2 timing1440 2`; instance 1 = the monitor A: OTG1 / DIG2 / PHY C, the default; 2 = the monitor B: OTG2 / DIG3 / PHY D; no argument: print the run scripts)\n"
+                    "       accel disp2 plane|show|flipA|flipB|crc|planeoff|planerec 1|2    (0.0.655: the plane ops take the instance, 1 = the MONA SINK-B at 1920x1080 (buffers 127 x 64 KiB, 240-px bars), 2 = the monitor B; planerec prints the record page of the last plane op)\n"
+                    "       accel disp2 plane|show|flipA|flipB|crc|planeoff|fbhold 1|2    (0.0.652: fbhold = HOLD the plane for the rest of the boot after a successful show - IRREVERSIBLE; 0.0.658: `fbhold 1` = the MONA, `fbhold 2` = the monitor B; then `accel fbpublish 1|2`. 0.0.635: the monitor B's plane from VRAM, instance 2 ONLY: plane = draw A and B + program HUBP2 / DPP2 / MPCC2; show = DPG2 off; flipA / flipB = flip to buffer A / B; crc = OTG2 CRC; planeoff = the rollback)\n");
+    return 2;
+}
+static void d2_script(void) {
+    printf("M4d run script (0.0.631, 0.0.633). Boot-args navi48-metal-disp=1 navi48-dmubcmd=1 navi48-disp2=1. Watch BOTH screens: the DP SINK-A must stay lit and moving; the monitor A SINK-B (instance 1) or the monitor B SINK-C (instance 2) is the target.\n"
+    "  INSTANCE 1 (the monitor A, HDMI ddc2/hpd3, UNIPHY_C):\n"
+    "  pre   accel disp2 status               OTG0 frames advance across 50 ms; note DIG1_DIG_BE_CNTL; OTG1 stopped; OTG1_PHYPLL source 0; DIG2 FE off\n"
+    "  1     accel dmubsend pclk otg1-on      PLL2 -> OTG1 at 148.5 MHz: OTG1_PHYPLL_PIXEL_RATE_CNTL source becomes 2\n"
+    "  2     accel dmubsend phyc enable       PHY C, DVI, 4 lanes: the monitor A wakes (HDMI input banner, black); DIG2 BE_CLK_CNTL 0x2812, BE_EN 1\n"
+    "  3     accel disp2 status               OTG0 still counting, DIG1_DIG_BE_CNTL as at pre\n"
+    "  4     accel disp2 timing               status 0; OTG1 frames advance; DPG1_CONTROL 0x00661001 (colour squares); 15 = the DP was disturbed and the kext ran `off` itself: go to ROLLBACK\n"
+    "  5     accel disp2 connect              status 0; SYMCLKC FE_EN 1 / SRC 2 first; DIG2 FE_EN 1, BE_CNTL FE source 0x4, mapper 2: the monitor A shows the colour squares\n"
+    "  6     watch the monitor A 10 s; accel disp2 status   OTG1 counting; DIG2_DIG_FIFO_CTRL0 error bits 28-29 zero\n"
+    "  7     accel disp2 off                  DPG1 off, DIG2 FE / FIFO off, SYMCLKC FE off, mapper 0, BE FE source 0, OTG1 stopped, clocks off\n"
+    "  8     accel dmubsend phyc disable\n"
+    "  9     accel dmubsend pclk otg1-off\n"
+    "  post  accel disp2 status               OTG1 stopped, DIG2 FE off, mapper 0, OTG0 counting, DIG1_DIG_BE_CNTL and SYMCLKB as at pre\n"
+    "  ROLLBACK (at ANY step where OTG0 stops counting, DIG1_DIG_BE_CNTL or SYMCLKB changes, or the DP screen changes): accel disp2 off ; accel dmubsend phyc disable ; accel dmubsend pclk otg1-off ; stop, no retry this boot.\n"
+    "  The monitor A with no signal 10 s after `connect` while OTG1 counts: capture `accel disp2 status` and `accel dispcensus 8`, run the ROLLBACK, stop.\n"
+    "  INSTANCE 2 (the monitor B, HDMI ddc3/hpd4, UNIPHY_D; 1920x1080@60 CEA VIC 16, which its EDID lists). First `accel scdcread 3 0x01 1` (sink version) works with no video at all.\n"
+    "  pre   accel disp2 status 2             OTG0 counting; OTG2 stopped; OTG2_PHYPLL source 0; DIG3 FE off\n"
+    "  1     accel dmubsend pclk otg2-on      PLL3 -> OTG2 at 148.5 MHz: OTG2_PHYPLL_PIXEL_RATE_CNTL source becomes 3 (SUSPECTED by analogy; `disp2 timing 2` refuses with status 8 if it is not 3)\n"
+    "  2     accel dmubsend phyd enable       PHY D, DVI, 4 lanes, HPD4: DIG3 BE_CLK_CNTL mode 2 + clock, BE_EN 1\n"
+    "  3     accel disp2 timing 2 ; accel disp2 connect 2 ; accel dmubsend digd setup (the order of the monitor A's run)\n"
+    "  4     accel scdcread 3 0x40 1          Status_Flags_0: clock detected + ch0..ch2 locked means the monitor B locks onto our TMDS (no one needs to watch); accel scdcread 3 0x50 7 = the character error counters\n"
+    "  5     accel disp2 status 2            (prints pages 1-3) ; accel disp2 off 2 ; accel dmubsend phyd disable ; accel dmubsend pclk otg2-off\n"
+    "  ROLLBACK: accel disp2 off 2 ; accel dmubsend phyd disable ; accel dmubsend pclk otg2-off.\n"
+    "  INSTANCE 2 at 2560x1440@60 (0.0.634, the monitor B's CTA DTD 241.50 MHz; the same order as the 1080p run with the three -1440 templates):\n"
+    "  pre   accel dispcensus plane > plane-pre.txt   (M4a census, READ ONLY; also `accel dispcensus dpwatch` = the nine DP registers every op below compares)\n"
+    "  1     accel dmubsend pclk otg2-1440-on     PLL3 -> OTG2 at 241.5 MHz (template 13)\n"
+    "  2     accel dmubsend phyd enable-1440      PHY D, DVI, 4 lanes, HPD4, symclk 241.5 MHz (template 14)\n"
+    "  3     accel disp2 timing1440 2 ; accel disp2 connect 2 ; accel dmubsend digd setup-1440   (template 15)\n"
+    "  4     read the SCDC lock status exactly as in the 1080p run above ; accel disp2 status 2 ; then accel disp2 off 2 ; accel dmubsend phyd disable ; accel dmubsend pclk otg2-off\n"
+    "  EVERY disp2 op and EVERY dmubsend template prints the DP watch before -> after (MPC_OUT0_MUX, MPCC0 TOP / BOT / OPP, HUBP0 DCHUBP_CNTL incl. underflow 30:28, DPPCLK0 DTO, DPPCLK_CTRL bit 0, DET0, COMPBUF; 0.0.635: and ODM0 underflow, DPP_TOP0, MPCC0 UPDATE_LOCK_SEL, OTG2_GLOBAL_CONTROL2, HUBP0's primary address) and says DP DISTURBED on any change.\n"
+    "  THE MONB'S PLANE (0.0.635, M4c / M4d; after step 3 above has the monitor B lit with the DPG pattern, boot-args as above; EVERY op is instance 2 and prints the gate values):\n"
+    "  p1    accel disp2 plane 2     draws bars A and B (white..black / reversed) in VRAM, verifies 24 points each, programs HUBP2 / DPP2 / MPCC2 (0.0.638: the HUBP clock is a bare enable, four recorded reads - HUBP2_HUBP_CLK_CNTL, DCCG_GATE_DISABLE_CNTL6, DCCG_GATE_DISABLE_CNTL, DOMAIN2_PG_STATUS - ~1 ms later and after the 2-frame wait, no clock-status wait), (0.0.643) takes OTG2's update lock (optc3_lock), writes the address, joins MPCC2 + the mux and unblanks back to back inside it, releases it, and only then gates FLIP_PENDING = 0 and EARLIEST_INUSE = A (no pre-unblank gate: a blanked HUBP never consumes a pending address); a failed WAIT prints its register and last value; any failure runs the rollback itself (which zeroes the address)\n"
+    "  p2    accel disp2 crc 2       CRC with the DPG pattern on (repeat 10x: stable); accel disp2 show 2   DPG2 off: the monitor B shows eight colour bars, white on the left (buffer A) ; accel disp2 crc 2 (repeat: stable, differs from the DPG's)\n"
+    "  p3    accel disp2 flipB 2 ; accel disp2 crc 2 ; accel disp2 flipA 2 ; accel disp2 crc 2   (B's bars are reversed; the CRC returns to A's); repeat the cycle 5 times\n"
+    "  p4    accel scdcread 3 0x40 (0x4F expected) ; accel disp2 status 2 ; accel disp2 planeoff 2 (the rollback: DPG2 on, blank, mux / MPCC2 none, clocks off, then the buffers are freed ONLY if HUBP2's clock reads off)\n"
+    "  p5    (0.0.652, M5; boot-args as above PLUS navi48-fb2=1 and NO navi48-metal-ws; the aux kext com.navi48.accelprobe 0.0.4 installed at its NEW path, tools/native/navi48accel/INSTALL.md)  after p1, p2 and `accel disp2 show 2` (the plane SHOWN on buffer A, p3 may be skipped):\n"
+    "        accel disp2 fbhold 2    HOLDS the plane for the rest of the boot (IRREVERSIBLE: the pair is pinned, plane / show / flip / planeoff / timing / connect / off are REFUSED, `crc` and the status pages still work) ; accel disp2 status 2   reports it ; accel fbpublish 2   re-reads the gates and the monitor B's EDID, publishes the display nub: `ioreg -c IOFramebuffer -l` shows TWO framebuffers. A reboot is the only way back. (0.0.658: the same for the monitor A with `fbhold 1` / `fbpublish 1`, see Run B below.)\n"
+    "  `accel disp2 off 2` is REFUSED while HUBP2's clock is on: run planeoff first (0.0.636: so are timing, connect and timing1440 on instance 2). planeoff on a plane that is already off answers OK (nothing to do), so a runner may always call it.\n");
+    printf("monitor A plane run (0.0.655; instance 1, 1920x1080@60; the monitor B SHOWN on its static plane - `plane 2` + `show 2` - with NO `fbhold` and NO `fbpublish` this boot, the DP untouched). Boot-args navi48-metal-disp=1 navi48-dmubcmd=1 navi48-disp2=1. RUN A (unattended; the spec's Run A):\n"
+    "  A0    accel disp2 status 2 ; accel disp2 crc 2   (the monitor B's HUBP2 underflow bits and CRC_A = 0x78097625 / 0x4bd14c15 BEFORE any monitor A op; the kext's MONB WATCH compares nine monitor B rows around every monitor A op)\n"
+    "  A1    accel dispcensus mona   (before) ; accel dmubsend pclk otg1-on ; accel dmubsend phyc enable ; accel dmubsend digc setup ; accel disp2 timing 1 ; accel disp2 connect 1 ; accel dispcensus mona   (after)\n"
+    "  A2    accel disp2 plane 1     draws bars A and B (1920x1080, 240-px bars, white..black / reversed) in two 127 x 64 KiB buffers, verifies 24 points each (rows 0 / 540 / 1079), programs HUBP1 / DPP1 / MPCC1 with the 24 explicit 1080p values (no COPY0), LOCKs OTG1, unblanks, UNLOCKs\n"
+    "  A3    accel disp2 crc 1       (DPG on) ; accel disp2 show 1 ; accel disp2 crc 1 x10 (stable; the DIG2 output CRC line is informational (DIG2 CRC not enabled) and is NOT a pass criterion) ; accel disp2 flipB 1 ; accel disp2 flipA 1 (x5) ; accel disp2 planeoff 1\n"
+    "  PASS: every step status 0, the monitor B CRC unchanged (CRC_A), `monitor B watch ... unchanged` after every monitor A op, DIG2 FIFO error 0 (the DIG2 output CRC is informational (DIG2 CRC not enabled): never a pass criterion); whether the image shows needs the user (the monitor A has no SCDC). `accel disp2 off 1` is REFUSED while HUBP1's clock is on: run planeoff first.\n");
+    printf("Run B (0.0.658; BOTH displays as macOS framebuffers: the monitor B = instance 2 = display index 1 (OTG2, DDC line 3, 2560x1440), the monitor A = instance 1 = display index 2 (OTG1, DDC line 2, 1920x1080); UNATTENDED, 0 users, the DP at the login window, console root, variant variants/configs/stage17-native-1440-metal-disp-amfi-fb2.plist = navi48-native=1 navi48-metal=1 navi48-metal-disp=1 navi48-dmubcmd=1 navi48-disp2=1 navi48-fb2=1, NO navi48-metal-ws, and NO GPU-mode recipe afterwards; the aux kext com.navi48.accelprobe 0.0.6 installed at /Library/Extensions/Navi48Accel-0.0.6.kext, tools/native/navi48accel/INSTALL.md step 4b). ORDER: nothing is published until BOTH planes are HELD, and there is ONE WindowServer restart, after both nubs exist:\n"
+    "  B0    the monitor B chain (the F2 order): accel dmubsend pclk otg2-1440-on ; accel disp2 timing1440 2 ; accel dmubsend phyd enable-1440 ; accel dmubsend digd setup-1440 ; accel disp2 connect 2\n"
+    "  B1    accel disp2 plane 2 ; accel disp2 crc 2 ; accel disp2 show 2 ; accel disp2 crc 2   (the monitor B shows the static bars A; CRC_A = 0x78097625 / 0x4bd14c15)\n"
+    "  B2    the monitor A chain (the Run A order): accel dmubsend pclk otg1-on ; accel dmubsend phyc enable ; accel dmubsend digc setup ; accel disp2 timing 1 ; accel disp2 connect 1 ; accel disp2 plane 1 ; accel disp2 show 1 ; accel disp2 crc 1   (after EVERY monitor A op: `monitor B watch ... unchanged` and the monitor B CRC still CRC_A)\n"
+    "  B3    accel disp2 fbhold 2 ; accel disp2 fbhold 1   (each IRREVERSIBLE this boot and each reads the gates only; from here NO dmubsend of any kind and no plane / show / flip / planeoff / timing / connect / off on a HELD instance: the kext REFUSES them, the monitor A's pclk otg1 / phyc / digc templates included)\n"
+    "  B4    accel fbpublish 2 ; accel fbpublish 1   (each re-reads ITS gates and ITS EDID and publishes ITS nub, Navi48DisplayIndex 1 / 2; both must answer status 0; either order works and neither touches the other's state)\n"
+    "  B5    ioreg -c IOFramebuffer -l   must show TWO Navi48Framebuffer nodes (one per index) beside RDNA4FB, and an AppleDisplay under each; if WindowServer has not added them: ONE `killall -9 WindowServer` at 0 users (never with a user logged in), then ioreg and `system_profiler SPDisplaysDataType` again (3 displays: the DP, the monitor B, the monitor A)\n"
+    "  STOP rule: any non-zero status or exit 3 / 4 / DP DISTURBED BEFORE the holds: accel disp2 planeoff 1 ; accel disp2 off 1 ; accel dmubsend phyc disable ; accel dmubsend pclk otg1-off ; accel disp2 planeoff 2 ; then reboot. AFTER a hold nothing can be undone (a held instance refuses every teardown): reboot.\n");
+}
+static int d2_status_call(uint32_t r[N48D2_STAT_COUNT], int print) {
+    uint64_t o[16];
+    if (dr_call(N48D2_ACT, d2_arg(N48D2_OP_STATUS), o) != 0) return -1;
+    const uint64_t *v = o + 3;
+    const uint32_t st = (uint32_t)(v[0] & 0xFF);
+    if (st != N48D2_OK) { printf("accel disp2 status: status %u (%s)\n", st, n48d2_status_name(st)); return -1; }
+    for (uint32_t i = 0; i < N48D2_STAT_COUNT; i++) r[i] = (uint32_t)(v[1 + i / 2u] >> (32u * (i & 1u)));
+    if (print) {
+        if ((v[0] >> N48D2_STAT_HELD_BIT) & 1u) printf("  *** instance %u's plane is HELD for this boot (0.0.652, `disp2 fbhold`): the pair is pinned, plane / show / flip / planeoff / fbhold / timing / connect / off are REFUSED until a reboot ***\n", g_d2_inst);
+        const unsigned otg = g_d2_inst, dig = g_d2_inst + 1u;
+        const struct n48d2_stat_reg *tbl = n48d2_stat_tbl(g_d2_inst);
+        printf("accel disp2 status (instance %u: OTG%u / DIG%u): status 0 (OK)\n", g_d2_inst, otg, dig);
+        for (uint32_t i = 0; i < N48D2_STAT_COUNT; i++) printf("  %-32s %#06x = %#010x\n", tbl[i].name, tbl[i].abs, r[i]);
+        printf("  rates (50 ms windows; 60 Hz is ~3 frames): OTG%u ~%u Hz, OTG0 ~%u Hz\n", otg, ((r[3] - r[2]) & 0xFFFFFFu) * 20u, ((r[22] - r[21]) & 0xFFFFFFu) * 20u);
+        printf("  OTG%u %s (frames %u -> %u in 50 ms), master %u ; DPG%u %s ; DIG%u FE %s, source OTG%u, mode %u, FIFO %s, FIFO error %u ; BE mode %u, clock %u, enable %u, FE source %#x ; mapper link %u ; OTG%u PHYPLL source %u\n",
+               otg, r[3] != r[2] ? "COUNTING" : "stopped", r[2], r[3], r[0] & 1u, otg, (r[9] & 1u) ? "ON" : "off", dig, (r[13] & 1u) ? "ON" : "off", r[11] & 7u, r[12] & 7u, (r[14] & 1u) ? "on" : "off", (r[14] >> 28) & 3u,
+               r[16] & 7u, (r[16] >> 4) & 1u, r[17] & 1u, (r[15] >> 8) & 0x7Fu, r[18] & 7u, otg, r[20] & 7u);
+        printf("  DP side: OTG0 %s (frames %u -> %u in 50 ms) ; DIG1_DIG_BE_CNTL %#010x\n", r[22] != r[21] ? "COUNTING" : "*** NOT COUNTING ***", r[21], r[22], r[23]);
+    }
+    return 0;
+}
+static int d2_status2_call(int print) {      // 0.0.632: the second status page (op 5, reads only): SYMCLK, OTG PIXEL_RATE_CNTL, OTG V_TOTAL_CONTROL, FMT control / clamp, HUBP control
+    uint64_t o[16];
+    if (dr_call(N48D2_ACT, d2_arg(N48D2_OP_STATUS2), o) != 0) return -1;
+    const uint64_t *v = o + 3;
+    const uint32_t st = (uint32_t)(v[0] & 0xFF);
+    if (st != N48D2_OK) { printf("accel disp2 status (page 2): status %u (%s)\n", st, n48d2_status_name(st)); return -1; }
+    if (print) {
+        const struct n48d2_stat_reg *tbl = n48d2_stat2_tbl(g_d2_inst);
+        printf("accel disp2 status, page 2 (reads only):\n");
+        for (uint32_t i = 0; i < N48D2_STAT2_COUNT; i++) printf("  %-32s %#06x = %#010x\n", tbl[i].name, tbl[i].abs, (uint32_t)(v[1 + i / 2u] >> (32u * (i & 1u))));
+    }
+    return 0;
+}
+// 0.0.633: the third status page (op 6, reads only): the instance's DIG TMDS / FIFO / CRC registers, DIG1's two for comparison, SYMCLKB (the DP's: it must not change) and the instance's SYMCLK. r may be NULL.
+static int d2_status3_call(uint32_t r[N48D2_STAT3_COUNT], int print) {
+    uint64_t o[16];
+    uint32_t loc[N48D2_STAT3_COUNT];
+    if (!r) r = loc;
+    if (dr_call(N48D2_ACT, d2_arg(N48D2_OP_STATUS3), o) != 0) return -1;
+    const uint64_t *v = o + 3;
+    const uint32_t st = (uint32_t)(v[0] & 0xFF);
+    if (st != N48D2_OK) { printf("accel disp2 status (page 3): status %u (%s)\n", st, n48d2_status_name(st)); return -1; }
+    for (uint32_t i = 0; i < N48D2_STAT3_COUNT; i++) r[i] = (uint32_t)(v[1 + i / 2u] >> (32u * (i & 1u)));
+    if (print) {
+        const struct n48d2_stat_reg *tbl = n48d2_stat3_tbl(g_d2_inst);
+        printf("accel disp2 status, page 3 (reads only):\n");
+        for (uint32_t i = 0; i < N48D2_STAT3_COUNT; i++) printf("  %-32s %#06x = %#010x\n", tbl[i].name, tbl[i].abs, r[i]);
+        printf("  FIFO_CTRL1 levels %#010x ; HDMI_STATUS %#010x ; TMDS_CTL_BITS %#010x (DP's %#010x) ; SYMCLKB %#010x (the DP's: must equal its value before the op)\n", r[2], r[3], r[6], r[11], r[N48D2_STAT3_SYMCLKB]);
+    }
+    return 0;
+}
+// 0.0.635 (M4c / M4d): the gate values an op returns (n48d2_unpack_plane), decoded. Reads only.
+static void d2_print_gates(uint32_t op, const struct n48d2_out *r, const uint32_t *g) {
+    const uint32_t hc = g[N48D2_GT_HUBP_CNTL], fc = g[N48D2_GT_FLIP_CTL];
+    const uint64_t early = ((uint64_t)(g[N48D2_GT_EARLY_HI] & 0xFFFFu) << 32) | g[N48D2_GT_EARLY_LO];
+    const uint64_t A = ((uint64_t)g[N48D2_GT_A_HI] << 32) | g[N48D2_GT_A_LO], B = ((uint64_t)g[N48D2_GT_B_HI] << 32) | g[N48D2_GT_B_LO];
+    const uint32_t meta = g[N48D2_GT_META];
+    const unsigned I = g_d2_inst;      /* 0.0.655: the pipe number of the instance (1 = the monitor A, 2 = the monitor B); its DIG is I + 1 */
+    printf("  gates (final reads; 'stale' = ODM%u sticky bits already set before op 8 wrote anything):\n", I);
+    printf("    HUBP%u_DCHUBP_CNTL       : %#010x  underflow(30:28) %u  SEG_ALLOC_ERR %u  TIMEOUT(23:20) %#x  BLANK_EN %u  NO_OUTSTANDING_REQ %u  VTG_SEL %u\n", I, hc, (hc & N48D2_HUBP_UNDERFLOW_MASK) >> 28, (hc & N48D2_HUBP_SEG_ALLOC_ERR_MASK) ? 1u : 0u, (hc & N48D2_HUBP_TIMEOUT_MASK) >> 20, hc & 1u, (hc >> 1) & 1u, (hc >> 4) & 0xFu);
+    printf("    HUBP%u_HUBP_CLK_CNTL     : %#010x  clock enable %u  status(23:20) %#x\n", I, g[N48D2_GT_HUBP_CLK], g[N48D2_GT_HUBP_CLK] & 1u, (g[N48D2_GT_HUBP_CLK] >> 20) & 0xFu);
+    printf("    ODM%u_OPTC_INPUT_GLOBAL  : %#010x  underflow occurred(10) %u  occurred-current(13) %u  (stale %#x)\n", I, g[N48D2_GT_ODM2], (g[N48D2_GT_ODM2] >> 10) & 1u, (g[N48D2_GT_ODM2] >> 13) & 1u, (meta >> 16) & 0x2400u);
+    printf("    DCN_VM_FAULT_STATUS     : %#010x%s\n", g[N48D2_GT_VMFAULT], g[N48D2_GT_VMFAULT] ? "  *** VM FAULT ***" : "");
+    printf("    DCHUBBUB_DET%u_CTRL      : %#010x  size %u  current %u (3 wanted)\n", I, g[N48D2_GT_DET2], g[N48D2_GT_DET2] & N48D2_DET_SIZE_MASK, (g[N48D2_GT_DET2] & N48D2_DET_CUR_MASK) >> 8);
+    printf("    EARLIEST_INUSE          : %#llx  (A %#llx, B %#llx) -> %s\n", (unsigned long long)early, (unsigned long long)A, (unsigned long long)B, A && early == A ? "= A" : B && early == B ? "= B" : "NEITHER A NOR B");
+    printf("    FLIP_CONTROL            : %#010x  FLIP_PENDING %u\n", fc, (fc & N48D2_FLIP_PENDING_MASK) ? 1u : 0u);
+    printf("    MPCC%u_STATUS            : %#x (idle|busy|disabled = %u|%u|%u)   MPC_OUT%u_MUX %#010x (mux %u)   DIG%u_FIFO_CTRL0 %#010x (error 29:28 %u)\n", I, g[N48D2_GT_MPCC_STATUS], g[N48D2_GT_MPCC_STATUS] & 1u, (g[N48D2_GT_MPCC_STATUS] >> 1) & 1u, (g[N48D2_GT_MPCC_STATUS] >> 2) & 1u, I, g[N48D2_GT_MPC_MUX], g[N48D2_GT_MPC_MUX] & 0xFu, I + 1u, g[N48D2_GT_FIFO], (g[N48D2_GT_FIFO] >> 28) & 3u);
+    if (op == N48D2_OP_CRC) printf("    OTG%u CRC                : RG %#010x  B %#010x\n", I, g[N48D2_GT_CRC_RG], g[N48D2_GT_CRC_B]);
+    if (I == N48D2_INST_MONA) {       /* 0.0.655: the monitor B watch of an MONA op (META bits 16..24; rows 0 DPPCLK_CTRL bit 6, 1 DPPCLK2_DTO, 2 MPC_OUT2_MUX, 3 MPCC2 TOP/OPP, 4 DET2 current, 5 HUBP2 underflow, 6 EARLIEST_INUSE2, 7 DENTIST_DISPCLK_CNTL, 8 OTG2 counting) */
+        const uint32_t w2 = (meta >> 16) & 0x1FFu;
+        printf("    monitor B watch (kext)       : %s (changed mask %#x)\n", w2 ? "*** THE MONB WAS DISTURBED ***" : "all nine rows unchanged across the op", w2);
+    }
+    printf("    plane                   : stage %u (%s), latched buffer %c, buffers %s\n", meta & 0xFFu, (meta & 0xFFu) == N48D2_PL_NONE ? "none" : (meta & 0xFFu) == N48D2_PL_ALLOC ? "allocated" : (meta & 0xFFu) == N48D2_PL_PLANE ? "PLANE up, DPG on" : (meta & 0xFFu) == N48D2_PL_SHOWN ? "SHOWN, DPG off" : (meta & 0xFFu) == N48D2_PL_HELD ? "HELD for this boot (0.0.652: pinned, irreversible; Navi48Framebuffer scans A)" : (meta & 0xFFu) == N48D2_PL_LEAKED ? "LEAKED" : "released", ((meta >> 12) & 1u) ? 'B' : 'A', ((meta >> 8) & 1u) ? "RELEASED to the allocator" : (meta & 0xFFu) == N48D2_PL_LEAKED ? "LEAKED (the HUBP clock did not read off or NO_OUTSTANDING_REQ timed out: reboot)" : "kept");
+    (void)r;
+}
+// 0.0.638: the RECORD page of the last plane op (op 13 `planerec`; the kext reads NO register for it): the recorded reads of op 8 (no gate) and the register + LAST value of every WAIT that timed out. Returns 0 and prints, or -1.
+static int d2_print_rec(void) {
+    uint64_t o[16];
+    uint32_t rec[N48D2_REC_N];
+    if (dr_call(N48D2_ACT, d2_arg(N48D2_OP_PLANEREC), o) != 0) return -1;
+    if ((o[3] & 0xFFu) != N48D2_OK) { printf("  recorded reads          : planerec answered status %u (%s)\n", (unsigned)(o[3] & 0xFFu), n48d2_status_name((uint32_t)(o[3] & 0xFFu))); return -1; }
+    n48d2_unpack_rec(o + 3, rec);
+    const uint32_t valid = rec[N48D2_RC_VALID];
+    printf("  recorded reads (planerec; READS ONLY, never a gate; valid %#x: bit0 sample A, bit1 sample B, bit2 WAIT record, bit3 rollback WAIT record, bit4 DET2 before the unblank, bit5 post-unblank health read, bit6 address left in place):\n", valid);
+    printf("                                 HUBP%u_HUBP_CLK_CNTL     DCCG_GATE_DISABLE_CNTL6  DCCG_GATE_DISABLE_CNTL   DOMAIN%u_PG_STATUS\n", g_d2_inst, g_d2_inst);
+    for (uint32_t k = 0; k < 2u; k++) {
+        const uint32_t *s = &rec[4u * k];
+        if (!(valid & (k ? N48D2_RV_B : N48D2_RV_A))) { printf("    %-27s: not taken\n", k ? "after the 2-frame wait" : "~1 ms after the clock enable"); continue; }
+        printf("    %-27s: %#010x (enable %u, status 23:20 %#x)  %#010x  %#010x  %#010x\n", k ? "after the 2-frame wait" : "~1 ms after the clock enable", s[0], s[0] & 1u, (s[0] >> 20) & 0xFu, s[1], s[2], s[3]);
+    }
+    if (valid & N48D2_RV_DET0) printf("    DCHUBBUB_DET%u_CTRL before the unblank: %#010x (current %u)\n", g_d2_inst, rec[N48D2_RC_DET0], (unsigned)((rec[N48D2_RC_DET0] >> 8) & 0xFu));
+    if (valid & N48D2_RV_UND) printf("    post-unblank health read (RECORDED, not gated): HUBP%u_DCHUBP_CNTL %#010x (underflow 30:28 %#x, TIMEOUT 23:20 %#x), ODM%u_OPTC_INPUT_GLOBAL_CONTROL %#010x\n", g_d2_inst, rec[N48D2_RC_UND_HUBP], (rec[N48D2_RC_UND_HUBP] >> 28) & 7u, (rec[N48D2_RC_UND_HUBP] >> 20) & 0xFu, g_d2_inst, rec[N48D2_RC_UND_ODM]);
+    printf("    plane state             : %s\n", (valid & N48D2_RV_HELD) ? "HELD for this boot (disp2 fbhold ran; irreversible, a reboot releases it)" : "not held");
+    if (valid & N48D2_RV_ADDRKEPT) printf("    rollback: NO_OUTSTANDING_REQ never asserted - the primary address was LEFT in place and the buffers are leaked\n");
+    if (valid & N48D2_RV_WAIT) printf("    wait timed out at %s (%#06x) last value %#010x\n", n48d2_wait_reg_name(rec[N48D2_RC_WAIT_ABS]), rec[N48D2_RC_WAIT_ABS], rec[N48D2_RC_WAIT_VAL]);
+    if (valid & N48D2_RV_RB) printf("    rollback: wait timed out at %s (%#06x) last value %#010x\n", n48d2_wait_reg_name(rec[N48D2_RC_RB_ABS]), rec[N48D2_RC_RB_ABS], rec[N48D2_RC_RB_VAL]);
+    return 0;
+}
+/* 0.0.657: the monitor B watch outcome of an MONA op from the result the kext already returns (no kext change): an monitor A op that ends in N48D2_DP_DISTURBED because of the watch carries (first changed row + 1) in the 4-bit guard field (n48d2_w2_first); status OK means the watch compared equal. Runners grep for CHANGED. */
+static void d2_print_monb_watch(uint32_t status, uint32_t guard) {
+    static const char *const rows[9] = { "DPPCLK_CTRL bit 6", "DPPCLK2_DTO", "MPC_OUT2_MUX", "MPCC2 TOP/OPP", "DET2 current", "HUBP2 underflow", "EARLIEST_INUSE2", "DENTIST_DISPCLK_CNTL", "OTG2 counting" };
+    if (status == N48D2_DP_DISTURBED && guard >= 1u && guard <= 9u) printf("  monitor B watch: CHANGED (row %u, %s; the kext rolled the monitor A op back)\n", guard - 1u, rows[guard - 1u]);
+    else if (status == N48D2_DP_DISTURBED) printf("  monitor B watch: unchanged (the DP-side check, not the monitor B watch, ended the op)\n");
+    else if (status == N48D2_OK || status == N48D2_WAIT_TIMEOUT) printf("  monitor B watch: unchanged\n");
+    else printf("  monitor B watch: not evaluated (status %u, %s: the op did not complete)\n", status, n48d2_status_name(status));
+}
+static int cmd_disp2_plane(const char *a1, uint32_t op, uint32_t bufIdx) {
+    uint32_t pre[N48D2_STAT_COUNT], dpw0[N48D2_DPX_BUF], dpw1[N48D2_DPX_BUF];
+    const int haveWatch = dp_watch_read(dpw0) == 0;
+    if (op != N48D2_OP_PLANEOFF) {         /* the rollback must work even when these reads fail; everything else is REFUSED by the CLI without them */
+        if (!haveWatch) { printf("accel disp2 %s: REFUSED by the CLI: the DP watch (dispcensus pages 10 and 43) could not be read; nothing was sent\n", a1); return 1; }
+        if (d2_status_call(pre, 0) != 0) return 1;
+        if (pre[N48D2_STAT_OTG0_FC_A] == pre[N48D2_STAT_OTG0_FC_A + 1u]) { printf("accel disp2 %s: REFUSED by the CLI: OTG0's frame counter did not advance in 50 ms (%u); nothing was sent\n", a1, pre[N48D2_STAT_OTG0_FC_A]); return 3; }
+    } else if (!haveWatch) printf("  (the DP watch could not be read before planeoff: the plane-side check is skipped)\n");
+    uint64_t o[16];
+    if (dr_call(N48D2_ACT, d2_arg(op) | ((uint64_t)bufIdx << 16), o) != 0) return 1;
+    struct n48d2_out r;
+    uint32_t g[N48D2_GATES];
+    n48d2_unpack_plane(o + 3, &r, g);
+    printf("accel disp2 %s %u: status %u (%s)\n", a1, g_d2_inst, r.status, n48d2_status_name(r.status));
+    if (r.status == N48D2_DP_DISTURBED && g_d2_inst == N48D2_INST_MONA && r.guard != 0u) printf("  *** the MONB WATCH tripped (0.0.655): the first changed row is row %u (1 + index) of: 0 DPPCLK_CTRL bit 6, 1 DPPCLK2_DTO, 2 MPC_OUT2_MUX, 3 MPCC2 TOP/OPP, 4 DET2 current, 5 HUBP2 underflow, 6 EARLIEST_INUSE2, 7 DENTIST_DISPCLK_CNTL, 8 OTG2 counting; the kext rolled the monitor A op back ***\n", r.guard - 1u);
+    printf("  steps                   : %u written of this op's last list ; wait timeouts %u%s\n", r.done, r.timeouts, r.auto_off ? " ; the ROLLBACK (planeoff list) was run by the kext" : "");
+    if (r.fail != 0xFFu) printf("  stopped / refused at    : step %u of the last list\n", r.fail);
+    if (r.status == N48D2_GUARD_REFUSED) printf("  guard                   : %s\n", r.guard == N48D2_G_FORBIDDEN ? "a FORBIDDEN register (the DP's path)" : r.guard == N48D2_G_OTHER ? "a register of the OTHER instance" : r.guard == N48D2_G_VALUE ? "a forbidden VALUE" : "an unlisted register");
+    if (r.pre_abs) printf("  precheck / gate register: %#06x = %#010x\n", r.pre_abs, r.pre_val);
+    if (r.pre_wait) printf("  wait timed out at %s (%#06x) last value %#010x\n", n48d2_wait_reg_name(r.pre_abs), r.pre_abs, r.pre_val);      /* 0.0.638: the gate that failed was a WAIT / a polled gate: its register and the LAST value read (no post-rollback read needed) */
+    if (op != N48D2_OP_FBHOLD) {      /* 0.0.652: fbhold reads the gates only (no frame counter is read; the DP watch below is the CLI's own before / after) */
+        printf("  OTG0 frames (DP)        : %u -> %u (%s)\n", r.f0a, r.f0b, r.f0b != r.f0a ? "COUNTING" : "*** NOT COUNTING ***");
+        printf("  OTG%u frames             : %u -> %u (%s)\n", g_d2_inst, r.f1a, r.f1b, r.f1b != r.f1a ? "counting" : "stopped");
+    }
+    if (r.dp_changed) printf("  kext DP change mask     : %#x (bits 0..5 the six DP registers, 6 SYMCLKB, 7 OTG0 not counting)  *** DP DISTURBED ***\n", r.dp_changed);
+    if (r.dpx_changed) printf("  kext DP-plane mask      : %#x (bit i = row i of the 15-row DP watch below; bit 14 = HUBP0's primary-address rule)  *** DP DISTURBED ***\n", r.dpx_changed);
+    d2_print_gates(op, &r, g);
+    if (op == N48D2_OP_PLANE || op == N48D2_OP_FBHOLD || r.timeouts != 0u) (void)d2_print_rec();      /* 0.0.638: op 8 always (the recorded reads), any op that timed out a WAIT (its register + last value) */
+    int watchBad = 0;
+    if (haveWatch) {
+        if (dp_watch_read(dpw1) != 0) printf("  *** the DP watch AFTER the op could not be read: treat the DP as unchecked ***\n");
+        else if (dp_watch_report(a1, dpw0, dpw1) != 0u) watchBad = 1;
+    }
+    if (r.dp_changed || r.dpx_changed || r.status == N48D2_DP_DISTURBED) watchBad = 1;
+    if (watchBad && op == N48D2_OP_FBHOLD) { printf("  *** DP DISTURBED around `accel disp2 fbhold` (the op reads only and wrote nothing): investigate; `planeoff` is REFUSED once the plane is HELD ***\n"); return 4; }
+    if (watchBad && op != N48D2_OP_PLANEOFF) {
+        printf("  *** ABORT: DP DISTURBED during `accel disp2 %s`: running `accel disp2 planeoff %u` now ***\n", a1, g_d2_inst);
+        uint64_t o2[16];
+        if (dr_call(N48D2_ACT, d2_arg(N48D2_OP_PLANEOFF), o2) == 0) { struct n48d2_out r2; uint32_t g2[N48D2_GATES]; n48d2_unpack_plane(o2 + 3, &r2, g2); printf("  planeoff: status %u (%s)\n", r2.status, n48d2_status_name(r2.status)); }
+        return 4;
+    }
+    if (watchBad) return 4;
+    if (op == N48D2_OP_CRC && g_d2_inst == N48D2_INST_MONA && r.status == N48D2_OK) {      /* 0.0.655: the DIG2 output CRC as the SECOND WITNESS (status3 page, READS ONLY; the DIG CRC must have been enabled by the firmware: nothing in the spec writes DIG2_DIG_OUTPUT_CRC_CNTL, whose census value is 0x00000100) */
+        uint32_t r3[N48D2_STAT3_COUNT];
+        if (d2_status3_call(r3, 0) == 0) printf("  DIG2 output CRC (informational (DIG2 CRC not enabled)): CNTL %#010x RESULT %#010x%s\n", r3[8], r3[9], (r3[8] & 1u) ? "  (informational only: NOT a pass criterion)" : "  (CRC_EN is 0: the DIG CRC is not running; informational only, NOT a pass criterion)");
+    }
+    if (op == N48D2_OP_FBHOLD && r.status == N48D2_OK) printf("  *** the %s's plane (instance %u) is now HELD for the rest of this boot (the pair is pinned; nothing can move or free it). Next: `accel fbpublish %u` (needs boot-arg navi48-fb2=1). A reboot is the only way back. ***\n", g_d2_inst == N48D2_INST_MONA ? "monitor A" : "monitor B", g_d2_inst, g_d2_inst);
+    return r.status == N48D2_OK ? 0 : 3;
+}
+// ---- 0.0.652 (multi-monitor stage M5): `accel fbpublish 2|1` (action 105). After `disp2 plane N`, `show N` and `fbhold N` (the plane HELD, the pair pinned) the kext re-reads the live gates and the display's EDID, builds the IMMUTABLE snapshot
+// and publishes Navi48DisplayNub under the GPU's PCI device (0.0.658: ONE nub per display index: `fbpublish 2` = the monitor B = instance 2 = Navi48DisplayIndex 1, `fbpublish 1` = the monitor A = instance 1 = Navi48DisplayIndex 2); the aux kext's Navi48Framebuffer
+// (com.navi48.accelprobe 0.0.4; 0.0.6 for the monitor A) then matches it and WindowServer sees another display. Needs boot-args navi48-metal-disp=1
+// navi48-disp2=1 navi48-fb2=1 (NOT navi48-metal-ws). NO withdraw: a reboot is the only way back. The statuses and their texts are Navi48DisplayOps.h's (N48_FBP_*).
+// ---- 0.0.663 (ReBAR + Stage 2 review S3): `accel vramstat` (action 108). READ-ONLY. Layout (out[3..15] = v[0..12]): v0 status (0 ok, 1 the ladder / allocator is not up), v1 visible total, v2 visible free, v3 hi total, v4 hi free, v5 vramLimit,
+// v6 mapped BAR0 bytes, v7 BAR0 phys, v8 VRAM bytes, v9 vramBase, v10 the GMC's CPU-visible size, v11 bit0 hi pool exists, v12 hi pool base. Needs boot-arg navi48-metal-disp=1.
+static int cmd_vramstat(const char *a1) {
+    if (a1) { fprintf(stderr, "usage: accel vramstat   (no argument; read-only)\n"); return 2; }
+    uint64_t o[16];
+    if (dr_call(108, 0, o) != 0) return 1;
+    const uint64_t *v = o + 3;
+    if (v[0] > 1) { printf("accel vramstat: status %llu (refused)\n", (unsigned long long)v[0]); return 1; }
+    printf("accel vramstat: BAR0 phys %#llx, mapped %llu MiB (%#llx bytes), vramLimit %llu MiB (%#llx), VRAM %llu MiB, vramBase %llu MiB\n", (unsigned long long)v[7], (unsigned long long)(v[6] >> 20), (unsigned long long)v[6],
+           (unsigned long long)(v[5] >> 20), (unsigned long long)v[5], (unsigned long long)(v[8] >> 20), (unsigned long long)(v[9] >> 20));
+    {   /* 0.0.664: v11 bit0 hi pool, bit1 BAR0's ReBAR capability found, bits 8..31 its current size in MiB, bits 32..63 its supported-sizes mask (bit k = 1 MiB << k) */
+        const uint32_t mask = (uint32_t)(v[11] >> 32);
+        if (v[11] & 2u) {
+            printf("  ReBAR BAR0  : current %llu MiB, supported-sizes mask %#x:", (unsigned long long)((v[11] >> 8) & 0xFFFFFFu), mask);
+            unsigned lowest = 99; for (unsigned k = 0; k < 32; k++) if ((mask >> k) & 1u) { printf(" %llu MiB", (unsigned long long)(1ull << k)); if (lowest == 99) lowest = k; }
+            if (lowest != 99) printf("  (smallest %llu MiB = ResizeAppleGpuBars code %u)", (unsigned long long)(1ull << lowest), lowest);
+            printf("\n");
+        } else printf("  ReBAR BAR0  : capability not found / not readable\n");
+    }
+    if (v[0] == 1) { printf("  allocator: NOT up (the ladder did not reach the GMC allocator); only the BAR0 fields above are valid\n"); return 1; }
+    printf("  visible pool: %llu bytes total (%llu MiB), %llu bytes free (%llu MiB), GMC visible size %llu MiB\n", (unsigned long long)v[1], (unsigned long long)(v[1] >> 20), (unsigned long long)v[2], (unsigned long long)(v[2] >> 20), (unsigned long long)(v[10] >> 20));
+    if (v[11] & 1u) printf("  hi pool     : %llu bytes total (%llu MiB), %llu bytes free (%llu MiB), based at vram+%#llx\n", (unsigned long long)v[3], (unsigned long long)(v[3] >> 20), (unsigned long long)v[4], (unsigned long long)(v[4] >> 20), (unsigned long long)v[12]);
+    else printf("  hi pool     : not created\n");
+    return 0;
+}
+// ---- 0.0.659 (M6 Stage 1a): `accel m6stat [0|1|2|3]` (action 106). READ-ONLY report of the multi-display routing (boot-arg navi48-m6=1 and navi48-metal-disp=1): the per-pipe submits, the IOSurface IDs the kernel learned (3 per pipe are expected), the
+// ambiguous ones, the refused presents and their reasons, the performs completed without a copy (pipes on the monitor A / the monitor B), the vblank stamps per OTG and the AGDC answers. No argument prints all four pages (0.0.660: page 3 = per-pipe last-transaction age and the table's self-healing counters). Layout: native_disp.cpp n48disp_verb.
+static int m6stat_page(unsigned page) {
+    uint64_t o[16];
+    if (dr_call(106, page, o) != 0) return 1;
+    const uint64_t *v = o + 3;
+    const uint32_t st = (uint32_t)v[0];
+    if (st != 0) { printf("accel m6stat %u: status %u (%s)\n", page, st, st == 2 ? "display is OFF: boot-arg navi48-metal-disp is not 1" : "refused"); return 1; }
+    const uint64_t f = v[1];
+    printf("accel m6stat %u: navi48-m6 latch %s; pipe adopted %s; armed %s; %u pipes recorded; surface table %u IDs\n", page, (f & 1u) ? "ON" : "OFF", (f & 2u) ? "yes" : "no", (f & 4u) ? "yes" : "no", (unsigned)((f >> 8) & 0xFFu), (unsigned)((f >> 16) & 0xFFFFu));
+    static const char *const nm[3] = { "instance 0 (DP, OTG0)", "instance 1 (monitor A, OTG1)", "instance 2 (monitor B, OTG2)" };
+    if (page == 0) {
+        for (int i = 0; i < 3; i++) printf("  %-24s : %llu transactions, %llu surface IDs seen (3 expected)\n", nm[i], (unsigned long long)v[2 + i], (unsigned long long)v[5 + i]);
+        printf("  ambiguous IDs (seen on two pipes)      : %llu (0 expected)\n  presents refused by the routing guard   : %llu\n  performs completed without any copy    : %llu (pipes on instance 1 / 2)\n  submits on a pipe with no known framebuffer: %llu (0 expected)\n  DP presents the guard let through      : %llu\n",
+               (unsigned long long)v[8], (unsigned long long)v[9], (unsigned long long)v[10], (unsigned long long)v[11], (unsigned long long)v[12]);
+    } else if (page == 1) {
+        for (int i = 0; i < 3; i++) printf("  %-24s : %llu vblank stamps written, %llu refused, last period %llu ns\n", nm[i], (unsigned long long)v[2 + i], (unsigned long long)v[5 + i], (unsigned long long)v[8 + i]);
+        printf("  guard refusals: unknown %llu, ambiguous %llu, other instance %llu, no readable ID %llu\n", (unsigned long long)(v[11] & 0xFFFFu), (unsigned long long)((v[11] >> 16) & 0xFFFFu), (unsigned long long)((v[11] >> 32) & 0xFFFFu), (unsigned long long)((v[11] >> 48) & 0xFFFFu));
+        printf("  AGDC: %llu framebuffers in the last 0x980 reply; 0x921 answered for a non-DP endpoint %llu times, 0x711 %llu times; last endpoint dword %llu\n", (unsigned long long)(v[12] & 0xFFu), (unsigned long long)((v[12] >> 8) & 0xFFFFu), (unsigned long long)((v[12] >> 24) & 0xFFFFu), (unsigned long long)((v[12] >> 40) & 0xFFFFFFu));
+    } else if (page == 4) {   /* 0.0.662 (Stage 2 item 10): the AGDC replies PER INSTANCE and the endpoint dwords seen */
+        for (int i = 0; i < 3; i++) printf("  %-24s : AGDC 0x921 answered %llu times, 0x711 %llu times\n", nm[i], (unsigned long long)v[2 + i], (unsigned long long)v[5 + i]);
+        printf("  endpoint dwords seen (bitmask 0x%llx:", (unsigned long long)v[8]);
+        for (int e = 0; e < 32; e++) if ((v[8] >> e) & 1ull) printf(" %d%s", e, e == 31 ? "+" : "");
+        printf(" - exactly {0 1 2} expected with a three-entry list); nfb of the last 0x980 reply %llu; endpoints outside the list %llu (last endpoint dword %llu)\n", (unsigned long long)v[9], (unsigned long long)v[10], (unsigned long long)v[11]);
+    } else if (page == 3) {   /* 0.0.660: the pipes' clocks (K1) and the table's self-healing */
+        for (int i = 0; i < 3; i++) {
+            if (v[2 + i] == ~0ull) printf("  %-24s : no transaction since boot; %llu submits learned since the last table reset\n", nm[i], (unsigned long long)v[5 + i]);
+            else printf("  %-24s : last transaction %llu ms ago; %llu submits learned since the last table reset\n", nm[i], (unsigned long long)v[2 + i], (unsigned long long)v[5 + i]);
+        }
+        printf("  table: %llu IDs re-learned after their old owner went stale, %llu entries evicted (full table), %llu resets, %llu routed-present sightings\n", (unsigned long long)v[8], (unsigned long long)v[9], (unsigned long long)(v[10] & 0xFFFFu), (unsigned long long)(v[10] >> 16));
+        printf("  property: %llu writes, %llu publishes folded into another publisher's; AGDC endpoints outside the 0x980 list: %llu (last endpoint dword %llu)\n", (unsigned long long)(v[11] & 0xFFFFFFFFu), (unsigned long long)(v[11] >> 32), (unsigned long long)(v[12] & 0xFFFFFFFFu), (unsigned long long)(v[12] >> 32));
+    } else {
+        for (int i = 0; i < 3; i++) { printf("  %-24s : IDs", nm[i]); for (int k = 0; k < 3; k++) { const uint64_t e = v[2 + i * 3 + k]; if (e) printf(" %u%s", (unsigned)(e & 0xFFFFFFFFu), (e >> 32) ? "(AMBIGUOUS)" : ""); else printf(" -"); } printf("\n"); }
+        printf("  learns: %llu submits learned, %llu table writes published; declined: txn %llu, pipe mismatch %llu, plane %llu, class %llu, id read %llu; entries evicted %llu, bad instance %llu, busy %llu\n", (unsigned long long)(v[11] & 0xFFFFFFFFu), (unsigned long long)(v[11] >> 32),
+               (unsigned long long)(v[12] & 0xFFu), (unsigned long long)((v[12] >> 8) & 0xFFu), (unsigned long long)((v[12] >> 16) & 0xFFu), (unsigned long long)((v[12] >> 24) & 0xFFu), (unsigned long long)((v[12] >> 32) & 0xFFu), (unsigned long long)((v[12] >> 40) & 0xFFu), (unsigned long long)((v[12] >> 48) & 0xFFu), (unsigned long long)((v[12] >> 56) & 0xFFu));
+    }
+    return 0;
+}
+// ---- 0.0.661 (M6 Stage 1b) + 0.0.662 (M6 Stage 2): `accel m6xstat [page]` / `accel m6xstat <1|2> <page|all>` (action 107). READ-ONLY report of an HDMI instance's scanout (instance 2 = the monitor B, HUBP2 / OTG2, the default; instance 1 = the monitor A, HUBP1 / OTG1) behind boot-args navi48-m6=1 AND navi48-m6flip=1 (instance 1: and navi48-m6flip1=1).
+// ONE argument is a PAGE of the monitor B, exactly as 0.0.661 (the 1b kit parses it); TWO arguments are the instance then the page (or `all`). The action argument is page | instance << 8 (the monitor B is sent as the plain page: an older kernel still understands it). Page 0: acquired / restoring / the counters (presents, latched,
+// replaced, refused, reuse_inuse_refused, watchdog restores, restores and failures) / A and B; page 1: the three slots (MC, presents, latches), writer refusals, the last address written; page 2: the LIVE registers the run kit reads every minute
+// (HUBP2 underflow bits, ODM2 bit 10, the VM fault register, FLIP_PENDING, the programmed address and EARLIEST_INUSE2, OTG2's frame counter). No argument prints all three pages.
+static int m6xstat_page(unsigned inst, unsigned page) {
+    uint64_t o[16];
+    const unsigned tag = inst == 1u ? 0x10u : 0x20u;
+    if (dr_call(107, inst == 1u ? (uint64_t)(page | (1u << 8)) : (uint64_t)page, o) != 0) return 1;
+    const uint64_t *v = o + 3;
+    const uint64_t f = v[0];
+    const int off = inst == 1u ? ((f & 3u) != 3u || !(f & (1u << 11))) : ((f & 3u) != 3u);
+    if (inst == 1u) printf("accel m6xstat inst1 page %u: navi48-m6 %s, navi48-m6flip %s, navi48-m6flip1 %s%s\n", page, (f & 1u) ? "ON" : "OFF", (f & 2u) ? "ON" : "OFF", (f & (1u << 11)) ? "ON" : "OFF", off ? "  (instance 1 is OFF: nothing was read)" : "");
+    else printf("accel m6xstat %u: navi48-m6 %s, navi48-m6flip %s%s\n", page, (f & 1u) ? "ON" : "OFF", (f & 2u) ? "ON" : "OFF", off ? "  (instance 2 is OFF: nothing was read)" : "");
+    if (off) return 0;
+    if (page == 0) {
+        printf("  instance %u: acquired %s, restoring %s, wantRestore %s, restoreFailed %s, console learned %s; generation %u, acquires %u\n", inst, (f & 4u) ? "YES" : "no", (f & 8u) ? "YES" : "no", (f & 16u) ? "YES" : "no", (f & 32u) ? "YES" : "no", (f & 64u) ? "yes" : "no", (unsigned)(v[1] & 0xFFFFFFFFu), (unsigned)(v[1] >> 32));
+        printf("  A (console) 0x%llx  B 0x%llx\n", (unsigned long long)v[2], (unsigned long long)v[3]);
+        { const unsigned gh = (unsigned)((f >> 8) & 7u); if (gh) printf("  GPU-HELD: %s (EARLIEST_INUSE%u differing from A is NOT a latch failure while instance %u is acquired)\n", gh <= 3 ? "the hardware fetches client slot" : "EARLIEST_INUSE is not a registered slot", inst, inst); if (gh && gh <= 3) printf("  ... slot 0x%x\n", tag + gh - 1); }
+        printf("  presents %llu, latched %llu, replaced %llu, refused %llu, latched-by-poll %llu, REUSE_INUSE_REFUSED %llu\n", (unsigned long long)(v[4] & 0xFFFFFFFFu), (unsigned long long)(v[4] >> 32), (unsigned long long)(v[5] & 0xFFFFFFFFu), (unsigned long long)(v[5] >> 32), (unsigned long long)(v[6] & 0xFFFFFFFFu), (unsigned long long)(v[6] >> 32));
+        printf("  watchdog restores %llu, restores %llu (failed %llu); Acquire refused %llu (last reason %llu: 1 busy 2 stage 3 buffers 4 cur 5 window 6 not-counting 7 geometry 8 restore-exact 9 address 10 pending 11 hubp 12 vm-fault 13 watchdog 14 dead read); idle %llu ms; M6 table gen %llu\n", (unsigned long long)(v[7] & 0xFFFFFFFFu), (unsigned long long)(v[7] >> 32), (unsigned long long)v[8] & 0xFFFFFFFFull, (unsigned long long)(v[8] >> 32), (unsigned long long)(v[9] & 0xFFFFFFFFu), (unsigned long long)v[10], (unsigned long long)(v[9] >> 32));
+        printf("  last restore %llu us; last address written 0x%llx\n", (unsigned long long)v[11], (unsigned long long)v[12]);
+    } else if (page == 1) {
+        for (int i = 0; i < 3; i++) printf("  slot 0x%x: MC 0x%llx, presents %llu, latches %llu\n", tag + i, (unsigned long long)v[1 + i], (unsigned long long)(v[4 + i] & 0xFFFFFFFFu), (unsigned long long)(v[4 + i] >> 32));
+        printf("  writer refusals %llu, write failures %llu; untagged presents refused %llu; geometry refusals %llu\n", (unsigned long long)(v[7] & 0xFFFFFFFFu), (unsigned long long)(v[7] >> 32), (unsigned long long)(v[8] & 0xFFFFFFFFu), (unsigned long long)(v[8] >> 32));
+        printf("  first latch %llu ns, last latch %llu ns; front slot 0x%x, pending slot 0x%x (0xffffffff = none); last address written 0x%llx\n", (unsigned long long)v[9], (unsigned long long)v[10], (unsigned)(v[11] & 0xFFFFFFFFu), (unsigned)(v[11] >> 32), (unsigned long long)v[12]);
+    } else {
+        const uint32_t hc = (uint32_t)v[1], vmf = (uint32_t)(v[1] >> 32), odm = (uint32_t)v[2], fcr = (uint32_t)v[3];
+        printf("  HUBP%u_DCHUBP_CNTL 0x%08x (underflow %u, BLANK_EN %u, VTG_SEL %u); DCN_VM_FAULT_STATUS 0x%08x; ODM%u OPTC_INPUT_GLOBAL_CONTROL 0x%08x (bit 10 %u); OTG%u frame counter %llu\n", inst, hc, (hc >> 28) & 7u, hc & 1u, (hc >> 4) & 0xFu, vmf, inst, odm, (odm >> 10) & 1u, inst, (unsigned long long)(v[2] >> 32));
+        printf("  FLIP_CONTROL 0x%08x (FLIP_PENDING %u); viewport 0x%08x; programmed 0x%x:0x%08x; EARLIEST_INUSE%u 0x%x:0x%08x; pitch 0x%x; SURFACE_CONFIG 0x%x; SURFACE_CONTROL 0x%x; VMID_SETTINGS_0 0x%x; OTG%u_CONTROL 0x%08x\n", fcr, (fcr >> 8) & 1u, (unsigned)(v[3] >> 32),
+               (unsigned)(v[4] >> 32), (unsigned)v[4], inst, (unsigned)(v[5] >> 32), (unsigned)v[5], (unsigned)v[6], (unsigned)(v[6] >> 32), (unsigned)v[7], (unsigned)(v[7] >> 32), inst, (unsigned)v[8]);
+        printf("  disp2 plane state of instance %u: stage %u (6 = HELD), cur %u (0 = A), pair pinned %u; A 0x%llx B 0x%llx\n", inst, (unsigned)(v[9] & 0xFFu), (unsigned)((v[9] >> 8) & 0xFFu), (unsigned)((v[9] >> 16) & 1u), (unsigned long long)v[10], (unsigned long long)v[11]);
+    }
+    return 0;
+}
+static int cmd_m6xstat(const char *a1, const char *a2) {
+    const char *use = "usage: accel m6xstat [0|1|2]   (the monitor B: 0 state and counters, 1 slots and refusals, 2 the live HUBP2 / OTG2 registers; no argument = all three)\n       accel m6xstat <1|2> <0|1|2|all>   (instance 1 = the monitor A, 2 = the monitor B, then the page)\n";
+    if (a2) {   // 0.0.662: instance, then page
+        if (strcmp(a1, "1") && strcmp(a1, "2")) { fputs(use, stderr); return 2; }
+        const unsigned inst = (unsigned)(a1[0] - '0');
+        if (!strcmp(a2, "all")) { int rc = 0; for (unsigned p = 0; p < 3; p++) rc |= m6xstat_page(inst, p); return rc; }
+        if (strcmp(a2, "0") && strcmp(a2, "1") && strcmp(a2, "2")) { fputs(use, stderr); return 2; }
+        return m6xstat_page(inst, (unsigned)(a2[0] - '0'));
+    }
+    if (a1 && strcmp(a1, "0") && strcmp(a1, "1") && strcmp(a1, "2")) { fputs(use, stderr); return 2; }
+    if (a1) return m6xstat_page(2u, (unsigned)(a1[0] - '0'));      // ONE argument: a page of the monitor B, as 0.0.661
+    int rc = 0;
+    for (unsigned p = 0; p < 3; p++) rc |= m6xstat_page(2u, p);
+    return rc;
+}
+static int cmd_m6stat(const char *a1) {
+    if (a1 && strcmp(a1, "0") && strcmp(a1, "1") && strcmp(a1, "2") && strcmp(a1, "3") && strcmp(a1, "4")) { fprintf(stderr, "usage: accel m6stat [0|1|2|3|4]   (4: the AGDC replies per instance and the endpoint dwords seen; 0: pipes and surface IDs, 1: stamps per OTG, guard reasons and AGDC, 2: the IDs and the learn bookkeeping, 3: each pipe's last-transaction age and the table's self-healing; no argument = all four; read-only; needs boot-args navi48-metal-disp=1 and, for anything but zeros, navi48-m6=1)\n"); return 2; }
+    if (a1) return m6stat_page((unsigned)(a1[0] - '0'));
+    int rc = 0;
+    for (unsigned p = 0; p < 5; p++) rc |= m6stat_page(p);
+    return rc;
+}
+
+static int cmd_fbpublish(const char *a1) {
+    if (!a1 || (strcmp(a1, "2") && strcmp(a1, "1"))) { fprintf(stderr, "usage: accel fbpublish 2|1   (2 = the monitor B, 1 = the monitor A: the disp2 instance; after `accel disp2 plane N` / `show N` / `fbhold N`; boot-args navi48-metal-disp=1 navi48-disp2=1 navi48-fb2=1; NO withdraw: reboot)\n"); return 2; }
+    const unsigned inst = (unsigned)(a1[0] - '0');      /* 0.0.658: the instance (2 = the monitor B, display index 1; 1 = the monitor A, display index 2) */
+    uint64_t o[16];
+    if (dr_call(105, inst, o) != 0) return 1;
+    const uint64_t *v = o + 3;
+    const uint32_t st = (uint32_t)(v[0] & 0xFFu);
+    printf("accel fbpublish %u: status %u (%s)\n", inst, st, n48disp_fbp_name(st));
+    if (st == N48_FBP_OK) {
+        printf("  nub registry entry ID   : %llu   (Navi48DisplayNub, Navi48DisplayIndex %u, attached to the GPU's IOPCIDevice)\n", (unsigned long long)v[1], (unsigned)((v[6] >> 32) & 0xFFFFu));
+        printf("  aperture (CPU)          : %#llx, %llu bytes (BAR0 + buffer A's offset)   MC A %#llx   MC B %#llx\n", (unsigned long long)v[2], (unsigned long long)v[3], (unsigned long long)v[4], (unsigned long long)v[5]);
+        printf("  mode                    : %ux%u, refresh %#x (16.16 = %.3f Hz), pixel clock %llu Hz, EDID %u bytes\n", (unsigned)(v[6] & 0xFFFFu), (unsigned)((v[6] >> 16) & 0xFFFFu), (unsigned)(v[7] & 0xFFFFFFFFu), (double)(uint32_t)(v[7] & 0xFFFFFFFFu) / 65536.0, (unsigned long long)v[8], (unsigned)(v[7] >> 32));
+    }
+    if (st != N48_FBP_NOT_HELD && st != N48_FBP_OFF && st != N48_FBP_BAD_ARG && st != N48_FBP_EXISTS && st != N48_FBP_PIPE_ADOPTED && st != N48_FBP_WS_OPEN && st != N48_FBP_METAL_NUB) {
+        const uint64_t early = v[10];
+        printf("  live gates              : EARLIEST_INUSE %#llx  HUBP<inst>_DCHUBP_CNTL %#010x  FLIP_CONTROL %#010x  DCN_VM_FAULT_STATUS %#010x  hold verdict %#x (0 = buffer A is the front buffer, healthy)\n", (unsigned long long)early, (unsigned)v[11], (unsigned)(v[11] >> 32), (unsigned)v[12], (unsigned)(v[12] >> 32));
+        printf("  EDID / registry / BAR0  : block 0 checksum %u, header %u, block 1 checksum %u ; RDNA4FB EDID,DDC<line> present %u, block 0 equals it %u ; aperture ok %u ; DDC status %u\n", (unsigned)(v[9] & 1u), (unsigned)((v[9] >> 1) & 1u), (unsigned)((v[9] >> 2) & 1u), (unsigned)((v[9] >> 3) & 1u), (unsigned)((v[9] >> 4) & 1u), (unsigned)((v[9] >> 5) & 1u), (unsigned)((v[9] >> 8) & 0xFFu));
+    }
+    if (st == N48_FBP_OK) printf("  Next (0 users, console root): `ioreg -c IOFramebuffer -l` must show another Navi48Framebuffer (one per display index) and its AppleDisplay (the monitor B: \"SINK-C\"; the monitor A: SINK-B); `system_profiler SPDisplaysDataType` lists it; the WindowServer pid unchanged (or ONE `killall -9 WindowServer` at 0 users after both nubs exist).\n");
+    return st == N48_FBP_OK ? 0 : 3;
+}
+static int cmd_disp2(const char *a1, const char *a2) {
+    if (!a1) { d2_script(); return 0; }
+    {   /* 0.0.635 (M4c / M4d): the plane ops: `accel disp2 plane|show|flipA|flipB|crc|planeoff|planerec 2` (the monitor B); 0.0.655: ... and `... 1` (the monitor A, 1080p60); 0.0.658: fbhold for either instance too */
+        const uint32_t pop = !strcmp(a1, "plane") ? N48D2_OP_PLANE : !strcmp(a1, "show") ? N48D2_OP_SHOW : !strcmp(a1, "flipA") || !strcmp(a1, "flipB") ? N48D2_OP_FLIP : !strcmp(a1, "crc") ? N48D2_OP_CRC : !strcmp(a1, "planeoff") ? N48D2_OP_PLANEOFF : !strcmp(a1, "fbhold") ? N48D2_OP_FBHOLD : !strcmp(a1, "planerec") ? N48D2_OP_PLANEREC : 0u;
+        if (pop != 0u) {
+            if (!a2 || (strcmp(a2, "1") && strcmp(a2, "2"))) { fprintf(stderr, "accel disp2 %s: the plane ops take the instance: `accel disp2 %s 1` (the monitor A, 1920x1080) or `accel disp2 %s 2` (the monitor B, 2560x1440)%s\n", a1, a1, a1, pop == N48D2_OP_FBHOLD ? "; fbhold names its instance too (0.0.658: 1 = the monitor A, 2 = the monitor B)" : ""); return 2; }
+            g_d2_inst = !strcmp(a2, "1") ? N48D2_INST_MONA : N48D2_INST_MONB;
+            if (pop == N48D2_OP_PLANEREC) return d2_print_rec() == 0 ? 0 : 3;
+            return cmd_disp2_plane(a1, pop, !strcmp(a1, "flipB") ? 1u : 0u);
+        }
+    }
+    const uint32_t op = !strcmp(a1, "timing") ? N48D2_OP_TIMING : !strcmp(a1, "timing1440") ? N48D2_OP_TIMING1440 : !strcmp(a1, "connect") ? N48D2_OP_CONNECT : !strcmp(a1, "off") ? N48D2_OP_OFF : !strcmp(a1, "status") ? N48D2_OP_STATUS : 0u;
+    if (op == 0u) return d2_usage();
+    if (op == N48D2_OP_TIMING1440 && (!a2 || strcmp(a2, "2"))) { fprintf(stderr, "accel disp2 timing1440: the 2560x1440@60 timing is the monitor B's alone: `accel disp2 timing1440 2`\n"); return 2; }
+    if (a2) {      // 0.0.633: the instance
+        const unsigned long inst = strtoul(a2, NULL, 0);
+        if (strcmp(a2, "1") && strcmp(a2, "2")) return d2_usage();
+        g_d2_inst = (uint32_t)inst;
+    }
+    uint32_t pre[N48D2_STAT_COUNT], post[N48D2_STAT_COUNT], pre3[N48D2_STAT3_COUNT], post3[N48D2_STAT3_COUNT];
+    if (op == N48D2_OP_STATUS) return (d2_status_call(pre, 1) == 0 && d2_status2_call(1) == 0 && d2_status3_call(NULL, 1) == 0) ? 0 : 3;     // pages 1, 2 and 3 are printed in order
+    const int guarded = op == N48D2_OP_TIMING || op == N48D2_OP_TIMING1440 || op == N48D2_OP_CONNECT;
+    uint32_t dpw0[N48D2_DPX_BUF], dpw1[N48D2_DPX_BUF];
+    int haveWatch = dp_watch_read(dpw0) == 0;      /* 0.0.634: the DP's plane side before the op (dispcensus page 10) */
+    int havePre3 = 0;
+    if (guarded) {        // the CLI's own pre-check: OTG0 counting, and SYMCLKB noted
+        if (!haveWatch) { printf("accel disp2 %s: REFUSED by the CLI: the DP watch (dispcensus page 10) could not be read; nothing was sent\n", a1); return 1; }
+        if (d2_status_call(pre, 0) != 0) return 1;
+        if (pre[N48D2_STAT_OTG0_FC_A] == pre[N48D2_STAT_OTG0_FC_A + 1u]) { printf("accel disp2 %s: REFUSED by the CLI: OTG0's frame counter did not advance in 50 ms (%u); nothing was sent\n", a1, pre[N48D2_STAT_OTG0_FC_A]); return 3; }
+        if (d2_status3_call(pre3, 0) != 0) return 1;
+        havePre3 = 1;
+    } else {              // `off` must work even when the reads fail (it is the rollback): the DP checks are best effort there
+        havePre3 = d2_status3_call(pre3, 0) == 0;
+        if (!haveWatch) printf("  (the DP watch could not be read before `off`: the plane-side check is skipped)\n");
+    }
+    uint64_t o[16];
+    if (dr_call(N48D2_ACT, d2_arg(op), o) != 0) return 1;
+    struct n48d2_out r;
+    n48d2_unpack(o + 3, &r);
+    printf("accel disp2 %s %u: status %u (%s)\n", a1, g_d2_inst, r.status, n48d2_status_name(r.status));
+    if (g_d2_inst == N48D2_INST_MONA) d2_print_monb_watch(r.status, r.guard);      /* 0.0.657: timing 1 / connect 1 / off 1 print the monitor B watch outcome too */
+    printf("  steps                   : %u of %u written ; wait timeouts %u%s\n", r.done, r.total, r.timeouts, r.auto_off ? " ; `off` was run by the kext (rollback)" : "");
+    if (op == N48D2_OP_CONNECT) printf("  FIFO reset (enc35)      : %s\n", n48d2_symclk_report(&r));     // 0.0.632: did the FE symbol clock exist when the FIFO was reset?
+    if (r.fail != 0xFFu) printf("  stopped / refused at    : step %u\n", r.fail);
+    if (r.status == N48D2_GUARD_REFUSED) printf("  guard                   : %s\n", r.guard == N48D2_G_FORBIDDEN ? "a FORBIDDEN register (the DP's path)" : r.guard == N48D2_G_OTHER ? "a register of the OTHER instance" : r.guard == N48D2_G_VALUE ? "a forbidden VALUE" : "an unlisted register");
+    if (r.pre_abs) printf("  precheck                : register %#06x = %#010x\n", r.pre_abs, r.pre_val);
+    printf("  OTG0 frames (DP)        : %u -> %u (%s)\n", r.f0a, r.f0b, r.f0b != r.f0a ? "COUNTING" : "*** NOT COUNTING ***");
+    printf("  OTG%u frames             : %u -> %u (%s)\n", g_d2_inst, r.f1a, r.f1b, r.f1b != r.f1a ? "counting" : "stopped");
+    static const char *const dpn[N48D2_DP_REGS] = { "OTG0_OTG_CONTROL", "DIG1_DIG_FE_CNTL", "DIG1_DIG_BE_CLK_CNTL", "DIG1_DIG_BE_CNTL", "DIG1_DIG_BE_EN_CNTL", "DIG1_STREAM_MAPPER" };
+    for (unsigned i = 0; i < N48D2_DP_REGS; i++) printf("  %-23s : %#010x -> %#010x%s\n", dpn[i], r.dp_before[i], r.dp_after[i], r.dp_before[i] != r.dp_after[i] ? "  *** CHANGED ***" : "");
+    if (r.dpx_changed) printf("  kext DP-plane change mask : %#x (bit i = row i of the DP watch below)  *** DP DISTURBED ***\n", r.dpx_changed);
+    printf("  after                   : OTG%u_CONTROL %#010x ; DPG%u_CONTROL %#010x ; DIG%u FE_EN %#x FE_CLK_CNTL %#010x FIFO_CTRL0 %#010x BE_CNTL %#010x\n", g_d2_inst, r.otg1_ctl, g_d2_inst, r.dpg_ctl, g_d2_inst + 1u, r.fe_en, r.fe_clk, r.fifo, r.be_cntl);
+    /* 0.0.634: SYMCLKB before / after for EVERY op (the status3 pair; the old per-op line printed unpacked scalars) and the DP plane watch after the op */
+    int watchBad = 0;
+    {
+        int havePost3 = d2_status3_call(post3, 0) == 0;
+        if (havePre3 && havePost3) printf("  SYMCLKB_CLOCK_ENABLE    : %#010x -> %#010x%s\n", pre3[N48D2_STAT3_SYMCLKB], post3[N48D2_STAT3_SYMCLKB], pre3[N48D2_STAT3_SYMCLKB] != post3[N48D2_STAT3_SYMCLKB] ? "  *** CHANGED ***" : "");
+        else printf("  SYMCLKB_CLOCK_ENABLE    : not compared (a status3 read failed)\n");
+        if (havePre3 && havePost3 && pre3[N48D2_STAT3_SYMCLKB] != post3[N48D2_STAT3_SYMCLKB]) { watchBad = 1; printf("  *** DP DISTURBED (SYMCLKB changed) ***\n"); }
+        if (haveWatch) {
+            if (dp_watch_read(dpw1) != 0) printf("  *** the DP watch AFTER the op could not be read: treat the DP as unchecked ***\n");
+            else if (dp_watch_report(a1, dpw0, dpw1) != 0u) watchBad = 1;
+        }
+    }
+    if (guarded) {        // the CLI's own post-check: OTG0 still counting, DIG1_DIG_BE_CNTL and SYMCLKB unchanged, the DP plane watch unchanged, else `disp2 off` at once
+        int bad = d2_status_call(post, 0) != 0;
+        if (!bad && (watchBad || r.dpx_changed != 0u)) bad = 1;
+        if (!bad && (post[N48D2_STAT_OTG0_FC_A] == post[N48D2_STAT_OTG0_FC_A + 1u] || post[23] != pre[23] || post3[N48D2_STAT3_SYMCLKB] != pre3[N48D2_STAT3_SYMCLKB])) bad = 1;
+        if (bad) {
+            printf("  *** ABORT: the DP check after %s failed (OTG0 %u -> %u, DIG1_DIG_BE_CNTL %#010x -> %#010x, SYMCLKB %#010x -> %#010x): running `accel disp2 off %u` now; then run `accel dmubsend %s disable` and `accel dmubsend pclk otg%u-off` ***\n",
+                   a1, post[N48D2_STAT_OTG0_FC_A], post[N48D2_STAT_OTG0_FC_A + 1u], pre[23], post[23], pre3[N48D2_STAT3_SYMCLKB], post3[N48D2_STAT3_SYMCLKB], g_d2_inst, g_d2_inst == N48D2_INST_MONB ? "phyd" : "phyc", g_d2_inst);
+            uint64_t o2[16];
+            if (dr_call(N48D2_ACT, d2_arg(N48D2_OP_OFF), o2) == 0) { struct n48d2_out r2; n48d2_unpack(o2 + 3, &r2); printf("  disp2 off: status %u (%s), %u of %u steps\n", r2.status, n48d2_status_name(r2.status), r2.done, r2.total); }
+            return 4;
+        }
+        printf("  CLI DP check            : OTG0 counting (%u -> %u), DIG1_DIG_BE_CNTL unchanged (%#010x), SYMCLKB unchanged (%#010x), DP plane watch unchanged\n", post[N48D2_STAT_OTG0_FC_A], post[N48D2_STAT_OTG0_FC_A + 1u], post[23], post3[N48D2_STAT3_SYMCLKB]);
+    }
+    if (watchBad && !guarded) return 4;     /* `off` itself disturbed the DP: nothing more can be run safely; the caller must stop */
+    return r.status == N48D2_OK ? 0 : 3;
+}
+
 static int cmd_accel(const char *what, const char *arg, const char *arg2, const char *arg3) {
     // 0 = status, 1 = fire, 2 = re-drive AMDHardware::setMemoryAllocationsEnabled(true)
     // so the 68 MiB page-table VRAM allocation it makes can be traced; see
@@ -752,8 +1683,8 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     // SURFACE_EARLIEST_INUSE: the console A or flip mode's B) into the kext by SDMA, then this tool pulls it and writes a 256-byte
     // header + the raw surface to [file] (default ./scanout-full-<n>-<time>.n48scan; never over an existing file) and frees it
     // (`scanout 10`). READ-ONLY toward the display; decode with tools/runkit/scanout2png.py.
-    // notes/design/SCANOUT-SELFTEST-FULL.md; 7 is 0.0.416, notes/design/SDMA-GCR.md; 8 is 0.0.417,
-    // notes/design/SDMA-DCC-NOPTE.md D7 - the 1920x1080 UNIFORM-probe copy of mode 6's live case).
+    // an internal design note; 7 is 0.0.416, an internal design note; 8 is 0.0.417,
+    // an internal design note D7 - the 1920x1080 UNIFORM-probe copy of mode 6's live case).
     // 6 (0.0.414, section 950) is the FULL-GEOMETRY SDMA self-test: one call, the 256x256 section 719 control then
     // the live 1920x1080 ADDR3 64KB_2D geometry, on our own three scratch VRAM buffers. 7 (0.0.416, section 953) is
     // the SDMA CACHE-RINSE instrument: `scanout 7 <vramOff>` copies a 256 KiB plane window linearly into our scratch
@@ -802,7 +1733,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     else if (what && !strcmp(what, "ucprobe")) in = 81;
     else if (what && !strcmp(what, "fbbench")) in = 68;
     else if (what && !strcmp(what, "fbwc")) in = 69;
-    // 82 - 0.0.417 (notes/design/SDMA-DCC-NOPTE.md, D1; section 957). `sdmadcc [0|1|2]`: the SDMA0_DCC_CNTL
+    // 82 - 0.0.417 (an internal design note, D1; section 957). `sdmadcc [0|1|2]`: the SDMA0_DCC_CNTL
     // no-PTE read-decompression / write-compression switch. 0 READ SDMA0_DCC_CNTL (GC[0]+0x34) and
     // SDMA1_DCC_CNTL (GC[0]+0x634) raw and decoded per set; 1 CAPTURE SDMA0's value on first use, write
     // captured & ~0x00015554 (only the eight *_COMP_EN_n bits), read back and report; 2 RESTORE the captured
@@ -872,6 +1803,55 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     //     killall -9 WindowServer            (within 15 s; no `pipearm 1` dance and no 120 s spacing needed)
     //     navi48test accel pipereload 1      (optional: the window should read closed, "closed by slot 267" 1)
     else if (what && !strcmp(what, "pipereload")) in = 90;
+    // 91..93 - 0.0.622 (multi-monitor stage M1, an internal design note): the display instruments. All need boot-arg navi48-metal-disp=1 (admitted past 82 only then).
+    //     ddcread <line 2|3> <block 0..3> : an EDID block over the HDMI DDC line with the DC_I2C engine (writes only that engine's registers, after the arbitration read says it is free)
+    //     dmubring [0|1..25|0x80]          : READ-ONLY DMUB state and ring decode (the ring is beyond the BAR0 aperture on this card: reported, not read)
+    //     dispcensus [0|1|2..9]            : READ-ONLY census of power gates, DIG, OTG, DCCG / PHY PLL and hot-plug registers
+    else if (what && !strcmp(what, "ddcread")) in = 91;
+    else if (what && !strcmp(what, "dmubring")) in = 92;
+    else if (what && !strcmp(what, "dispcensus")) in = 93;
+    // 99 - 0.0.633 (multi-monitor): scdcread <line 2|3> <off 0..0x5f> [len 1..16] : READ-ONLY SCDC status bytes from the HDMI sink (slave 0x54) over the same DC_I2C engine as ddcread (needs boot-arg navi48-metal-disp=1)
+    else if (what && !strcmp(what, "scdcread")) in = 99;
+    // 94 - 0.0.624 (stage M1.5): READ-ONLY dumps of the DMUB REGION4 window in VRAM (needs the same boot-arg; the window base is computed live from the DMCUB registers; MM_INDEX reads via the kext's existing reader).
+    //     region4read <off> [n]   : up to 64 dwords at window offset <off> (4-byte aligned, off + n*4 <= 0x10000)
+    //     region4dump             : CLI convenience, repeated 94 calls over 0x3100..0x3140, 0x4c00..0x4e00, 0x6000..0x8000 (four contexts, labelled) and the ring 0x0..0x2000
+    else if (what && (!strcmp(what, "region4read") || !strcmp(what, "region4dump"))) in = 94;
+    // 95..97 - 0.0.625 (stages M2 / M3): the FIRST verbs that SEND to the display firmware. Need boot-arg navi48-metal-disp=1 AND navi48-dmubcmd=1 (default OFF: the kext refuses and touches nothing).
+    //     dmubsend detect <ctx>|begin|end|setmode <ctx>|enable <ctx>|disable <0x7000|0x7800>|replay <slot_off> : ONE allowlisted command appended to the DMUB inbox1 ring; waits at most 100 ms for RPTR; never retried
+    //     dmubmode save|restore|0x1a6|0x1d4 : the 32-byte mode block at REGION4 + 0x4c00 (a prior save is required before a mode write)
+    //     dmubctx <0x7000|0x7800> status <value> : the M2 marker dword (context + 0x1a0); never the live DP context 0x6800
+    //     The M2 / M3 scripts are printed by `accel dmubsend` with no argument.
+    else if (what && !strcmp(what, "dmubsend")) in = 95;
+    else if (what && !strcmp(what, "dmubmode")) in = 96;
+    else if (what && !strcmp(what, "dmubctx")) in = 97;
+    // 98 - 0.0.631 (stage M4d): disp2 timing|connect|off|status - the OTG1 -> DIG2 test pattern. Needs boot-arg navi48-metal-disp=1 AND navi48-disp2=1. `accel disp2` alone prints the run script.
+    else if (what && !strcmp(what, "disp2")) in = 98;
+    // 100..102 - 0.0.623 (GPU-apps G1, an internal design note section 4): hang recovery. They exist ONLY when the PC booted with boot-arg navi48-g1=1 (else
+    // 0xe00002c2). Root only (this client). Run with WindowServer on the CPU renderer: hangtest refuses while ANY native session is open (a WindowServer one by name).
+    //   hangtest [1]        a kernel-owned VMID-8 test context submits ONE IB that never retires (WAIT_REG_MEM on a dword nobody writes); after 2 s HUNG is latched
+    //   hangrecover <0..4>  0 auto (mesreset then remap), 1 release (the CPU writes the awaited value: harness control), 2 mesreset (MES RESET legacy GFX queue),
+    //                       3 remap (MES unmap + MQD/ring re-init + map), 4 abandon (close the test context, HUNG stays: reboot). HUNG is cleared ONLY after a probe IB
+    //                       retires and reads back. Give the method explicitly.
+    //   hangstat [0..8]     0 the summary, 1..8 one attempt each
+    else if (what && !strcmp(what, "hangtest")) in = 100;
+    else if (what && !strcmp(what, "hangrecover")) in = 101;
+    else if (what && !strcmp(what, "hangstat")) in = 102;
+    // 103 - 0.0.627 (GPU-apps G2, an internal design note section 4): `sessstat [0..4]`, READ-ONLY. Exists ONLY when the PC booted with boot-arg
+    // navi48-multisession=1 (else 0xe00002c2). Page 0..3: native session slot 0..3 (VMID 8..11); page 4 (the default): the global page.
+    else if (what && !strcmp(what, "sessstat")) in = 103;
+    // 104 - 0.0.640 (GPU-apps G4, an internal design note section 4): `appallow add <name>|remove <name>|list`, the kernel's allow-list of user applications that may open a native
+    // GPU session (name = the executable's base name, the first 16 characters; see Navi48AppKey.h for what that is worth). Touches no hardware. Exists ONLY when the PC booted with BOTH
+    // boot-args navi48-apps=1 and navi48-multisession=1 (else 0xe00002c2). The list is empty at every boot and holds 32 entries; this verb is the only way to change it.
+    else if (what && !strcmp(what, "appallow")) in = 104;
+    // 105 - 0.0.652 (multi-monitor stage M5): fbpublish 2 - publish the monitor B's display nub for the aux kext's Navi48Framebuffer (after disp2 plane / show / fbhold 2); 0.0.658: `fbpublish 1` = the monitor A's (display index 2). Needs boot-args navi48-metal-disp=1 navi48-disp2=1 navi48-fb2=1. No withdraw: reboot.
+    else if (what && !strcmp(what, "fbpublish")) in = 105;
+    // 106 - 0.0.659 (M6 Stage 1a): `m6stat [0|1|2|3]` - READ-ONLY report of the multi-display routing: per pipe transactions, the IOSurface IDs the kernel learned (3 per pipe expected), ambiguous IDs, presents refused by the routing guard, performs completed
+    // without a copy, vblank stamps per OTG, the AGDC answers. Same latch as the pipe verbs (boot-arg navi48-metal-disp=1); the counters stay 0 without boot-arg navi48-m6=1. No argument = all three pages.
+    else if (what && !strcmp(what, "m6stat")) in = 106;
+    // 107 - 0.0.661 (M6 Stage 1b): `m6xstat [0|1|2]` - READ-ONLY report of instance 2's scanout (the monitor B): acquired, slots, EARLIEST_INUSE2, FLIP_PENDING, the counters, the watchdog restores, the live HUBP2 / OTG2 health registers. Needs boot-args navi48-m6=1 AND navi48-m6flip=1.
+    else if (what && !strcmp(what, "m6xstat")) in = 107;
+    // 108 - 0.0.663 (ReBAR + Stage 2 review S3): `vramstat` - READ-ONLY: the kernel allocator's free visible-VRAM bytes and the visible / hi pool sizes, vramLimit, the mapped BAR0 bytes and BAR0's physical address. No argument. Same latch as the pipe verbs (boot-arg navi48-metal-disp=1).
+    else if (what && !strcmp(what, "vramstat")) in = 108;
     // 51 — 0.0.239, `shadercache [1|2|3]` (milestone 3 step 2, an earlier analysis).
     // Arms the hash-keyed substitution of gfx1201 code for Apple's GFX10 shaders at
     // the residency copy: kernsub's seam, with kernsub's one hard-coded kernel at one
@@ -902,7 +1882,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     // an ordinary PTE page. No argument reserves and reports only; 1 also builds.
     else if (what && !strcmp(what, "ringmap")) in = 53;
     // 54 — 0.0.247, `vmctx` (milestone 3 step 4, the OBSERVE BOOT of
-    // notes/M3-ROOT-WRITE-REVIEW.md section 7.1). READ-ONLY: neither this verb nor the
+    // notes/an internal review note section 7.1). READ-ONLY: neither this verb nor the
     // VMM slot-40/41 hooks it reports on write anything — not Apple's page tables, not
     // Apple's objects, not a register, not VRAM. RUN IT WHILE A METAL CLIENT IS ALIVE.
     // It prints, for every AMDHWVMContext Apple created this boot, the root page-table
@@ -947,10 +1927,10 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
         fprintf(stderr, "accel: unknown verb \"%s\"\n", what);
         fprintf(stderr, "  known: status fire memenable synctables enablerings "
                         "startengines ringstate dumpring programqueue ringhooks "
-                        "dumpib rebaseib enablequeue kickdoorbell ringrefs queuestate opengate neuterpoll chanstate pokecompletion signalcompletion bindchannel schedstate stampstate signalstamp stampgap runcheckts runadvance xlatregs srbmprobe resume pm4powerup setvspace kiqenable kiqstamp kiqchan gfxmap gfxstate sdmamap sdmastate faultclear vmstate vmib ringib pagecopy flushdrop kernsub vmpage renderxlat eopbridge bootchain shadercache vmroots ringmap vmctx rootwrite rearmdrain pairing drain flushhook scanout gfxcensus gfxneuter finishread gfxcapture gfxprobe pipeguard agdc agdchold cqprobe ucprobe fbbench fbwc pipeshim pipemode emcensus routea dcnstate dcnvbl dcnflip dcnmode fbname sdmadcc pipeadopt pipearm pipestat pipestamps pipeshortcut pipeagdc pipevbl pipereload\n");
+                        "dumpib rebaseib enablequeue kickdoorbell ringrefs queuestate opengate neuterpoll chanstate pokecompletion signalcompletion bindchannel schedstate stampstate signalstamp stampgap runcheckts runadvance xlatregs srbmprobe resume pm4powerup setvspace kiqenable kiqstamp kiqchan gfxmap gfxstate sdmamap sdmastate faultclear vmstate vmib ringib pagecopy flushdrop kernsub vmpage renderxlat eopbridge bootchain shadercache vmroots ringmap vmctx rootwrite rearmdrain pairing drain flushhook scanout gfxcensus gfxneuter finishread gfxcapture gfxprobe pipeguard agdc agdchold cqprobe ucprobe fbbench fbwc pipeshim pipemode emcensus routea dcnstate dcnvbl dcnflip dcnmode fbname sdmadcc pipeadopt pipearm pipestat pipestamps pipeshortcut pipeagdc pipevbl pipereload ddcread dmubring dispcensus region4read region4dump dmubsend dmubmode dmubctx disp2 hangtest hangrecover hangstat sessstat scdcread appallow fbpublish m6stat m6xstat vramstat\n");
         return 2;
     }
-    const char *verb = in == 90 ? "pipereload" : in == 89 ? "pipevbl" : in == 88 ? "pipeagdc" : in == 87 ? "pipeshortcut" : in == 86 ? "pipestamps" : in == 85 ? "pipestat" : in == 84 ? "pipearm" : in == 83 ? "pipeadopt" : in == 82 ? "sdmadcc" : in == 81 ? "ucprobe" : in == 80 ? "cqprobe" : in == 79 ? "agdchold" : in == 78 ? "fbname" : in == 77 ? "dcnmode" : in == 76 ? "dcnflip" : in == 75 ? "dcnvbl" : in == 74 ? "dcnstate" : in == 73 ? "routea" : in == 72 ? "emcensus" : in == 71 ? "pipemode" : in == 70 ? "pipeshim" : in == 69 ? "fbwc" : in == 68 ? "fbbench" : in == 67 ? "agdc" : in == 66 ? "pipeguard" : in == 65 ? "gfxprobe" : in == 64 ? "gfxcapture" : in == 63 ? "finishread" : in == 62 ? "gfxneuter" : in == 61 ? "gfxcensus" : in == 60 ? "scanout" : in == 59 ? "flushhook" : in == 58 ? "drain" : in == 57 ? "pairing" : in == 56 ? "rearmdrain" : in == 55 ? "rootwrite" : in == 54 ? "vmctx" : in == 53 ? "ringmap" : in == 52 ? "vmroots" : in == 51 ? "shadercache" : in == 50 ? "bootchain" : in == 49 ? "eopbridge" : in == 48 ? "renderxlat" : in == 47 ? "vmpage" : in == 46 ? "kernsub" : in == 45 ? "flushdrop" : in == 44 ? "pagecopy" : in == 43 ? "ringib" : in == 42 ? "vmib" : in == 41 ? "vmstate" : in == 40 ? "faultclear"
+    const char *verb = in == 108 ? "vramstat" : in == 107 ? "m6xstat" : in == 106 ? "m6stat" : in == 105 ? "fbpublish" : in == 104 ? "appallow" : in == 103 ? "sessstat" : in == 99 ? "scdcread" : in == 102 ? "hangstat" : in == 101 ? "hangrecover" : in == 100 ? "hangtest" : in == 98 ? "disp2" : in == 97 ? "dmubctx" : in == 96 ? "dmubmode" : in == 95 ? "dmubsend" : in == 94 ? "region4read" : in == 93 ? "dispcensus" : in == 92 ? "dmubring" : in == 91 ? "ddcread" : in == 90 ? "pipereload" : in == 89 ? "pipevbl" : in == 88 ? "pipeagdc" : in == 87 ? "pipeshortcut" : in == 86 ? "pipestamps" : in == 85 ? "pipestat" : in == 84 ? "pipearm" : in == 83 ? "pipeadopt" : in == 82 ? "sdmadcc" : in == 81 ? "ucprobe" : in == 80 ? "cqprobe" : in == 79 ? "agdchold" : in == 78 ? "fbname" : in == 77 ? "dcnmode" : in == 76 ? "dcnflip" : in == 75 ? "dcnvbl" : in == 74 ? "dcnstate" : in == 73 ? "routea" : in == 72 ? "emcensus" : in == 71 ? "pipemode" : in == 70 ? "pipeshim" : in == 69 ? "fbwc" : in == 68 ? "fbbench" : in == 67 ? "agdc" : in == 66 ? "pipeguard" : in == 65 ? "gfxprobe" : in == 64 ? "gfxcapture" : in == 63 ? "finishread" : in == 62 ? "gfxneuter" : in == 61 ? "gfxcensus" : in == 60 ? "scanout" : in == 59 ? "flushhook" : in == 58 ? "drain" : in == 57 ? "pairing" : in == 56 ? "rearmdrain" : in == 55 ? "rootwrite" : in == 54 ? "vmctx" : in == 53 ? "ringmap" : in == 52 ? "vmroots" : in == 51 ? "shadercache" : in == 50 ? "bootchain" : in == 49 ? "eopbridge" : in == 48 ? "renderxlat" : in == 47 ? "vmpage" : in == 46 ? "kernsub" : in == 45 ? "flushdrop" : in == 44 ? "pagecopy" : in == 43 ? "ringib" : in == 42 ? "vmib" : in == 41 ? "vmstate" : in == 40 ? "faultclear"
                      : in == 39 ? "sdmastate" : in == 38 ? "sdmamap"
                      : in == 37 ? "gfxstate" : in == 36 ? "gfxmap"
                      : in == 35 ? "kiqchan" : in == 34 ? "kiqstamp" : in == 33 ? "kiqenable" : in == 32 ? "setvspace" : in == 31 ? "pm4powerup" : in == 30 ? "resume" : in == 29 ? "srbmprobe" : in == 28 ? "xlatregs" : in == 27 ? "runadvance" : in == 26 ? "runcheckts" : in == 25 ? "stampgap" : in == 24 ? "signalstamp" : in == 23 ? "stampstate" : in == 22 ? "schedstate" : in == 21 ? "bindchannel" : in == 20 ? "signalcompletion" : in == 19 ? "pokecompletion" : in == 18 ? "chanstate" : in == 17 ? "neuterpoll" : in == 16 ? "opengate" : in == 15 ? "queuestate" : in == 14 ? "ringrefs" : in == 13 ? "kickdoorbell" : in == 12 ? "enablequeue" : in == 11 ? "rebaseib" : in == 10 ? "dumpib" : in == 9 ? "ringhooks" : in == 8 ? "programqueue" : in == 7 ? "dumpring" : in == 6 ? "ringstate" : in == 5 ? "startengines" : in == 4 ? "enablerings" : in == 3 ? "synctables"
@@ -958,6 +1938,19 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     // out[0..2] are the long-standing three; out[3..15] are verb-specific extras
     // (rule 14: a result that matters must not depend on the shared log buffer).
     // 16 is the hard ABI limit — io_scalar_inband64_t is uint64_t[16].
+    if (in == 99) return cmd_scdcread(arg, arg2, arg3);   // 0.0.633: own layout (navi48_dispread.h)
+    if (in == 91) return cmd_ddcread(arg, arg2);          // 0.0.622: own paging (two calls per EDID block), own layout (navi48_dispread.h)
+    if (in == 92) return cmd_dmubring(arg);
+    if (in == 93) return cmd_dispcensus(arg);
+    if (in == 94) return !strcmp(what, "region4dump") ? cmd_region4dump() : cmd_region4read(arg, arg2);   // 0.0.624: own paging (22 dwords a call), own layout (navi48_dispread.h)
+    if (in == 95) return cmd_dmubsend(arg, arg2);          // 0.0.625: own layout (navi48_dmubcmd.h)
+    if (in == 96) return cmd_dmubmode(arg);
+    if (in == 97) return cmd_dmubctx(arg, arg2, arg3);
+    if (in == 105) return cmd_fbpublish(arg);               // 0.0.652 (M5): own layout (Navi48DisplayOps.h)
+    if (in == 108) return cmd_vramstat(arg);                // 0.0.663: own layout (Navi48Bringup.cpp accelExperiment, action 108)
+    if (in == 107) return cmd_m6xstat(arg, arg2);           // 0.0.661 (M6 Stage 1b): own layout (dcn/navi48_dcn.cpp scanXReport); 0.0.662: arg2 = the page after an instance
+    if (in == 106) return cmd_m6stat(arg);                  // 0.0.659 (M6 Stage 1a): own layout (native_disp.cpp n48disp_verb)
+    if (in == 98) return cmd_disp2(arg, arg2);             // 0.0.631: own layout (navi48_disp2.h); 0.0.633: arg2 = the instance (1 monitor A, 2 monitor B)
     uint64_t out[16] = {0};
     uint32_t outCnt = 16;
     // 0.0.194: scalarInput[1] is a verb argument — `vmib`'s VA. Always sent, so
@@ -966,7 +1959,11 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     if (arg) in2[1] = strtoull(arg, NULL, 0);
     // 0.0.618 review: `pipevbl` with no argument would send 0 and turn the vblank timestamps OFF; require 0 or 1.
     if (in == 89 && !arg) { fprintf(stderr, "accel pipevbl: give 0 or 1 explicitly (read the state with `accel pipestat 4`)\n"); return 2; }
-    // 0.0.416 (notes/design/SDMA-GCR.md, G2): mode 7 carries its source VRAM offset as a SECOND CLI token
+    // 0.0.623 (G1): hangtest's only mode is 1 (the default); hangrecover's method is never defaulted (0 would run `auto`).
+    if (in == 100 && !arg) in2[1] = 1;
+    if (in == 103 && !arg) in2[1] = 4;   // 0.0.627 (G2): sessstat defaults to the global page
+    if (in == 101 && !arg) { fprintf(stderr, "accel hangrecover: give the method: 0 auto, 1 release, 2 mesreset, 3 remap, 4 abandon (read the state with `accel hangstat`)\n"); return 2; }
+    // 0.0.416 (an internal design note, G2): mode 7 carries its source VRAM offset as a SECOND CLI token
     // (`accel scanout 7 <vramOff> [gcr]`) and packs it into the ONE ABI scalar with the mode and the GCR flag
     // (sdma_gcr.h). All other verbs ignore arg2/arg3.
     // build 0.0.542: `accel scanout full [file]` is mode 9 (the optional file is written by scanfull_pull below).
@@ -975,6 +1972,17 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
         const uint64_t off = arg2 ? strtoull(arg2, NULL, 0) : 0;
         const int gcr = (arg3 && !strcmp(arg3, "gcr")) ? 1 : 0;
         in2[1] = n48_scanout7_scalar(off, gcr);
+    }
+    if (in == 104) {   // 0.0.640 (G4): `appallow add <name>|remove <name>|list [page]` -> (op << 60) | key / page (Navi48AppKey.h); 0.0.641: `strikes`
+        const int isStrikes = arg && !strcmp(arg, "strikes");
+        const int isList = arg && !strcmp(arg, "list");
+        const int isAdd = arg && !strcmp(arg, "add"), isRem = arg && !strcmp(arg, "remove");
+        if ((!isList && !isAdd && !isRem && !isStrikes) || ((isAdd || isRem) && (!arg2 || !arg2[0]))) {
+            fprintf(stderr, "accel appallow: usage: appallow add <name> | remove <name> | list [page 0..3] | strikes   (name = the executable's base name; only its first %u characters count)\n", N48A_COMM_MAX);
+            return 2;
+        }
+        in2[1] = isStrikes ? n48a_arg(N48A_OP_STRIKES, 0) : isList ? n48a_arg(N48A_OP_LIST, arg2 ? strtoull(arg2, NULL, 0) : 0) : n48a_arg(isAdd ? N48A_OP_ADD : N48A_OP_REMOVE, n48a_comm_key(arg2));
+        if (!isList && !isStrikes) printf("accel appallow: name \"%.16s\" -> key %#llx\n", arg2, (unsigned long long)n48a_comm_key(arg2));
     }
     kern_return_t kr = IOConnectCallScalarMethod(conn, kNavi48SelAccelExperiment,
                                                  in2, 2, out, &outCnt);
@@ -1317,6 +2325,93 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
             if (out[i]) printf("  command %#llx x%llu\n", out[i] >> 32, out[i] & 0xffffffffull);
         if (st != 0 && st != 12) return 3;
     }
+    if (in == 104) {
+        // 0.0.640 (G4): out[3 + i] = v[i] of amdgpu::n1c_app_verb (amd/native_g4_pure.h verb_run): v[0] code, v[1] entries after, v[2] op, v[3] max (32), v[4..12] key / the page's entries.
+        static const char *cn[] = { "ok", "OFF: boot-arg navi48-apps or navi48-multisession is not 1", "bad argument", "FULL (32 entries)", "already on the list", "not on the list" };
+        const unsigned long long c = out[3];
+        printf("  code                    : %llu (%s)\n", c, c <= 5 ? cn[c] : "?");
+        printf("  entries on the list     : %llu of %llu\n", out[4], out[6]);
+        if (c == 0 && out[5] == N48A_OP_STRIKES) {   // 0.0.641: out[7 + 2i] = key, out[8 + 2i] = strikes of table slot i, out[15] = the limit
+            printf("  strikes (automatic recoveries blamed on an APP session, per executable-name key; at %llu the name is refused at open until reboot)\n", out[15]);
+            for (unsigned i = 0; i < 4; i++) printf("    slot %u                : key %#llx  strikes %llu%s\n", i, out[7 + 2 * i], out[8 + 2 * i], out[7 + 2 * i] == 0 ? "  (empty)" : out[8 + 2 * i] >= out[15] ? "  REFUSED" : "");
+        }
+        if (c == 0 && out[5] == N48A_OP_LIST) {
+            printf("  page                    : keys of slots %llu..%llu (0 = empty slot)\n", (arg2 ? strtoull(arg2, NULL, 0) : 0) * 9, (arg2 ? strtoull(arg2, NULL, 0) : 0) * 9 + 8);
+            for (unsigned i = 0; i < 9; i++) printf("    slot %2llu              : %#llx\n", (arg2 ? strtoull(arg2, NULL, 0) : 0) * 9 + i, out[7 + i]);
+        }
+        return c == 0 || c == 4 || c == 5 ? 0 : 3;
+    }
+    if (in == 103) {
+        // 0.0.627 (G2): out[3 + i] = v[i] of amdgpu::n1c_g2_stat (amd/native_g2_pure.h sess_out / global_out); v[0] is the code.
+        const unsigned long long c = out[3];
+        printf("  code                    : %llu (%s)\n", c, c == 0 ? "ok" : c == 1 ? "OFF: boot-arg navi48-multisession is not 1" : c == 2 ? "bad page" : "?");
+        if (c == 0 && out[4] == 4) {
+            printf("  open / DEAD slots / HUNG: %llu / %llu / %llu\n", out[5] & 0xff, (out[5] >> 8) & 0xff, (out[5] >> 16) & 1);
+            if ((out[5] >> 20) & 0xffff) printf("  BOs leaked at close     : %llu (a CPU mapping outlived the session: the range stays out of the pool until reboot; 0.0.640)\n", (out[5] >> 20) & 0xffff);
+            if ((out[5] >> 56) != 0)   /* 0.0.641: apps ON: the visible-pool use of non-WindowServer sessions and its cap (boot-arg navi48-appvis) */
+                printf("  non-WS visible VRAM     : %llu KiB held of a %llu MiB cap (boot-arg navi48-appvis, default 64; WindowServer is not capped)\n", (out[5] >> 36) & 0xfffff, (out[5] >> 56));
+            printf("  seq emitted / retired   : %llu / %llu\n", out[6], out[7]);
+            printf("  other sessions' VRAM    : %llu MiB of a %llu MiB budget\n", out[8] >> 20, out[9] >> 20);
+            printf("  automatic recoveries    : %llu (last guilty slot %llu, seq %llu; collateral submissions %llu; at most 3 per boot)\n", out[10], out[11], out[12], out[13]);
+            /* 0.0.629 (R5): the GCVM L2 protection-fault word (STATUS_LO32 | ADDR_LO32 << 32), READ ONLY: now, and at the previous `sessstat 4` */
+            printf("  gcvm fault now / prev   : %#llx (vmid %llu) / %#llx (vmid %llu)%s\n", out[14], (out[14] >> 20) & 0xf, out[15], (out[15] >> 20) & 0xf,
+                   out[14] != out[15] ? "  CHANGED since the previous sessstat 4" : "");
+        } else if (c == 0 && out[4] == 5) {
+            /* 0.0.650 (G5 Stage 1): out[3 + i] = v[i] of amdgpu::n1c_g5_stat (amd/native_g5_pure.h stat_out); exists only with boot-arg navi48-g5=1 */
+            printf("  G5 flags                : G5 on%s%s\n", (out[5] & 2) ? ", WindowServer ACTIVE (submitted in the last 100 ms)" : ", WindowServer idle", (out[5] & 4) ? ", WindowServer open" : ", no WindowServer open");
+            printf("  credit K                : %llu app job(s) may be in flight ahead of WindowServer (boot-arg navi48-g5credit, default 1)\n", out[6]);
+            printf("  app jobs in flight now  : %llu    WindowServer seqnos outstanding now: %llu\n", out[7], out[8]);
+            printf("  app submits delayed     : %llu    total delay %llu ms    maximum delay %llu ms\n", out[9], out[10], out[11]);
+            printf("  credit-wait timeouts    : %llu    app submits admitted: %llu\n", out[12], out[13]);
+            if (out[14] == ~0ull) printf("  since WindowServer's last submit : never\n"); else printf("  since WindowServer's last submit : %llu ms\n", out[14]);
+            printf("  WindowServer ring reserve: %llu dwords (only WindowServer may use the last of the ring)\n", out[15]);
+        } else if (c == 0) {
+            const unsigned long long st = out[5] & 0xff;
+            printf("  slot / VMID / session   : %llu / %llu / %llu\n", out[4], out[6], out[7]);
+            printf("  state                   : %s%s%s%s\n", st == 0 ? "free" : st == 1 ? "OPEN" : st == 2 ? "DEAD (its VMID is never reused this boot)" : "?",
+                   (out[5] & 0x100) ? ", WindowServer" : "", (out[5] & 0x200) ? ", hello" : "", (out[5] & 0x400) ? ", POISONED (guilty of a recovered hang)" : "");
+            if (out[5] & 0x800) printf("  role                    : APP (an allow-listed user application: no ReadRegs, no scanout, the 25%% VRAM budget; 0.0.640)\n");
+            printf("  VRAM / GTT / imported   : %llu / %llu / %llu KiB\n", out[8] >> 10, out[9] >> 10, out[10] >> 10);
+            printf("  page tables / last seq / BOs : %llu KiB / %llu / %llu\n", out[11] >> 10, out[12], out[13]);
+            printf("  gcvm fault at open      : %#llx (vmid %llu)   (0.0.629: compare with sessstat 4)\n", out[14], (out[14] >> 20) & 0xf);   /* R5, read only */
+        }
+        return c == 0 ? 0 : 3;
+    }
+    if (in == 100 || in == 101 || in == 102) {
+        // 0.0.623 (G1): out[3 + i] = v[i] of amdgpu::n1c_g1_verb; v[0] is the code (amd/native_g1_pure.h enum Code).
+        const unsigned long long c = out[3];
+        const char *cn = c == 0 ? "ok" : c == 1 ? "REFUSED: boot-arg navi48-g1 is not 1" : c == 2 ? "REFUSED: bad mode / method" : c == 3 ? (in == 100 ? "REFUSED: a test context already holds the GPU" : "REFUSED: no test context holds a hang")
+                       : c == 4 ? (in == 100 ? "REFUSED: a WindowServer native session is open" : "REFUSED: HUNG is not latched") : c == 5 ? (in == 100 ? "REFUSED: a native session is open" : "REFUSED: attempt budget spent")
+                       : c == 6 ? (in == 100 ? "REFUSED: the GPU is HUNG" : "REFUSED: a MES frame timed out earlier in this boot (only release and abandon remain; reboot)")
+                       : c == 7 ? "REFUSED: remap needs the most recent MES RESET on this hang to have been acknowledged (run mesreset first)" : c == 10 ? "HANG HELD: the IB did not retire in 2 s, HUNG latched, the test context holds the GPU"
+                       : c == 11 ? "no hang: the IB retired (closed normally)" : c == 12 ? "the native open was refused (see rc)" : c == 13 ? "test BO setup failed" : c == 14 ? "the ring refused the submit"
+                       : c == 20 ? "RECOVERED: a probe retired and read back, HUNG cleared, test context closed" : c == 21 ? "ALL FAILED: HUNG stays latched" : c == 22 ? "abandoned: HUNG stays latched (reboot)"
+                       : c == 30 ? "verified" : c == 31 ? "the method's own step was not acked" : c == 32 ? "probe refused by the ring" : c == 33 ? "probe did not retire in 1 s" : c == 34 ? "probe retired, data wrong" : "?";
+        printf("  code                    : %llu (%s)\n", c, cn);
+        if (in == 100) {
+            printf("  rc / seq                : %#llx / %llu\n", out[4], out[5]);
+            printf("  emitted / retired       : %llu / %llu\n", out[6], out[7]);
+            printf("  CP_STAT / rptr / wc     : %#llx / %llu / %llu\n", out[8], out[9], out[10]);
+            printf("  GCVM fault status lo    : %#llx\n", out[11]);
+        } else if (in == 101) {
+            printf("  attempts this call      : %llu\n", out[4]);
+            for (unsigned i = 0; i < 2 && i < out[4]; i++)
+                printf("  attempt %u               : status %llu, act rc %#llx, verify %llu us\n", i, out[5 + 3 * i], out[6 + 3 * i], out[7 + 3 * i]);
+            printf("  HUNG cleared / still    : %llu / %llu\n", out[11], out[12]);
+            printf("  emitted / retired       : %llu / %llu (attempts on this hang %llu)\n", out[13], out[14], out[15]);
+        } else if (arg == NULL || strtoull(arg, NULL, 0) == 0) {
+            printf("  phase / HUNG / holds    : %llu / %llu / %llu\n", out[4], out[5], out[6]);
+            printf("  hung seq / emitted / retired / wc : %llu / %llu / %llu / %llu\n", out[7], out[8], out[9], out[10]);
+            printf("  attempts / last method  : %llu / %llu\n", out[11], out[12]);
+            printf("  tests / recovered / failed runs : %llu / %llu / %llu\n", out[13], out[14], out[15]);
+        } else {
+            printf("  method / act rc / act us: %llu / %#llx / %llu\n", out[4], out[5], out[6]);
+            printf("  probe rc / seq          : %#llx / %llu\n", out[7], out[8]);
+            printf("  retired / data ok / us  : %llu / %llu / %llu\n", out[9], out[10], out[11]);
+            printf("  rptr / CP_STAT after    : %llu / %#llx\n", out[12], out[13]);
+        }
+        if (in == 101 && c != 20 && c != 22) return 3;
+    }
     if (in == 78) {
         // 0.0.308: out[3 + i] = v[i] of n48fbname::control.
         char nm[9]; unsigned long long w = out[9];
@@ -1494,7 +2589,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
                                      "source control FAILED", "PRE-FLIGHT copy FAILED", "FENCE timeout", "READBACK mismatch",
                                      "plan refused", "interlock: positive control not passed", "ring write failed",
                                      "nothing saved to restore", "buffer unresolved", "backing unprepared or short",
-                                     /* 0.0.416 mode 7 (notes/design/SDMA-GCR.md G2) */
+                                     /* 0.0.416 mode 7 (an internal design note G2) */
                                      "mode 7 source not 4 KiB aligned", "mode 7 source outside the card's VRAM",
                                      "mode 7 source overlaps one of our own allocations",
                                      /* 0.0.518 / 0.0.542 */
@@ -1555,7 +2650,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
             return st != 0 ? 3 : 0;
         }
         if (arg && strtoull(arg, NULL, 0) == 6) {
-            /* 0.0.414 (notes/design/SCANOUT-SELFTEST-FULL.md, section 950): the FULL-GEOMETRY SDMA self-test.
+            /* 0.0.414 (an internal design note, section 950): the FULL-GEOMETRY SDMA self-test.
                One call, two cases in order: the 256x256 section 719 control, then the live 1920x1080 geometry.
                Three scratch VRAM buffers only - it never touches the scanout, needs no interlock, no WindowServer
                and no Apple accelerator. The 16x16 wrong-cell maps and the decoded wrong pixels are in the driver
@@ -1574,7 +2669,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
             return st != 0 ? 3 : 0;
         }
         if (arg && strtoull(arg, NULL, 0) == 7) {
-            /* 0.0.416 (notes/design/SDMA-GCR.md, section 953): the SDMA CACHE-RINSE INSTRUMENT. READ-ONLY on the
+            /* 0.0.416 (an internal design note, section 953): the SDMA CACHE-RINSE INSTRUMENT. READ-ONLY on the
                source. ONE COPY_LINEAR of a 256 KiB window, optionally with the GCR_REQ (GL2 write-back + invalidate)
                immediately before it in the SAME submission, into a low scratch of ours; then the scratch and the
                source are both read through the MM window and compared per 256-byte line.
@@ -1597,7 +2692,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
             return st != 0 ? 3 : 0;
         }
         if (arg && strtoull(arg, NULL, 0) == 8) {
-            /* D7 (0.0.417, notes/design/SDMA-DCC-NOPTE.md): THE UNIFORM PROBE. Mode 6's live 1920x1080 case
+            /* D7 (0.0.417, an internal design note): THE UNIFORM PROBE. Mode 6's live 1920x1080 case
                exactly - same buffers, packet fields, sample set, report lines and POISON detection - except the
                CPU writes 0xff00ff00 everywhere and every expected value is 0xff00ff00. It measures the WRITE
                compression half: with SDMA0's no-PTE write compression ON a constant block is stored as a code
@@ -1649,7 +2744,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
         if (st != 0) return 3;
     }
     if (in == 82) {
-        /* D1 (0.0.417, notes/design/SDMA-DCC-NOPTE.md): out[i] = v[i] of navi48_sdmadcc_control.
+        /* D1 (0.0.417, an internal design note): out[i] = v[i] of navi48_sdmadcc_control.
            v: 0 op (0 refused, 1 read, 2 set, 3 restore), 1 SDMA0 raw, 2 SDMA1 raw, 3 restore value,
            4 written/target, 5 read-back, 6 match, 7 status (0 ok, 1 bad arg, 2 no context, 3 no GC base,
            4 mismatch), 8 captured. The per-set decode uses sdma_dcc.h's own accessors. */
@@ -2480,7 +3575,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s info|counters|reg <dw>|regs (list on stdin)|poke|submit|log|metrics|power <n>|logreset|\n       accel [status|fire [1 gate closed|2 gate open]|memenable|synctables|enablerings|startengines|ringstate|dumpring|programqueue|ringhooks|dumpib|rebaseib|enablequeue|kickdoorbell|ringrefs|queuestate|opengate|neuterpoll|chanstate|pokecompletion|signalcompletion|bindchannel|schedstate|stampstate|signalstamp|stampgap|runcheckts|runadvance|xlatregs|srbmprobe|resume|pm4powerup|setvspace|kiqenable|kiqstamp|kiqchan|gfxmap|gfxstate|sdmamap|sdmastate|faultclear|vmstate|vmib [va]|ringib [chan]|pagecopy [1]|flushdrop|kernsub [1|2|3]|vmpage [va]|renderxlat [0|1|3|4|5|0x101|base|flags|n<<4|6 or 7]|eopbridge [1|2]|bootchain [mode]|shadercache [1|2|3]|vmroots [addr]|ringmap [0|1]|vmctx|rootwrite [0|1]|rearmdrain [0|1]|pairing [1|2]|drain|flushhook [1|2|3]|scanout [0|1|2|3|4|5|6|7 <vramOff> [gcr]|8|full [file]|10]|sdmadcc [0|1|2]|gfxcensus [1|2]|gfxneuter [1|2]|finishread|gfxcapture [1|2]|gfxprobe [1|2]|pipeguard [1]|agdc [1]|agdchold [ms 1..5000]|cqprobe|ucprobe [0|1|2]|fbbench [rows]|fbwc [1]|pipeshim [0|1|2|3|4|5]|pipemode [0|1]|emcensus [0|1|2]|routea [0|1|2]|dcnstate [1]|dcnvbl [0|1|2]|dcnflip [0|1|2..30|1002..1240]|dcnmode [0|1..30|101..130]|fbname [0|1]|pipeadopt|pipearm [0|1]|pipestat [0|1|2|3|4]|pipestamps|pipeshortcut [0|1]|pipeagdc [0|1]|pipevbl [0|1]|pipereload [0|1]]|capstream <file> [ms] [s] [stopfile]|bigmem [mb]|test <id> <iters> [us]|suite [iters]\n", argv[0]);
+        fprintf(stderr, "usage: %s info|counters|reg <dw>|regs (list on stdin)|poke|submit|log|metrics|power <n>|logreset|\n       accel [status|fire [1 gate closed|2 gate open]|memenable|synctables|enablerings|startengines|ringstate|dumpring|programqueue|ringhooks|dumpib|rebaseib|enablequeue|kickdoorbell|ringrefs|queuestate|opengate|neuterpoll|chanstate|pokecompletion|signalcompletion|bindchannel|schedstate|stampstate|signalstamp|stampgap|runcheckts|runadvance|xlatregs|srbmprobe|resume|pm4powerup|setvspace|kiqenable|kiqstamp|kiqchan|gfxmap|gfxstate|sdmamap|sdmastate|faultclear|vmstate|vmib [va]|ringib [chan]|pagecopy [1]|flushdrop|kernsub [1|2|3]|vmpage [va]|renderxlat [0|1|3|4|5|0x101|base|flags|n<<4|6 or 7]|eopbridge [1|2]|bootchain [mode]|shadercache [1|2|3]|vmroots [addr]|ringmap [0|1]|vmctx|rootwrite [0|1]|rearmdrain [0|1]|pairing [1|2]|drain|flushhook [1|2|3]|scanout [0|1|2|3|4|5|6|7 <vramOff> [gcr]|8|full [file]|10]|sdmadcc [0|1|2]|gfxcensus [1|2]|gfxneuter [1|2]|finishread|gfxcapture [1|2]|gfxprobe [1|2]|pipeguard [1]|agdc [1]|agdchold [ms 1..5000]|cqprobe|ucprobe [0|1|2]|fbbench [rows]|fbwc [1]|pipeshim [0|1|2|3|4|5]|pipemode [0|1]|emcensus [0|1|2]|routea [0|1|2]|dcnstate [1]|dcnvbl [0|1|2]|dcnflip [0|1|2..30|1002..1240]|dcnmode [0|1..30|101..130]|fbname [0|1]|pipeadopt|pipearm [0|1]|pipestat [0|1|2|3|4]|pipestamps|pipeshortcut [0|1]|pipeagdc [0|1]|pipevbl [0|1]|pipereload [0|1]|ddcread <line 2|3> <block 0..3>|dmubring [0|1..25|0x80]|dispcensus [0|1|2..9]|region4read <off> [1..64]|region4dump|dmubsend detect <ctx>/begin/end/setmode <ctx>/enable <ctx>/disable <0x7000|0x7800>/replay <slot_off>/pclk otg3-on|otg3-off|otg1-on|otg1-off/phyc enable|disable/digc setup|dmubmode save/restore/0x1a6/0x1d4|dmubctx <ctx> status <v>|disp2 [timing|timing1440|connect|off|status [1|2]|plane|show|flipA|flipB|crc|planeoff 2]|hangtest [1]|hangrecover <0..4>|hangstat [0..8]|sessstat [0..5]|scdcread <line 2|3> <off 0..0x5f> [len 1..16]|appallow add <name>/remove <name>/list/strikes]|fbpublish 2|1|m6stat [0|1|2|3]|m6xstat [0|1|2]|vramstat|capstream <file> [ms] [s] [stopfile]|bigmem [mb]|test <id> <iters> [us]|suite [iters]\n", argv[0]);
         return 2;
     }
     if (open_service() < 0) return 1;

@@ -1,4 +1,4 @@
-// gfx_flightring.h — C5 part 1 (0.0.443, notes/design/C5-CONTINUOUS.md Q1 "For N flights"): THE FLIGHT RING.
+// gfx_flightring.h — C5 part 1 (0.0.443, an internal design note Q1 "For N flights"): THE FLIGHT RING.
 // Pure C, host-tested by tests/gfx_flightring_test.cpp (with planted defects); the kext compiles the SAME header.
 // DEFAULT-INERT in the sense every other X-header here is: a zero-initialised ring is sixteen FREE entries, and
 // every function below answers the empty/off case first.
@@ -24,14 +24,14 @@
 // ---------------------------------------------------------------------------------------------------------------------
 //   FREE       the slot holds no flight. The boot-time zero value.
 //   PENDING    pushed at the GATE STAMP — the same instant 0.0.442 wrote `gKsFlight.active = 1`, BEFORE the keystone
-//              runs. This preserves KEYSTONE-A-PRIME's ordering (notes/design/KEYSTONE-A-PRIME.md, "A′'s order: stamp
+//              runs. This preserves KEYSTONE-A-PRIME's ordering (an internal design note, "A′'s order: stamp
 //              before the marker read"): an unmap that races in between the stamp and the keystone's decision must
 //              still see this flight as live and defer, exactly as it did when the single record's `active` bit was
 //              set at the same instant.
 //   COMMITTED  the keystone proved the frame will run (n48_fr_mark_committed). In flight; may still retire by its own
 //              fence or expire by its own timeout.
 //   NOT_RUN    reached from COMMITTED (the ring-walk exemption refused the frame AFTER the keystone permitted it —
-//              the IB was NOPed and never reached the CP) OR, since 0.0.444 (C5-RING-REVIEW.md (B) item 4), from
+//              the IB was NOPed and never reached the CP) OR, since 0.0.444 (an internal review note (B) item 4), from
 //              PENDING (a TOKEN MISMATCH at the hook: the entry's own flight preserved A′'s ordering and must stay
 //              live rather than being freed, matching 0.0.442's timing — see n48_fr_mark_not_run). Either way it
 //              is still deferred to its own bound — nothing will ever write its fence slot, so a poll can never
@@ -101,7 +101,7 @@ enum {
     N48_FR_COMMITTED,
     N48_FR_NOT_RUN,
     N48_FR_RETIRED,
-    /* 0.0.444 (notes/design/C5-RING-REVIEW.md (B) item 6) — EXPIRED, TERMINAL. A live entry (PENDING/COMMITTED/
+    /* 0.0.444 (an internal design note (B) item 6) — EXPIRED, TERMINAL. A live entry (PENDING/COMMITTED/
      * NOT_RUN) whose own age has passed the same bound n48_fr_defer_verdict already judges it against
      * (n48_fr_expire). Distinct from RETIRED (a fence proved the frame ran) so a report can still tell "we gave up
      * waiting" from "we saw it finish" apart, but for every DECISION this header makes (defer/withdraw, blocking,
@@ -292,7 +292,7 @@ static inline uint32_t n48_fr_commit_mark(n48_fr_ring *r, uint32_t seq, uint32_t
     return 1u;
 }
 
-/* COMMITTED -> NOT_RUN, or (0.0.444, C5-RING-REVIEW.md (B) item 4) PENDING -> NOT_RUN.
+/* COMMITTED -> NOT_RUN, or (0.0.444, an internal review note (B) item 4) PENDING -> NOT_RUN.
  *   COMMITTED -> NOT_RUN: the ring-walk exemption refused it (the IB was NOPed and never reached the CP).
  *   PENDING -> NOT_RUN: a TOKEN MISMATCH at the hook. This entry's push preserved KEYSTONE-A-PRIME's ordering
  *     ("stamp before the marker read"), so it must stay counted as a live flight — freeing it to FREE instead
@@ -345,7 +345,7 @@ static inline uint32_t n48_fr_retire_nopped(n48_fr_ring *r, uint32_t seq)
  * it again, so this is the fail-closed direction (a call on anything else is a no-op, never a stray free of a live
  * entry). Every OTHER entry in the ring is untouched, which is the whole of what replaces 0.0.431's stash/restore:
  * there is no single record left for a refusal to clobber. */
-/* 0.0.444 (C5-RING-REVIEW.md (B) item 2/3, Q1 route 2) — `state` GOES FIRST. Through 0.0.443 this wrote the fields
+/* 0.0.444 (an internal review note (B) item 2/3, Q1 route 2) — `state` GOES FIRST. Through 0.0.443 this wrote the fields
  * (`at_us` among them, to 0) BEFORE `state = FREE`, so a concurrent scan (hook_unmapVA holds no lock across this)
  * could observe PENDING with `at_us == 0` — a torn stamp — and fail the whole ring closed to TORN even while an
  * EARLIER, still-COMMITTED entry was validly within its bound: an earlier-withdrawal route the review named
@@ -408,7 +408,7 @@ static inline uint32_t n48_fr_poll_entry(n48_fr_ring *r, uint32_t idx, uint32_t 
     return 1u;
 }
 
-/* 0.0.444 (C5-RING-REVIEW.md (B) item 6) — A LIVE ENTRY PAST ITS OWN BOUND BECOMES EXPIRED. Asks exactly the same
+/* 0.0.444 (an internal review note (B) item 6) — A LIVE ENTRY PAST ITS OWN BOUND BECOMES EXPIRED. Asks exactly the same
  * per-entry age question n48_fr_defer_verdict's timeout pass does (a torn `at_us == 0` or a future stamp never
  * expires here — the defer verdict's own TORN/age-0 handling covers those, and expiry is a STATE change, so it
  * must never fire on evidence the defer verdict itself would not trust). Idempotent: EXPIRED is terminal, and this
@@ -525,7 +525,7 @@ static inline uint32_t n48_fr_keystone_guard(const n48_fr_ring *r, uint32_t tok_
     "(state %s), so the KEYSTONE WAS NOT RUN for it and wrote nothing. NEUTERING: a commit whose flight the ring " \
     "cannot track must not run (0.0.444 item 5(ii))."
 
-/* Item 5/item 8 (0.0.444, C5-RING-REVIEW.md Q5): does any entry with an ordinal EARLIER than `retiredOrdinal`
+/* Item 5/item 8 (0.0.444, an internal review note Q5): does any entry with an ordinal EARLIER than `retiredOrdinal`
  * remain un-retired and STILL ABLE TO RETIRE BY FENCE (PENDING or COMMITTED)? 0.0.443 also counted NOT_RUN here,
  * which the review named a false-positive source once retirement is wired up: a NOT_RUN entry's own slot is never
  * written by anything (gfx_fence828.h's owned slot dies with the IB that never ran), so it can NEVER retire by
@@ -549,7 +549,7 @@ static inline uint32_t n48_fr_out_of_order(const n48_fr_ring *r, uint32_t retire
     return 0u;
 }
 
-/* 0.0.444 (C5-RING-REVIEW.md (B) item 2) — "THE RING SCAN", ASKED BEFORE THE CLOCK IS EVER READ. A cheap presence
+/* 0.0.444 (an internal review note (B) item 2) — "THE RING SCAN", ASKED BEFORE THE CLOCK IS EVER READ. A cheap presence
  * check over `state` alone (no `at_us`, no timing), so the caller can decide whether reading the clock is even
  * worth doing WITHOUT yet comparing anything against a `now_us` snapshot. This is the fix for Q1 route 1: through
  * 0.0.443 the caller (hook_unmapVA) read the clock, THEN scanned the ring, so a push landing in between could hand

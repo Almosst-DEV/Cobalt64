@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Host tests for tools/gfx-readset.py and the header it generates, src/xlat12/xlat12_readset.h
-(notes/design/D4-PRIME.md item 2). Each planted-break case below is written to FAIL when the check it is
+(an internal design note item 2). Each planted-break case below is written to FAIL when the check it is
 attached to is disabled or weakened, so a vacuous test cannot pass silently - (prove tests
 non-vacuous").
 """
@@ -321,7 +321,7 @@ class T5ImagesInlineProof(unittest.TestCase):
 
 
 class T6ConstPSUnorm16ExportShape(unittest.TestCase):
-    """COVERAGE TASK S4 (notes/design/MIB-COMMIT.md): Const_PS_unorm16_gfx1201 (Apple's
+    """COVERAGE TASK S4 (an internal design note): Const_PS_unorm16_gfx1201 (Apple's
     gShaderCode_gfx10_Const_PS[patch 5@4], key 0x42b75958085306e5) must export mrt0 with write mask
     0x3, DONE, and both packed words produced by v_cvt_pk_norm_u16_f32 - the shape
     tools/air-gfx.py's _export_packed_unorm16() lowers to and tools/gfx-io-check.py's "packed ...
@@ -417,7 +417,7 @@ class T7StoreDisqualifiesProof(unittest.TestCase):
 
 
 class T8VertexSlotOffset(unittest.TestCase):
-    """D4-8 (CONFIRMED, notes/design/D4-PRIME-FIXES.md): a vertex row's EMITTED slot is the raw SGPR minus 8
+    """D4-8 (CONFIRMED, an internal design note): a vertex row's EMITTED slot is the raw SGPR minus 8
     (vertex user data starts at s8 in these programs) - xlat12_ib.c indexes the vertex stage's own 0-based
     user-data array with this value. UberCompositeVertex's ABI (src/xlat12/xlat12_abi_ptrs.h) independently
     declares user-data slots 4 and 6 for the SAME identity, so this is a real, cross-checked expectation."""

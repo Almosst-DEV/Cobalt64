@@ -1,0 +1,5 @@
+#!/bin/bash
+case "${@: -1}" in
+  kern.boottime) echo "{ sec = 1791469800, usec = 0 } Thu Oct  8 12:56:40 2026" ;;
+  kern.bootargs) if [ -f "$SIM_DIR/cfg/bootargs" ]; then cat "$SIM_DIR/cfg/bootargs"; else echo "navi48-stage=17 navi48-native=1 navi48-metal=1 navi48-metal-disp=1 navi48-metal-ws=1 navi48-dmubcmd=1 navi48-disp2=1 navi48-fb2=1 navi48-m6=1 navi48-m6flip=1 navi48-m6flip1=1 npci=0x2000"; fi ;;
+esac

@@ -1,4 +1,4 @@
-// native_ws_open_test.cpp - build 0.0.612 (milestone #11 step 11c, notes/design/NATIVE-S4-M11.md sections 3, 7, 8): W1 the class rename, W2 the open policy (uid 88 behind
+// native_ws_open_test.cpp - build 0.0.612 (milestone #11 step 11c, an internal design note sections 3, 7, 8): W1 the class rename, W2 the open policy (uid 88 behind
 // navi48-metal-ws=1), W3 the "Navi48,Ready" property and where the HUNG latch writes it.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //       -I src/navi48-bringup/src -I src/navi48-bringup/src/amd src/navi48-bringup/tests/native_ws_open_test.cpp -o /tmp/native_ws_open && /tmp/native_ws_open .
@@ -114,7 +114,7 @@ static void o3_pins(const std::string &root) {
             expect_u("no kext source uses the old class name as code", bad, 0);
         }
     }
-    expect(br.find("return IOAccelNavi48NativeClient::create(this, owningTask, securityID, type, properties, handler);") != std::string::npos, "newUserClient creates the renamed class for type N48N");
+    expect(br.find("return IOAccelNavi48NativeClient::create(this, this, n48native::policy::kRouteBringup, owningTask, securityID, type, properties, handler);") != std::string::npos, "newUserClient creates the renamed class for type N48N");
     expect_u("the user-client type is still 'N48N'", N48N_UC_TYPE, 0x4E34384Eu);
     expect(br.find("if (type == N48N_UC_TYPE)") != std::string::npos, "the type switch is unchanged");
     expect(plist.find("Navi48NativeClient") == std::string::npos, "no personality names the user-client class (it is created by newUserClient)");
@@ -137,7 +137,7 @@ static void o3_pins(const std::string &root) {
     // W2: the policy wiring
     const std::string init = fn_body(cli, "bool IOAccelNavi48NativeClient::initWithTask(");
     expect(!init.empty(), "initWithTask is found");
-    expect(init.find("n48native::policy::open_decision(admin, uid, n48native::policy::latch_is_on(gMetalWsLatch), amdgpu::n1c_is_open())") != std::string::npos, "initWithTask asks the pure decision, with the latched boot-arg and the open state");
+    expect(init.find("n48native::policy::open_decision(admin, uid, n48native::policy::latch_is_on(gMetalWsLatch),") != std::string::npos && init.find("n48native::g2::ws_already_open(appsOn, amdgpu::n1c_is_open(), amdgpu::n1c_ws_is_open())") != std::string::npos, "initWithTask asks the pure decision, with the latched boot-arg and the open state (0.0.641: apps ON = a WindowServer session, else any native client)");
     expect(init.find("clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) == kIOReturnSuccess") != std::string::npos, "the administrator test is the old clientHasPrivilege call, unchanged");
     expect(init.find("kauth_cred_getuid(kauth_cred_get())") != std::string::npos, "the uid is the opener's effective uid");
     expect(init.find("if (!d.admit)") != std::string::npos && init.find("return false;") != std::string::npos, "a refused decision fails initWithTask (NotPrivileged)");
@@ -155,7 +155,7 @@ static void o3_pins(const std::string &root) {
     expect(init.find("if (gMetalWsLatch == n48native::policy::kLatchUnset) latchBootArgs();") != std::string::npos && init.find("latchBootArgs();") < init.find("open_decision("), "initWithTask latches (if start never did) BEFORE it decides");
     expect(init.find("clientHasPrivilege") < init.find("open_decision("), "the privilege query precedes the decision");
     // the service and the open path are unchanged
-    expect(cli.find("const IOReturn rc = amdgpu::n1c_open(*owner->bringupContext());") != std::string::npos && cli.find("return kIOReturnNotPrivileged;   // non-root") != std::string::npos, "create() still refuses with NotPrivileged and opens through n1c_open (exclusivity, VMID 8)");
+    expect(cli.find("const IOReturn rc = amdgpu::n1c_open(*owner->bringupContext(), uc->wsSession, &ref);") != std::string::npos && cli.find("return kIOReturnNotPrivileged;   // non-root") != std::string::npos, "create() still refuses with NotPrivileged and opens through n1c_open (exclusivity with the switch OFF, VMID 8; 0.0.627: the WindowServer flag and the session reference)");
     expect_u("still exactly one native VMID", n48native::kNativeVmid, 8);
 }
 
@@ -229,7 +229,9 @@ static void o4_pins(const std::string &root) {
     expect(poll.find("hang_detect(gHang") != std::string::npos && poll.find("if (det) hang_announce(em, re);") != std::string::npos && poll.find("hang_detect(gHang") < poll.find("hang_announce("), "hang_poll: the latch is set, then announced");
     expect(wait.find("hang_latch_wait(gHang)") != std::string::npos && wait.find("if (det) hang_announce(em, re);") != std::string::npos && wait.find("hang_latch_wait(gHang)") < wait.find("hang_announce("), "hang_from_wait: the latch is set, then announced");
     expect(poll.find("IOLockUnlock(gHangLock);") < poll.find("hang_announce(") && wait.find("IOLockUnlock(gHangLock);") < wait.find("hang_announce("), "the announce runs with the hang lock released");
-    expect_u("hang_announce has exactly two callers", count_of(eng, "hang_announce(em, re)"), 2);
+    expect_u("hang_announce has exactly three callers (0.0.627: + stall_handle, after its own hang_latch_wait)", count_of(eng, "hang_announce(em, re)"), 3);
+    { const std::string sh = fn_body(eng, "static bool stall_handle(uint64_t em, uint64_t re) {");
+      expect(!sh.empty() && sh.find("const bool det = hang_latch_wait(gHang);") < sh.find("if (det) hang_announce(em, re);") && sh.find("IOLockUnlock(gHangLock);\n    if (det) hang_announce(em, re);") != std::string::npos, "stall_handle: the latch is set, then announced, with the hang lock released"); }
     expect_u("hang_log has exactly one caller: hang_announce", count_of(eng, "hang_log(emitted, retired);"), 1);
     expect(count_of(eng, "hang_log(") == 2, "hang_log is defined once and called once");
     expect(ann.find("hang_log(emitted, retired);") != std::string::npos && ann.find("Navi48MetalNub::hungLatched();") != std::string::npos && ann.find("hang_log(") < ann.find("Navi48MetalNub::hungLatched();"), "hang_announce logs, then writes the property");
@@ -257,9 +259,10 @@ static void o4_pins(const std::string &root) {
 // ---- O5 (review items B and E): who may call what -----------------------------------------------------------------------------------------------------
 static void o5_reach(const std::string &root) {
     const uint32_t allowedWs[] = { N48N_SEL_HELLO, N48N_SEL_QUERYINFO, N48N_SEL_READREGS, N48N_SEL_BOCREATE, N48N_SEL_BOFREE, N48N_SEL_GEMVA, N48N_SEL_CTX, N48N_SEL_SUBMIT, N48N_SEL_WAITSEQ,
-                                  N48N_SEL_SCAN_QUERY, N48N_SEL_SCAN_ACQUIRE, N48N_SEL_SCAN_REGISTER, N48N_SEL_SCAN_PRESENT, N48N_SEL_SCAN_STATUS, N48N_SEL_SCAN_RELEASE, N48N_SEL_BO_IMPORT_HOST };
+                                  N48N_SEL_SCAN_QUERY, N48N_SEL_SCAN_ACQUIRE, N48N_SEL_SCAN_REGISTER, N48N_SEL_SCAN_PRESENT, N48N_SEL_SCAN_STATUS, N48N_SEL_SCAN_RELEASE, N48N_SEL_BO_IMPORT_HOST,
+                                  N48N_SEL_SCANX_ACQUIRE, N48N_SEL_SCANX_REGISTER, N48N_SEL_SCANX_PRESENT, N48N_SEL_SCANX_STATUS, N48N_SEL_SCANX_RELEASE };   // 0.0.661: instance 2's scanout (22..26) is WindowServer's too
     const uint32_t refusedWs[] = { N48N_SEL_DAL_STEP, N48N_SEL_MODE_TRIAL, N48N_SEL_MODE_HOLD, N48N_SEL_MODE_RELEASE, N48N_SEL_METAL_NUB_PUBLISH, N48N_SEL_METAL_NUB_WITHDRAW,
-                                   22u, 23u, 64u, 255u, 0x80000000u, 0xFFFFFFFFu };
+                                   27u, 28u, 64u, 255u, 0x80000000u, 0xFFFFFFFFu };
     for (uint32_t sel : allowedWs) {
         expect(selector_allowed(false, sel) && selector_allowed(true, sel), "a uid-88 client may call the WindowServer set (Hello .. WaitSeq, scanout, BoImportHost)");
         expect(selector_allowed_for_windowserver(sel), "the WindowServer set holds it");
@@ -273,9 +276,9 @@ static void o5_reach(const std::string &root) {
     for (uint32_t sel = 0; sel < 300u; sel++) {
         expect(selector_allowed(true, sel), "administrator: every selector is allowed");
         if (selector_allowed(false, sel)) nAllowed++; else if (sel < N48N_SEL_COUNT_1_9) nRefusedBelowCount++;
-        expect(selector_allowed(false, sel) == (sel <= 14u || sel == 21u), "uid 88: exactly 0..14 and 21");
+        expect(selector_allowed(false, sel) == (sel <= 14u || sel == 21u || (sel >= 22u && sel <= 26u)), "uid 88: exactly 0..14, 21 and (0.0.661) 22..26");
     }
-    expect_u("the WindowServer set has 16 selectors", nAllowed, 16u);
+    expect_u("the WindowServer set has 21 selectors (0.0.661: + 22..26)", nAllowed, 21u);
     expect_u("six ABI selectors are refused to it (15..20)", nRefusedBelowCount, 6u);
     expect_u("selector 21 is BoImportHost", N48N_SEL_BO_IMPORT_HOST, 21u); expect_u("selector 14 is the last scanout selector", N48N_SEL_SCAN_RELEASE, 14u);
     expect_u("selector 8 is WaitSeq", N48N_SEL_WAITSEQ, 8u); expect_u("selector 15 is the DAL step", N48N_SEL_DAL_STEP, 15u); expect_u("selector 19 is the nub publish", N48N_SEL_METAL_NUB_PUBLISH, 19u);
@@ -294,7 +297,8 @@ static void o5_reach(const std::string &root) {
     const size_t pOpen = ext.find("if (!args || !opened) return kIOReturnNotReady;"), pGate = ext.find("if (!n48native::policy::selector_allowed(adminClient, selector)) {"), pSw = ext.find("switch (selector) {");
     expect(pOpen != std::string::npos && pGate != std::string::npos && pSw != std::string::npos && pOpen < pGate && pGate < pSw, "E: the selector gate sits after the opened check and BEFORE the switch (reachable for every selector)");
     if (pGate != std::string::npos && pSw != std::string::npos) {
-        const std::string gate = ext.substr(pGate, pSw - pGate);
+        const size_t pAppGate = ext.find("// 0.0.640 (G4): an APP client reaches only");   // 0.0.640: the APP gate follows the uid-88 gate; this block is the uid-88 gate alone
+        const std::string gate = ext.substr(pGate, (pAppGate != std::string::npos && pAppGate > pGate ? pAppGate : pSw) - pGate);
         expect(gate.find("return kIOReturnNotPrivileged;") != std::string::npos && gate.find("NCLOG(\"selector %u refused: not permitted for a uid-88 (non-administrator) client\", selector);") != std::string::npos, "E: the refusal is NotPrivileged with a log line");
         expect(gate.find("return kIOReturnNotPrivileged;") > gate.find("NCLOG("), "E: the log line comes before the return");
     }
@@ -306,7 +310,7 @@ static void o5_reach(const std::string &root) {
     expect(c21 != std::string::npos, "the selector 21 case is found");
     if (c21 != std::string::npos) {
         const std::string c = cli.substr(c21, cli.find("default:", c21) - c21);
-        const size_t pShape = c.find("if (!shape(4, 4, 0, 0)) return kIOReturnBadArgument;"), pOwn = c.find("if (!n48native::policy::import_caller_ok(current_task(), task)) {"), pCall = c.find("return amdgpu::n1c_bo_import_host(task,");
+        const size_t pShape = c.find("if (!shape(4, 4, 0, 0)) return kIOReturnBadArgument;"), pOwn = c.find("if (!n48native::policy::import_caller_ok(current_task(), task)) {"), pCall = c.find("return amdgpu::n1c_bo_import_host(r, task,");
         expect(pShape != std::string::npos && pOwn != std::string::npos && pCall != std::string::npos && pShape < pOwn && pOwn < pCall, "B: shape, then the owning-task check, THEN the import");
         if (pOwn != std::string::npos && pCall != std::string::npos) {
             const std::string blk = c.substr(pOwn, pCall - pOwn);
@@ -314,7 +318,7 @@ static void o5_reach(const std::string &root) {
         }
     }
     expect(cli.find("#include <kern/task.h>") != std::string::npos, "current_task comes from <kern/task.h>");
-    expect_u("the stored task is used in exactly one selector: 21 (the lifetime report)", count_of(cli, "(task,") + count_of(cli, ", task)"), 2u);
+    expect_u("the stored task is used in exactly one selector: 21 (the lifetime report)", count_of(cli, "(r, task,") + count_of(cli, ", task)"), 2u);
 }
 
 int main(int argc, char **argv) {

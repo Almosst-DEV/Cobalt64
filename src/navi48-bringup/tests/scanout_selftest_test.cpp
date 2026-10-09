@@ -1,4 +1,4 @@
-// scanout_selftest_test.cpp — S7 of notes/design/SCANOUT-SELFTEST-FULL.md (0.0.414): the pure half of the
+// scanout_selftest_test.cpp — S7 of an internal design note (0.0.414): the pure half of the
 // full-geometry SDMA self-test, host-tested. Three things are pinned here, each with a mutant that must be
 // caught (the pipeshim_verify_test style, not a vacuous pass):
 //   1. the S5 sample-set generator — count, bounds, no duplicate, and every named row/column present;
@@ -145,7 +145,7 @@ static int checks(const Fns &fn)
         expect_u("at(count+1) is refused", (uint64_t)fn.at(w, h, n + 1u, &x, &y), 0u);
     }
 
-    // --- D7 (0.0.417, notes/design/SDMA-DCC-NOPTE.md): the UNIFORM probe `scanout 8` writes, and the value
+    // --- D7 (0.0.417, an internal design note): the UNIFORM probe `scanout 8` writes, and the value
     //     every sampled position must then read back. Constant, and neither the self-naming probe nor POISON. ---
     {
         expect_u("the uniform probe value is 0xff00ff00", N48_TILE_UNIFORM_PIXEL, 0xff00ff00u);

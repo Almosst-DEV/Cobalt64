@@ -18,7 +18,7 @@ fresh() {
   cp -R "$ROOT/$SR" "$SCR/$SR"
   cp "$ROOT/$K/Makefile" "$ROOT/$K/Info.plist" "$SCR/$K/"
   cp "$ROOT/$K/tests/native_metal_test.cpp" "$SCR/$K/tests/"
-  cp "$ROOT/notes/design/NATIVE-S1C-ABI.md" "$SCR/notes/design/"
+  cp "$ROOT/an internal design note" "$SCR/notes/design/"
   cp "$ROOT/tools/native/n48nub.c" "$ROOT/tools/native/build.sh" "$SCR/tools/native/"
 }
 build_run() {   # -> prints the verdict line; returns 0 if the suite PASSED, 1 if it failed, 2 if it did not compile
@@ -126,7 +126,9 @@ plant 30 $N "the gate ignores the S1b POSITIVE flag" 'g.s1bPositive = s.positive
 plant 31 $N "the gate ignores HUNG" 'g.hung = amdgpu::n1c_hung();' 'g.hung = false;'
 plant 32 $N "the gate does not read the Hello state" 'g.hello = amdgpu::n1c_hello_done();' 'g.hello = true;'
 plant 33 $N "the populate hook is not the pure config_populate" 'n48metal::config_populate(cfg, bytes, (uint64_t)(uintptr_t)kAccelName)' '0'
-plant 34 $N "the ops table carries the wrong build" 'sizeof(N48MetalOps), 620u,' 'sizeof(N48MetalOps), 610u,'
+plant 34 $N "the ops table carries the wrong build" 'const N48MetalOps gOps = {
+	N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 664u,' 'const N48MetalOps gOps = {
+	N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 610u,'
 plant 35 $N "the memory-map hook claims success" 'return (int)kIOReturnUnsupported;' 'return 0;'
 plant 36 $N "the nub source touches a register" '	MNLOG("device_close");' '	MNLOG("device_close"); (void)"WREG32";'
 plant 37 $N "device_close is not identity-checked (a stale ctx frees the live device)" 'if (!d || d != gDev || d->magic != kDevMagic) return;' 'if (!d) return;'
@@ -134,15 +136,15 @@ plant 38 $C "the publish selector accepts the wrong shape" 'if (!shape(1, 4, 0, 
 		return Navi48MetalNub::selectorPublish' 'if (!shape(1, 3, 0, 0)) return kIOReturnBadArgument;
 		return Navi48MetalNub::selectorPublish'
 plant 39 $C "the withdraw selector is not dispatched" 'case N48N_SEL_METAL_NUB_WITHDRAW:' 'case 20 + 100:'
-plant 40 $SR/amd/native_s1c.h "the kext build is not bumped" 'kN1cKextBuild = 620;' 'kN1cKextBuild = 610;'
+plant 40 $SR/amd/native_s1c.h "the kext build is not bumped" 'kN1cKextBuild = 664;' 'kN1cKextBuild = 610;'
 plant 41 $K/Info.plist "the plist is not bumped (one occurrence)" '<key>CFBundleShortVersionString</key>
-	<string>0.0.620</string>' '<key>CFBundleShortVersionString</key>
+	<string>0.0.664</string>' '<key>CFBundleShortVersionString</key>
 	<string>0.0.610</string>'
-plant 42 $SR/Navi48NativeABI.h "the ABI minor is not bumped" '#define N48N_ABI_MINOR     9u ' '#define N48N_ABI_MINOR     7u '
+plant 42 $SR/Navi48NativeABI.h "the ABI minor is not bumped" '#define N48N_ABI_MINOR     12u ' '#define N48N_ABI_MINOR     7u '
 plant 43 $SR/Navi48NativeABI.h "the withdraw selector moves" 'N48N_SEL_METAL_NUB_WITHDRAW = 20,' 'N48N_SEL_METAL_NUB_WITHDRAW = 21,'
 plant 44 $SR/Navi48MetalOps.h "the ops table grows a member in the middle (offsets move)" '    uint32_t reserved0;    /*  20  0 */' '    uint32_t reserved0;    /*  20  0 */
     uint32_t sneaky;'
-plant 45 notes/design/NATIVE-S1C-ABI.md "the ABI addendum is missing" '## ABI 1.8 addendum' '## ABI addendum'
+plant 45 an internal design note "the ABI addendum is missing" '## ABI 1.8 addendum' '## ABI addendum'
 plant 46 $SR/Navi48NativeClient.cpp "a third caller publishes from the client (case duplicated outside the guard)" 'return Navi48MetalNub::selectorWithdraw(si[0], so);' 'Navi48MetalNub::selectorPublish(owner, 0, so); return Navi48MetalNub::selectorWithdraw(si[0], so);'
 
 plant 49 $N "DEADLOCK: the failed-publish path releases the nub while holding the lock (free() takes it)" '		IOLockUnlock(gLock);
@@ -154,7 +156,7 @@ plant 48 tools/native/n48nub.c "the tool publishes without saying Hello" 'if (he
         const uint64_t in[1] = { 0 }; uint64_t o[4]'
 plant 50 $N "the nub is not retained across registerService() (a racing withdraw frees it)" '	nub->retain();' '	(void)nub;'
 plant 51 $SR/Navi48MetalOps.h "the ops header drops the generic hook member" '    uint64_t caps;' '    uint64_t caps_;'
-plant 52 $P "the caps constant loses the hook bit" 'constexpr uint64_t kOpsCaps = N48_CAP_VHOOK;' 'constexpr uint64_t kOpsCaps = 0;'
+plant 52 $P "the caps constant loses the hook bit" 'constexpr uint64_t kOpsCaps = N48_CAP_VHOOK | N48_CAP_NATIVE_OPEN;' 'constexpr uint64_t kOpsCaps = N48_CAP_NATIVE_OPEN;'
 
 # ---- 0.0.611: config atomicity, vhook rate limit, vhook output-parameter writes ----
 plant 53 $P "config_populate fills the CALLER's struct in place (a refusal leaves our values there)" '    config_fill(work, namePtr);

@@ -3,7 +3,7 @@
  * Linked with UNMODIFIED Linux objects: dc/bios/command_table2.c, command_table_helper2.c,
  * dce112/command_table_helper2_dce112.c (the DMUB command builders and DC->ATOM translations), dmub/src/dmub_srv.c,
  * dmub_dcn401.c and dmub_reg.c (GPINT, the inbox1 ring queue/execute/idle wait, fw meta lookup). The bios parser is
- * set up the way the vendored Sapphire ROM makes Linux set it up: no digxencodercontrol / setpixelclock /
+ * set up the way the vendored board ROM makes Linux set it up: no digxencodercontrol / setpixelclock /
  * enabledisppowergating / dig1transmittercontrol command tables (their master-table entries are 0, see
  * notes/DISPLAY-DESIGN.md), so amdgpu_atom_parse_cmd_header() fails and every call takes the *_fallback -> DMUB path. */
 #include "dm_services.h"

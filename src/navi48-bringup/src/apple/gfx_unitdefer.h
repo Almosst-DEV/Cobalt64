@@ -1,4 +1,4 @@
-// gfx_unitdefer.h - build 0.0.506 ( (1),; notes/design/UNIT-ROOM.md, CONTINUATION-UNITS.md):
+// gfx_unitdefer.h - build 0.0.506 ( (1),; an internal design note, CONTINUATION-UNITS.md):
 // SWITCH 70, THE DEFERRED ROOM RETRY. DEFAULT OFF, REQUIRES 55 (units). PURE: the kext's gfxsrc_policy and the host test
 // (tests/gfx_mib_units_checks.h run_frame) call the same functions in the same order.
 //

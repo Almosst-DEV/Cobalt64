@@ -46,6 +46,15 @@ int main(void) {
     CHECK("RG8 plane with a 960-byte row (< 960*2) refused (77)", !run(&q, &o) && o.code == 77, "code %d", o.code);
     q = p1; q.pbpr = 2048; q.alloc = P0 + 2048ull * 540;
     CHECK("padded plane 1 row (2048) -> bufferRowLength 1024 texels, not the width", run(&q, &o) && o.rowlen == 1024, "rowlen %zu", o.rowlen);
+    // build 7: a descriptor inside the plane (Core Image intermediates), RGBA16Float bpe 8
+    n48pl_in ci = { .pc = 1, .plane = 0, .pw = 320, .ph = 576, .pbpe = 8, .pbpr = 2560, .poff = 0, .alloc = 2560ull * 576, .dw = 308, .dh = 514, .dbpp = 8 };
+    CHECK("308x514 on 320x576 (bpe 8, bpr 2560) accepted, rowlen 320", run(&ci, &o) && o.rowlen == 320, "ok %d code %d rowlen %zu", o.ok, o.code, o.rowlen);
+    q = ci; q.dw = 330;
+    CHECK("330x514 on 320x576 refused (75)", !run(&q, &o) && o.code == 75, "code %d: %s", o.code, o.why);
+    q = ci; q.dh = 577;
+    CHECK("308x577 on 320x576 refused (75)", !run(&q, &o) && o.code == 75, "code %d: %s", o.code, o.why);
+    q = ci; q.dw = 320; q.dh = 576;
+    CHECK("320x576 exact unchanged", run(&q, &o) && o.rowlen == 320, "rowlen %zu", o.rowlen);
     // single plane surfaces: exactly today's answers
     n48pl_in s1 = { .pc = 1, .plane = 0, .pw = 64, .ph = 64, .pbpe = 4, .pbpr = 256, .poff = 0, .alloc = 16384, .dw = 64, .dh = 64, .dbpp = 4 };
     CHECK("pc 1 plane 0 accepted as today", run(&s1, &o) && o.off == 0 && o.rowlen == 64, "rowlen %zu", o.rowlen);

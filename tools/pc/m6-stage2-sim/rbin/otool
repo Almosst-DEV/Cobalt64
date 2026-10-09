@@ -1,0 +1,2 @@
+#!/bin/bash
+echo "    cmd LC_UUID"; echo "   cmdsize 24"; echo "      uuid 1B911394-AAAA-BBBB-CCCC-111122223333"

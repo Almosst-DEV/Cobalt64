@@ -11,6 +11,7 @@
 #include <stdint.h>
 
 class Navi48Bringup;
+namespace amdgpu { struct BringupContext; }   // 0.0.635: disp2's plane op
 struct n48_sf_dcn;   // build 0.0.542: apple/scanout_full.h
 struct n48n_scan_query;    // build 0.0.603: Navi48NativeABI.h
 struct n48n_scan_status;
@@ -91,7 +92,7 @@ void fmCrcEnd();
 // built at start() (navi48_liveraster.h n48lr_scan_surface; no register is written, no bind() needed). 1 = every read made.
 uint32_t roScanSurface(n48_sf_dcn *s);
 
-// build 0.0.603 (native S2a; contract: the "ABI 1.1 addendum" of notes/design/NATIVE-S1C-ABI.md, design notes/design/NATIVE-S2.md + Review).
+// build 0.0.603 (native S2a; contract: the "ABI 1.1 addendum" of an internal design note, design an internal design note + Review).
 // The native scanout path behind the N48N selectors 9..14. All of it needs bind() to have succeeded and a NATIVE boot (Acquire checks the
 // S1b gate), and none of it runs unless a native client calls it. Return values are IOReturn codes (n48scan::k*); 0 = success.
 //   LOCK ORDER: the native client's lock (gCliLock) is taken BEFORE the scanout lock, never after; the interrupt handler takes only the
@@ -127,6 +128,34 @@ void modeHoldSessionClosed(uint32_t sess);
 // 0.0.614 (native AGDC, amd/native_agdc_pure.h): true while a row-120 hold is launching or up (the claim to the runner's end). ONE atomic load of each word: no lock, no register, callable from anywhere.
 bool modeHoldActive();
 uint32_t scanGeneration();
+// build 0.0.622 (multi-monitor track, stage M1; dcn/navi48_dispread.h, an internal design note): the three instruments behind accel verbs 91 / 92 / 93. Each fills out[0..12] (13 scalars) and returns the
+// N48DR_ status (out[0]'s low byte). ddcRead needs bind() (its writes go through the DCN allowlist); dmubRing and dispCensus read through the read-only device attach() built and need nothing else.
+uint32_t ddcRead(uint64_t arg, uint64_t *out, unsigned outCount);
+uint32_t scdcRead(uint64_t arg, uint64_t *out, unsigned outCount);   // 0.0.633: verb 99, READ-ONLY SCDC read over the same DC_I2C engine as ddcRead (same busy flag)
+uint32_t dmubRing(uint64_t arg, uint64_t *out, unsigned outCount);
+uint32_t dispCensus(uint64_t arg, uint64_t *out, unsigned outCount);
+// build 0.0.624 (stage M1.5; dcn/navi48_dispread.h): verb 94 `region4read`. READ-ONLY: DMCUB register reads (dcn41_dmub_probe) for the window base, then navi48_vram_read_mm. Same 13-scalar contract.
+uint32_t region4Read(uint64_t arg, uint64_t *out, unsigned outCount);
+// build 0.0.625 (stages M2 / M3; dcn/navi48_dmubcmd.h): verbs 95 `dmubsend`, 96 `dmubmode`, 97 `dmubctx`. The FIRST code that sends to the display firmware; ALL behind boot-arg navi48-dmubcmd=1 (default OFF: N48DR_CMD_OFF,
+// nothing touched). Same 13-scalar contract. dmubSend needs bind() (its one register write, DMCUB_INBOX1_WPTR, goes through the DCN write allowlist); VRAM only through navi48_vram_write_mm.
+bool dmubCmdLatchedOn();   // 0.0.626 (F4): the navi48-dmubcmd latch; the dispatcher asks it before bind()
+uint32_t dmubSend(uint64_t arg, uint64_t *out, unsigned outCount);
+uint32_t dmubMode(uint64_t arg, uint64_t *out, unsigned outCount);
+uint32_t dmubCtx(uint64_t arg, uint64_t *out, unsigned outCount);
+// build 0.0.631 (stage M4d; dcn/navi48_disp2.h): verb 98 `disp2 timing|connect|off|status` - the OTG1 -> DIG2 test pattern. Behind boot-arg navi48-disp2=1 (default OFF: N48D2_OFF, nothing touched).
+// Same 13-scalar contract. Needs bind() (every write: the instance guard, then the DCN write allowlist).
+bool disp2LatchedOn();     // the navi48-disp2 latch; the dispatcher asks it before bind()
+uint32_t disp2(uint64_t arg, uint64_t *out, unsigned outCount, amdgpu::BringupContext *ctx = nullptr);   // 0.0.635: ctx = the bring-up context (the plane op's buffers come from its VRAM allocator, through amdgpu::n1c_d2_alloc / n1c_d2_free)
+// build 0.0.652 (M5): what `fbpublish 2` (Navi48DisplayNub.cpp) reads from the display layer. disp2Held: the plane is HELD (stage HELD or the pair pinned): atomic loads only. fbView: the software facts (NO register is read).
+// fbLive: the plane's live gates, READS ONLY (the busy flag of disp2): returns N48D2_OK / N48D2_BUSY / N48D2_NO_DEVICE; *holdBad = n48d2_hold_verdict over them (0 = buffer A is the front buffer and the plane is healthy), gates = the N48D2_GATES dwords.
+// fbEdid: a display's EDID blocks 0 and 1 (256 bytes) over its DDC line (the monitor B: 3; 0.0.658: the monitor A: 2) through the same engine sequence as `accel ddcread` (the DC_I2C engine's registers only, via the DCN allowlist); returns an N48DR_ status.
+// 0.0.658: fbView / fbLive take the disp2 INSTANCE (2 = the monitor B, 1 = the monitor A): the software facts and the live gates of THAT instance's plane; fbEdid takes the DDC line (the caller got it from n48disp_geom_for_index).
+struct FbView { bool held, pinned, devOk; uint64_t mc[2]; uint64_t offA, bar0Phys, bar0Size; uint32_t cur; uint64_t bufBytes; };      // bufBytes (0.0.658): the plane buffer's allocation size of the instance (the aperture must lie inside it)
+bool disp2Held();
+bool disp2HeldInst(uint32_t inst);      // 0.0.655: HELD is per instance (disp2Held() = the monitor B's)
+void fbView(FbView *v, uint32_t inst);
+uint32_t fbLive(uint32_t inst, uint32_t *holdBad, uint32_t *gates);
+uint32_t fbEdid(uint32_t ddcLine, uint8_t out[256]);
 // 0.0.617 (K6): true from a native client's scanout Acquire until the console restore completed (release, watchdog, IRQ storm guard, N48N close). ONE atomic load: no lock, no register, callable from the display
 // pipe's hooks (the transaction path); it never waits on the scanout lock.
 bool scanActive();
@@ -135,6 +164,22 @@ bool scanActive();
 // The totals, blank start and pixel clock are re-read at most every 250 ms (cached); the position is read on every call. false = no coherent sample (no device, no lit OTG, a mode trial running, a
 // position outside the raster, a period outside 1 ms .. 100 ms): the caller writes nothing.
 bool vblSample(uint64_t *periodNs, uint64_t *delayNs, uint64_t *nowAbs);
+// 0.0.659 (M6 Stage 1a): the same sample for the monitor A (inst 1, OTG1) / the monitor B (inst 2, OTG2) from THAT display's own OTG; w, h, pixHz are the geometry table's (the raster must be lit with exactly that active size). Reads only.
+bool vblSampleInst(uint32_t inst, uint32_t w, uint32_t h, uint64_t pixHz, uint64_t *periodNs, uint64_t *delayNs, uint64_t *nowAbs);
+// ---- 0.0.661 (M6 Stage 1b, ABI 1.11, behind the latches navi48-m6=1 AND navi48-m6flip=1) + 0.0.662 (M6 Stage 2, ABI 1.12, instance 1 also behind navi48-m6flip1=1): the HDMI displays' scanout - INSTANCE 2 = the monitor B (HUBP2 / OTG2) and
+// INSTANCE 1 = the monitor A (HUBP1 / OTG1), poll-only. The sequences are dcn/navi48_scanx_flow.h (host-tested over a fake HUBPn, one XDesc per instance). Every function takes the INSTANCE (1 or 2; anything else is BadArgument).
+// With a latch OFF every function below touches NOTHING (no register, no lock) and the selectors answer Unsupported (instance 1 without navi48-m6flip1: BadArgument at the client, exactly 0.0.661's answer). Slot ids are TAGGED (instance 1: 0x10 | k, instance 2: 0x20 | k).
+uint32_t scanXAcquire(uint32_t inst, uint64_t out[5]);                  // out: [0] A (the instance's console MC), [1] extended OTG frame count, [2] the M6 table generation, [3] 0 (the native client fills the free visible-VRAM figure), [4] geometry: w | h << 16 | pitchPx << 32
+uint32_t scanXRegister(uint32_t inst, bool boVis, uint64_t boMc, uint64_t boSize, uint64_t offset, uint32_t pitchBytes, uint32_t width, uint32_t height, uint32_t format, uint64_t out[2]);   // out: [0] tagged slot id, [1] slot MC
+uint32_t scanXPresent(uint32_t inst, uint64_t slotId, uint64_t flags, uint64_t out[3]);   // out: [0] present id, [1] target frame, [2] 0
+uint32_t scanXStatus(uint32_t inst, struct n48n_scan_status *o, uint64_t out[4]);      // out: [0] table generation, [1] reuse_inuse_refused, [2] restores | restoreFailures << 32, [3] write refusals | write failures << 32
+uint32_t scanXRelease(uint32_t inst, const char *why, uint64_t out[2]);                // THE restore of A (Restore); idempotent; out: [0] verified 1/0, [1] plane MC after
+uint32_t scanXBoGone(uint32_t inst, uint32_t pinMask, uint32_t pinGen, bool alwaysFull, uint64_t *out);   // 0 nothing / dropped, 1 restored and verified, 2 NOT verified: LEAK the BO
+uint32_t scanXGeneration(uint32_t inst);                                 // the acquisition generation of that instance (0 for any other number)
+uint32_t scanXGpuHeld(uint32_t inst);                                    // 0 = not GPU-held (or not instance 1 / 2, or a latch OFF: nothing read); 1..3 = the instance is acquired and slot k+1 is what its HUBP fetches; 4 = acquired, EARLIEST is not a slot (n48scanx::gpu_held_code). disp2's status / crc / fbLive report it instead of a latch failure
+bool scanXClash(uint64_t mc, uint64_t bytes);                           // true when [mc, mc + bytes) overlaps an HDMI display's A, B or a registered slot (instance 0's Register asks it with the latches ON; the monitor A's only with navi48-m6flip1)
+uint32_t scanXReport(uint64_t arg, uint64_t *v, unsigned n);            // accel `m6xstat [page]` (action 107): READ-ONLY report of an HDMI instance's scanout state; arg = page | instance << 8 (instance 0 = the monitor B)
+void scanXShutdown();                                                   // kext stop: the restores, then a bounded wait for the watchdog threads
 // `dcnflip 0` on a native boot: the same restore, and it also acts when nothing is acquired but HUBP0 is off the console learned earlier.
 void scanEscape(const char *why);
 void scanLogState();

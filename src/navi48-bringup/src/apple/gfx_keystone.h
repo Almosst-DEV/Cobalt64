@@ -336,7 +336,7 @@ static inline uint32_t n48_ks_post_walk_withdrawn(uint32_t marker_set, uint32_t 
 }
 
 /* =====================================================================================================================
- * 0.0.418 (notes/design/BUILD-0.0.418.md, E4) — THE WITHDRAWAL MARKER IS A COUNTER, NOT A FLAG (owed since 0.0.411).
+ * 0.0.418 (an internal design note, E4) — THE WITHDRAWAL MARKER IS A COUNTER, NOT A FLAG (owed since 0.0.411).
  *
  * 0.0.411 made `VmCtxObs::ksWithdrawing` a single flag that hook_unmapVA SETS at entry and CLEARS at its one exit, and
  * the keystone refuses whenever it is set. But hook_unmapVA holds no lock across the clear -> Apple's unmapVA -> re-arm

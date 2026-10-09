@@ -200,10 +200,10 @@ static int check_entry(const sc_cache *c, uint32_t eoff, sc_match *m)
         if (cap < adw * 4u) return SC_E_ENTRY;
     }
     if (flags & (SC_F_SUBSTITUTE | SC_F_RELOCATE)) {
-        /* 0.0.311 (notes §565): both flags mean "an image is stored here", and they are ALTERNATIVES - an entry that
+        /* 0.0.311: both flags mean "an image is stored here", and they are ALTERNATIVES - an entry that
          * claimed both would be saying the same bytes may and may not be written over Apple's program. The capacity
          * clause belongs to SUBSTITUTE alone: a relocated image goes into our arena, not into Apple's allocation, and
-         * bounding it by that allocation is exactly the rule that kept RectPosTexFast_VS out of the blob (§564). */
+         * bounding it by that allocation is exactly the rule that kept RectPosTexFast_VS out of the blob. */
         if ((flags & SC_F_SUBSTITUTE) && (flags & SC_F_RELOCATE)) return SC_E_ENTRY;
         if (flags & (SC_F_CONFLICT | SC_F_HASH_ONLY)) return SC_E_ENTRY;
         if (sdw == 0) return SC_E_ENTRY;
@@ -501,7 +501,7 @@ int sc_subst_image(const sc_cache *c, const sc_match *m, uint8_t *out, size_t ou
     if (st != SC_OK) return st;
     sbytes = e.subst_dwords * 4u;
     if (e.flags & SC_F_RELOCATE) {
-        /* 0.0.311 (notes §565): a RELOCATED image is placed in our own arena, so neither of the two rules that exist for
+        /* 0.0.311: a RELOCATED image is placed in our own arena, so neither of the two rules that exist for
          * writing over Apple's program applies to it. It is NOT padded to Apple's extent (there is no tail of Apple's
          * program left behind it to overwrite) and it is NOT capped by Apple's allocation (that allocation is not where
          * it goes). Only the caller's buffer bounds it. */

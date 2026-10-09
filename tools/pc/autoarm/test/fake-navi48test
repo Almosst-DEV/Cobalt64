@@ -1,0 +1,70 @@
+#!/bin/bash
+# fake-navi48test - stands in for ~testuser/navi48-staging/navi48test in the auto-arm tests. Output formats copied from the real CLI (checked against the m6-stage2-sim build of the real printf bodies).
+# World state: $FAKE_DIR/st/*. Every call is appended to $FAKE_DIR/cmds.log as "CLI <args>". Scenario knobs (env): FAKE_FAIL_VERB FAKE_FAIL_MODE(rc|badout|empty) FAKE_USER_AFTER_VERB FAKE_RASTER FAKE_DRIVER_DOWN FAKE_UF_INST FAKE_VMF FAKE_HUNG FAKE_NO_ACQ FAKE_MONA_DRIFT FAKE_MONA_FIRST FAKE_NODES_STUCK
+D=${FAKE_DIR:?}; S=$D/st; mkdir -p "$S"
+echo "CLI $*" >>"$D/cmds.log"
+V="$*"
+after() { if [ -n "${FAKE_USER_AFTER_VERB:-}" ] && [ "$V" = "$FAKE_USER_AFTER_VERB" ]; then echo testuser >"$D/console"; echo "testuser console  Oct  8 16:40" >"$D/who"; fi; }
+trap after EXIT
+failnow=0
+if [ -n "${FAKE_FAIL_VERB:-}" ] && [ "$V" = "$FAKE_FAIL_VERB" ]; then
+  fn=$(cat "$S/failcount" 2>/dev/null || echo 0); fn=$((fn+1)); echo $fn >"$S/failcount"; [ "$fn" = "${FAKE_FAIL_NTH:-1}" ] && failnow=1
+fi
+if [ $failnow = 1 ]; then
+  case "${FAKE_FAIL_MODE:-rc}" in rc) echo "accel ${V#accel }: FAILED (0xe00002c2)"; exit 1 ;; empty) exit 0 ;; badout) echo "accel ${V#accel }: status 19 (BUSY)"; echo "  DP plane watch (x): *** DP DISTURBED ***"; exit 0 ;; esac
+fi
+restarted=0; [ -f "$S/restarted" ] && restarted=1
+acq() { [ $restarted = 1 ] && [ -z "${FAKE_NO_ACQ:-}" ] && echo YES || echo no; }
+okline() { echo "accel $1: status 0 (OK)"; }
+dpw() { echo "  DP plane watch (op): all 15 registers unchanged (row 14 is the kext's rule)"; }
+monbw() { echo "  monitor B watch: unchanged"; }
+crc() { # crc <inst>
+  local i=$1 rg=0x78097625 b=0x4bd14c15
+  if [ $i = 1 ]; then rg=0xe7a0b345; b=0xb196d20f; [ -n "${FAKE_MONA_DRIFT:-}" ] && [ -f "$S/held1" ] && { rg=0xdeadbeef; b=0xb196d20f; }; fi
+  okline "disp2 crc $i"
+  echo "    HUBP${i}_DCHUBP_CNTL       : 0x00000020  underflow(30:28) 0  SEG_ALLOC_ERR 0  TIMEOUT(23:20) 0  BLANK_EN 0  NO_OUTSTANDING_REQ 0  VTG_SEL $i"
+  echo "    ODM${i}_OPTC_INPUT_GLOBAL  : 0000000000  underflow occurred(10) 0  occurred-current(13) 0  (stale 0)"
+  echo "    DCN_VM_FAULT_STATUS     : 0000000000"
+  echo "    MPCC${i}_STATUS            : 0x2 (idle|busy|disabled = 0|1|0)   MPC_OUT${i}_MUX 0000000000 (mux 0)   DIG$((i+1))_FIFO_CTRL0 0x0000001d (error 29:28 0)"
+  echo "    OTG${i} CRC                : RG $rg  B $b"
+  [ $i = 1 ] && echo "    monitor B watch (kext)       : all nine rows unchanged across the op (changed mask 0)"
+  dpw
+}
+case "$V" in
+ "accel m6xstat 0"|"accel m6xstat 2 0")
+   [ -n "${FAKE_DRIVER_DOWN:-}" ] && { echo "Navi48Bringup not found in the IORegistry"; exit 1; }
+   if [ -n "${FAKE_DRIVER_DELAY:-}" ]; then n=$(cat "$S/drv" 2>/dev/null || echo 0); n=$((n+1)); echo $n >"$S/drv"; [ $n -le "$FAKE_DRIVER_DELAY" ] && { echo "Navi48Bringup not found in the IORegistry"; exit 1; }; fi
+   echo "accel m6xstat 0: navi48-m6 ON, navi48-m6flip ON"
+   echo "  instance 2: acquired $(acq), restoring no, wantRestore no, restoreFailed no, console learned no; generation 0, acquires 0" ;;
+ "accel m6xstat 1 0")
+   echo "accel m6xstat inst1 page 0: navi48-m6 ON, navi48-m6flip ON, navi48-m6flip1 ON"
+   echo "  instance 1: acquired $(acq), restoring no, wantRestore no, restoreFailed no, console learned no; generation 0, acquires 0" ;;
+ "accel m6xstat 2 2"|"accel m6xstat 1 2")
+   i=${V##* }; i=${V#accel m6xstat }; i=${i%% *}
+   uf=0; [ "${FAKE_UF_INST:-}" = "$i" ] && [ $restarted = 1 ] && uf=1
+   vmf=00000000; [ -n "${FAKE_VMF:-}" ] && [ $restarted = 1 ] && vmf=00000008
+   echo "accel m6xstat $i: navi48-m6 ON, navi48-m6flip ON"
+   echo "  HUBP${i}_DCHUBP_CNTL 0x00000020 (underflow $uf, BLANK_EN 0, VTG_SEL $i); DCN_VM_FAULT_STATUS 0x$vmf; ODM${i} OPTC_INPUT_GLOBAL_CONTROL 0x00000000 (bit 10 0); OTG${i} frame counter 100000" ;;
+ "accel m6stat 0") echo "accel m6stat 0: navi48-m6 latch ON; pipe adopted $([ -f $S/adopted ] && echo yes || echo no); armed $([ -f $S/armed ] && echo yes || echo no); 0 pipes recorded; surface table 0 IDs" ;;
+ "accel m6stat 4") echo "accel m6stat 4: ..."; echo "  endpoint dwords seen (bitmask 0x0: none)" ;;
+ "reg 0x4fea") echo "reg[0x4fea] = ${FAKE_RASTER:-0xa9f}" ;;
+ "accel disp2 status 2") okline "disp2 status (instance 2: OTG2 / DIG3)"; echo "  DP side: OTG0 COUNTING (frames 7 -> 10 in 50 ms) ; DIG1_DIG_BE_CNTL 0x00000810" ;;
+ "accel vramstat") echo "accel vramstat: BAR0 phys 0x7800000000, mapped 256 MiB"; echo "  visible pool: 268435456 bytes total (256 MiB), 100663296 bytes free (96 MiB)" ;;
+ "accel dmubsend "*) okline "${V#accel }"; dpw ;;
+ "accel disp2 timing1440 2"|"accel disp2 connect 2"|"accel disp2 plane 2"|"accel disp2 show 2") okline "${V#accel }"; dpw; [ "$V" = "accel disp2 show 2" ] && touch "$S/monbchain" ;;
+ "accel disp2 timing 1"|"accel disp2 connect 1"|"accel disp2 plane 1"|"accel disp2 show 1") okline "${V#accel }"; monbw; dpw ;;
+ "accel scdcread 3 0x40 1") echo "accel scdcread: the sink LOCKS onto our TMDS (status 0x4f)" ;;
+ "accel disp2 crc 2") crc 2 ;;
+ "accel disp2 crc 1") crc 1 ;;
+ "accel disp2 fbhold "?) i=${V##* }; touch "$S/held$i"; okline "disp2 fbhold $i"; dpw; monbw ;;
+ "accel fbpublish "?) i=${V##* }; touch "$S/pub$i"; echo "accel fbpublish $i: status 0 (OK, Navi48DisplayIndex $i)" ;;
+ "accel pipeadopt") touch "$S/adopted"; n=2; [ -f "$S/pub1" ] && n=3; okline pipeadopt; echo "  pipes ours / all, display-machine starts / PCI substituted: $n / $n, 0" ;;
+ "accel pipeagdc 1") echo "accel pipeagdc: agdc status  : 0 (PUBLISHED)" ;;
+ "accel fbname 1") echo "accel fbname: class name NOW  : AMDRDNA4Framebuffer" ;;
+ "accel pipearm 1") touch "$S/armed"; echo "accel pipearm: accel+0xccf now  : 1" ;;
+ "accel pipereload") echo "accel pipereload: restart window  : OPEN, 15 s" ;;
+ "accel sessstat 4") echo "accel sessstat 4:"; echo "  open / DEAD slots / HUNG: 0 / 0 / ${FAKE_HUNG:-0}" ;;
+ "accel appallow add "*) echo "accel appallow: name \"${V#accel appallow add }\" -> key 0x1234" ;;
+ *) echo "fake-navi48test: unhandled '$V'"; exit 9 ;;
+esac
+exit 0

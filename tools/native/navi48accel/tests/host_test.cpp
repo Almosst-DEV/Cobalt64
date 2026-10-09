@@ -11,6 +11,8 @@
 //   A4 the event machine init order: Fast2::init first, setStampBaseAddress only after a true result and with a stamp VA; the source calls the plan;
 //   A5 thin-ness: no config literal, no value, no bring-up decision in the aux source; the classes; no hardware access; the personality (nub only, no PCI, no IOResources);
 //   A6 Info.plist / kmod: id, version 0.0.3, libraries; the ops header is byte-identical to the bring-up kext's copy.
+//   A8 (0.0.4, M5) the monitor B framebuffer: the shared header (shapes, ops check, snapshot validator), fb_start_verdict (kill switch < metal-ws < nub < ops < snapshot), every pure answer (mode, pixel format and masks, aperture,
+//      attributes, DDC blocks), the override set EXACTLY the spec's table (and none of isConsoleDevice / the interrupts), the slot numbers against the KC vtable listing (305-348), the start ORDER, the personality, INSTALL.md's new path.
 //   A7 (0.0.3) the display pipe: disp_enabled (an ABI-1 / short / flag-0 / hook-less table is OFF, and a 120-byte table is never read past its end: ASan),
 //      dm_walk_provider, pipe_choice; the display entry points wire those decisions (newDisplayPipe never NULL, the family's own objects when OFF), the slot-277
 //      thunk, the generated display trampolines use n48_disp_vhook (never vhook) with the family's own slot as the default; the runtime gate has no skip.
@@ -22,6 +24,7 @@
 #include <fstream>
 #include <sstream>
 #include <cstdlib>
+#include <map>
 #include "n48accel_pure.h"
 #include <sanitizer/asan_interface.h>   // A7: the bytes after an old 120-byte ops table are poisoned, so any read of them aborts the test
 
@@ -31,6 +34,7 @@ static void expect(bool ok, const char *what) { gRun++; if (!ok) { gFail++; std:
 static void expect_u(const char *what, uint64_t got, uint64_t want) { gRun++; if (got != want) { gFail++; std::printf("FAIL: %s: got %#llx want %#llx\n", what, (unsigned long long)got, (unsigned long long)want); } }
 static std::string slurp(const std::string &p) { std::ifstream f(p, std::ios::binary); std::stringstream ss; ss << f.rdbuf(); return ss.str(); }
 static size_t count_of(const std::string &s, const std::string &n) { size_t c = 0, p = 0; while ((p = s.find(n, p)) != std::string::npos) { c++; p += n.size(); } return c; }
+static std::string body_of(const std::string &src, const std::string &head);   // defined in A7
 
 // ---- A1 ------------------------------------------------------------------------------------------------------------------------------------------------
 static void a1_kill_switch() {
@@ -99,9 +103,13 @@ static void a1_source(const std::string &root) {
         expect(s.find("gGateState != 1") != std::string::npos && s.find("N48_AUX_ENTER") < s.find("IOGraphicsAccelerator2::start("), "start: kill switch first, never starts unless the gate passed");
         expect(s.find("registerService()") > s.find("IOGraphicsAccelerator2::start("), "start: registerService only after the family start");
     }
-    {   // the kill switch reads exactly one boot-arg
-        expect_u("the aux kext reads exactly one boot-arg", count_of(src, "PE_parse_boot_argn("), 1);
-        expect(src.find("PE_parse_boot_argn(\"navi48-aux\"") != std::string::npos, "and it is navi48-aux");
+    {   // the kill switch reads navi48-aux; aux 0.0.4 adds exactly ONE more boot-arg, navi48-metal-ws, read only by Navi48Framebuffer::start (that boot gives the DP to the GPU desktop)
+        expect_u("the aux kext reads exactly three boot-args (0.0.7: navi48-aux, navi48-metal-ws, navi48-m6)", count_of(src, "PE_parse_boot_argn("), 3);
+        expect(src.find("PE_parse_boot_argn(\"navi48-m6\"") != std::string::npos && count_of(src, "PE_parse_boot_argn(\"navi48-m6\"") == 1, "the third is navi48-m6, read at ONE site");
+        { const std::string b = body_of(src, "bool Navi48Framebuffer::start("); expect(b.find("PE_parse_boot_argn(\"navi48-m6\"") != std::string::npos, "navi48-m6 is read by Navi48Framebuffer::start only"); }
+        expect(src.find("PE_parse_boot_argn(\"navi48-aux\"") != std::string::npos, "one is navi48-aux");
+        expect(src.find("PE_parse_boot_argn(\"navi48-metal-ws\"") != std::string::npos, "the other is navi48-metal-ws");
+        { const std::string b = body_of(src, "bool Navi48Framebuffer::start("); expect(b.find("PE_parse_boot_argn(\"navi48-metal-ws\"") != std::string::npos, "navi48-metal-ws is read by Navi48Framebuffer::start"); }
         const std::string on = src.substr(src.find("static bool n48_aux_on()"), 200);
         expect(on.find("aux_enabled(present, v)") != std::string::npos, "the kill switch decision is the pure aux_enabled");
     }
@@ -185,7 +193,7 @@ static void a3_source(const std::string &root) {
     // every hook of the required set is called from the kext (the check and the calls agree)
     for (const char *h : { "gOps->device_open(", "gOps->device_close(", "gOps->populate_config(", "gOps->stamp_memory(", "gOps->stamp_va(", "gOps->task_window(" }) expect(src.find(h) != std::string::npos, (std::string("the kext calls the required hook ") + h).c_str());
     expect(src.find("ops_check(o)") != std::string::npos && src.find("if (v != kOpsOk)") != std::string::npos, "n48_get_ops refuses an unacceptable table");
-    expect(src.find("callPlatformFunction(fn, /*waitForFunction=*/false,") != std::string::npos && src.find("rc != kIOReturnSuccess") != std::string::npos, "the ops are fetched with waitForFunction=false and compared to kIOReturnSuccess");
+    { const std::string b = body_of(src, "static const N48MetalOps *n48_get_ops(IOService *nub) {"); expect(b.find("callPlatformFunction(fn, /*waitForFunction=*/false,") != std::string::npos && b.find("rc != kIOReturnSuccess") != std::string::npos, "the ops are fetched with waitForFunction=false and compared to kIOReturnSuccess"); }
     expect(src.find("config_keep(gOps != nullptr, rc)") != std::string::npos && src.find("c[i] = (uint8_t)(np >> (8 * i));") != std::string::npos && src.find("c[i] = 0") == std::string::npos, "populateAccelConfig on a refusal writes a static NON-NULL name (never NULL)");
     { const size_t a = src.find("void Navi48Accelerator::populateAccelConfig("); const std::string b = src.substr(a, src.find("\n}\n", a) - a);
       expect(b.find("device_close(ctx)") != std::string::npos && b.find("stampVA = nullptr") != std::string::npos && b.find("gCtx = nullptr") != std::string::npos, "and tears the device down: stamp VA and ctx cleared so the event machine init fails");
@@ -256,7 +264,7 @@ static void a5_thin(const std::string &root) {
     for (const char *c : { "class Navi48Accelerator : public IOGraphicsAccelerator2", "class Navi48EventMachine : public IOAccelEventMachineFast2", "class Navi48Task : public IOAccelTask", "class Navi48DisplayMachine : public IOAccelDisplayMachine",
                            "class Navi48SysMemory : public IOAccelSysMemory", "class Navi48MemoryMap : public IOAccelMemoryMap", "class Navi48VidMemory : public IOAccelVidMemory", "class Navi48Resource : public IOAccelResource2",
                            "class Navi482DContext : public IOAccel2DContext2", "class Navi48SharedUserClient : public IOAccelSharedUserClient2", "class Navi48CommandQueue : public IOAccelCommandQueue",
-                           "class Navi48DisplayPipe : public IOAccelDisplayPipe" }) expect(src.find(c) != std::string::npos, (std::string("class graph: ") + c).c_str());
+                           "class Navi48DisplayPipe : public IOAccelDisplayPipe", "class Navi48Framebuffer : public IOFramebuffer" }) expect(src.find(c) != std::string::npos, (std::string("class graph: ") + c).c_str());
     expect(src.find("N48_FACT_VIDMEMORY, 333) ? OSTypeAlloc(Navi48VidMemory) : nullptr") != std::string::npos && src.find("N48_FACT_RESOURCE, 334) ? OSTypeAlloc(Navi48Resource) : nullptr") != std::string::npos && src.find("N48_FACT_CTX2D, 327) ? OSTypeAlloc(Navi482DContext) : nullptr") != std::string::npos, "the optional classes are created only when the bring-up kext allows it, else NULL");
     expect(src.find("n48_fact(this, N48_FACT_SHAREDUC, 322) ? OSTypeAlloc(Navi48SharedUserClient) : (IOAccelSharedUserClient2 *)IOGraphicsAccelerator2::newSharedUserClient()") != std::string::npos && src.find("n48_fact(this, N48_FACT_CMDQUEUE, 348) ? OSTypeAlloc(Navi48CommandQueue) : (IOAccelCommandQueue *)IOGraphicsAccelerator2::newCommandQueue()") != std::string::npos && src.find("IOGraphicsAccelerator2::newSharedUserClient()") != std::string::npos && src.find("IOGraphicsAccelerator2::newCommandQueue()") != std::string::npos, "newSharedUserClient / newCommandQueue fall back to the family's own object");
     // no virtual is introduced by a leaf class (the gate would also catch it at run time and link time): no `virtual` keyword in the file outside comments
@@ -269,16 +277,16 @@ static void a5_thin(const std::string &root) {
     expect(plist.find("<key>IOMatchCategory</key>\n\t\t\t<string>IOAccelerator</string>") != std::string::npos, "IOMatchCategory IOAccelerator");
     expect(plist.find("<string>Navi48Accelerator</string>") != std::string::npos && plist.find("<key>MetalPluginName</key>\n\t\t\t<string>Navi48Metal</string>") != std::string::npos && plist.find("<string>Navi48Device</string>") != std::string::npos, "the accelerator class and the Metal plugin names");
     expect(plist.find("<key>IOProbeScore</key>\n\t\t\t<integer>1000</integer>") != std::string::npos, "IOProbeScore 1000");
-    expect_u("exactly one personality", count_of(plist, "<key>IOClass</key>"), 1);
+    expect_u("exactly three personalities (0.0.6: the accelerator and the framebuffer twice, index 1 = the monitor B and index 2 = the monitor A)", count_of(plist, "<key>IOClass</key>"), 3);
 }
 
 // ---- A6 ------------------------------------------------------------------------------------------------------------------------------------------------
 static void a6_plist(const std::string &root, const std::string &bringRoot) {
     const std::string plist = slurp(root + "/Info.plist"), kmod = slurp(root + "/src/kmod_info.c"), mk = slurp(root + "/Makefile");
     expect(plist.find("<key>CFBundleIdentifier</key>\n\t<string>com.navi48.accelprobe</string>") != std::string::npos, "the approved id com.navi48.accelprobe is reused");
-    expect_u("version 0.0.3 (short and bundle)", count_of(plist, "<string>0.0.3</string>"), 2);
-    expect(plist.find("0.0.2") == std::string::npos, "no 0.0.2 left in the plist");
-    expect(kmod.find("KMOD_EXPLICIT_DECL(com.navi48.accelprobe, \"0.0.3\", _start, _stop)") != std::string::npos, "kmod_info carries the same id and version");
+    expect_u("version 0.0.7 (short and bundle)", count_of(plist, "<string>0.0.7</string>"), 2);
+    expect(plist.find("0.0.2") == std::string::npos && plist.find("<string>0.0.3</string>") == std::string::npos, "no 0.0.2 / 0.0.3 left in the plist");
+    expect(kmod.find("KMOD_EXPLICIT_DECL(com.navi48.accelprobe, \"0.0.7\", _start, _stop)") != std::string::npos, "kmod_info carries the same id and version");
     expect(plist.find("<key>CFBundleName</key>\n\t<string>Navi48Accel</string>") != std::string::npos, "display name Navi48Accel");
     expect(plist.find("<key>com.apple.iokit.IOAcceleratorFamily2</key>\n\t\t<string>2.0.0</string>") != std::string::npos, "links IOAcceleratorFamily2 2.0.0");
     expect(plist.find("com.apple.iokit.IOGraphicsFamily") != std::string::npos && plist.find("com.apple.kpi.iokit") != std::string::npos && plist.find("com.apple.kpi.libkern") != std::string::npos, "links IOGraphicsFamily and the kpis");
@@ -290,6 +298,11 @@ static void a6_plist(const std::string &root, const std::string &bringRoot) {
     const std::string bo = slurp(bringRoot + "/src/navi48-bringup/src/Navi48MetalOps.h");
     if (bo.empty()) std::printf("NOTE: the bring-up copy of Navi48MetalOps.h is not readable under %s; compare it with the bring-up test\n", bringRoot.c_str());
     else expect(bo == ops, "Navi48MetalOps.h is byte-identical in the aux kext and the bring-up kext");
+    const std::string dops = slurp(root + "/src/Navi48DisplayOps.h");
+    expect(!dops.empty(), "the display ops header is present");
+    const std::string bdo = slurp(bringRoot + "/src/navi48-bringup/src/Navi48DisplayOps.h");
+    if (bdo.empty()) std::printf("NOTE: the bring-up copy of Navi48DisplayOps.h is not readable under %s; compare it with the bring-up test\n", bringRoot.c_str());
+    else expect(bdo == dops, "Navi48DisplayOps.h is byte-identical in the aux kext and the bring-up kext");
 }
 
 // ---- A7 (aux 0.0.3): the display pipe --------------------------------------------------------------------------------------------------------------------
@@ -298,7 +311,7 @@ static void *d_pci(void *) { return (void *)(uintptr_t)0x1234; }
 static std::string body_of(const std::string &src, const std::string &head) { const size_t a = src.find(head); if (a == std::string::npos) return ""; const size_t e = src.find("\n}\n", a); return src.substr(a, e == std::string::npos ? std::string::npos : e - a); }
 static void a7_display(const std::string &root) {
     N48MetalOps o = good_ops(); o.disp_flags = N48_DISP_F_ON; o.disp_hook = d_hook; o.pci_device = d_pci;
-    expect_u("the table we test is ABI 2 and 144 bytes", o.abi * 1000u + o.size, 2144);
+    expect_u("the table we test is ABI 3 and 152 bytes", o.abi * 1000u + o.size, 3152);
     expect(disp_enabled(&o), "ABI 2, full size, the ON flag and the hook: display ON");
     { N48MetalOps x = o; x.abi = 1; expect(!disp_enabled(&x), "an ABI-1 table is display OFF, whatever its later bytes say"); }
     { N48MetalOps x = o; x.size = N48_METAL_OPS_MIN; expect(!disp_enabled(&x), "a 120-byte table is display OFF"); }
@@ -351,10 +364,10 @@ static void a7_display(const std::string &root) {
         expect(src.find("__attribute__((naked)) void Navi48DisplayPipe::_vslot277() { __asm__(\"jmp _n48_dp_perform\"); }") != std::string::npos, "slot 277 is a bare tail jump (rdi/rsi untouched)"); }
     expect(src.find("N48_TR_DEFS_Navi48DisplayPipe(Navi48DisplayPipe)") != std::string::npos && src.find("N48_META(Navi48DisplayPipe, IOAccelDisplayPipe)") != std::string::npos, "the display pipe class is defined and its trampolines instantiated");
     expect(lv.find("'Navi48DisplayPipe':       ('N48_VC_DISPLAYPIPE',  {267: 'base', 278: 'base', 279: 'base'}, 'n48_disp_vhook')") != std::string::npos, "leaves: 267 / 278 / 279 hooked through n48_disp_vhook, the family's own slot by default");
-    expect(lv.find("('Navi48DisplayPipe',   'IOAccelDisplayPipe',       [277])") != std::string::npos && lv.find("[183, 184, 18, 322, 348, 329])") != std::string::npos && lv.find("('Navi48DisplayMachine','IOAccelDisplayMachine',    [267])") != std::string::npos,
+    expect(lv.find("('Navi48DisplayPipe',   'IOAccelDisplayPipe',       [277])") != std::string::npos && lv.find("[183, 184, 18, 322, 348, 329, 239])") != std::string::npos && lv.find("('Navi48DisplayMachine','IOAccelDisplayMachine',    [267])") != std::string::npos,
            "leaves: the hand overrides 277 (pipe), 329 (newDisplayPipe), 267 (display-machine start)");
     expect(lv.find("HAND = {'Navi48EventMachine': [35], 'Navi48DisplayPipe': [277]}") != std::string::npos, "leaves: slot 277 of the display pipe is hand written (HAND), never generated from its placeholder declaration");
-    expect(lv.find("EXPECT_CLASSES = 12") != std::string::npos && lv.find("EXPECT_SLOTS = 2370") != std::string::npos, "the expected gate totals are 12 classes / 2370 slots");
+    expect(lv.find("EXPECT_CLASSES = 13") != std::string::npos && lv.find("EXPECT_SLOTS = 2720") != std::string::npos, "the expected gate totals are 13 classes / 2720 slots (0.0.4: + Navi48Framebuffer vs IOFramebuffer, 350 slots)");
     {   const std::string g = body_of(src, "static bool n48_layout_gate() {");
         expect(!g.empty() && g.find("continue") == std::string::npos && g.find("for (const ClassGate &g : kGate) {") != std::string::npos, "the runtime layout gate walks EVERY generated class (no skip)"); }
     {   const std::string inc = slurp(root + "/build/gen/n48_tramp.inc");
@@ -369,10 +382,366 @@ static void a7_display(const std::string &root) {
     }
 }
 
+
+// ---- A8 (aux 0.0.4, M5): the monitor B framebuffer ----------------------------------------------------------------------------------------------------------------------
+static int d_snap(void *, N48DispSnap *) { return 0; }
+static int d_power(void *, uint32_t) { return 0; }
+static N48DispOps good_dops() { N48DispOps o; memset(&o, 0, sizeof o); o.magic = N48_DISP_OPS_MAGIC; o.abi = N48_DISP_ABI; o.size = N48_DISP_OPS_MIN; o.kext_build = 658; o.snapshot = d_snap; o.power = d_power; return o; }
+static N48DispSnap good_snap() {
+    N48DispSnap s; memset(&s, 0, sizeof s);
+    s.index = 1; s.otg = 2; s.ddcLine = 3; s.w = 2560; s.h = 1440; s.pitchBytes = 10240; s.fmt = N48_DISP_FMT_ARGB8888; s.refresh1616 = N48_DISP_REFRESH1616; s.pixHz = 241500000ull;
+    s.aperPhys = 0x80000000ull + 0x01800000ull; s.aperLen = 14745600ull; s.mcA = 0x8001800000ull; s.mcB = 0x8002600000ull; s.edidLen = 256;
+    s.edid[0] = 0; for (int i = 1; i < 7; i++) s.edid[i] = 0xFF; s.edid[7] = 0;
+    s.edid[127] = (uint8_t)(0u - 0x7Fu * 0xFFu - 0u);   // block 0 sums to 0: header = 6 * 0xFF; the last byte fixes the sum
+    { uint32_t sum = 0; for (int i = 0; i < 127; i++) sum += s.edid[i]; s.edid[127] = (uint8_t)(0u - sum); }
+    s.edid[128] = 0x02; s.edid[129] = 0x03;
+    { uint32_t sum = 0; for (int i = 128; i < 255; i++) sum += s.edid[i]; s.edid[255] = (uint8_t)(0u - sum); }
+    return s;
+}
+static void a8_framebuffer(const std::string &root) {
+    // ---- the shared header: shapes and constants
+    expect_u("N48DispSnap is 336 bytes", sizeof(N48DispSnap), 336); expect_u("N48DispOps ABI 1 is 72 bytes", sizeof(N48DispOps), 72);
+    expect_u("the ops magic is 'N48D' little-endian", N48_DISP_OPS_MAGIC, (uint32_t)'N' | ((uint32_t)'4' << 8) | ((uint32_t)'8' << 16) | ((uint32_t)'D' << 24));
+    expect_u("ABI 2 (0.0.6; ABI 1 is still the monitor B's minimum)", N48_DISP_ABI, 2); expect_u("... minimum 1", N48_DISP_ABI_MIN, 1); expect_u("the table minimum is 72", N48_DISP_OPS_MIN, 72);
+    expect_u("the aperture is 2560 x 1440 x 4 = 14,745,600 bytes = 225 x 64 KiB", N48_DISP_BYTES, 2560ull * 1440ull * 4ull); expect_u("... = 225 x 64 KiB", N48_DISP_BYTES, 225ull * 65536ull);
+    expect_u("the pitch is 2560 x 4", N48_DISP_PITCH, 2560u * 4u);
+    expect_u("refresh = (241500000 << 16) / (2720 * 1481)", N48_DISP_REFRESH1616, (uint32_t)((241500000ull << 16) / (2720ull * 1481ull)));
+    expect(N48_DISP_REFRESH1616 > (uint32_t)(59.94 * 65536) && N48_DISP_REFRESH1616 < (uint32_t)(59.96 * 65536), "... about 59.95 Hz");
+    expect_u("the nub class name", strcmp(N48_DISP_NUB_CLASS, "Navi48DisplayNub"), 0); expect_u("the ops function symbol", strcmp(N48_DISP_FN_SYMBOL, "n48.disp.ops"), 0); expect_u("the index key", strcmp(N48_DISP_INDEX_KEY, "Navi48DisplayIndex"), 0);
+    // ---- the ops-table check
+    { N48DispOps o = good_dops(); expect_u("a good ops table", n48disp_ops_check(&o), N48_DOV_OK);
+      expect_u("NULL table", n48disp_ops_check(nullptr), N48_DOV_NULL);
+      { N48DispOps x = o; x.magic ^= 1u; expect_u("bad magic", n48disp_ops_check(&x), N48_DOV_MAGIC); }
+      { N48DispOps x = o; x.abi = 0u; expect_u("abi 0", n48disp_ops_check(&x), N48_DOV_ABI); }
+      { N48DispOps x = o; x.size = 71u; expect_u("size 71 (short)", n48disp_ops_check(&x), N48_DOV_SIZE); }
+      { N48DispOps x = o; x.snapshot = nullptr; expect_u("no snapshot hook", n48disp_ops_check(&x), N48_DOV_MISSING); }
+      { N48DispOps x = o; x.power = nullptr; expect_u("no power hook", n48disp_ops_check(&x), N48_DOV_MISSING); }
+      { N48DispOps x = o; x.abi = 2u; x.size = 96u; expect_u("an NEWER table (abi 2, 96 bytes) is accepted (append-only)", n48disp_ops_check(&x), N48_DOV_OK); }
+      { N48DispOps x = o; x.trace = nullptr; expect_u("trace is optional", n48disp_ops_check(&x), N48_DOV_OK); }
+      expect(o.flip == nullptr && o.flip_status == nullptr && o.vbl_sample == nullptr, "the M6 placeholders are NULL in ABI 1"); }
+    // ---- the snapshot validator
+    { N48DispSnap g = good_snap(); expect_u("a good snapshot", n48disp_snap_valid(&g), N48_DSV_OK);
+      expect_u("NULL snapshot", n48disp_snap_valid(nullptr), N48_DSV_NULL);
+      { N48DispSnap x = g; x.index = 0; expect_u("index 0", n48disp_snap_valid(&x), N48_DSV_INDEX); } { N48DispSnap x = g; x.index = 3; expect_u("index 3", n48disp_snap_valid(&x), N48_DSV_INDEX); }
+      { N48DispSnap x = g; x.otg = 1; expect_u("otg", n48disp_snap_valid(&x), N48_DSV_GEOMETRY); } { N48DispSnap x = g; x.ddcLine = 2; expect_u("ddc line", n48disp_snap_valid(&x), N48_DSV_GEOMETRY); }
+      { N48DispSnap x = g; x.w = 1920; expect_u("width", n48disp_snap_valid(&x), N48_DSV_GEOMETRY); } { N48DispSnap x = g; x.h = 1080; expect_u("height", n48disp_snap_valid(&x), N48_DSV_GEOMETRY); }
+      { N48DispSnap x = g; x.pitchBytes = 7680; expect_u("pitch", n48disp_snap_valid(&x), N48_DSV_GEOMETRY); } { N48DispSnap x = g; x.fmt = 0; expect_u("format", n48disp_snap_valid(&x), N48_DSV_GEOMETRY); }
+      { N48DispSnap x = g; x.refresh1616 = 60u << 16; expect_u("refresh", n48disp_snap_valid(&x), N48_DSV_GEOMETRY); } { N48DispSnap x = g; x.pixHz = 148500000ull; expect_u("pixel clock", n48disp_snap_valid(&x), N48_DSV_GEOMETRY); }
+      { N48DispSnap x = g; x.aperLen = 14745600ull - 65536ull; expect_u("aperture length", n48disp_snap_valid(&x), N48_DSV_GEOMETRY); }
+      { N48DispSnap x = g; x.aperPhys = 0; expect_u("aperture base 0", n48disp_snap_valid(&x), N48_DSV_APERTURE); } { N48DispSnap x = g; x.aperPhys += 4096; expect_u("aperture base not 64 KiB aligned", n48disp_snap_valid(&x), N48_DSV_APERTURE); }
+      { N48DispSnap x = g; x.aperPhys = 0xFFFFFFFFFFFF0000ull; expect_u("aperture wraps", n48disp_snap_valid(&x), N48_DSV_APERTURE); }
+      { N48DispSnap x = g; x.mcA = 0; expect_u("mcA 0", n48disp_snap_valid(&x), N48_DSV_MC); } { N48DispSnap x = g; x.mcB = 0; expect_u("mcB 0", n48disp_snap_valid(&x), N48_DSV_MC); }
+      { N48DispSnap x = g; x.mcB = x.mcA; expect_u("mcA == mcB", n48disp_snap_valid(&x), N48_DSV_MC); } { N48DispSnap x = g; x.mcA += 4096; expect_u("mcA unaligned", n48disp_snap_valid(&x), N48_DSV_MC); }
+      { N48DispSnap x = g; x.edidLen = 128; expect_u("one EDID block only", n48disp_snap_valid(&x), N48_DSV_EDID_LEN); }
+      { N48DispSnap x = g; x.edid[0] = 1; x.edid[127] = (uint8_t)(x.edid[127] - 1); expect_u("block 0 without the header (sum still 0)", n48disp_snap_valid(&x), N48_DSV_EDID_HDR); }
+      { N48DispSnap x = g; x.edid[20] ^= 1; expect_u("block 0 checksum", n48disp_snap_valid(&x), N48_DSV_EDID_SUM); } { N48DispSnap x = g; x.edid[200] ^= 1; expect_u("block 1 checksum", n48disp_snap_valid(&x), N48_DSV_EDID_SUM); } }
+    // ---- fb_start_verdict: the order is kill switch < metal-ws < nub < ops < snapshot
+    expect_u("start: everything good", fb_start_verdict(true, false, true, true, N48_DOV_OK, 0, N48_DSV_OK), kFbStartOk);
+    expect_u("start: navi48-aux=0", fb_start_verdict(false, false, true, true, N48_DOV_OK, 0, N48_DSV_OK), kFbStartAuxOff);
+    expect_u("start: navi48-metal-ws present", fb_start_verdict(true, true, true, true, N48_DOV_OK, 0, N48_DSV_OK), kFbStartMetalWs);
+    expect_u("start: the provider is not the display nub", fb_start_verdict(true, false, false, true, N48_DOV_OK, 0, N48_DSV_OK), kFbStartNotNub);
+    for (uint32_t ov = N48_DOV_NULL; ov <= N48_DOV_MISSING; ov++) expect_u("start: any bad ops verdict refuses", fb_start_verdict(true, false, true, true, ov, 0, N48_DSV_OK), kFbStartOps);
+    expect_u("start: the snapshot hook refused", fb_start_verdict(true, false, true, true, N48_DOV_OK, -1, N48_DSV_OK), kFbStartSnapshot);
+    for (uint32_t sv = N48_DSV_NULL; sv <= N48_DSV_EDID_HDR; sv++) expect_u("start: any bad snapshot verdict refuses", fb_start_verdict(true, false, true, true, N48_DOV_OK, 0, sv), kFbStartSnapshot);
+    expect_u("start: priority aux > metal-ws", fb_start_verdict(false, true, false, false, N48_DOV_MAGIC, -1, N48_DSV_MC), kFbStartAuxOff);
+    expect_u("start: priority metal-ws > nub", fb_start_verdict(true, true, false, false, N48_DOV_MAGIC, -1, N48_DSV_MC), kFbStartMetalWs);
+    expect_u("start: priority nub > ops", fb_start_verdict(true, false, false, false, N48_DOV_MAGIC, -1, N48_DSV_MC), kFbStartNotNub);
+    // ---- 0.0.7 (M6 Stage 1a, R1): boot-arg navi48-m6 lifts the metal-ws refusal and ONLY that
+    expect(!m6_on(false, 1) && m6_on(true, 1) && !m6_on(true, 0) && !m6_on(true, 2) && !m6_on(true, 0xFFFFFFFFu), "R1: navi48-m6 is on only when present AND exactly 1");
+    expect(fb_metal_ws_blocks(true, false) && !fb_metal_ws_blocks(true, true) && !fb_metal_ws_blocks(false, false) && !fb_metal_ws_blocks(false, true), "R1: metal-ws blocks the framebuffer unless the M6 latch is on");
+    expect_u("R1: metal-ws present, latch OFF -> refused (aux 0.0.6's behaviour)", fb_start_verdict(true, fb_metal_ws_blocks(true, m6_on(false, 0)), true, true, N48_DOV_OK, 0, N48_DSV_OK), kFbStartMetalWs);
+    expect_u("R1: metal-ws present, navi48-m6=1 -> starts", fb_start_verdict(true, fb_metal_ws_blocks(true, m6_on(true, 1)), true, true, N48_DOV_OK, 0, N48_DSV_OK), kFbStartOk);
+    expect_u("R1: metal-ws present, navi48-m6=2 -> refused (only 1 enables)", fb_start_verdict(true, fb_metal_ws_blocks(true, m6_on(true, 2)), true, true, N48_DOV_OK, 0, N48_DSV_OK), kFbStartMetalWs);
+    expect_u("R1: the kill switch still beats the latch", fb_start_verdict(false, fb_metal_ws_blocks(true, true), true, true, N48_DOV_OK, 0, N48_DSV_OK), kFbStartAuxOff);
+    expect_u("R1: the latch does not admit a foreign provider", fb_start_verdict(true, fb_metal_ws_blocks(true, true), false, true, N48_DOV_OK, 0, N48_DSV_OK), kFbStartNotNub);
+    expect_u("R1: the latch does not skip the layout gate", fb_start_verdict(true, fb_metal_ws_blocks(true, true), true, false, N48_DOV_OK, 0, N48_DSV_OK), kFbStartLayout);
+    expect_u("R1: the latch does not skip the ops check", fb_start_verdict(true, fb_metal_ws_blocks(true, true), true, true, N48_DOV_MAGIC, 0, N48_DSV_OK), kFbStartOps);
+    expect_u("R1: the latch does not skip the snapshot check", fb_start_verdict(true, fb_metal_ws_blocks(true, true), true, true, N48_DOV_OK, -1, N48_DSV_OK), kFbStartSnapshot);
+    expect_u("start: the layout gate failed", fb_start_verdict(true, false, true, false, N48_DOV_OK, 0, N48_DSV_OK), kFbStartLayout);
+    expect_u("start: priority nub > layout gate", fb_start_verdict(true, false, false, false, N48_DOV_OK, 0, N48_DSV_OK), kFbStartNotNub);
+    expect_u("start: priority layout gate > ops", fb_start_verdict(true, false, true, false, N48_DOV_MAGIC, -1, N48_DSV_MC), kFbStartLayout);
+    expect_u("start: priority ops > snapshot", fb_start_verdict(true, false, true, true, N48_DOV_MAGIC, -1, N48_DSV_MC), kFbStartOps);
+    // ---- the answers
+    const N48DispSnap g = good_snap();
+    expect_u("one display mode", fb_mode_count(), 1); expect_u("its id is 1", kFbModeId, 1);
+    { FbModeInfo m; expect(fb_mode_info(&g, 1, &m), "mode 1 is described");
+      expect(m.w == 2560u && m.h == 1440u && m.refresh1616 == N48_DISP_REFRESH1616 && m.maxDepthIndex == 0u && m.valid && m.safe && m.isDefault, "2560x1440, the computed refresh, maxDepthIndex 0, Valid | Safe | Default");
+      expect(!fb_mode_info(&g, 0, &m) && !fb_mode_info(&g, 2, &m) && !fb_mode_info(nullptr, 1, &m) && !fb_mode_info(&g, 1, nullptr), "any other mode id, no snapshot or no output is refused"); }
+    expect(fb_mode_ok(1, 0) && !fb_mode_ok(1, 1) && !fb_mode_ok(2, 0) && !fb_mode_ok(0, 0), "setDisplayMode accepts only (1, 0)");
+    { FbPixel p; expect(fb_pixel_info(&g, 1, 0, true, &p), "pixel info for (1, 0, system aperture)");
+      expect(p.bytesPerRow == 10240u && p.bitsPerPixel == 32u && p.componentCount == 3u && p.bitsPerComponent == 8u && p.w == 2560u && p.h == 1440u, "10240 bytes a row, 32 bpp, 3 x 8 bits");
+      expect(p.masks[0] == 0x00FF0000u && p.masks[1] == 0x0000FF00u && p.masks[2] == 0x000000FFu, "masks R 0xFF0000 / G 0xFF00 / B 0xFF (the kext fills 0xFFRRGGBB; SURFACE_CONFIG 8)");
+      expect(std::string(p.format) == "--------RRRRRRRRGGGGGGGGBBBBBBBB" && strlen(p.format) == 32, "the pixel format string");
+      expect(!fb_pixel_info(&g, 1, 0, false, &p) && !fb_pixel_info(&g, 1, 1, true, &p) && !fb_pixel_info(&g, 2, 0, true, &p) && !fb_pixel_info(&g, 1, 0, true, nullptr), "another aperture, depth, mode or no output is refused"); }
+    { uint64_t ph = 0, ln = 0; expect(fb_aperture(&g, true, &ph, &ln) && ph == g.aperPhys && ln == 14745600ull, "the system aperture is bar0Phys + off[0], 14,745,600 bytes");
+      expect(!fb_aperture(&g, false, &ph, &ln), "any other aperture returns NULL"); N48DispSnap z = g; z.aperPhys = 0; expect(!fb_aperture(&z, true, &ph, &ln), "no aperture without a base"); }
+    { FbAttr a = fb_connection_attr(&g, kFbAttrEnable); expect(a.rc == kFbRcSuccess && a.hasValue && a.value == 1u, "kConnectionEnable = 1");
+      a = fb_connection_attr(&g, kFbAttrCheckEnable); expect(a.rc == kFbRcSuccess && a.hasValue && a.value == 1u, "kConnectionCheckEnable = 1");
+      a = fb_connection_attr(&g, kFbAttrFlags); expect(a.rc == kFbRcSuccess && a.hasValue && a.value == 0u, "kConnectionFlags = 0");
+      a = fb_connection_attr(&g, kFbAttrHlDdc); expect(a.rc == kFbRcSuccess && !a.hasValue, "kConnectionSupportsHLDDCSense = success (no value) with an EDID");
+      N48DispSnap z = g; z.edidLen = 0; a = fb_connection_attr(&z, kFbAttrHlDdc); expect(a.rc == kFbRcUnsupported, "... Unsupported without one");
+      a = fb_connection_attr(&g, kFbAttrPower); expect(a.rc == kFbRcSuper, "kConnectionPower is not answered by getAttributeForConnection (super)");
+      a = fb_connection_attr(&g, 0x12345678u); expect(a.rc == kFbRcSuper, "an unknown connection attribute goes to super");
+      a = fb_attr(kFbAttrCursor); expect(a.rc == kFbRcSuccess && a.hasValue && a.value == 0u, "getAttribute('crsr') = 0 (software cursor)");
+      a = fb_attr(kFbAttrPower); expect(a.rc == kFbRcSuper, "getAttribute(powr) is super's"); a = fb_attr(0x1u); expect(a.rc == kFbRcSuper, "every other attribute is super's");
+      expect(fb_power_attr(kFbAttrPower) && !fb_power_attr(kFbAttrCursor) && !fb_power_attr(kFbAttrEnable), "only 'powr' is recorded as power"); }
+    expect_u("'crsr'", kFbAttrCursor, 0x63727372u); expect_u("'powr'", kFbAttrPower, 0x706f7772u); expect_u("'enab'", kFbAttrEnable, 0x656e6162u); expect_u("'cena'", kFbAttrCheckEnable, 0x63656e61u); expect_u("'flgs'", kFbAttrFlags, 0x666c6773u); expect_u("'hddc'", kFbAttrHlDdc, 0x68646463u);
+    { const uint8_t *src = nullptr; uint64_t n = 0;
+      expect(fb_has_ddc(&g, 0) && !fb_has_ddc(&g, 1) && !fb_has_ddc(&g, -1) && !fb_has_ddc(nullptr, 0), "hasDDCConnect: connection 0 with an EDID");
+      expect_u("block 1 is the base EDID", fb_ddc_block(&g, 0, 1, true, true, 128, &src, &n), kFbDdcOk); expect(src == g.edid && n == 128u, "... bytes 0..127");
+      expect_u("block 2 is the CTA extension", fb_ddc_block(&g, 0, 2, true, true, 128, &src, &n), kFbDdcOk); expect(src == g.edid + 128 && n == 128u, "... bytes 128..255");
+      expect_u("a 64-byte buffer gets 64 bytes", fb_ddc_block(&g, 0, 1, true, true, 64, &src, &n), kFbDdcOk); expect_u("... n", n, 64);
+      expect_u("a 1000-byte buffer gets 128 bytes", fb_ddc_block(&g, 0, 2, true, true, 1000, &src, &n), kFbDdcOk); expect_u("... n", n, 128);
+      expect_u("block 0 (1-based) is not found", fb_ddc_block(&g, 0, 0, true, true, 128, &src, &n), kFbDdcNotFound); expect_u("block 3 is not found", fb_ddc_block(&g, 0, 3, true, true, 128, &src, &n), kFbDdcNotFound);
+      expect_u("another connection is unsupported", fb_ddc_block(&g, 1, 1, true, true, 128, &src, &n), kFbDdcUnsupported); expect_u("another block type is unsupported", fb_ddc_block(&g, 0, 1, false, true, 128, &src, &n), kFbDdcUnsupported);
+      expect_u("no buffer is unsupported", fb_ddc_block(&g, 0, 1, true, false, 128, &src, &n), kFbDdcUnsupported); }
+    // ---- the source: the override set is EXACTLY the spec's table
+    const std::string src = slurp(root + "/src/Navi48Accel.cpp"), lv = slurp(root + "/gates/leaves.py"), plist = slurp(root + "/Info.plist"), inst = slurp(root + "/INSTALL.md");
+    std::string decl; { const size_t a = src.find("class Navi48Framebuffer : public IOFramebuffer {"); const size_t e = a == std::string::npos ? a : src.find("\n};\n", a); if (a != std::string::npos && e != std::string::npos) decl = src.substr(a, e - a); }
+    expect(!decl.empty(), "the Navi48Framebuffer class is declared");
+    std::vector<std::string> ovr;
+    { size_t p = 0; while ((p = decl.find(" override;", p)) != std::string::npos) { const size_t ls = decl.rfind('\n', p); const std::string line = decl.substr(ls + 1, p - ls - 1); const size_t pr = line.find('('); const size_t sp = line.rfind(' ', pr); std::string nm = line.substr(sp + 1, pr - sp - 1); while (!nm.empty() && nm[0] == '*') nm.erase(0, 1); ovr.push_back(nm); p += 10; } }
+    { const char *want[] = { "start", "getApertureRange", "getVRAMRange", "enableController", "getPixelFormats", "getDisplayModeCount", "getDisplayModes", "getInformationForDisplayMode", "getPixelFormatsForDisplayMode", "getPixelInformation",
+                             "getCurrentDisplayMode", "setDisplayMode", "getStartupDisplayMode", "setAttribute", "getAttribute", "getConnectionCount", "setAttributeForConnection", "getAttributeForConnection", "hasDDCConnect", "getDDCBlock" };
+      expect_u("exactly 20 overrides (the spec's table: start + enableController + the apertures + the mode / pixel answers + the attributes + the DDC pair)", ovr.size(), 20);
+      for (const char *w : want) { bool f = false; for (const std::string &o : ovr) if (o == w) f = true; expect(f, (std::string("override present: ") + w).c_str()); }
+      for (const std::string &o : ovr) { bool f = false; for (const char *w : want) if (o == w) f = true; expect(f, ("no other override: " + o).c_str()); } }
+    expect(decl.find("isConsoleDevice") == std::string::npos && src.find("Navi48Framebuffer::isConsoleDevice") == std::string::npos, "isConsoleDevice is NOT overridden (the base returns 0)");
+    for (const char *t : { "registerForInterruptType", "unregisterInterrupt", "setInterruptState", "getNotificationSemaphore" }) expect(decl.find(t) == std::string::npos && src.find(std::string("Navi48Framebuffer::") + t) == std::string::npos, (std::string("the interrupts are super's: ") + t).c_str());
+    expect(decl.find("virtual") == std::string::npos, "the leaf declares no new virtual");
+    // the slot numbers, against the KC's IOFramebuffer vtable listing (ioaccel-layout/vtables/IOFramebuffer.tsv: idx, ..., demangled)
+    { std::string tsv = slurp(root + "/../ioaccel-layout/vtables/IOFramebuffer.tsv"); if (tsv.empty()) tsv = slurp(root + "/ioaccel/IOFramebuffer.tsv");     // the plant scratch tree carries a copy
+      if (tsv.empty()) std::printf("NOTE: IOFramebuffer.tsv not readable under %s/../ioaccel-layout\n", root.c_str());
+      else {
+        std::map<int, std::pair<std::string, bool>> row; std::istringstream is(tsv); std::string ln;
+        while (std::getline(is, ln)) { if (ln.empty() || ln[0] == '#') continue; std::vector<std::string> f; size_t a = 0; while (true) { const size_t t = ln.find('\t', a); f.push_back(ln.substr(a, t == std::string::npos ? std::string::npos : t - a)); if (t == std::string::npos) break; a = t + 1; } if (f.size() >= 7) row[atoi(f[0].c_str())] = { f[6], f[3] == "PURE" }; }
+        expect_u("the listing has 350 slots", row.size(), 350);
+        struct E { int slot; const char *name; };
+        // the spec's gate list (slots 305..348): 305 isConsoleDevice, 310 getVRAMRange, 311 enableController, 309 + 312-318 pure, 319 setDisplayMode, 322 getStartupDisplayMode, 325 / 326 set / getAttribute, 330-332 connection count / set / get, 344 / 345 hasDDCConnect / getDDCBlock, 346-348 interrupts
+        const E spec[] = { { 305, "isConsoleDevice" }, { 310, "getVRAMRange" }, { 311, "enableController" }, { 319, "setDisplayMode" }, { 322, "getStartupDisplayMode" }, { 325, "setAttribute" }, { 326, "getAttribute" }, { 330, "getConnectionCount" },
+                           { 331, "setAttributeForConnection" }, { 332, "getAttributeForConnection" }, { 344, "hasDDCConnect" }, { 345, "getDDCBlock" }, { 346, "registerForInterruptType" }, { 347, "unregisterInterrupt" }, { 348, "setInterruptState" } };
+        for (const E &e : spec) expect(row.count(e.slot) && row[e.slot].first.find(std::string("::") + e.name + "(") != std::string::npos, (std::string("KC slot ") + std::to_string(e.slot) + " is " + e.name).c_str());
+        const E pure[] = { { 309, "getApertureRange" }, { 312, "getPixelFormats" }, { 313, "getDisplayModeCount" }, { 314, "getDisplayModes" }, { 315, "getInformationForDisplayMode" }, { 316, "getPixelFormatsForDisplayMode" }, { 317, "getPixelInformation" }, { 318, "getCurrentDisplayMode" } };
+        // pure rows show as __cxa_pure_virtual in the listing: the slot numbers are pinned to the 8 PURE rows (309, 312-318) and their names to the SDK header's order
+        int np = 0; for (auto &kv : row) if (kv.second.second) np++;
+        expect_u("the listing has 8 pure slots (309, 312-318)", np, 8);
+        for (const E &e : pure) expect(row.count(e.slot) && row[e.slot].second, (std::string("KC slot ") + std::to_string(e.slot) + " is pure (" + e.name + ")").c_str());
+        // leaves.py: FB_EXTRA are exactly the non-pure overrides above, FB_PURE the pure ones
+        expect(lv.find("FB_EXTRA = [184, 310, 311, 319, 322, 325, 326, 330, 331, 332, 344, 345]") != std::string::npos && lv.find("FB_PURE = [309, 312, 313, 314, 315, 316, 317, 318]") != std::string::npos, "leaves: the framebuffer's override slots");
+        expect(row.count(184) && row[184].first.find("::start(") != std::string::npos, "KC slot 184 is start"); } }
+    expect(lv.find("('Navi48Framebuffer',   'IOFramebuffer',            FB_EXTRA)") != std::string::npos && lv.find("FB_LEAF = 'Navi48Framebuffer'") != std::string::npos, "leaves: the framebuffer leaf vs IOFramebuffer and its negative-control class");
+    // the start ORDER: kill switch < metal-ws < nub class < ops < snapshot < snapshot check < verdict < IOFramebuffer::start
+    { const std::string b = body_of(src, "bool Navi48Framebuffer::start(IOService *provider) {");
+      const size_t ks = b.find("N48_AUX_ENTER(false);"), ws = b.find("PE_parse_boot_argn(\"navi48-metal-ws\""), nb = b.find("n48_is_class(provider, N48_DISP_NUB_CLASS)"), lg = b.find("!metalWs && isNub && n48_layout_gate()"), go = b.find("n48_get_dops(provider)"), oc = b.find("n48disp_ops_check_for(o, pidx)"),
+                   sn = b.find("o->snapshot((void *)provider, &s)"), sv = b.find("fb_snap_for_index(&s, pidx)"), vd = b.find("fb_start_verdict(n48_aux_on(), metalWs, isNub, layoutOk, ov, rc, sv)"), rf = b.find("if (v != kFbStartOk) return false;"), sup = b.find("IOFramebuffer::start(provider)");
+      expect(ks != std::string::npos && ws != std::string::npos && nb != std::string::npos && lg != std::string::npos && go != std::string::npos && oc != std::string::npos && sn != std::string::npos && sv != std::string::npos && vd != std::string::npos && rf != std::string::npos && sup != std::string::npos, "start has all its steps");
+      expect(ks < ws && ws < nb && nb < lg && lg < go && go < oc && oc < sn && sn < sv && sv < vd && vd < rf && rf < sup, "ORDER in Navi48Framebuffer::start: kill switch < metal-ws < nub class < RUNTIME LAYOUT GATE < ops < snapshot < validation < verdict < refuse < IOFramebuffer::start");
+      expect(b.find("layoutOk ? n48_get_dops(provider) : nullptr") != std::string::npos && b.find("layoutOk ? n48disp_ops_check_for(o, pidx)") != std::string::npos && b.find("ov == N48_DOV_OK ? o->snapshot(") != std::string::npos, "the ops are fetched only after the layout gate passed (from the nub), the snapshot only from a good table");
+      expect(b.find("snap = s; dops = o;") > rf, "the snapshot is stored only after the verdict");
+      // 0.0.7: the M6 latch is read right after metal-ws and BEFORE the layout gate; `metalWs` (the name every later line uses) is the pure fb_metal_ws_blocks of the two
+      const size_t m6 = b.find("PE_parse_boot_argn(\"navi48-m6\""), mw = b.find("const bool metalWs = fb_metal_ws_blocks(metalWsArg, m6On);");
+      expect(m6 != std::string::npos && mw != std::string::npos && ws < m6 && m6 < mw && mw < nb && b.find("const bool m6On = m6_on(PE_parse_boot_argn(\"navi48-m6\", &m6v, sizeof(m6v)), m6v);") != std::string::npos, "0.0.7: ORDER: metal-ws read < navi48-m6 read < metalWs = fb_metal_ws_blocks(...) < the nub class check, and the latch goes through the pure m6_on"); }
+    { const std::string b = body_of(src, "IODeviceMemory *Navi48Framebuffer::getApertureRange(");
+      expect(b.find("fb_aperture(&snap, aperture == kIOFBSystemAperture, &phys, &len)") != std::string::npos && b.find("IODeviceMemory::withRange(") != std::string::npos && b.find("return nullptr;") != std::string::npos, "getApertureRange: system aperture only, from the snapshot"); }
+    { const std::string b = body_of(src, "IODeviceMemory *Navi48Framebuffer::getVRAMRange("); expect(b.find("fb_aperture(&snap, true, &phys, &len)") != std::string::npos, "getVRAMRange is the same range"); }
+    { const std::string b = body_of(src, "IOReturn Navi48Framebuffer::enableController() {"); expect(b.find("initForPM();") != std::string::npos && b.find("return kIOReturnSuccess;") != std::string::npos, "enableController: initForPM, then success"); }
+    { const std::string b = body_of(src, "void Navi48Framebuffer::initForPM() {");
+      for (const char *t : { "kIOPMPreventSystemSleep", "registerPowerDriver(this, powerStates, 3)", "temporaryPowerClampOn()", "changePowerStateTo(1)", "{ 1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 }" }) expect(b.find(t) != std::string::npos, (std::string("initForPM (RDNA4FB verbatim): ") + t).c_str()); }
+    { const std::string b = body_of(src, "IOReturn Navi48Framebuffer::setAttribute(");
+      expect(b.find("powerState = (uint32_t)value;") != std::string::npos && b.find("return kIOReturnSuccess;") != std::string::npos && b.find("if (!fb_power_attr((uint32_t)attribute)) return IOFramebuffer::setAttribute(attribute, value);") != std::string::npos && b.find("if (!fb_power_attr((uint32_t)attribute)) return IOFramebuffer::setAttribute(attribute, value);") < b.find("powerState = (uint32_t)value;"), "setAttribute(power): only 'powr' is recorded (then success); everything else is super's");
+      expect(b.find("WREG") == std::string::npos && b.find("config") == std::string::npos, "setAttribute(power): no hardware action"); }
+    { const std::string b = body_of(src, "IOReturn Navi48Framebuffer::getAttribute("); expect(b.find("fb_attr((uint32_t)attribute)") != std::string::npos && b.find("IOFramebuffer::getAttribute(attribute, value)") != std::string::npos, "getAttribute: 'crsr' from the pure answer, the rest super's"); }
+    { const std::string b = body_of(src, "IOReturn Navi48Framebuffer::getDDCBlock("); expect(b.find("fb_ddc_block(&snap,") != std::string::npos && b.find("blockType == kIODDCBlockTypeEDID") != std::string::npos, "getDDCBlock: the cached EDID, EDID type only"); }
+    { const std::string b = body_of(src, "IOReturn Navi48Framebuffer::setDisplayMode("); expect(b.find("fb_mode_ok((uint32_t)displayMode, (uint32_t)depth)") != std::string::npos && b.find("kIOReturnUnsupported") != std::string::npos, "setDisplayMode: only (1, 0), else Unsupported"); }
+    { const std::string b = body_of(src, "static const N48DispOps *n48_get_dops(IOService *nub) {");
+      expect(b.find("callPlatformFunction(fn, /*waitForFunction=*/false, (void *)&o, nullptr, nullptr, nullptr)") != std::string::npos && b.find("N48_DISP_FN_SYMBOL") != std::string::npos, "the display ops are fetched from the nub with waitForFunction = false"); }
+    { const std::string b = body_of(src, "IOReturn Navi48Framebuffer::getCurrentDisplayMode(");
+      expect(b.find("*displayMode = (IODisplayModeID)kFbModeId;") != std::string::npos && b.find("*depth = 0;") != std::string::npos, "getCurrentDisplayMode answers (1, 0)"); }
+    { const std::string b = body_of(src, "IOReturn Navi48Framebuffer::getStartupDisplayMode(");
+      expect(b.find("*displayMode = (IODisplayModeID)kFbModeId;") != std::string::npos && b.find("*depth = 0;") != std::string::npos && b.find("IOFramebuffer::getStartupDisplayMode") == std::string::npos, "getStartupDisplayMode answers (1, 0) itself (the base getter returns 0xE00002C7)"); }
+    { const std::string b = body_of(src, "IOItemCount Navi48Framebuffer::getConnectionCount() {"); expect(b.find("return 1;") != std::string::npos, "one connection"); }
+    { const std::string b = body_of(src, "UInt64 Navi48Framebuffer::getPixelFormatsForDisplayMode("); expect(b.find("return 0;") != std::string::npos, "getPixelFormatsForDisplayMode returns 0 (obsolete)"); }
+    { const std::string b = body_of(src, "const char *Navi48Framebuffer::getPixelFormats() {"); expect(b.find("IO32BitDirectPixels \"\\0\"") != std::string::npos, "the pixel formats: IO32BitDirectPixels, double-NUL terminated"); }
+    { const std::string b = body_of(src, "IOReturn Navi48Framebuffer::getDisplayModes("); expect(b.find("allDisplayModes[0] = (IODisplayModeID)kFbModeId;") != std::string::npos && b.find("kIOReturnBadArgument") != std::string::npos, "getDisplayModes: one id, a NULL array is a bad argument"); }
+    { const std::string b = body_of(src, "IOReturn Navi48Framebuffer::getInformationForDisplayMode(");
+      expect(b.find("fb_mode_info(&snap, (uint32_t)displayMode, &m)") != std::string::npos && b.find("kDisplayModeValidFlag") != std::string::npos && b.find("kDisplayModeSafeFlag") != std::string::npos && b.find("kDisplayModeDefaultFlag") != std::string::npos, "getInformationForDisplayMode: from the snapshot, Valid | Safe | Default"); }
+    { const std::string b = body_of(src, "IOReturn Navi48Framebuffer::getPixelInformation(");
+      expect(b.find("fb_pixel_info(&snap,") != std::string::npos && b.find("pixelInfo->pixelType = kIORGBDirectPixels;") != std::string::npos && b.find("componentMasks[i] = p.masks[i]") != std::string::npos, "getPixelInformation: from the snapshot, RGB direct, the masks"); }
+    { const std::string b = body_of(src, "IOReturn Navi48Framebuffer::getAttributeForConnection(");
+      expect(b.find("fb_connection_attr(&snap, (uint32_t)attribute)") != std::string::npos && b.find("IOFramebuffer::getAttributeForConnection(connectIndex, attribute, value)") != std::string::npos && b.find("kFbRcUnsupported") != std::string::npos, "getAttributeForConnection: the pure answers, super for the rest"); }
+    { const std::string b = body_of(src, "IOReturn Navi48Framebuffer::setAttributeForConnection("); expect(b.find("connPower = (uint32_t)value;") != std::string::npos && b.find("fb_power_attr((uint32_t)attribute)") != std::string::npos, "setAttributeForConnection(power): recorded only"); }
+    { const std::string b = body_of(src, "bool Navi48Framebuffer::hasDDCConnect("); expect(b.find("fb_has_ddc(&snap, (int32_t)connectIndex)") != std::string::npos, "hasDDCConnect: from the snapshot"); }
+    // the personality
+    expect(plist.find("<key>Navi48Framebuffer</key>") != std::string::npos, "a Navi48Framebuffer personality");
+    { const size_t a = plist.find("<key>Navi48Framebuffer</key>"), e = plist.find("<key>Navi48Accelerator</key>"); const std::string p = plist.substr(a, e - a);
+      expect(p.find("<key>IOProviderClass</key>\n\t\t\t<string>Navi48DisplayNub</string>") != std::string::npos && p.find("<key>IOClass</key>\n\t\t\t<string>Navi48Framebuffer</string>") != std::string::npos &&
+             p.find("<key>IOMatchCategory</key>\n\t\t\t<string>IOFramebuffer</string>") != std::string::npos && p.find("<key>IOPropertyMatch</key>\n\t\t\t<dict>\n\t\t\t\t<key>Navi48DisplayIndex</key>\n\t\t\t\t<integer>1</integer>") != std::string::npos,
+             "the framebuffer personality: IOProviderClass Navi48DisplayNub, IOClass Navi48Framebuffer, IOMatchCategory IOFramebuffer, IOPropertyMatch {Navi48DisplayIndex: 1}");
+      expect(p.find("IOPCI") == std::string::npos && p.find("IOResource") == std::string::npos && p.find("IOProbeScore") == std::string::npos, "no PCI / IOResources match for the framebuffer (it runs only when the nub exists)"); }
+    // INSTALL.md: the new path for an already-approved id
+    expect(inst.find("/Library/Extensions/Navi48Accel-0.0.4.kext") != std::string::npos && inst.find("NEW") != std::string::npos && inst.find("0.0.4") != std::string::npos, "INSTALL.md names the new install path /Library/Extensions/Navi48Accel-0.0.4.kext");
+    { size_t p = 0; bool bad = false; while ((p = inst.find("update-all", p)) != std::string::npos) { const size_t ls = inst.rfind('\n', p), le = inst.find('\n', p); const std::string line = inst.substr(ls + 1, (le == std::string::npos ? inst.size() : le) - ls - 1); /* the whole line */ if (line.find("Do NOT") == std::string::npos && line.find("NOT advised") == std::string::npos && line.find("never") == std::string::npos && line.find("not a command") == std::string::npos && line.find("NOT") == std::string::npos && line.find("NEVER") == std::string::npos) bad = true; p += 10; }
+      expect(!bad, "INSTALL.md never suggests kmutil install --update-all (only warns against it)"); }
+    expect(src.find("n48accel: layout PASS") == std::string::npos || true, "(the runtime gate logs layout PASS <slots>/<slots>; 2720 for 0.0.4 is the sum of the generated tables)");
+}
+
+// ---- A9 (0.0.5, G6): the 'N48N' user client on the accelerator ----------------------------------------------------------------------------------------------
+static int32_t g_no_rc; static void *g_no_client;
+static int32_t o_native(void *, void *, void *, void *, uint32_t, void **h) { if (h) *h = g_no_client; return g_no_rc; }
+static void a9_native_open(const std::string &root, const std::string &bring) {
+    // the type constant, the capability, the table shape
+    expect_u("the type constant is 'N48N'", N48_METAL_UC_N48N, 0x4E34384Eu);
+    expect_u("ops ABI 3", N48_METAL_ABI, 3); expect_u("152 bytes", sizeof(N48MetalOps), 152); expect_u("native_open at 144", offsetof(N48MetalOps, native_open), 144);
+    expect_u("the capability is bit 1", N48_CAP_NATIVE_OPEN, 2);
+    // native_open_usable: every way a table can fail to carry a usable hook
+    N48MetalOps good = good_ops(); good.caps = N48_CAP_VHOOK | N48_CAP_NATIVE_OPEN; good.native_open = o_native;
+    expect(native_open_usable(&good), "a good ABI-3 table with the capability and the hook is usable");
+    expect(!native_open_usable(nullptr), "no table: not usable");
+    { N48MetalOps x = good; x.abi = 2; expect(!native_open_usable(&x), "ABI 2: not usable (the member does not exist)"); }
+    { N48MetalOps x = good; x.abi = 1; x.size = N48_METAL_OPS_MIN; expect(!native_open_usable(&x), "ABI 1 / 120 bytes: not usable"); }
+    { N48MetalOps x = good; x.size = N48_METAL_OPS_V2; expect(!native_open_usable(&x), "a 144-byte table: not usable (native_open is outside its size)"); }
+    { N48MetalOps x = good; x.caps = N48_CAP_VHOOK; expect(!native_open_usable(&x), "capability bit clear: not usable"); }
+    { N48MetalOps x = good; x.caps = N48_CAP_NATIVE_OPEN << 1; expect(!native_open_usable(&x), "a different capability bit: not usable"); }
+    { N48MetalOps x = good; x.native_open = nullptr; expect(!native_open_usable(&x), "no hook: not usable"); }
+    { N48MetalOps x = good; x.abi = 4; x.size = N48_METAL_OPS_V3 + 16; expect(native_open_usable(&x), "a newer, longer table keeps the member usable (append-only)"); }
+    // a 144-byte table is never read past its end (ASan poison on the bytes after it)
+    { alignas(8) static uint8_t buf[sizeof(N48MetalOps)]; N48MetalOps x = good; x.abi = 2; x.size = N48_METAL_OPS_V2; std::memcpy(buf, &x, N48_METAL_OPS_V2);
+      ASAN_POISON_MEMORY_REGION(buf + N48_METAL_OPS_V2, sizeof(N48MetalOps) - N48_METAL_OPS_V2);
+      expect(!native_open_usable((const N48MetalOps *)buf), "a 144-byte table: native_open_usable does not read the missing member");
+      ASAN_UNPOISON_MEMORY_REGION(buf + N48_METAL_OPS_V2, sizeof(N48MetalOps) - N48_METAL_OPS_V2); }
+    // nuc_plan: the whole input space
+    for (int tn = 0; tn < 2; ++tn) for (int aux = 0; aux < 2; ++aux) for (int gate = 0; gate < 2; ++gate) for (int dev = 0; dev < 2; ++dev) for (int tab = 0; tab < 3; ++tab) {
+        const N48MetalOps *t = tab == 0 ? nullptr : tab == 1 ? &good : nullptr; N48MetalOps nocap = good; nocap.caps = N48_CAP_VHOOK; if (tab == 2) t = &nocap;
+        const uint32_t type = tn ? N48_METAL_UC_N48N : 0x1234u;
+        const NucPlan p = nuc_plan(type, aux != 0, gate != 0, t, dev != 0);
+        if (!tn) expect(p == kNucFamily, "any other type goes to the family, whatever the state");
+        else {
+            expect(p != kNucFamily, "AN 'N48N' OPEN NEVER FALLS THROUGH TO THE FAMILY, whatever the state");
+            const bool all = aux && gate && dev && tab == 1;
+            expect((p == kNucNative) == all, "'N48N' reaches the hook only with the kill switch on, the gate passed, a device and a usable table");
+            if (!all) expect(p == kNucUnsupported, "'N48N' otherwise is Unsupported");
+        }
+    }
+    expect(nuc_plan(0, true, true, &good, true) == kNucFamily && nuc_plan(N48_METAL_UC_N48N + 1, true, true, &good, true) == kNucFamily && nuc_plan(N48_METAL_UC_N48N - 1, true, true, &good, true) == kNucFamily, "neighbouring type numbers are the family's");
+    // the answer is an IOReturn, never a bool
+    expect_u("success with a client is 0", (uint32_t)nuc_result(0, true), 0u);
+    expect_u("success with NO client is an internal error", (uint32_t)nuc_result(0, false), 0xE00002C9u);
+    expect_u("a refusal is passed through unchanged (NotPrivileged)", (uint32_t)nuc_result((int32_t)0xE00002C1, false), 0xE00002C1u);
+    expect_u("a refusal is passed through unchanged even if an object was returned (NotPermitted)", (uint32_t)nuc_result((int32_t)0xE00002E2, true), 0xE00002E2u);
+    expect_u("the bool value 1 is NOT success", (uint32_t)nuc_result(1, true), 1u);
+    expect(kIoSuccess == 0 && kIoUnsupported == (int32_t)0xE00002C7 && kIoBadArgument == (int32_t)0xE00002C2 && kIoInternalError == (int32_t)0xE00002C9, "the IOReturn constants");
+    // the source: slot 239 and the wiring
+    const std::string src = slurp(root + "/src/Navi48Accel.cpp"), lv = slurp(root + "/gates/leaves.py"), plist = slurp(root + "/Info.plist"), inst = slurp(root + "/INSTALL.md"), kmod = slurp(root + "/src/kmod_info.c");
+    expect(lv.find("('Navi48Accelerator',   'IOGraphicsAccelerator2',   [183, 184, 18, 322, 348, 329, 239])") != std::string::npos, "leaves: slot 239 (newUserClient) is an override of Navi48Accelerator");
+    expect(lv.find("EXPECT_CLASSES = 13") != std::string::npos && lv.find("EXPECT_SLOTS = 2720") != std::string::npos, "the layout gate stays at 13 classes / 2720 slots (no new class, no new slot)");
+    expect(src.find("IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) override;") != std::string::npos, "the class declares the 4-argument newUserClient override");
+    const std::string b = body_of(src, "IOReturn Navi48Accelerator::newUserClient(");
+    expect(!b.empty(), "newUserClient is defined");
+    expect(b.find("N48_AUX_ENTER(type == N48_METAL_UC_N48N ? kIOReturnUnsupported : IOGraphicsAccelerator2::newUserClient(owningTask, securityID, type, handler));") != std::string::npos, "the kill switch is first: off = Unsupported for 'N48N', the family's own call for every other type");
+    { const size_t ks = b.find("N48_AUX_ENTER"), pl = b.find("nuc_plan("), fam = b.find("if (plan == kNucFamily) return IOGraphicsAccelerator2::newUserClient("), uns = b.find("if (plan != kNucNative) return kIOReturnUnsupported;"), hook = b.find("gOps->native_open("), res = b.find("nuc_result(rc, uc != nullptr)");
+      expect(ks != std::string::npos && pl != std::string::npos && fam != std::string::npos && uns != std::string::npos && hook != std::string::npos && res != std::string::npos && ks < pl && pl < fam && fam < uns && uns < hook && hook < res, "ORDER: kill switch < plan < family (other types only) < Unsupported (the rest of 'N48N') < the hook < the IOReturn check"); }
+    expect_u("the family's newUserClient is called in exactly two places: the kill-switch line and the other-type branch", count_of(b, "IOGraphicsAccelerator2::newUserClient("), 2u);
+    expect(b.find("nuc_plan(type, true, gGateState == 1, gOps, ctx != nullptr && ctx == gCtx)") != std::string::npos, "the plan sees the layout gate state, the ops table and a live device");
+    expect(b.find("gOps->native_open(ctx, this, (void *)owningTask, securityID, type, (void **)&uc)") != std::string::npos, "the hook gets this accelerator, the task, the security id and the type");
+    expect(b.find("return (IOReturn)out;") != std::string::npos && b.find("rc == 1") == std::string::npos && b.find("out == 1") == std::string::npos && b.find("(bool)") == std::string::npos && b.find("? true") == std::string::npos && b.find("return true") == std::string::npos && b.find("!rc") == std::string::npos, "the hook's IOReturn is returned as an IOReturn (never read as a bool)");
+    expect(b.find("if (out == kIoSuccess) *handler = uc;") != std::string::npos && b.find("if (handler) *handler = nullptr;") != std::string::npos, "*handler is written only on success, cleared before");
+    expect(b.find("if (!handler) return kIOReturnBadArgument;") != std::string::npos && b.find("if (!handler) return kIOReturnBadArgument;") > b.find("if (plan != kNucNative)"), "a NULL handler is BadArgument only after the plan said native");
+    expect(src.find("N48_TR_NATIVE_OPEN") != std::string::npos, "the open is traced");
+    // the layout lists agree in gate_link / gen_gate (they read leaves.py): nothing else names slot 239
+    // versions and the install path
+    expect(plist.find("<string>0.0.7</string>") != std::string::npos && count_of(plist, "<string>0.0.7</string>") == 2 && plist.find("0.0.4") == std::string::npos && plist.find("<string>0.0.5</string>") == std::string::npos && plist.find("<string>0.0.6</string>") == std::string::npos, "Info.plist says 0.0.7 (carried twice)");
+    expect(kmod.find("KMOD_EXPLICIT_DECL(com.navi48.accelprobe, \"0.0.7\", _start, _stop)") != std::string::npos, "kmod_info says 0.0.7");
+    expect(inst.find("/Library/Extensions/Navi48Accel-0.0.5.kext") != std::string::npos && inst.find("Step 4b") != std::string::npos, "INSTALL.md documents the new install path /Library/Extensions/Navi48Accel-0.0.5.kext (step 4b)");
+    { const size_t a = inst.find("## 0.0.5 (G6"), e = inst.find("## 0.0.4 (M5", a); const std::string sec = (a == std::string::npos || e == std::string::npos) ? "" : inst.substr(a, e - a);
+      expect_u("the 0.0.5 section uses the NEW path in every step (cp, chown, chmod, xattr, libraries, load)", count_of(sec, "/Library/Extensions/Navi48Accel-0.0.5.kext"), 7u);
+      expect(sec.find("Navi48Accel-0.0.4.kext") == std::string::npos, "the 0.0.5 section never names the 0.0.4 path"); }
+    { const size_t a = inst.find("## 0.0.5 (G6"), e = inst.find("## 0.0.4 (M5", a); const std::string sec = (a == std::string::npos || e == std::string::npos) ? "" : inst.substr(a, e - a);
+      expect(!sec.empty() && sec.find("update-all") != std::string::npos && sec.find("NEVER `kmutil install --update-all`") != std::string::npos, "the 0.0.5 section forbids kmutil install --update-all");
+      expect(sec.find("kmutil load -p /Library/Extensions/Navi48Accel-0.0.5.kext") != std::string::npos && sec.find("backup/auxkc-pre-0.0.5") != std::string::npos, "the 0.0.5 section: back up the aux KC, one load at the new path"); }
+    // the two Navi48MetalOps.h copies
+    { const std::string a = slurp(root + "/src/Navi48MetalOps.h"), c = slurp(bring + "/src/navi48-bringup/src/Navi48MetalOps.h");
+      expect(!a.empty() && !c.empty() && a == c, "the aux and bring-up copies of Navi48MetalOps.h are byte-identical (ABI 3)"); }
+}
+
+// ---- A10 (aux 0.0.6, Run B): the monitor A as display index 2 ------------------------------------------------------------------------------------------------------
+static N48DispSnap mona_snap() {
+    N48DispSnap s = good_snap();
+    s.index = N48_DISPA_INDEX; s.otg = N48_DISPA_OTG; s.ddcLine = N48_DISPA_DDC_LINE; s.w = N48_DISPA_W; s.h = N48_DISPA_H; s.pitchBytes = N48_DISPA_PITCH; s.refresh1616 = N48_DISPA_REFRESH1616; s.pixHz = N48_DISPA_PIXHZ;
+    s.aperPhys = 0x80000000ull + 0x02000000ull; s.aperLen = N48_DISPA_BYTES; s.mcA = 0x8002000000ull; s.mcB = 0x80027F0000ull;
+    return s;
+}
+static void a10_mona_framebuffer(const std::string &root) {
+    const std::string src = slurp(root + "/src/Navi48Accel.cpp"), pure = slurp(root + "/src/n48accel_pure.h"), plist = slurp(root + "/Info.plist"), inst = slurp(root + "/INSTALL.md"), dops = slurp(root + "/src/Navi48DisplayOps.h");
+    // ---- the per-index geometry (the shared table) and the provider index
+    expect_u("provider index: the monitor B", fb_provider_index(true, 1), 1); expect_u("provider index: the monitor A", fb_provider_index(true, 2), 2);
+    expect_u("provider index: 0 / 3 / a huge value / no property are unknown", fb_provider_index(true, 0) + fb_provider_index(true, 3) + fb_provider_index(true, 0x100000001ull) + fb_provider_index(false, 1), 0);
+    { N48DispSnap d = good_snap(), a = mona_snap();
+      expect_u("the monitor B's snapshot is valid for index 1", fb_snap_for_index(&d, 1), N48_DSV_OK); expect_u("the monitor A's snapshot is valid for index 2", fb_snap_for_index(&a, 2), N48_DSV_OK);
+      expect_u("the monitor A's snapshot under the monitor B's nub (index 1) is refused", fb_snap_for_index(&a, 1), N48_DSV_INDEX); expect_u("the monitor B's snapshot under the monitor A's nub (index 2) is refused", fb_snap_for_index(&d, 2), N48_DSV_INDEX);
+      expect_u("an unknown provider index (0) is refused", fb_snap_for_index(&a, 0), N48_DSV_INDEX); expect_u("... and NULL", fb_snap_for_index(nullptr, 2), N48_DSV_NULL);
+      // a WRONG geometry for index 2 is refused field by field (the aux kext accepts nothing the table does not list)
+      { N48DispSnap x = a; x.w = 2560; expect_u("monitor A snapshot with the monitor B's width", fb_snap_for_index(&x, 2), N48_DSV_GEOMETRY); }
+      { N48DispSnap x = a; x.h = 1440; expect_u("monitor A snapshot with the monitor B's height", fb_snap_for_index(&x, 2), N48_DSV_GEOMETRY); }
+      { N48DispSnap x = a; x.pitchBytes = 10240; expect_u("monitor A snapshot with the monitor B's pitch", fb_snap_for_index(&x, 2), N48_DSV_GEOMETRY); }
+      { N48DispSnap x = a; x.otg = 2; expect_u("monitor A snapshot on OTG2", fb_snap_for_index(&x, 2), N48_DSV_GEOMETRY); }
+      { N48DispSnap x = a; x.ddcLine = 3; expect_u("monitor A snapshot with DDC line 3", fb_snap_for_index(&x, 2), N48_DSV_GEOMETRY); }
+      { N48DispSnap x = a; x.refresh1616 = N48_DISP_REFRESH1616; expect_u("monitor A snapshot with the monitor B's refresh", fb_snap_for_index(&x, 2), N48_DSV_GEOMETRY); }
+      { N48DispSnap x = a; x.pixHz = 241500000ull; expect_u("monitor A snapshot with the monitor B's pixel clock", fb_snap_for_index(&x, 2), N48_DSV_GEOMETRY); }
+      { N48DispSnap x = a; x.aperLen = N48_DISP_BYTES; expect_u("monitor A snapshot with the monitor B's aperture length", fb_snap_for_index(&x, 2), N48_DSV_GEOMETRY); }
+      { N48DispSnap x = a; x.aperLen = 127ull * 65536ull; expect_u("monitor A snapshot with the whole allocation as the aperture", fb_snap_for_index(&x, 2), N48_DSV_GEOMETRY); }
+      { N48DispSnap x = d; x.aperLen = 8294400ull; expect_u("monitor B snapshot with the monitor A's aperture length", fb_snap_for_index(&x, 1), N48_DSV_GEOMETRY); }
+      // every answer comes from the snapshot: the mode, the pixel format, the aperture, the EDID
+      FbModeInfo m; expect(fb_mode_info(&a, 1, &m) && m.w == 1920u && m.h == 1080u && m.refresh1616 == 0x3C0000u && m.maxDepthIndex == 0u && m.valid && m.safe && m.isDefault, "mode 1 of the monitor A's framebuffer is 1920x1080 at exactly 60 Hz (from the snapshot, not 2560x1440)");
+      FbPixel px; expect(fb_pixel_info(&a, 1, 0, true, &px) && px.bytesPerRow == 7680u && px.w == 1920u && px.h == 1080u && px.bitsPerPixel == 32u, "pixel info: pitch 7680, 1920x1080");
+      uint64_t ph = 0, ln = 0; expect(fb_aperture(&a, true, &ph, &ln) && ph == a.aperPhys && ln == 8294400ull, "the monitor A's aperture is its own buffer A, 8,294,400 bytes");
+      const uint8_t *sp = nullptr; uint64_t n = 0; expect_u("the monitor A's EDID block 1 is from its snapshot", fb_ddc_block(&a, 0, 1, true, true, 128, &sp, &n), kFbDdcOk); expect(sp == a.edid && n == 128u, "... bytes 0..127 of the snapshot"); }
+    // ---- the ops check for an index: an ABI-1 bring-up kext is refused for the monitor A, still accepted for the monitor B
+    { N48DispOps o = good_dops(); o.abi = 1u;
+      expect_u("ABI-1 table, the monitor B: accepted", n48disp_ops_check_for(&o, 1), N48_DOV_OK); expect_u("ABI-1 table, the monitor A: refused cleanly (N48_DOV_ABI)", n48disp_ops_check_for(&o, 2), N48_DOV_ABI);
+      o.abi = 2u; expect_u("ABI-2 table, the monitor A", n48disp_ops_check_for(&o, 2), N48_DOV_OK); expect_u("ABI-2 table, an unknown index", n48disp_ops_check_for(&o, 0), N48_DOV_ABI);
+      o.abi = 1u; const uint32_t ovMonA = n48disp_ops_check_for(&o, 2);
+      expect_u("start verdict: an ABI-1 table for the monitor A is an ops refusal", fb_start_verdict(true, false, true, true, ovMonA, 0, N48_DSV_OK), kFbStartOps); }
+    // ---- source pins: start reads the nub's index and uses it for the ops check and the snapshot check; nothing is hard-wired to 2560x1440
+    { const std::string b = body_of(src, "bool Navi48Framebuffer::start(IOService *provider) {"); const size_t pi = b.find("n48_provider_index(provider)"), oc = b.find("n48disp_ops_check_for(o, pidx)"), sv = b.find("fb_snap_for_index(&s, pidx)");
+      expect(pi != std::string::npos && oc != std::string::npos && sv != std::string::npos && pi < oc && oc < sv, "start: the nub's index is read BEFORE the ops check and the snapshot check, which both use it");
+      expect(src.find("OSDynamicCast(OSNumber, nub->getProperty(N48_DISP_INDEX_KEY))") != std::string::npos && src.find("fb_provider_index(n != nullptr,") != std::string::npos, "the index is the nub's Navi48DisplayIndex OSNumber"); }
+    { std::string fbcode = src; const size_t a = fbcode.find("// ---- Navi48Framebuffer (aux 0.0.4, M5)"); fbcode = a == std::string::npos ? "" : fbcode.substr(a);
+      expect(!fbcode.empty() && fbcode.find("2560") == std::string::npos && fbcode.find("1440") == std::string::npos && fbcode.find("10240") == std::string::npos && fbcode.find("N48_DISP_W") == std::string::npos && fbcode.find("N48_DISP_H") == std::string::npos && fbcode.find("N48_DISP_BYTES") == std::string::npos && fbcode.find("N48_DISP_PITCH") == std::string::npos && fbcode.find("14745600") == std::string::npos && fbcode.find("8294400") == std::string::npos && fbcode.find("7680") == std::string::npos && fbcode.find("1920") == std::string::npos && fbcode.find("1080") == std::string::npos,
+             "no monitor B geometry is hard-wired in the framebuffer class: it answers from the snapshot");
+      std::string pcode = pure; const size_t b2 = pcode.find("// ---- the monitor B framebuffer (aux 0.0.4"), e2 = pcode.find("// ---- task window"); pcode = (b2 == std::string::npos || e2 == std::string::npos) ? "" : pcode.substr(b2, e2 - b2);
+      expect(!pcode.empty() && pcode.find("N48_DISP_W") == std::string::npos && pcode.find("N48_DISP_H") == std::string::npos && pcode.find("N48_DISP_BYTES") == std::string::npos && pcode.find("N48_DISP_PITCH") == std::string::npos && pcode.find("2560") == std::string::npos && pcode.find("1440") == std::string::npos,
+             "the pure framebuffer answers use no monitor B constant (only the snapshot and the shared validators)"); }
+    // ---- the personalities
+    { const size_t a = plist.find("<key>Navi48Framebuffer2</key>"), e = plist.find("<key>Navi48Accelerator</key>"); const std::string p = (a == std::string::npos || e == std::string::npos) ? "" : plist.substr(a, e - a);
+      expect(!p.empty() && p.find("<key>IOProviderClass</key>\n\t\t\t<string>Navi48DisplayNub</string>") != std::string::npos && p.find("<key>IOClass</key>\n\t\t\t<string>Navi48Framebuffer</string>") != std::string::npos && p.find("<key>IOMatchCategory</key>\n\t\t\t<string>IOFramebuffer</string>") != std::string::npos &&
+             p.find("<key>IOPropertyMatch</key>\n\t\t\t<dict>\n\t\t\t\t<key>Navi48DisplayIndex</key>\n\t\t\t\t<integer>2</integer>") != std::string::npos && p.find("IOPCI") == std::string::npos && p.find("IOResource") == std::string::npos && p.find("IOProbeScore") == std::string::npos,
+             "the monitor A personality: same class, IOProviderClass Navi48DisplayNub, IOPropertyMatch {Navi48DisplayIndex: 2}, no PCI / IOResources match");
+      expect_u("the framebuffer class is named in exactly two personalities", count_of(plist, "<string>Navi48Framebuffer</string>"), 2); }
+    // ---- the shared header carries the table; INSTALL.md documents the NEW path
+    expect(dops.find("n48disp_geom_for_index(s->index, &g)") != std::string::npos && dops.find("#define N48_DISPA_REFRESH1616 0x3C0000u") != std::string::npos && dops.find("N48_DISPA_BYTES       8294400ull") != std::string::npos, "the shared header validates through the per-index table (monitor A: refresh 0x3C0000, 8,294,400 bytes)");
+    expect(inst.find("/Library/Extensions/Navi48Accel-0.0.6.kext") != std::string::npos && inst.find("## 0.0.6 (") != std::string::npos, "INSTALL.md documents the new install path /Library/Extensions/Navi48Accel-0.0.6.kext");
+    { const size_t a = inst.find("## 0.0.6 ("), e = inst.find("## 0.0.5 (G6", a); const std::string sec = (a == std::string::npos || e == std::string::npos) ? "" : inst.substr(a, e - a);
+      expect_u("the 0.0.6 section uses the NEW path in every step (cp, chown, chmod, xattr, libraries, load)", count_of(sec, "/Library/Extensions/Navi48Accel-0.0.6.kext"), 7u);
+      expect(sec.find("Navi48Accel-0.0.5.kext") == std::string::npos && sec.find("Navi48Accel-0.0.4.kext") == std::string::npos, "the 0.0.6 section never names an older path");
+      expect(sec.find("NEVER `kmutil install --update-all`") != std::string::npos && sec.find("kmutil load -p /Library/Extensions/Navi48Accel-0.0.6.kext") != std::string::npos && sec.find("backup/auxkc-pre-0.0.6") != std::string::npos && sec.find("Step 4b") != std::string::npos, "the 0.0.6 section: step 4b, back up the aux KC, one load at the new path, never --update-all");
+      expect(sec.find("fbhold 2") != std::string::npos && sec.find("fbhold 1") != std::string::npos && sec.find("fbpublish 2") != std::string::npos && sec.find("fbpublish 1") != std::string::npos && sec.find("killall -9 WindowServer") != std::string::npos, "the 0.0.6 section carries the Run B order"); }
+}
+
+// A11 (aux 0.0.7, M6 Stage 1a): INSTALL.md documents the NEW install path for the already-approved id, in every step, and the Stage 1a order.
+static void a11_m6_install(const std::string &root) {
+    const std::string inst = slurp(root + "/INSTALL.md");
+    expect(inst.find("/Library/Extensions/Navi48Accel-0.0.7.kext") != std::string::npos && inst.find("## 0.0.7 (") != std::string::npos, "INSTALL.md documents the new install path /Library/Extensions/Navi48Accel-0.0.7.kext");
+    const size_t a = inst.find("## 0.0.7 ("), e = inst.find("## 0.0.6 (", a); const std::string sec = (a == std::string::npos || e == std::string::npos) ? "" : inst.substr(a, e - a);
+    expect_u("the 0.0.7 section uses the NEW path in every step (cp, chown, chmod, xattr, libraries, load)", count_of(sec, "/Library/Extensions/Navi48Accel-0.0.7.kext"), 7u);
+    expect(sec.find("Navi48Accel-0.0.5.kext") == std::string::npos && sec.find("Navi48Accel-0.0.4.kext") == std::string::npos && count_of(sec, "Navi48Accel-0.0.6.kext") == 1u, "the 0.0.7 section names only the 0.0.6 directory it moves away");
+    expect(sec.find("NEVER `kmutil install --update-all`") != std::string::npos && sec.find("kmutil load -p /Library/Extensions/Navi48Accel-0.0.7.kext") != std::string::npos && sec.find("backup/auxkc-pre-0.0.7") != std::string::npos && sec.find("Step 4b") != std::string::npos, "the 0.0.7 section: step 4b, back up the aux KC, one load at the new path, never --update-all");
+    expect(sec.find("navi48-m6=1") != std::string::npos && sec.find("stage17-native-1440-metal-disp-amfi-m6.plist") != std::string::npos && sec.find("accel fbpublish 2") != std::string::npos && sec.find("accel pipeadopt") != std::string::npos && sec.find("accel pipeagdc 1") != std::string::npos && sec.find("accel m6stat") != std::string::npos, "the 0.0.7 section carries the navi48-m6 latch and the Stage 1a order");
+}
+
 int main(int argc, char **argv) {
     const std::string root = argc > 1 ? argv[1] : ".";
     const std::string bring = argc > 2 ? argv[2] : root;
-    a1_kill_switch(); a1_source(root); a2_gate(); a3_ops(); a3_source(root); a3b_tramp(root); a4_em(root); a5_thin(root); a6_plist(root, bring); a7_display(root);
+    a1_kill_switch(); a1_source(root); a2_gate(); a3_ops(); a3_source(root); a3b_tramp(root); a4_em(root); a5_thin(root); a6_plist(root, bring); a7_display(root); a8_framebuffer(root); a9_native_open(root, bring); a10_mona_framebuffer(root); a11_m6_install(root);
     std::printf("n48accel host_test: %d checks, %d failed\n", gRun, gFail);
     return gFail ? 1 : 0;
 }

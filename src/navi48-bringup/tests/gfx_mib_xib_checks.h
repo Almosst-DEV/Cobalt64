@@ -1,4 +1,4 @@
-// gfx_mib_xib_checks.h — build 0.0.505 (notes/design/CROSS-IB.md Q4 C1-C4, tests T1-T8; ): THE CROSS-IB
+// gfx_mib_xib_checks.h — build 0.0.505 (an internal design note Q4 C1-C4, tests T1-T8; ): THE CROSS-IB
 // CHECKS, included by gfx_mib_test.cpp (the `gfx_mib` suite: it links xlat12_ib.c/xlat12.c and reads AppleHardwareHook.cpp
 // for its pins). Everything here drives the REAL code (gfx_mib.h n48_mib_segment / n48_mib_lead_try / n48_mib_units /
 // n48_mib_head_executes / n48_mib_xib_note, gfx_commit.h n48_cm_gate, xlat12_ib_translate_draw_ex) over run10p's REAL

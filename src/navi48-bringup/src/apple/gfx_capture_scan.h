@@ -79,7 +79,7 @@ static inline void n48_gcap_push(n48_gcap_item *it, uint32_t max, uint32_t *cnt,
     (*cnt)++;
 }
 
-/* 0.0.395 (notes/design/R5-REDESIGN.md v2 "the one-dword filler, again"): THE SCANNER'S FLAGS.
+/* 0.0.395 (an internal design note v2 "the one-dword filler, again"): THE SCANNER'S FLAGS.
  *
  * WHY A FLAG AND NOT AN UNCONDITIONAL BRANCH. fixed the one-dword filler (`0xFFFF1000` = PACKET3(NOP, 0x3FFF),
  * one dword, proven on this silicon) in `n48_cp_scan_frame` but NOT here, so `n48_gcap_scan` still sizes it by its count

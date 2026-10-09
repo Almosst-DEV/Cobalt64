@@ -81,7 +81,7 @@
 namespace amdgpu {
 
 // ---------------------------------------------------------------------------------------------------------------------
-//  0.0.604 (notes/design/NATIVE-S2-DISPCLK.md C6): ONE lock for the PPSMC mailbox and the DAL mailbox (smu_dal.cpp), so a
+//  0.0.604 (an internal design note C6): ONE lock for the PPSMC mailbox and the DAL mailbox (smu_dal.cpp), so a
 //  metrics read, a power-state change, the boot-time init and a DAL experiment step can never interleave. It is RECURSIVE
 //  for its owning thread, so a caller that needs several messages back to back (the user client's doMetrics / doPowerState)
 //  holds it across the whole sequence while each message still takes it itself. If IOLockAlloc fails smu_lock_enter()

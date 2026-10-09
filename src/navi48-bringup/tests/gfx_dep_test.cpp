@@ -198,7 +198,7 @@ static uint32_t mut_gate(int m, const n48_cm_frame *c, uint32_t *detail)
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// 0.0.421 (notes/design/MIB-COMMIT.md H4). THE FRAME'S READ-SET IS THE UNION OF EVERY SEGMENT'S.
+// 0.0.421 (an internal design note H4). THE FRAME'S READ-SET IS THE UNION OF EVERY SEGMENT'S.
 // ---------------------------------------------------------------------------------------------------------------------
 // Through 0.0.420 the kext captured one consumer per SEGMENT and the gate read whatever the LAST segment left, so an
 // input an EARLY segment bound was invisible to R1-R4. gfx_cp_build.h's n48_cp_merge_consumer folds every segment into
@@ -1111,7 +1111,7 @@ static void l1_input_free_checks()
 }
 
 // =========================================================================================================================
-// FINDING 4 — 0.0.438 (FINDING 4 INTERIM REFUSAL; notes/design/D4-PRIME.md Finding 4). A segment's translate
+// FINDING 4 — 0.0.438 (FINDING 4 INTERIM REFUSAL; an internal design note Finding 4). A segment's translate
 // exports only its LAST draw's inputs (xlat12_ib.c's d_in_clear runs on every draw, never accumulating), so a segment with
 // MORE THAN ONE DRAW must (a) set the consumer's `over` when built the regular way (n48_cp_build_consumer) and (b) never
 // be admitted by the input-free fill builder (n48_cp_build_input_free) at all. No real 2-draw ColorFill-then-GPUPass
@@ -1169,14 +1169,14 @@ static void finding4_multidraw_checks()
 }
 
 // =========================================================================================================
-// D4' (notes/design/D4-PRIME.md, notes/design/R1-MEMDST.md Q5) — THE D4' CONSUMER'S OWN RULE, PURE. The
+// D4' (an internal design note, an internal design note Q5) — THE D4' CONSUMER'S OWN RULE, PURE. The
 // xlat12-side accumulation (d_readset_accum, rs_* never cleared per draw) is host-tested by
 // src/xlat12/tests/test_xlat12_ib.c's test_d4_readset (T1, T6, T7, R1-MEMDST Q6's INDEX_BASE, the arm32 f1-f16
 // corpus); this covers the kext-side build/merge/eval that reads its export.
 // =========================================================================================================
 // D4' item D (reviewer gap 1, R1-MEMDST.md Q5) — REAL R4 COUNTS, THROUGH THE REAL TRANSLATOR, THROUGH BUILD AND
 // MERGE, INTO THE RULE. fixture_mib_f48_f20_f21.h's F21 IB0 segment 0 is a REAL captured live triplet (WRITE_DATA,
-// RELEASE_MEM, WAIT_REG_MEM on the fence page - notes/design/R1-MEMDST.md Q1); translating it (forcing
+// RELEASE_MEM, WAIT_REG_MEM on the fence page - an internal design note Q1); translating it (forcing
 // ps_readset1/vs_readset1 to STRICT-OK-NONE rows so R1-R3 stay vacuous and only R4 can speak - the segment's own
 // real program identity is not what this test is about) gives ds.r4_waits == 1, ds.r4_memwrites == 2, the
 // translator's OWN counts, not asserted values. Runs the segment through n48_cp_build_consumer_d4, THEN
@@ -1195,7 +1195,7 @@ static uint32_t d4_f21_seg0_consumer(n48_cp_consumer_d4 *acc, xlat12_draw_stats 
     xlat12_draw_stats ds {};
     uint32_t len = 0;
     // The translate's own return code is NOT checked here: this segment's live triplet is exactly what
-    // notes/design/R1-MEMDST.md Q6 says phase 1 refuses at segmentation/translate for F20/F21 - but ds.r4_waits and
+    // an internal design note Q6 says phase 1 refuses at segmentation/translate for F20/F21 - but ds.r4_waits and
     // ds.r4_memwrites are filled by d_region as the packets are WALKED, before any refusal, so they are still the
     // translator's own real counts for these real bytes (the property under test, independent of whether the
     // OVERALL segment would go on to commit).
@@ -1235,7 +1235,7 @@ static void d4_item_d_real_r4_checks()
     expect_u("D4 item D   ... and the read-set decline cause is DISPATCH", (ds.rs_decl_why & XLAT12_RS_WHY_DISPATCH) ? 1u : 0u, 1u);
 }
 
-// D4' T4 (D4-PRIME.md, notes/design/R1-MEMDST.md) — THE HAZARD RING GIVES R3-neutered-write-destination. A D4'
+// D4' T4 (D4-PRIME.md, an internal design note) — THE HAZARD RING GIVES R3-neutered-write-destination. A D4'
 // consumer whose enumerated pointer resolves to a page a held-back frame named as ANY destination (the physical R3
 // question n48_cp_eval_hz_d4 shares with n48_cp_eval_hz above) refuses - mirroring r5_t4_real_f15's own real-frame
 // shape (0x400800000 / page 0x10030000, the values  fix 4 measured off arm13's real capture) rather than
@@ -1373,7 +1373,7 @@ static void d4_wiring_checks(const char *srcPath)
     expect_u("D4 wiring: the `if (gXpD4Frame.d4)` block exists in the kext source (independent of ds.in_abi)",
              start != std::string::npos ? 1u : 0u, 1u);
     if (start == std::string::npos) return;
-    // 0.0.444 (C5-RING-REVIEW.md (B) item K(ii), D1 hole) — the merge condition is now `!cgRefused && !st`,
+    // 0.0.444 (an internal review note (B) item K(ii), D1 hole) — the merge condition is now `!cgRefused && !st`,
     // not `!cgRefused` alone: through 0.0.443 a segment the TRANSLATOR itself refused (`st != 0`) left `cgRefused`
     // false (it is set only inside the `if (!st) {...}` copy-guard block above, which a translator refusal never
     // reaches) and so took the MERGE path, feeding the D4' union whatever partial `ds` the translator had written
@@ -1399,7 +1399,7 @@ static void d4_wiring_checks(const char *srcPath)
              (cgSite != std::string::npos && cgSite < start) ? 1u : 0u, 1u);
 }
 
-// 0.0.444 (C5-RING-REVIEW.md (B) item K(i), D1 hole) — THE VERTEX READ-SET FALLBACK IN d_table_desc
+// 0.0.444 (an internal review note (B) item K(i), D1 hole) — THE VERTEX READ-SET FALLBACK IN d_table_desc
 // (src/xlat12/xlat12_ib.c). names four real vertex programs with NO xlat12_abi_ptrs.h row - I, G, V and attr
 // (RectPosTexFast_VS_attr, ws_G_VfxXh, ws_I_VfxU10Xh, ws_V_VfxU10Xh) - each of which DOES have a kXlat12Readset row
 // (xlat12_readset.h). This drives the REAL kXlat12Readset table and the REAL admission rule
@@ -1456,7 +1456,7 @@ static void test_k1_vertex_readset_fallback_admission()
     }
 }
 
-// 0.0.444 (C5-RING-REVIEW.md (B) item K(ii), D1 hole) — BEHAVIOURAL PROOF: a segment the TRANSLATOR itself
+// 0.0.444 (an internal review note (B) item K(ii), D1 hole) — BEHAVIOURAL PROOF: a segment the TRANSLATOR itself
 // refused (st != 0) must set `over` on the D4' union and merge NOTHING, driven through the SAME two functions the
 // kext calls (n48_cp_build_consumer_d4, n48_cp_merge_dedup) under the SAME condition gfxsrc_policy now evaluates
 // (`!cgRefused && !st`), modelled here since the kext's own segment loop cannot be linked into this host suite.
@@ -2505,7 +2505,7 @@ static void test_446_ki_gated_by_switch40()
 
 // Reviewer item 9 (0.0.442, review of 0.0.441) — THE REAL FENCE PATH OVER F48'S OWN FINAL SEGMENT, fed
 // through R1's memdst scan (gfx_memdst.h) with the kext's real geometry. F48 is a 2-IB (mib) frame, so its fence
-// may only be OFFERED at the FRAME'S final segment (n48_f828_offered's own rule, notes/design/MIB-COMMIT.md B3) -
+// may only be OFFERED at the FRAME'S final segment (n48_f828_offered's own rule, an internal design note B3) -
 // IB1's last real segment (dwords [6512, kF48MibIbs[1].len) within IB1, i.e. [kF48MibIbs[1].off+6512, kF48Mib_dwords)
 // in the concatenation). n48_f828_find runs on Apple's OWN untouched bytes there (the buried NOP9+RELEASE_MEM this
 // dead-page mechanism reads, which translation never rewrites at this offset - the SAME bytes would appear in a
@@ -2538,7 +2538,7 @@ static void test_item9_fence_path()
         // the dead page 0x400040018" for the FRAME as a whole - not necessarily this ONE segment). Reported, not
         // forced: whatever why names IS this build's answer for F48's real final segment.
         printf("  FINDING: F48's real final segment does NOT offer a fence828 candidate here (why=%u) - the fence "
-               "identity question does not arise for this segment; see notes/design/R1-MEMDST.md Q6 for the "
+               "identity question does not arise for this segment; see an internal design note Q6 for the "
                "frame-wide count this build's own scan (below) cross-checks.\n", why);
         expect_u("item9 n48_f828_find over F48's real final segment completed (a definite why, not a crash)", 1u, 1u);
     } else {
@@ -2765,7 +2765,7 @@ static void test_f97_e2e_real_frame()
 // before ever reaching a clean control - linear is the only shape this harness can prove without a colour-target
 // ledger.
 // =============================================================================================================
-// build 0.0.470 (notes/design/NO-SAMPLER-CLASS10.md section 5, N9 and N1's consumer half) — SWITCH 51.
+// build 0.0.470 (an internal design note section 5, N9 and N1's consumer half) — SWITCH 51.
 //
 // N9, THE KEXT GATE MATRIX 43 x 51. gfxsrc_pgm_profile (AppleHardwareHook.cpp) runs switch 43's block and then switch
 // 51's, both zeroing `out->ps_table_abi1`. This (1) pins the two blocks' own statements, each exactly once, INSIDE
@@ -3990,7 +3990,7 @@ static void frozen_fill_property()
 }
 
 // =====================================================================================================================
-// 0.0.395 (notes/design/R5-REDESIGN.md v2; ) — R5′ AND ITS TESTS T1-T5, OVER THE RAW arm20 CAPTURE.
+// 0.0.395 (an internal design note v2; ) — R5′ AND ITS TESTS T1-T5, OVER THE RAW arm20 CAPTURE.
 // =====================================================================================================================
 // T1 (fails on the 0.0.394 rule, passes on the new one) uses the real f2..f40 bodies twice: once with the FIXED walk and
 // PER IB, once with 0.0.394's stopped walk and only the first IB. T2 is the cap, synthetic. T3 is the real 1456-dword LUT
@@ -5189,7 +5189,7 @@ int main(int argc, char **argv)
     std::printf("\n== 0.0.438 (notes 996, FINDING 4 INTERIM REFUSAL): a 2-draw segment sets over, never input-free ==\n");
     finding4_multidraw_checks();
 
-    std::printf("\n== D4' (notes/design/D4-PRIME.md, notes/design/R1-MEMDST.md Q5): the D4' consumer's own rule ==\n");
+    std::printf("\n== D4' (an internal design note, an internal design note Q5): the D4' consumer's own rule ==\n");
     d4_checks();
     d4_wiring_checks(srcPath);
     test_d4_translator_refused_sets_over();

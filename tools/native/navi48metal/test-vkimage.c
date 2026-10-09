@@ -1,11 +1,13 @@
 // test-vkimage.c (m11h9): checks the Vulkan call shapes the bundle's new texture code uses (3D box copies with bufferRowLength / bufferImageHeight, per-level copies,
 // the GENERAL-layout vkCmdBlitImage mip chain of generateMipmapsForTexture:, an R8 image with a (0,0,0,R) component-mapped view) on ANY Vulkan device. It runs on the host Mac through MoltenVK
 // (no RADV is reachable while WindowServer holds the exclusive N48N client), so it proves the call parameters and the data movement, not RADV.
+// bundle 9 adds the cube and 2D-array sections: the image / view / attachment-view parameters come from n48_texdesc.h, the same header the bundle uses.
 // build+run: clang -I/opt/homebrew/include test-vkimage.c -L/opt/homebrew/lib -lvulkan -o /tmp/test-vkimage && /tmp/test-vkimage
 #include <vulkan/vulkan.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "n48_texdesc.h"   // bundle 9: the cube / 2D-array mapping under test is the bundle's own header
 static VkDevice dev; static VkPhysicalDevice pd; static VkQueue q; static VkCommandPool pool; static int fails;
 #define CHECK(c, ...) do { int ok_ = (c) ? 1 : 0; printf("%s: ", ok_ ? "ok  " : "FAIL"); printf(__VA_ARGS__); printf("\n"); if (!ok_) fails++; } while (0)
 #define VK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { printf("FAIL %s = %d (line %d)\n", #x, r_, __LINE__); exit(2); } } while (0)
@@ -86,5 +88,58 @@ int main(void) {
           .components = { VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R }, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
       VkImageView v1, v2; VkResult r1 = vkCreateImageView(dev, &vc, NULL, &v1); vc.components = (VkComponentMapping){0}; VkResult r2 = vkCreateImageView(dev, &vc, NULL, &v2);
       CHECK(r1 == VK_SUCCESS && r2 == VK_SUCCESS, "R8_UNORM: view with components (0,0,0,R) and an identity view of the same image both create (%d, %d)", r1, r2); }
+
+    // ---- bundle 9: cube (6 layers, CUBE_COMPATIBLE) and 2D array (5 layers): per-layer upload / read back, the sampling view, per-layer attachment views ----
+    for (int pass = 0; pass < 2; pass++) {
+      const char *nm = pass == 0 ? "cube" : "2DArray"; n48td_t ti; int okmap = n48td_map(pass == 0 ? N48TD_MTL_CUBE : N48TD_MTL_2DARRAY, 64, 64, 1, pass == 0 ? 1 : 5, 1, 1, N48TD_USE_RENDERTARGET | 1, &ti);
+      CHECK(okmap, "%s: the descriptor maps (%u layers, view type %u, flags 0x%x)", nm, ti.layers, ti.viewType, ti.flags);
+      if (!okmap) continue;
+      if (pass == 0) CHECK((ti.flags & 0x10u) != 0 && ti.viewType == VK_IMAGE_VIEW_TYPE_CUBE && ti.layers == 6, "cube: VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT is set, the view type is CUBE, 6 layers");
+      const uint32_t NL = ti.layers; const VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;
+      VkImageFormatProperties ifp; VkResult fr = vkGetPhysicalDeviceImageFormatProperties(pd, fmt, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+          VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, ti.flags, &ifp);
+      CHECK(fr == VK_SUCCESS && ifp.maxArrayLayers >= NL, "%s: vkGetPhysicalDeviceImageFormatProperties with the create flags succeeds and maxArrayLayers (%u) >= %u", nm, fr == VK_SUCCESS ? ifp.maxArrayLayers : 0, NL);
+      VkImage img; VkImageCreateInfo ic = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = ti.flags, .imageType = (VkImageType)ti.imageType, .format = fmt, .extent = { 64, 64, 1 }, .mipLevels = 1, .arrayLayers = ti.layers, .samples = VK_SAMPLE_COUNT_1_BIT,
+          .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+      VkResult cr = vkCreateImage(dev, &ic, NULL, &img); CHECK(cr == VK_SUCCESS, "%s: vkCreateImage (arrayLayers %u, flags 0x%x) = %d", nm, ic.arrayLayers, ic.flags, cr); if (cr != VK_SUCCESS) continue;
+      VkMemoryRequirements mr; vkGetImageMemoryRequirements(dev, img, &mr); VkDeviceMemory mem; VkMemoryAllocateInfo ma = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = memtype(mr.memoryTypeBits, 0) };
+      VK(vkAllocateMemory(dev, &ma, NULL, &mem)); VK(vkBindImageMemory(dev, img, mem, 0));
+      // the sampling view of the whole image
+      VkImageViewCreateInfo vc = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img, .viewType = (VkImageViewType)ti.viewType, .format = fmt, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, ti.layers } };
+      VkImageView sv; VkResult vr = vkCreateImageView(dev, &vc, NULL, &sv); CHECK(vr == VK_SUCCESS, "%s: the sampling view (type %s, %u layers) creates (%d)", nm, pass == 0 ? "CUBE" : "2D_ARRAY", ti.layers, vr);
+      Buf up = mkbuf(64 * 64 * 4), dn = mkbuf(64 * 64 * 4); VkCommandBuffer c; VkImageLayout lay = VK_IMAGE_LAYOUT_UNDEFINED;
+      #define TOLAY(nl) do { if (lay != (nl)) { VkImageMemoryBarrier b_ = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, \
+          .oldLayout = lay, .newLayout = (nl), .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = img, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, NL } }; \
+          vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b_); lay = (nl); } } while (0)
+      // upload: face k gets colour (10+40k, 200-30k, 5+50k, 255), slice k -> baseArrayLayer through the bundle's own n48td_base_layer
+      for (uint32_t k = 0; k < NL; k++) { uint8_t col[4] = { (uint8_t)(10 + 40 * k), (uint8_t)(200 - 30 * k), (uint8_t)(5 + 50 * k), 255 }; for (int i = 0; i < 64 * 64; i++) memcpy((uint8_t *)up.p + i * 4, col, 4);
+          c = begin(); TOLAY(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL); VkBufferImageCopy b = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, n48td_base_layer(0, k), 1 }, .imageExtent = { 64, 64, 1 } };
+          vkCmdCopyBufferToImage(c, up.b, img, lay, 1, &b); end(c); }
+      int bad = 0; for (uint32_t k = 0; k < NL; k++) { uint8_t col[4] = { (uint8_t)(10 + 40 * k), (uint8_t)(200 - 30 * k), (uint8_t)(5 + 50 * k), 255 }; memset(dn.p, 0, 64 * 64 * 4);
+          c = begin(); TOLAY(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); VkBufferImageCopy b = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, n48td_base_layer(0, k), 1 }, .imageExtent = { 64, 64, 1 } };
+          vkCmdCopyImageToBuffer(c, img, lay, dn.b, 1, &b); end(c); for (int i = 0; i < 64 * 64; i++) if (memcmp((uint8_t *)dn.p + i * 4, col, 4)) { bad++; break; } }
+      CHECK(bad == 0, "%s: %u layers uploaded one by one and read back one by one: %d layer(s) differ (each holds its own colour)", nm, NL, bad);
+      // a 2D view of layer 3 (the bundle's attachment-view parameters) used as a CLEARED colour attachment
+      n48td_att_t av; int has = n48td_att_view(pass == 0 ? N48TD_K_CUBE : N48TD_K_2DARRAY, ti.layersIvar, 3, &av); CHECK(has && av.viewType == VK_IMAGE_VIEW_TYPE_2D && av.baseLayer == 3 && av.layerCount == 1, "%s: the attachment view of layer 3 is a 2D view, base layer 3, 1 layer", nm);
+      VkImageViewCreateInfo ac = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img, .viewType = (VkImageViewType)av.viewType, .format = fmt, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, av.baseLayer, av.layerCount } };
+      VkImageView atv; VkResult ar = vkCreateImageView(dev, &ac, NULL, &atv); CHECK(ar == VK_SUCCESS, "%s: the per-layer 2D attachment view creates (%d)", nm, ar);
+      if (ar == VK_SUCCESS) {
+        VkAttachmentDescription ad = { .format = fmt, .samples = VK_SAMPLE_COUNT_1_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+        VkAttachmentReference ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL }; VkSubpassDescription sp = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = 1, .pColorAttachments = &ref };
+        VkRenderPassCreateInfo rpc = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 1, .pAttachments = &ad, .subpassCount = 1, .pSubpasses = &sp }; VkRenderPass rp; VK(vkCreateRenderPass(dev, &rpc, NULL, &rp));
+        VkFramebufferCreateInfo fbc = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = rp, .attachmentCount = 1, .pAttachments = &atv, .width = 64, .height = 64, .layers = 1 }; VkFramebuffer fb; VK(vkCreateFramebuffer(dev, &fbc, NULL, &fb));
+        c = begin(); TOLAY(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);   // the whole image moves (the bundle does the same: a pass only transitions its own layer)
+        VkClearValue cv = { .color = { .float32 = { 1.0f, 0.0f, 1.0f, 1.0f } } }; VkRenderPassBeginInfo rb = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = rp, .framebuffer = fb, .renderArea = { { 0, 0 }, { 64, 64 } }, .clearValueCount = 1, .pClearValues = &cv };
+        vkCmdBeginRenderPass(c, &rb, VK_SUBPASS_CONTENTS_INLINE); vkCmdEndRenderPass(c); end(c);
+        int clearedOk = 0, othersOk = 0;
+        for (uint32_t k = 0; k < NL; k++) { uint8_t col[4] = { (uint8_t)(10 + 40 * k), (uint8_t)(200 - 30 * k), (uint8_t)(5 + 50 * k), 255 }; if (k == 3) { col[0] = 255; col[1] = 0; col[2] = 255; col[3] = 255; }   // BGRA: clear (1,0,1,1) -> B 255, G 0, R 255
+            memset(dn.p, 0, 64 * 64 * 4); c = begin(); TOLAY(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); VkBufferImageCopy b = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, n48td_base_layer(0, k), 1 }, .imageExtent = { 64, 64, 1 } };
+            vkCmdCopyImageToBuffer(c, img, lay, dn.b, 1, &b); end(c); int same = 1; for (int i = 0; i < 64 * 64; i++) if (memcmp((uint8_t *)dn.p + i * 4, col, 4)) { same = 0; break; }
+            if (k == 3) clearedOk = same; else othersOk += same; }
+        CHECK(clearedOk, "%s: layer 3 cleared through its 2D attachment view reads back as the clear colour", nm);
+        CHECK(othersOk == (int)NL - 1, "%s: the other %u layers kept their colours (%d of %u)", nm, NL - 1, othersOk, NL - 1);
+      }
+    }
     printf(fails ? "FAIL test-vkimage (%d)\n" : "PASS test-vkimage\n", fails); return fails ? 1 : 0;
 }

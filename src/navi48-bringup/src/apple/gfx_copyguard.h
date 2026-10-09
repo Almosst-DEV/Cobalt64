@@ -1,4 +1,4 @@
-// gfx_copyguard.h — 0.0.435 (notes/design/PGMID-COPYGUARD.md Part 2). THE COPY-OVERLAP REFUSAL, PURE HALF.
+// gfx_copyguard.h — 0.0.435 (an internal design note Part 2). THE COPY-OVERLAP REFUSAL, PURE HALF.
 //
 // VERIFIED the hazard live: inside one decide37 2-IB pass the copier rewrote VA 0x4000b0000 (VRAM
 // [0x10010000,0x10018000)) TWICE while the policy pass could be reading the same range, `residency_copy_to_vram`
@@ -101,7 +101,7 @@ static inline int n48_cg_overlap(uint64_t lo1, uint64_t hi1, uint64_t lo2, uint6
 // real concurrency. It is written before `seq` goes odd, under the same `claimed` CAS as lo/hi, so the seqlock
 // bracket that already guards lo/hi against a torn read covers it too - a reader that sees `seq` stable sees the
 // matching owner, never a stale one from a previous occupant.
-// build 0.0.529 (notes/design/CG84.md item 8): `dlo`/`dhi`, the would-be DELTA of a residency copy (switch 84 SHADOW), or the
+// build 0.0.529 (an internal design note item 8): `dlo`/`dhi`, the would-be DELTA of a residency copy (switch 84 SHADOW), or the
 // delta itself (ON: then equal to lo/hi). INSTRUMENT ONLY: written with lo/hi, before `seq` goes odd; read only by the switch-84
 // SHADOW instrument check (n48_cg_check_fx with `used` 1). 0/0 = none (every writer but a switch-84 residency copy).
 typedef struct {
@@ -451,7 +451,7 @@ static inline void n48_cg_close_poison(n48_cg_poison *p, uint64_t lo, uint64_t h
 // page i was FIRST recorded (`cur_since` at that moment); `per_page`, set ONLY by the switch-78 redo (n48_cg_redo_rebase),
 // makes n48_cg_check_ex scan page i over [since[i], now) instead of [pass since, now). A deduplicated page keeps its OLDER
 // since. per_page 0 (every reset, and every pass while 78 is OFF) is the unchanged whole-pass window, check for check.
-// build 0.0.529 (notes/design/CG84.md items 2-3, switch 84) - APPENDED: a 16-byte GRANULE mask per recorded page
+// build 0.0.529 (an internal design note items 2-3, switch 84) - APPENDED: a 16-byte GRANULE mask per recorded page
 // (`gm[i]`, 256 bits = 4 KiB / 16), `fine` (latched by navi48_cg_seg_begin as "switch 84 is ON"), the latched switch-84 mode
 // `m84` (instrument only), a count of whole-page notes (`nfull`, instrument only) and the CENSUS list (`xpg`, contract item 5 /
 // X2): whole pages noted by a reader that does not go through gfxc_read_rs. RULES:
@@ -835,7 +835,7 @@ static inline uint32_t n48_cg_check(const n48_cg_pagerec *rec, const n48_cg_pois
 }
 
 // =====================================================================================================================
-// build 0.0.523 (notes/design/RING-NEUTER-FORGIVE.md rev 2 items 9-11) — SWITCH 78, THE COPY-GUARD REDO, PURE HALF.
+// build 0.0.523 (an internal design note rev 2 items 9-11) — SWITCH 78, THE COPY-GUARD REDO, PURE HALF.
 // One guard window per PASS (0.0.437): a refused segment cannot simply be re-checked from a fresh pass-wide mark (that drops
 // every earlier segment's window: fail-open), and keeping the old mark refuses again. So the redo is per PAGE:
 //   (1) PLAN (n48_cg_redo_plan): only an EVENT or IN_FLIGHT refusal, in pass 0, of a single or a unit (never a switch-56

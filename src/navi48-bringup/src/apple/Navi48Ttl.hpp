@@ -20,12 +20,12 @@
 #pragma once
 #include "AmdTtlServicesABI.h"
 #include "../amd/amdgpu_sysmem.h"
-#include "gfx_mmprio.h"   // 0.0.433 (notes/design/MM-PRIORITY.md): n48_mmprio_stats, the pure decision logic
+#include "gfx_mmprio.h"   // 0.0.433 (an internal design note): n48_mmprio_stats, the pure decision logic
 #include "gfx_mmhold.h"    // build 0.0.514 A3: the gVramMmLock hold-time taker tags (N48_MMT_*)
 #include "gfx_perf540.h"   // build 0.0.540: switch 96, perf540 (the ext accumulators' type, n48_pf_ext)
-#include "gfx_copyguard.h" // 0.0.435 (notes/design/PGMID-COPYGUARD.md Part 2): the copy-overlap refusal's pure logic
-#include "gfx_sk82.h"      // build 0.0.527 (notes/design/SKIP82.md): switch 82, the byte-identical re-copy skip (pure)
-#include "gfx_cg84.h"      // build 0.0.529 (notes/design/CG84.md): switch 84, the granule copy guard + delta write (pure)
+#include "gfx_copyguard.h" // 0.0.435 (an internal design note Part 2): the copy-overlap refusal's pure logic
+#include "gfx_sk82.h"      // build 0.0.527 (an internal design note): switch 82, the byte-identical re-copy skip (pure)
+#include "gfx_cg84.h"      // build 0.0.529 (an internal design note): switch 84, the granule copy guard + delta write (pure)
 #include "gfx_wc98.h"      // build 0.0.541: switch 98, the provenance-ask walk cache (pure): the generation
 
 namespace amdgpu { struct DeviceContext; struct BringupContext; }
@@ -143,12 +143,12 @@ uint32_t navi48_c88_watch_add(uint32_t ctx, uint64_t va, uint64_t len, uint64_t 
 void navi48_c88_unmap(uint32_t ctx, uint64_t va, uint64_t size);
 void navi48_c88_copy_note(uint64_t dVa, uint32_t dVaOk, uint64_t bytes, uint64_t vram, uint64_t copyNo);
 void navi48_c88_watch_state(uint32_t *n, uint64_t *va0, uint64_t *va1, uint32_t *lines, uint64_t *unlogged);
-// build 0.0.524 item 7 (notes/design/T0SRC.md): resources of a SECOND, different resource class that hook_new_resource left
+// build 0.0.524 item 7 (an internal design note): resources of a SECOND, different resource class that hook_new_resource left
 // alone (they keep Apple's own pageTexture). A count, read-only; the class is named once per boot by Navi48AccelPeer.cpp.
 uint64_t navi48_peer_res2_count(void);
 // build 0.0.535 item 3: the residency copies COMPLETED so far (the `COPIED #` counter, read-only; Navi48AccelPeer.cpp).
 uint64_t navi48_peer_copy_seq(void);
-// 0.0.433 (notes/design/MM-PRIORITY.md) — MM-WINDOW PRIORITY FOR THE POLICY PASS. Opens/closes the
+// 0.0.433 (an internal design note) — MM-WINDOW PRIORITY FOR THE POLICY PASS. Opens/closes the
 // scope that marks which thread owns gVramMmLock priority; nesting/owner arithmetic is gfx_mmprio.h's pure,
 // host-tested functions. Called ONLY by Navi48MmPrioScope's ctor/dtor below, and (build 0.0.550, switch 108) by
 // Navi48MmPrioRelease's ctor/dtor below, in the reverse order. Defined in Navi48Bringup.cpp.
@@ -234,7 +234,7 @@ private:
     uint32_t tok_;
 };
 
-// 0.0.435 (notes/design/PGMID-COPYGUARD.md Part 2) — THE COPY-OVERLAP REFUSAL. Open/close one residency
+// 0.0.435 (an internal design note Part 2) — THE COPY-OVERLAP REFUSAL. Open/close one residency
 // copy's scope over [lo, hi): claims a slot, publishes BEGIN, and on close publishes END, poisons on failure/
 // mismatch (a later clean covering copy clears it) and releases the slot — see gfx_copyguard.h for the pure
 // arithmetic and the binding order this depends on. Returns the slot index (>= 0), or -1 (UNTRACKED: no slot was
@@ -300,7 +300,7 @@ void navi48_cg_snapshot(n48_cg_stats *out);
 // whole duration and returns to baseline the moment it closes ("confirm free by census"). Blocking; an explicit
 // verb call, never a per-frame path. Defined in Navi48Bringup.cpp.
 void navi48_cg_phantom_scope(void);
-// 0.0.436 (notes/design/PGMID-COPYGUARD.md Part 1, design "2. M") — THE PER-PASS PROGRAM-IDENTITY
+// 0.0.436 (an internal design note Part 1, design "2. M") — THE PER-PASS PROGRAM-IDENTITY
 // MEMO'S OWN VALIDITY READS. gfx_pgmid.h's n48_pm needs the copy-guard ring's CURRENT position and a poison-overlap
 // answer for a single 4 KiB page, at arbitrary points within a pass (not only at navi48_cg_seg_begin's per-segment
 // mark) — these two thin reads are all it needs of this file's otherwise-private gCgRing/gCgPoison state. Defined
@@ -348,18 +348,18 @@ uint32_t navi48_pairing_control(uint64_t arg, uint64_t *out, unsigned count);
 // scratch VRAM buffers -> SDMA0 QUEUE0 copy into a 256x64 scanout rectangle -> every pixel read back through BAR0);
 // 2 restores the rectangle the positive control overwrote. out[0..12] as the definition documents. Defined in
 // Navi48Bringup.cpp.
-// 0.0.416 (notes/design/SDMA-GCR.md): the argument is the ONE ABI scalar, not just the mode. Modes 0..6 pass
+// 0.0.416 (an internal design note): the argument is the ONE ABI scalar, not just the mode. Modes 0..6 pass
 // scalar == mode (unchanged); mode 7 packs the mode, the GCR flag and the source VRAM offset into it
 // (sdma_gcr.h's n48_scanout7_scalar). Any other scalar with high bits set is refused as before.
 uint32_t navi48_scanout_control(uint64_t arg, uint64_t *out, unsigned count);
-// action 82 `sdmadcc [0|1|2]` (0.0.417, notes/design/SDMA-DCC-NOPTE.md, D1): SDMA0_DCC_CNTL's no-PTE read
+// action 82 `sdmadcc [0|1|2]` (0.0.417, an internal design note, D1): SDMA0_DCC_CNTL's no-PTE read
 // decompression / write compression. 0 reads SDMA0 (offset 0x0034) and SDMA1 (0x0634) raw and decoded per set;
 // 1 CAPTURES SDMA0's value on first use, writes `captured & ~0x00015554`, reads back and reports (idempotent);
 // 2 writes the captured value back. Any other argument, and 2 before a capture, is REFUSED. SDMA1 is never
 // written and SDMA0_DCC_CNTL is the only register this verb writes. out[0..8]; the argument rules and the mask
 // are src/apple/sdma_dcc.h, host-tested by tests/sdma_dcc_test.cpp. Defined in Navi48Bringup.cpp.
 uint32_t navi48_sdmadcc_control(uint64_t arg, uint64_t *out, unsigned count);
-// build 0.0.496 (notes/design/FAST-PAGEIN.md,), switch 63 (DEFAULT OFF): the residency copy through SDMA. The pure
+// build 0.0.496 (an internal design note,), switch 63 (DEFAULT OFF): the residency copy through SDMA. The pure
 // half is src/apple/fastcopy.h. navi48_fc_set: `gfxneuter 63 | M << 8` for M 1 (sampled verify), 2 (OFF), 3 (full verify); the
 // first ON binds the staging buffer and runs the positive control (0 done, 9 no lock, 12 set but the path cannot copy).
 // navi48_fc_chunk: one chunk of residency_copy_to_vram, AFTER that loop's own VRAM-guard check of [dAt, dAt + n); `fill`
@@ -395,7 +395,7 @@ void navi48_mmhold_snapshot(const char *where);
 uint32_t navi48_fc_scope_closed(uint64_t lo, uint64_t hi);
 uint32_t navi48_ic_bumped_mine(void);
 void navi48_ic_chunk_dead(uint64_t pos, uint64_t dAt, uint64_t n);
-// build 0.0.527 (notes/design/SKIP82.md; gfx_sk82.h) — SWITCH 82. gN48Sk82Live: 1 once its memory exists (sticky; the event
+// build 0.0.527 (an internal design note; gfx_sk82.h) — SWITCH 82. gN48Sk82Live: 1 once its memory exists (sticky; the event
 // sites' one load). navi48_sk82_ev: one invalidation event (AppleHardwareHook.cpp; any thread, no lock). navi48_sk82_try: the
 // copier's decision before rp_lin_prepare and the scope (1 = skip). navi48_sk82_result: the copy's result before its scope closes;
 // navi48_sk82_taint_mine: a write inside the copy's scope that is not the source (shadercache, kernsub); navi48_sk82_cand_mine:
@@ -416,7 +416,7 @@ uint32_t navi48_sk82_switch(uint32_t m, uint32_t contRefused, uint32_t *st);
 // continuous-arm guard). Writes amdgpu::gTlb83On (the ONLY writer) and prints the two bare-83 lines. Defined in Navi48Bringup.cpp.
 uint32_t navi48_tlb83_switch(uint32_t m, uint32_t contRefused, uint32_t *st);
 uint32_t navi48_fc_mode_now(void);
-// build 0.0.529 (notes/design/CG84.md; gfx_cg84.h) — SWITCH 84. gN48D84Live: 1 once the keys' memory exists (sticky; the
+// build 0.0.529 (an internal design note; gfx_cg84.h) — SWITCH 84. gN48D84Live: 1 once the keys' memory exists (sticky; the
 // copier's and the event sites' one load). gN48D84SrcThr: the thread whose ON copy writes from the scratch (0 = none; ic_read's and
 // fc_copy_chunk's one load). navi48_d84_plan: G0, before the copy's scope (returns the packed ON delta, 0 = the copy is 0.0.528's);
 // navi48_d84_result: the copy's result before its scope closes; navi48_d84_census: shadercache's programs for the copy;
@@ -457,7 +457,7 @@ uint32_t navi48_scanout_copy_vram(uint64_t srcOff, uint64_t srcLen, uint32_t src
 // srcStride is not a row pitch into it and no row address can be right. `swizzle` is the GFX12 ADDR3 enum (only 3,
 // ADDR3_64KB_2D, is accepted) and surfW/surfH are Apple's CB_COLOR0_ATTRIB2 MIP0_WIDTH/HEIGHT + 1, both read from the
 // resource by the caller. Defined in Navi48Bringup.cpp. out[0..10].
-// 0.0.416 (notes/design/SDMA-GCR.md G3): `gcr` prepends the SDMA GCR_REQ (GL2 write-back + invalidate) to the
+// 0.0.416 (an internal design note G3): `gcr` prepends the SDMA GCR_REQ (GL2 write-back + invalidate) to the
 // same submission as the tiled copy. false is the 0.0.415 behaviour, byte for byte; pipeshim ARG 5 passes true.
 uint32_t navi48_scanout_copy_tiled(uint64_t srcOff, uint64_t srcLen, uint32_t surfW, uint32_t surfH, uint32_t swizzle,
                                    uint32_t dstX, uint32_t dstY, uint32_t w, uint32_t h, uint64_t *out, unsigned count,
@@ -542,7 +542,7 @@ uint32_t navi48_flushhook_control(uint64_t arg, uint64_t *out, unsigned count);
 // Chains to Apple unconditionally; writes no register. 1 install+log, 2 stop logging, 0 read. Defined in
 // Navi48AccelPeer.cpp.
 uint32_t navi48_ucprobe_control(uint64_t arg, uint64_t *out, unsigned count);
-// build 0.0.503 (notes/design/HYBRID.md H1): switch 68, the hybrid refusal inside the slot-239 hook (installed at the
+// build 0.0.503 (an internal design note H1): switch 68, the hybrid refusal inside the slot-239 hook (installed at the
 // accelerator's start). get/set the switch (hw_hook_gfx_neuter's `68 | M << 8` owns the verb and its mid-arm guard) and print
 // the `hybrid68:` report line with `how` appended. Defined in Navi48AccelPeer.cpp.
 uint32_t navi48_hybrid_get(void);
@@ -586,7 +586,7 @@ bool navi48_vram_hi_pool(uint64_t &base, uint64_t &size, uint64_t &used);
 // declared in amd/amdgpu_gmc.h, which this layer does not include, so it is the one
 // accessor the mapping work was actually missing - the HDP flush it also needs
 // already exists above as navi48_hdp_flush_now(), contrary to  and to
-// M3-ROOT-WRITE-REVIEW.md.3. NOT Apple's invalidateVM, which our own vtable patch
+// an internal review note.3. NOT Apple's invalidateVM, which our own vtable patch
 // has already made inert. False when the GMC or GFXHUB is not ready, or on ACK
 // timeout. Nothing calls it yet. Defined in Navi48Bringup.cpp.
 bool navi48_gmc_flush_tlb_vmid(uint32_t vmid, uint32_t flush_type);

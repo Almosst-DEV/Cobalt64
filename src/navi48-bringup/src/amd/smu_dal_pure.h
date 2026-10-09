@@ -2,7 +2,7 @@
 //  smu_dal_pure.h - the PURE half of native step S2-DISPCLK (kext 0.0.604): the DAL mailbox allowlist, the DID -> MHz table, the clock
 //  readback decode, the step plans, the verdict rules and the sticky stop latch. No kernel header is included, so
 //  tests/native_s2_dal_test.cpp compiles this on the host Mac and drives the exact functions the kext calls (smu_dal.cpp).
-//  Design: notes/design/NATIVE-S2-DISPCLK.md sections 0, 3 and 4.
+//  Design: an internal design note sections 0, 3 and 4.
 //
 //  Everything here is arithmetic and decisions; nothing touches a register.
 //
@@ -236,7 +236,7 @@ constexpr bool e1b_enables(uint32_t levels6, uint32_t max6, uint32_t max7) { ret
 
 
 // =====================================================================================================================================================
-// P4: the clock hold (kext 0.0.607; design notes/design/NATIVE-S2-120HZ.md P4). A row-120 mode trial raises DISPCLK and DPPCLK to 530 MHz BEFORE it writes the first display register and lets
+// P4: the clock hold (kext 0.0.607; design an internal design note P4). A row-120 mode trial raises DISPCLK and DPPCLK to 530 MHz BEFORE it writes the first display register and lets
 // them go only AFTER its 60 Hz restore verified. The DAL mailbox owner word (gDalOwner in smu_dal.cpp) has three values so the mode trial's hold and a DAL step cannot both run, without the hold
 // denying the trial that owns it (F9: mt_in_use() is true while dal_busy(); dal_busy() is owner 1 only).
 // Everything below is decisions and the raise / release orchestration over a small interface (HoldIo), so tests/native_s2_dal_test.cpp and native_s2d_test.cpp drive the exact code the kext

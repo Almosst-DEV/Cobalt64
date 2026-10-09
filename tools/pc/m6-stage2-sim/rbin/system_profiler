@@ -1,0 +1,6 @@
+#!/bin/bash
+case "$(cat "$SIM_DIR/cfg/sysprof" 2>/dev/null || echo ok)" in
+  ok) printf 'Displays:\n  Resolution: 2560 x 1440 @ 60.00Hz\n  Resolution: 1920 x 1080 @ 60.00Hz\n  Resolution: 2560 x 1440 @ 60.00Hz\n' ;;
+  swap) printf 'Displays:\n  Resolution: 2560 x 1440 @ 60.00Hz\n  Resolution: 2560 x 1440 @ 60.00Hz\n  Resolution: 1920 x 1080 @ 60.00Hz\n  Resolution: 1920 x 1080 @ 60.00Hz\n' ;;
+  two) printf 'Displays:\n  Resolution: 2560 x 1440 @ 60.00Hz\n  Resolution: 2560 x 1440 @ 60.00Hz\n' ;;
+esac

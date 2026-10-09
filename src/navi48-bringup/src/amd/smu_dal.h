@@ -1,6 +1,6 @@
 //
 //  smu_dal.h - native step S2-DISPCLK (kext 0.0.604): the DAL mailbox sender and the named experiment steps E1b / E2 / E3 / E4 of
-//  notes/design/NATIVE-S2-DISPCLK.md. Default OFF: nothing is sent unless the boot-arg navi48-dalsmc=<1..4> is present AND the boot is a
+//  an internal design note. Default OFF: nothing is sent unless the boot-arg navi48-dalsmc=<1..4> is present AND the boot is a
 //  native boot (navi48-native=1 accepted) whose S1b self-test reported POSITIVE PASS, and the only caller is the N48N selector 15
 //  (Navi48NativeClient -> n1c_dal_step) on a user-client thread: never the interrupt handler, never under a display lock.
 //
@@ -32,7 +32,7 @@ kern_return_t smu_dal_send(const DeviceContext &dev, uint32_t msg, uint32_t para
 // True while a DAL STEP runs (owner 1; the mode trial refuses to start then; 0.0.605). 0.0.607: a clock hold (owner 2) does NOT count - it belongs to the mode trial that holds it.
 bool dal_busy();
 
-// 0.0.607, P4: the clock hold of the mode trial's row 120 (notes/design/NATIVE-S2-120HZ.md P4; pure logic in smu_dal_pure.h, hold_raise / hold_release). All three sleep and wait on the PMFW: trial thread,
+// 0.0.607, P4: the clock hold of the mode trial's row 120 (an internal design note P4; pure logic in smu_dal_pure.h, hold_raise / hold_release). All three sleep and wait on the PMFW: trial thread,
 // `dcnmode 0` and the kext stop only - never the watchdog, never under a display lock.
 uint32_t dal_hold_pre();                       // n48dal::HoldPre: 0 = a hold may start now (native + S1b, navi48-dalsmc=4, E1b done this boot, latch clear, state IDLE / RELEASED, owner idle)
 uint32_t dal_hold_state();                     // n48dal::HoldSt

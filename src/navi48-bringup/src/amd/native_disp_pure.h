@@ -3,7 +3,7 @@
 //  tests/native_disp_test.cpp compiles this very file (and amd/native_disp_flow.h, the sequencing built on it) and drives it, with planted breaks
 //  (tests/native_disp_plant.sh).
 //
-//  Design: notes/design/NATIVE-S4-M11H.md, section 3.4 (the aux alternative: Navi48DisplayPipe in the aux kext 0.0.3) and the "11h.1 RE facts" section, which
+//  Design: an internal design note, section 3.4 (the aux alternative: Navi48DisplayPipe in the aux kext 0.0.3) and the "11h.1 RE facts" section, which
 //  CORRECTS the memo and is binding where they differ. Layout facts come ONLY from that note, the memo, tools/native/ioaccel-layout (summary.md and the
 //  vtables) and the repo's own pure headers; nothing here was re-derived from an Apple binary. Every offset below is a NAMED CONSTANT with its source.
 //
@@ -15,6 +15,11 @@
 #include <stdint.h>
 #include "../Navi48MetalOps.h"
 #include "native_metal_pure.h"   // the IOAccelConfig store table (accel_layout_ok reads the SAME constants the populate hook writes)
+#include "../dcn/navi48_dispread.h"   // 0.0.622 (M1): verbs 91..93 and their legal arguments (n48dr_*_arg_ok)
+#include "../dcn/navi48_dmubcmd.h"    // 0.0.625 (M2/M3): verbs 95..97 (the DMUB command verbs; their own latch navi48-dmubcmd)
+#include "../dcn/navi48_disp2.h"      // 0.0.631 (M4d): verb 98 disp2 (its own latch navi48-disp2)
+#include "native_fb_pure.h"          // 0.0.652 (M5): verb 105 fbpublish (its own latch navi48-fb2) and the display nub
+#include "native_m6_pure.h"          // 0.0.659 (M6 Stage 1a): the routing guard, the surface table, the per-pipe probe entries (its own latch navi48-m6)
 
 namespace n48disp {
 
@@ -26,7 +31,7 @@ constexpr uint32_t kWillPerform = 0xE00002D8u;   // kIOReturnNotReady: the ONLY 
 enum Status : uint32_t {
     kOk = 0, kBadArg = 1, kOff = 2, kNoAccel = 3, kAccelLayout = 4, kFactsOff = 5, kHasPipes = 6, kNoPipe = 7, kPipeNotOurs = 8, kPipeMismatch = 9,
     kProbeFailed = 10, kAlready = 11, kWriteFailed = 12, kNoDisplayMachine = 13, kCapsFailed = 14, kBusy = 15, kNoEventMachine = 16,
-    kNullPipe = 17, kStatusCount = 18     // 0.0.615: kNullPipe = the display machine counts a pipe but its slot holds NULL (the family's init failed): reboot before any WindowServer restart
+    kNullPipe = 17, kFbNub = 18, kStatusCount = 19     // 0.0.652 (M5): kFbNub = a display nub (Navi48DisplayNub) exists: pipeadopt / pipearm 1 are refused. 0.0.615: kNullPipe = the display machine counts a pipe but its slot holds NULL (the family's init failed): reboot before any WindowServer restart
 };
 constexpr const char *status_name(uint32_t s) {
     return s == kOk ? "OK" : s == kBadArg ? "bad argument" : s == kOff ? "display is OFF (boot-arg navi48-metal-disp is not 1)" :
@@ -37,7 +42,8 @@ constexpr const char *status_name(uint32_t s) {
            s == kProbeFailed ? "requestProbe did not succeed" : s == kAlready ? "already adopted (verified again)" : s == kWriteFailed ? "the write did not read back" :
            s == kNoDisplayMachine ? "accel+0x378 is not a Navi48DisplayMachine" : s == kCapsFailed ? "the capabilities property could not be set" :
            s == kBusy ? "another display verb is running" : s == kNoEventMachine ? "accel+0x380 is not a Navi48EventMachine" :
-           s == kNullPipe ? "the family stored a NULL pipe (its init failed): reboot before any WindowServer restart" : "unknown";
+           s == kNullPipe ? "the family stored a NULL pipe (its init failed): reboot before any WindowServer restart" :
+           s == kFbNub ? "a Navi48DisplayNub is published (fbpublish 2): the display machine could hand a monitor B frame to the DP; pipeadopt and pipearm 1 are REFUSED for the rest of the boot (reboot)" : "unknown";
 }
 
 // ---- the boot-arg latch (same shape as native_open_policy_pure.h's metal-ws latch) -------------------------------------------------------------------------
@@ -53,26 +59,54 @@ constexpr uint32_t kActAdopt = 83u, kActArm = 84u, kActStat = 85u, kActStamps = 
 constexpr uint32_t kActAgdc = 88u;                                 // 0.0.614: `pipeagdc`, the native AGDC service (amd/native_agdc_pure.h; answered by DisplayPipeGuard.cpp, not by n48disp_verb)
 constexpr uint32_t kActVbl = 89u;                                  // 0.0.618: `pipevbl [0|1]`, the vblank-timestamp switch (V2)
 constexpr uint32_t kActReload = 90u;                               // 0.0.619: `pipereload [0|1]`, the operator restart window (R1): 0 (the default) opens it, 1 only reads it
-constexpr uint32_t kLastAction = 90u;
-constexpr bool action_admitted(bool latchOn, uint32_t action) { return action <= kLastOldAction || (latchOn && action <= kLastAction); }
-constexpr bool is_new_action(uint32_t action) { return action > kLastOldAction && action <= kLastAction; }
-constexpr bool is_pipe_verb(uint32_t action) { return (action >= kActAdopt && action <= kActShortcut) || action == kActVbl || action == kActReload; }   // the verbs n48disp_verb answers (83..87, 89 and 90; 88 is not one of them)
+constexpr uint32_t kActDdcRead = N48DR_ACT_DDCREAD;                // 0.0.622 (M1): `ddcread <line> <block>` - the HDMI DDC EDID read (dcn/navi48_dispread.h); writes only the DC_I2C engine's registers, through the DCN allowlist
+constexpr uint32_t kActDmubRing = N48DR_ACT_DMUBRING;              // 0.0.622 (M1): `dmubring [page]` - READ-ONLY DMUB state and ring decode
+constexpr uint32_t kActDispCensus = N48DR_ACT_DISPCENSUS;          // 0.0.622 (M1): `dispcensus [page]` - READ-ONLY display register census
+constexpr uint32_t kActRegion4Read = N48DR_ACT_REGION4READ;        // 0.0.624 (M1.5): `region4read <off> [n]` - READ-ONLY dump of the DMUB REGION4 window in VRAM (first 64 KiB, <= 64 dwords a call) through navi48_vram_read_mm
+constexpr uint32_t kActDmubSend = N48DM_ACT_SEND;                  // 0.0.625 (M2/M3): `dmubsend` - appends ONE allowlisted command to the DMUB inbox1 ring (dcn/navi48_dmubcmd.h); behind boot-arg navi48-dmubcmd=1 as well
+constexpr uint32_t kActDmubMode = N48DM_ACT_MODE;                  // 0.0.625: `dmubmode save|restore|0x1a6|0x1d4` - the mode block at REGION4 + 0x4c00
+constexpr uint32_t kActDmubCtx = N48DM_ACT_CTX;                    // 0.0.625: `dmubctx <ctx> status <v>` - the M2 marker dword at REGION4 + ctx + 0x1a0 (ctx 0x7000 / 0x7800)
+constexpr uint32_t kActDisp2 = N48D2_ACT;                          // 0.0.631 (M4d): `disp2 timing|connect|off|status` - OTG1 / DIG2 test pattern (dcn/navi48_disp2.h); behind boot-arg navi48-disp2=1 as well
+constexpr uint32_t kActScdcRead = N48DR_ACT_SCDCREAD;              // 0.0.633 (multi-monitor): `scdcread <line> <off> [len]` - READ-ONLY SCDC status read from the HDMI sink over the DC_I2C engine (dcn/navi48_dispread.h); writes only the engine's registers, through the DCN allowlist
+constexpr uint32_t kActFbPublish = 105u;                           // 0.0.652 (M5): `fbpublish 2|1` - builds the immutable snapshot and publishes Navi48DisplayNub (Navi48DisplayIndex 1 = the monitor B, 2 = the monitor A) for the aux kext's Navi48Framebuffer; behind boot-arg navi48-fb2=1 as well (n48fb::pre_verdict)
+constexpr uint32_t kActM6Stat = 106u;                              // 0.0.659 (M6 Stage 1a): `m6stat [page]` - READ-ONLY: per pipe transactions, surface IDs, ambiguous, refused presents, vblank stamps per OTG (pages 0..3); touches nothing
+constexpr uint32_t kActM6XStat = 107u;                             // 0.0.661 (M6 Stage 1b): `m6xstat [page]` - READ-ONLY report of instance 2's scanout (the monitor B's HUBP2 / OTG2: acquired, slots, EARLIEST2, FLIP_PENDING, counters, watchdog restores; pages 0..2); needs navi48-m6=1 AND navi48-m6flip=1 for anything but the latch words
+// 0.0.662 (M6 Stage 2): the argument of m6xstat is page | instance << 8: the page 0..2 and the instance 0 (= the default, the monitor B), 1 (the monitor A) or 2 (the monitor B). Everything above is refused.
+constexpr bool m6xstat_arg_ok(uint64_t arg) { return (arg & 0xFFull) <= 2ull && ((arg >> 8) & 0xFFull) <= 2ull && (arg >> 16) == 0ull; }
+constexpr uint32_t kActVramStat = 108u;                           // 0.0.663 (ReBAR, Stage 2 review S3): `vramstat` - READ-ONLY: the allocator's free visible-VRAM bytes, the visible / hi pool sizes, vramLimit, the mapped BAR0 bytes and BAR0's physical address; touches nothing
+constexpr uint32_t kLastAction = 99u;
+constexpr bool action_admitted(bool latchOn, uint32_t action) { return action <= kLastOldAction || (latchOn && (action <= kLastAction || action == kActFbPublish || action == kActM6Stat || action == kActM6XStat || action == kActVramStat)); }
+constexpr bool is_new_action(uint32_t action) { return (action > kLastOldAction && action <= kLastAction) || action == kActFbPublish || action == kActM6Stat || action == kActM6XStat || action == kActVramStat; }
+constexpr bool is_pipe_verb(uint32_t action) { return (action >= kActAdopt && action <= kActShortcut) || action == kActVbl || action == kActReload || action == kActM6Stat; }   // the verbs n48disp_verb answers (83..87, 89 and 90; 88 is not one of them)
 // The native-boot exemption (B5). On a native boot every accel verb but action 0 is refused (native_s1b_refuse) except the table in dcn/navi48_scanout_pure.h.
-// With the latch ON this adds EXACTLY: fbname 0|1, the five display verbs and pipeagdc 0|1 with their legal arguments. None of them touches GFX/VM state or a register:
+// With the latch ON this adds EXACTLY: fbname 0|1, the five display verbs and pipeagdc 0|1 with their legal arguments (0.0.622: and ddcread / dmubring / dispcensus with theirs; 0.0.625: and dmubsend / dmubmode / dmubctx, which write
+// DMUB REGION4 VRAM and one DMCUB register but ONLY with boot-arg navi48-dmubcmd=1 as well - they refuse N48DR_CMD_OFF otherwise). None of them touches GFX/VM state, and none but ddcread (and dmubsend) a register:
 // fbname swaps an OSMetaClass name pointer, adopt asks the accelerator for its normal probe, arm writes one config byte, stat/stamps only read, shortcut flips a flag,
 // pipeagdc (0.0.614) constructs Apple's AGDC object on a vtable copy (memory only: no GPU register, no page table) and starts it.
 constexpr bool verb_args_ok(uint32_t action, uint64_t arg) {       // the legal (action, argument) pairs of fbname and the five display verbs
     return (action == kActFbname && arg <= 1ull) || (action == kActAdopt && arg == 0ull) || (action == kActArm && arg <= 1ull) ||
            (action == kActStat && arg <= 4ull) || (action == kActStamps && arg == 0ull) || (action == kActShortcut && arg <= 1ull) ||
-           (action == kActAgdc && arg <= 1ull) || (action == kActVbl && arg <= 1ull) || (action == kActReload && arg <= 1ull);
+           (action == kActAgdc && arg <= 1ull) || (action == kActVbl && arg <= 1ull) || (action == kActReload && arg <= 1ull) ||
+           (action == kActDdcRead && n48dr_ddc_arg_ok(arg)) || (action == kActDmubRing && n48dr_dmub_arg_ok(arg)) || (action == kActDispCensus && n48dr_census_arg_ok(arg)) ||
+           (action == kActRegion4Read && n48dr_r4_arg_ok(arg)) || (action == kActScdcRead && n48dr_scdc_arg_ok(arg)) ||
+           (action >= kActDmubSend && action <= kActDmubCtx) ||
+           (action == kActM6Stat && arg < (uint64_t)n48m6::kStatPages) ||             // 0.0.659: the m6stat pages (0.0.660: four, page 3 = the pipes' clocks and the table's self-healing)
+           (action == kActVramStat && arg == 0ull) ||                                  // 0.0.663: vramstat takes no argument
+           (action == kActM6XStat && m6xstat_arg_ok(arg)) ||                           // 0.0.661: the m6xstat pages (0 state, 1 slots and refusals, 2 the live HUBPn / OTGn registers); 0.0.662: page | instance << 8
+           (action == kActFbPublish && n48fb::arg_ok(arg)) ||   // 0.0.652 (M5): the disp2 instance (`fbpublish 2` = the monitor B, `fbpublish 1` = the monitor A, 0.0.658); the navi48-fb2 latch and every other refusal are the verb's own (n48fb::pre_verdict)
+           action == kActDisp2;   // 0.0.631: like 95..97, any argument is ADMITTED here so a refusal keeps its own status (disp2 judges its argument and the navi48-disp2 latch itself, before any read or write)   // 0.0.625: any argument is ADMITTED here so a refusal keeps its own status (the verbs judge their argument and the navi48-dmubcmd latch themselves, before any write)   // 0.0.622: DCN-only, never GFX/VM; 0.0.624: region4read only READS VRAM through the existing MM reader (64 KiB window, 64 dwords)
 }
 constexpr bool native_exempt(bool latchOn, uint32_t action, uint64_t arg) { return latchOn && verb_args_ok(action, arg); }
+// 0.0.652 (M5) INTERLOCK: with a display nub published the accelerator's display machine must never get a pipe (with navi48-metal-disp=1 its framebuffer walk starts at the GPU's PCI device, where our monitor B framebuffer lives: the bundle
+// classifies display surfaces by SIZE and the monitor B at 1440p equals the DP, so monitor B frames could be flipped onto HUBP0 = the DP). pipeadopt (83) and pipearm 1 (84 with argument 1) are refused while the nub exists. pipearm 0 (disarm) is ALWAYS allowed.
+// 0.0.659 (M6 Stage 1a, R4): with the navi48-m6 latch ON the interlock is LIFTED - the routing guard (native_m6_pure.h) replaces it: a pipe on the monitor B's framebuffer never copies into the DP and a surface mapped to another instance is never presented.
+constexpr bool fb_interlock_refuses(uint32_t action, uint64_t arg, bool displayNubExists, bool m6On = false) { return !m6On && displayNubExists && (action == kActAdopt || (action == kActArm && arg == 1ull)); }
 
 // ---- the ops table the bring-up kext publishes (ABI 2 only when the latch is ON) -----------------------------------------------------------------------------
 // OFF: the ABI-1 shape (abi 1, 120 bytes, flags 0): the aux kext then takes every 0.0.2 default. ON: abi 2, 144 bytes, N48_DISP_F_ON.
 struct OpsShape { uint32_t abi, size, dispFlags; };
 constexpr OpsShape ops_shape(bool latchOn) {
-    return latchOn ? OpsShape{ 2u, N48_METAL_OPS_V2, N48_DISP_F_ON } : OpsShape{ 1u, N48_METAL_OPS_MIN, 0u };
+    return latchOn ? OpsShape{ N48_METAL_ABI, N48_METAL_OPS_V3, N48_DISP_F_ON } : OpsShape{ N48_METAL_ABI, N48_METAL_OPS_V3, 0u };   // 0.0.656 (G6): both ABI 3 / 152 bytes; OFF is "display flag clear, display members zero"
 }
 
 // ---- the factory mask -------------------------------------------------------------------------------------------------------------------------------------
@@ -143,18 +177,26 @@ struct PipeProbe {
     bool     traced;       // the aux kext's newDisplayPipe trace named this pointer as its own (b == 1)
     bool     backAccel, backDm, backFb;   // pipe+0x88 == the accelerator, +0x90 == the display machine, +0x98 == the RDNA4FB service
     bool     fbOurs;       // the framebuffer the registry names is RDNA4FB / AMDRDNA4FB
+    n48m6::EntsIn ents {};  // 0.0.659 (M6): EVERY pipe of the display machine, one entry each (n == 0: the legacy single-pipe probe above is the whole story, exactly 0.0.658)
 };
 constexpr bool pipe_ok(const PipeProbe &p) {
+    if (p.ents.n != 0u)       // 0.0.659 (M6): every pipe is judged (the walk's order is not established): the count is the entry count, each entry is ours, traced, back-linked, on a known framebuffer, one per instance
+        return p.accelOk && p.dmReadable && p.count == p.ents.n && n48m6::ents_verdict(p.ents) == n48m6::kEntsOk;
     return p.accelOk && p.dmReadable && p.count == 1u && p.havePipe && p.classOurs && p.traced && p.backAccel && p.backDm && p.backFb && p.fbOurs;
 }
 // The first failing check, as a status (kOk only when pipe_ok).
+constexpr uint32_t pipe_verdict_m6(const PipeProbe &p) {      // 0.0.659: the same order of questions, over every pipe
+    return !p.accelOk ? kNoAccel : !p.dmReadable ? kNoDisplayMachine : p.count == 0u ? kNoPipe : p.count != p.ents.n ? kPipeMismatch : n48m6::ents_any_null(p.ents) ? kNullPipe :
+           [&]() -> uint32_t { const uint32_t v = n48m6::ents_verdict(p.ents); return v == n48m6::kEntsOk ? kOk : (v == n48m6::kEntsNoPipe || v == n48m6::kEntsCount) ? kNoPipe : v == n48m6::kEntsNotOurs ? kPipeNotOurs : kPipeMismatch; }();
+}
 constexpr uint32_t pipe_verdict(const PipeProbe &p) {
+    if (p.ents.n != 0u) return pipe_verdict_m6(p);
     return !p.accelOk ? kNoAccel : !p.dmReadable ? kNoDisplayMachine : p.count == 0u ? kNoPipe : p.nullPipe ? kNullPipe : !p.havePipe ? kNoPipe : (!p.classOurs || !p.traced) ? kPipeNotOurs :
            (p.count != 1u || !p.backAccel || !p.backDm || !p.backFb || !p.fbOurs) ? kPipeMismatch : kOk;
 }
 // Before adopt asks for the probe: a display machine that already holds pipes is refused unless they are already the verified pipe (then the verb reports "already").
 constexpr uint32_t adopt_precheck(const PipeProbe &before) {
-    return !before.accelOk ? kNoAccel : !before.dmReadable ? kNoDisplayMachine : before.count == 0u ? kOk : before.nullPipe ? kNullPipe : pipe_ok(before) ? kAlready : kHasPipes;
+    return !before.accelOk ? kNoAccel : !before.dmReadable ? kNoDisplayMachine : before.count == 0u ? kOk : (before.nullPipe || n48m6::ents_any_null(before.ents)) ? kNullPipe : pipe_ok(before) ? kAlready : kHasPipes;
 }
 
 // ---- arm --------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -183,11 +225,17 @@ constexpr const char *auto_cause_name(uint32_t c) {
 // ---- 0.0.619 (R1): the operator restart window --------------------------------------------------------------------------------------------------------------------------
 // A DELIBERATE WindowServer restart (`accel pipereload`, then `killall -9 WindowServer`) looks to K1 (the uid-88 client closes while armed) and K3 (three slot-267 calls inside 120 s) exactly like a crash.
 // The verb opens a ONE-SHOT window of 15 s on the uptime clock. Inside it: (a) the next uid-88 client close while armed does NOT disarm, (b) slot-267 calls are NOT counted by the K3 guard.
-// The window closes when the first slot-267 of the NEW WindowServer has been seen after a tolerated close AND the pipe is still armed, or when 15 s have passed. The HUNG latch (K2) is never
+// 0.0.621: EVERY uid-88 client close inside the window is tolerated (WindowServer holds two such clients: the old one's SECOND close came 0.37 s after the new client's first slot 267 and, in 0.0.619, was
+// the K1 disarm). The window now closes only when BOTH the new WindowServer's first slot 267 has been seen after a tolerated close (with the pipe still armed) AND kReloadSettleNs have passed since the
+// LAST tolerated close, or when 15 s have passed. The HUNG latch (K2) is never
 // affected, and while HUNG the window is not honoured at all (a close or a slot-267 then takes the 0.0.617 path). Anything unreadable fails towards containment: a clock that went backwards = no window.
 constexpr uint64_t kReloadWindowNs = 15ull * 1000000000ull;
+constexpr uint64_t kReloadSettleNs = 4ull * 1000000000ull;     // 0.0.621: the quiet time after the last tolerated close (measured gap between the two old-client closes: 1.61 s)
 constexpr bool reload_live(uint32_t open, uint64_t openNs, uint64_t nowNs) { return open != 0u && nowNs >= openNs && nowNs - openNs < kReloadWindowNs; }   // exactly 15 s = expired
 constexpr bool reload_honoured(bool live, bool hung) { return live && !hung; }
+// 0.0.621: the window may close on the settle rule: a close was tolerated AND the new client's slot 267 was seen after it AND kReloadSettleNs have passed since the last tolerated close (exactly the settle time
+// = settled). A clock that went backwards past the last tolerated close counts as settled (fails towards containment: the window is shut).
+constexpr bool reload_settled(bool closeSeen, bool seen267, uint64_t lastTolNs, uint64_t nowNs) { return closeSeen && seen267 && (nowNs < lastTolNs || nowNs - lastTolNs >= kReloadSettleNs); }
 enum ReloadEv : uint32_t { kRwOpened = 0, kRwTolerated = 1, kRwClosed267 = 2, kRwExpired = 3, kRwCount = 4 };
 // The state reported by the verb: 0 closed, 1 open and waiting for the close, 2 open and the close has been tolerated (waiting for the new client's first slot 267).
 constexpr uint32_t reload_state(bool live, bool closeSeen) { return live ? (closeSeen ? 2u : 1u) : 0u; }
@@ -203,8 +251,11 @@ constexpr uint32_t disp_flags(bool on, bool adopted, bool armed, bool caps, bool
     return (on ? kFlagOn : 0u) | (adopted ? kFlagAdopted : 0u) | (armed ? kFlagArmed : 0u) | (caps ? kFlagCaps : 0u) | (shortcut ? kFlagShortcut : 0u) | (bar0Wc ? kFlagBar0Wc : 0u) |
            (autoCause != 0u && autoCause < kAdCount ? (kFlagAutoDisarmed | (autoCause << kFlagCauseShift)) : 0u);
 }
-// K1: the WindowServer GPU client (admitted by the uid-88 rule, i.e. NOT an administrator) closed or died. Only that client disarms: operator tools (root) open and close N48N all the time.
-constexpr bool ws_close_disarms(bool latchOn, bool adminClient) { return latchOn && !adminClient; }
+// K1: the WindowServer GPU client closed or died. Only that client disarms: operator tools (root) open and close N48N all the time.
+// 0.0.627 (G2): keyed on "the closing session IS WindowServer's" (the client's policy reason kReasonWindowServer), no longer on "not an administrator". Today the two are
+// the same set (a non-administrator is admitted ONLY by the uid-88 rule), so the change is behaviour-identical and unconditional; it keeps another non-administrator
+// client (a future app role, G4) from ever disarming WindowServer's pipe.
+constexpr bool ws_close_disarms(bool latchOn, bool closingIsWsSession) { return latchOn && closingIsWsSession; }
 
 // ---- the submit / isComplete results (slot 279 / 278) ---------------------------------------------------------------------------------------------------------
 // submit passes the transaction status through when it is nonzero (a transaction whose prepare failed must never reach perform), else the "will perform" code (11h.1 F2).
@@ -242,7 +293,7 @@ constexpr uint32_t bounds_check(const BoundsIn &b) {
 enum PerfReason : uint32_t {
     kPfCopied = 0, kPfDisarmed = 1, kPfNoPlane = 2, kPfBadTxn = 3, kPfBadArr = 4, kPfBadSurf = 5, kPfBadRes = 6, kPfBadSrc = 7, kPfFormat = 8, kPfMismatch = 9,
     kPfNoConsole = 10, kPfGeom = 11, kPfStride = 12, kPfDest = 13, kPfSrcRange = 14, kPfBusy = 15, kPfNoScratch = 16, kPfSrcRead = 17, kPfDstWrite = 18,
-    kPfNotPrepared = 19, kPfScanOwned = 20, kPfCount = 21     // 0.0.617 (K6): kPfScanOwned = a native client holds the scanout plane (its bundle flips): the v1 copy is skipped, nothing is read or wired.  0.0.616 (19): 0.0.616: the source memory descriptor is not in the prepared cache (perform never wires: IOGMD panics on an unwired readBytes, run m11h4-1)
+    kPfNotPrepared = 19, kPfScanOwned = 20, kPfOtherInst = 21, kPfRouteRefused = 22, kPfCount = 23     // 0.0.659 (M6): kPfOtherInst = the pipe is on instance 1 / 2 (completed without ANY copy); kPfRouteRefused = the routing guard refused (unknown / ambiguous / other-instance surface, or a pipe on no known framebuffer).   0.0.617 (K6): kPfScanOwned = a native client holds the scanout plane (its bundle flips): the v1 copy is skipped, nothing is read or wired.  0.0.616 (19): 0.0.616: the source memory descriptor is not in the prepared cache (perform never wires: IOGMD panics on an unwired readBytes, run m11h4-1)
 };
 constexpr const char *perf_name(uint32_t r) {
     return r == kPfCopied ? "copied" : r == kPfDisarmed ? "disarmed (completed, not copied)" : r == kPfNoPlane ? "no plane 0 in the transaction" : r == kPfBadTxn ? "txn is not a kernel pointer" :
@@ -252,7 +303,8 @@ constexpr const char *perf_name(uint32_t r) {
            r == kPfStride ? "stride refused" : r == kPfDest ? "destination rows past the console" : r == kPfSrcRange ? "source rows past the source" : r == kPfBusy ? "a copy was already running" :
            r == kPfNoScratch ? "no scratch buffer" : r == kPfSrcRead ? "the source read came back short" : r == kPfDstWrite ? "the console write was refused" :
            r == kPfNotPrepared ? "the source memory descriptor was not prepared by submit (not in the cache)" :
-           r == kPfScanOwned ? "the scanout plane is owned by a native client (the v1 copy is skipped)" : "unknown";
+           r == kPfScanOwned ? "the scanout plane is owned by a native client (the v1 copy is skipped)" :
+           r == kPfOtherInst ? "the pipe is on the monitor A / the monitor B (M6): completed without any copy into the DP" : r == kPfRouteRefused ? "the routing guard refused (surface not mapped to this pipe's instance)" : "unknown";
 }
 constexpr uint32_t perf_reason_from_bounds(uint32_t bv) {
     return bv == kBOk ? kPfCopied : bv == kBGeom || bv == kBBadArg ? kPfGeom : bv == kBStride ? kPfStride : bv == kBDest ? kPfDest : kPfSrcRange;
@@ -370,7 +422,7 @@ inline void ival_note(Ival &v, uint64_t nowNs) {
 }
 inline void ival_reset(Ival &v) { __atomic_store_n(&v.last, 0ull, __ATOMIC_RELEASE); v.d = Dur{}; }
 
-// ---- 0.0.618 (V1/V2): the vblank timestamps CoreDisplay reads (notes/design/NATIVE-S5-PACING.md section 2 and 4 fix 1) ----------------------------------------------------------------
+// ---- 0.0.618 (V1/V2): the vblank timestamps CoreDisplay reads (an internal design note section 2 and 4 fix 1) ----------------------------------------------------------------
 // CONFIRMED (AMDRadeonX6000 executeTransaction 0xbdcdbd0..0xbdcdc0e, `movq 0x30(%rax),%rcx; movq %rcx,0x178(%r14)` and `movq 0x40(%rax),%rcx; movq %rcx,0x188(%r14)`): Apple's driver writes the
 // transaction's +0x178 (the vblank time) and +0x188 (the next vblank time) before completion, in mach_absolute_time units. The family's sendNotification forwards them as the TransactionPerformed event's
 // +0x40 / +0x50, from which CoreDisplay calls SetVBLInfo(base, period = +0x50 - +0x40). +0x190 (the event's +0x58) is copied by Apple from the same record (0xbdcdbf8) but its meaning is not established:

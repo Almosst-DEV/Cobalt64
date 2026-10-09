@@ -1,7 +1,7 @@
 //
 //  smu_dal.cpp - native step S2-DISPCLK (kext 0.0.604). See smu_dal.h for the shape, smu_dal_pure.h for every decision (allowlist, DID -> MHz,
 //  verdict rules, the stop latch; host-tested by tests/native_s2_dal_test.cpp, which drives the same pure functions) and
-//  notes/design/NATIVE-S2-DISPCLK.md for the experiment.
+//  an internal design note for the experiment.
 //
 //  What this file WRITES: the three DAL mailbox dwords (RESP 0x16274, ARG 0x16273, MSG 0x1628A) and nothing else - no clock register, no
 //  display register. Everything it reads (CLK0 PLL_REQ / DFS_CNTL x2, DENTIST_DISPCLK_CNTL, the OTG frame counter through the scanout status
@@ -436,7 +436,7 @@ IOReturn dal_run_step(DeviceContext &dev, uint32_t step, n48n_dal_result *out) {
     return kIOReturnSuccess;
 }
 
-// ---- 0.0.607, P4: the clock hold (notes/design/NATIVE-S2-120HZ.md P4). The orchestration and every decision are in smu_dal_pure.h (hold_raise / hold_release, driven by the host tests); this is the hardware
+// ---- 0.0.607, P4: the clock hold (an internal design note P4). The orchestration and every decision are in smu_dal_pure.h (hold_raise / hold_release, driven by the host tests); this is the hardware
 // half. Callers: the mode trial's trial thread (raise before the first display write; release after the 60 Hz restore verified), `dcnmode 0` and the kext stop (release after a verified golden restore).
 // NEVER the watchdog, never the interrupt handler, never under gMtLock or the scanout lock: it sleeps and waits on the PMFW.
 static HoldCtl gHold = { kHsIdle, &gDalOwner, Decoded{}, 0u, { 0u, 0u } };

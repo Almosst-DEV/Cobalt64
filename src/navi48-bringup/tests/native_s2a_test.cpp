@@ -56,7 +56,7 @@ static void s1_abi() {
     expect_u("the v1.0 selector count is unchanged (old clients' tables stay valid)", N48N_SEL_COUNT, 9);
     expect_u("the ABI 1.1 selector count", N48N_SEL_COUNT_1_1, 15);
     expect_u("ABI major unchanged: every v1.0 client still handshakes", N48N_ABI_VERSION, 1);
-    expect_u("ABI minor (1.9 since 0.0.612: BoImportHost, selector 21; 1.8 since 0.0.610: the Metal nub selectors 19 / 20; 1.7 since 0.0.609: the row-120 HELD mode; 1.6 was 0.0.608: row 120 transition reads; 1.5 was 0.0.607: row 120 + the hold report; 1.4 was 0.0.606's 512 B result, 1.3 0.0.605's mode-trial selector, 1.2 0.0.604's DAL step)", N48N_ABI_MINOR, 9);
+    expect_u("ABI minor (1.12 since 0.0.662; 1.11 since 0.0.661; 1.10 since 0.0.640: the VRAM budget words; 1.9 since 0.0.612: BoImportHost, selector 21; 1.8 since 0.0.610: the Metal nub selectors 19 / 20; 1.7 since 0.0.609: the row-120 HELD mode; 1.6 was 0.0.608: row 120 transition reads; 1.5 was 0.0.607: row 120 + the hold report; 1.4 was 0.0.606's 512 B result, 1.3 0.0.605's mode-trial selector, 1.2 0.0.604's DAL step; 1.11 since 0.0.661: the instance-2 scanout selectors 22..26; 1.12 since 0.0.662: the instance-1 (monitor A) scanout behind navi48-m6flip1)", N48N_ABI_MINOR, 12);
     expect(N48N_HELLO_F_MINOR != 1u && (N48N_HELLO_F_MINOR & 1u) == 0u, "the minor flag is not bit 0: T1's Hello(flags = 1) is still refused");
     expect_u("query size", sizeof(n48n_scan_query), 96); expect_u("reg size", sizeof(n48n_scan_reg), 32);
     expect_u("slot size", sizeof(n48n_scan_slot), 32);   expect_u("status size", sizeof(n48n_scan_status), 256);
@@ -64,7 +64,7 @@ static void s1_abi() {
     expect_u("no-slot value equal", N48N_SCAN_NO_SLOT, kNoSlot);
     expect_u("format constant", N48N_SCAN_FMT_ARGB8888, kFmtArgb8888);
     expect_u("a v1.0 client's Hello out[0] (no flag) would be exactly the major", (uint64_t)N48N_ABI_VERSION, 1);
-    expect_u("with the flag out[0] = major | minor << 16", (uint64_t)N48N_ABI_VERSION | ((uint64_t)N48N_ABI_MINOR << 16), 0x90001);
+    expect_u("with the flag out[0] = major | minor << 16", (uint64_t)N48N_ABI_VERSION | ((uint64_t)N48N_ABI_MINOR << 16), 0xC0001);
 }
 
 static BoRef vis(uint64_t mc, uint64_t size) { return BoRef{ true, mc, size }; }
@@ -507,11 +507,11 @@ static void s11_pins(const std::string &root) {
     }
     // -- N48N side: restore before free, on every path --
     const std::string ecl = fn_body(eng, "void n1c_close(");
-    expect(ecl.find("scan_teardown(s, how, tr)") != std::string::npos && ecl.find("scan_teardown(s, how, tr)") < ecl.find("idle_wait()") && ecl.find("scan_teardown(s, how, tr)") < ecl.find("bool leak = hung_now();"),
-           "close: the console goes back BEFORE the idle wait and the HUNG decision");
+    expect(ecl.find("scan_teardown(s, how, tr)") != std::string::npos && ecl.find("scan_teardown(s, how, tr)") < ecl.find("own_wait(s)") && ecl.find("scan_teardown(s, how, tr)") < ecl.find("bool leak = hung_now();"),
+           "close: the console goes back BEFORE the own wait and the HUNG decision");
     expect(ecl.find("IOLockLock(gCliLock);") < ecl.find("scan_teardown(s, how, tr)"), "close: ... under gCliLock (lock order gCliLock -> DCN)");
-    expect(ecl.find("scan_teardown(s, how, tr)") < ecl.find("bo_release(h, kRelClosing)"), "close: ... and before any BO memory is freed");
-    const std::string ebo = fn_body(eng, "static void bo_release(uint32_t h, RelMode mode) {");
+    expect(ecl.find("scan_teardown(s, how, tr)") < ecl.find("bo_release(s, h, kRelClosing)"), "close: ... and before any BO memory is freed");
+    const std::string ebo = fn_body(eng, "static void bo_release(Session *s, uint32_t h, RelMode mode) {");
     expect(ebo.find("if (b.pinMask != 0u && scan_unpin(h, b, mode)) b.pinLeak = 1u;") != std::string::npos, "bo_release unpins in EVERY mode");
     expect(ebo.find("if (b.pinLeak != 0u) mode = kRelLeak;") > ebo.find("scan_unpin(h, b, mode)") && ebo.find("if (b.pinLeak != 0u) mode = kRelLeak;") < ebo.find("if (mode == kRelClosing) {"),
            "a BO whose console restore did NOT verify is LEAKED (mode forced to Leak before any branch frees it)");
@@ -520,7 +520,7 @@ static void s11_pins(const std::string &root) {
            "bo_release: the pin is dealt with BEFORE the Closing / Normal / Leak branches free or leak anything");
     const std::string eun = fn_body(eng, "static bool scan_unpin(");
     expect(eun.find("n48dcn::scanBoGone(b.pinMask, b.pinGen, mode != kRelNormal, r)") != std::string::npos, "Leak and Closing ask for the full restore (alwaysFull = mode != Normal)");
-    expect(fn_body(eng, "IOReturn n1c_bo_free(").find("if (hung_now()) bo_release(h, kRelLeak);") != std::string::npos, "BoFree under HUNG goes through bo_release(Leak), hence the restore first");
+    expect(fn_body(eng, "IOReturn n1c_bo_free(").find("if (hung_now()) m = kRelLeak;") != std::string::npos && fn_body(eng, "IOReturn n1c_bo_free(").find("bo_release(s, h, m);") != std::string::npos, "BoFree under HUNG goes through bo_release(Leak), hence the restore first");
     // BoFree: the pin lives on the Bo, set under gCliLock only
     expect_u("pinMask is written in exactly four places, all under gCliLock: register (stale clear, set), teardown (clear), unpin (clear); Release goes through teardown", count_of(eng, "pinMask = "), 4);
     const std::string ereg = fn_body(eng, "IOReturn n1c_scan_register(");
@@ -533,7 +533,7 @@ static void s11_pins(const std::string &root) {
     expect(fn_body(eng, "IOReturn n1c_scan_release(").find("IOLockLock(gCliLock)") < fn_body(eng, "IOReturn n1c_scan_release(").find("scan_teardown("), "Release takes gCliLock before the teardown");
     for (const char *fn : { "IOReturn n1c_scan_query(", "IOReturn n1c_scan_present(", "IOReturn n1c_scan_status(" }) {
         const std::string b = fn_body(eng, fn);
-        expect(!b.empty() && b.find("IOLockLock(gCliLock)") == std::string::npos && b.find("if (!sess_hello()) return kIOReturnNotReady;") != std::string::npos, "Query / Present / Status take only the scanout lock (never gCliLock after it)");
+        expect(!b.empty() && b.find("IOLockLock(gCliLock)") == std::string::npos && b.find("if (!sess_hello(ref)) return kIOReturnNotReady;") != std::string::npos && b.find("sess_lock(") == std::string::npos, "Query / Present / Status take only the scanout lock (never gCliLock after it, nor the session lock)");
     }
     expect(dcn.find("gCliLock") == std::string::npos, "the DCN layer never names the client lock: nothing there can take it after the scanout lock");
     // -- the interrupt path --
@@ -620,8 +620,8 @@ static void s11_pins(const std::string &root) {
         const size_t v = plist.find("<string>0.0.");
         const int ver = v == std::string::npos ? -2 : std::atoi(plist.c_str() + v + 12);
         expect(build > 0 && build == ver, "kN1cKextBuild equals the Info.plist patch version (Hello can no longer print a stale build)");
-        expect_u("Info.plist is 0.0.620", (uint64_t)ver, 620);
-        expect_u("the plist carries the version twice", count_of(plist, "0.0.620"), 2);
+        expect_u("Info.plist is 0.0.664", (uint64_t)ver, 664);
+        expect_u("the plist carries the version twice", count_of(plist, "0.0.664"), 2);
     }
     expect(mk.find("$(wildcard src/dcn/*.cpp)") != std::string::npos, "the Makefile builds src/dcn/*.cpp");
     // -- the tool --

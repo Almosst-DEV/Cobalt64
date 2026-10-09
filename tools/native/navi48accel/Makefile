@@ -1,4 +1,4 @@
-# Navi48Accel: the Aux-KC accelerator kext (com.navi48.accelprobe 0.0.2) of milestone #9, route A. Same recipe as tools/native/e3auxkc and
+# Navi48Accel: the Aux-KC accelerator kext (com.navi48.accelprobe 0.0.7: 0.0.2 milestone #9, 0.0.3 the display pipe, 0.0.4 the monitor B framebuffer of M5, 0.0.5 the N48N user client on the accelerator for sandboxed apps (G6), 0.0.6 the monitor A personality, 0.0.7 the navi48-m6 latch lifting the metal-ws refusal) of milestone #9, route A. Same recipe as tools/native/e3auxkc and
 # src/navi48-bringup/Makefile (RDNA4FB's MacKernelSDK, macOS 11 ABI, -mkernel -fapple-kext, -Xlinker -kext, ad-hoc codesign).
 #   make        build/Navi48Accel.kext + gates A/B/C + the host twin of the runtime layout gate (each FAILS the make)
 #   make test   host tests (tests/host_test.cpp) + planted breaks (tests/plant.sh)
@@ -32,7 +32,7 @@ $(GEN)/n48_tramp.inc: gates/gen_tramp.py gates/gen_gate.py gates/common.py gates
 	@mkdir -p $(GEN)
 	python3 gates/gen_tramp.py $@
 
-$(BUILD)/accel.o: src/Navi48Accel.cpp src/n48accel_pure.h src/Navi48MetalOps.h $(GENHDR) $(GEN)/n48_gate.inc $(GEN)/n48_tramp.inc
+$(BUILD)/accel.o: src/Navi48Accel.cpp src/n48accel_pure.h src/Navi48MetalOps.h src/Navi48DisplayOps.h $(GENHDR) $(GEN)/n48_gate.inc $(GEN)/n48_tramp.inc
 	@mkdir -p $(BUILD)
 	clang++ $(CXXFLAGS) -c src/Navi48Accel.cpp -o $@
 $(BUILD)/kmod_info.o: src/kmod_info.c

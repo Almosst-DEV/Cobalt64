@@ -10,7 +10,7 @@
 #
 # Steps given on the command line REPLACE the default list; readiness and `fire`
 # always run first because the accelerator does not attach until the TTL hook is
-# installed. Default list = the HANDOFF section 5 cycle (since an earlier run; until then
+# installed. Default list = the the project notes cycle (since an earlier run; until then
 # the default was the obsolete 0.0.177 logreset+kiqstamp sequence). The order is
 # load-bearing:
 #
@@ -23,7 +23,7 @@
 #   sleep5
 #
 # Extra step tokens (all [A-Za-z0-9._-], so accel-cycle.sh passes them through):
-#   blit | blit-<va>   the whole HANDOFF section 5 blit phase, expanded in place to
+#   blit | blit-<va>   the whole the project notes blit phase, expanded in place to
 #                      counters blit2start xlatregs neuterpoll sdmamap sleep2 vmstate
 #                      faultclear sleep3 vmib-<va> sdmastate reg-0x21c0 reg-0x3054
 #                      reg-0x2830 parkreads vmstate pagecopy counters blit2wait pagecopy
@@ -746,7 +746,7 @@ shift
 typeset -a STEPS
 if (( $# )); then STEPS=("$@"); else STEPS=(synctables setvspace pm4powerup kiqenable gfxmap pm4powerup sleep5); fi
 
-# `blit` / `blit-<va>` expands in place to the blit phase (HANDOFF section 5, rules 19-21):
+# `blit` / `blit-<va>` expands in place to the blit phase (the project notes):
 # the takeover verbs only after the client has submitted, every read while it lives,
 # vmstate before faultclear so the dispatch's latched fault is not discarded unread.
 typeset -a EXPANDED PARK
@@ -2142,7 +2142,7 @@ step_argv() {
         pipeshim-1)                                     reply=(hardtmo 20 sudo "$N48" accel pipeshim 1) ;;    # participate + census every transaction, present nothing
         pipeshim-2)                                     reply=(hardtmo 20 sudo "$N48" accel pipeshim 2) ;;    # participate + SDMA0 QUEUE0 present of plane 0
         pipeshim-4)                                     PIPESHIM_TICK_ARG=4; reply=(hardtmo 20 sudo "$N48" accel pipeshim 4) ;;    # 0.0.412: mode 2 present with the swizzle-3 plane FORCED down the linear row copy (instrument for uniform test content). Against a kext older than 0.0.412, 4 returns status 2 and changes nothing.
-        pipeshim-5)                                     PIPESHIM_TICK_ARG=5; reply=(hardtmo 20 sudo "$N48" accel pipeshim 5) ;;    # 0.0.416 (notes/design/SDMA-GCR.md G3/G4): mode 2 present with the SDMA GCR_REQ (GL2 write-back + invalidate) immediately before the tiled copy in the SAME submission. Against a kext older than 0.0.416, 5 returns status 2 and changes nothing.
+        pipeshim-5)                                     PIPESHIM_TICK_ARG=5; reply=(hardtmo 20 sudo "$N48" accel pipeshim 5) ;;    # 0.0.416 (an internal design note G3/G4): mode 2 present with the SDMA GCR_REQ (GL2 write-back + invalidate) immediately before the tiled copy in the SAME submission. Against a kext older than 0.0.416, 5 returns status 2 and changes nothing.
         pipeshimread)                                   reply=(hardtmo 20 sudo "$N48" accel pipeshim 3) ;;    # 0.0.338: 3 = READ ONLY. A BARE `accel pipeshim` SENDS SCALAR 0, WHICH TURNS THE SHIM OFF -- run mmv1 caught this step disarming the shim one step after arming it, so the whole armed window ran with the guard refusing. Against an OLD kext, 3 returns status 2 and still changes nothing.
         routea-1)                                       reply=(a_routea_arm) ;;                                # 0.0.295 (reviewed routeA-implreview): ARM + VERIFY corrected route A
         routea-0)                                       reply=(hardtmo 20 sudo "$N48" accel routea 0) ;;       # runtime mode off (inert; reboot to fully restore)
@@ -2187,7 +2187,7 @@ step_argv() {
         copyongate)                                     reply=(copy_on_gate) ;;                     # 0.0.278: copy on only after flushes are seen
         scanout-[0-9]*)                                 reply=(sudo "$N48" accel scanout "${1#scanout-}") ;;
         scanoutread)                                    reply=(sudo "$N48" accel scanout 0) ;;
-        # 0.0.417 (notes/design/SDMA-DCC-NOPTE.md, D4): the SDMA0_DCC_CNTL no-PTE compression set/restore. No
+        # 0.0.417 (an internal design note, D4): the SDMA0_DCC_CNTL no-PTE compression set/restore. No
         # tick interaction - each is a one-shot verb. sdmadcc-1 captures-then-clears SDMA0 only; sdmadcc-2
         # restores; sdmadcc-0 reads SDMA0+SDMA1 raw and decoded.
         sdmadcc-0)                                      reply=(sudo "$N48" accel sdmadcc 0) ;;

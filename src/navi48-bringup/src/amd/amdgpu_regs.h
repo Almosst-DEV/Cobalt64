@@ -44,7 +44,7 @@ struct DeviceContext {
     uint64_t vramSizeBytes { 0 };   // RCC_CONFIG_MEMSIZE
     uint64_t vramMcBase    { 0 };   // MMHUB FB_LOCATION_BASE << 24 (0x8000000000 here)
     uint64_t vramBase      { 0 };   // byte offset of the bring-up region (8 MiB here)
-    uint64_t vramLimit     { 0 };   // byte offset one past usable aperture (= bar0Size)
+    uint64_t vramLimit     { 0 };   // byte offset one past the usable visible window: n48rebar::plan_bar0's vramLimit (<= bar0Size; == bar0Size at a 256 MiB BAR0)
 
     // --- IP register bases from on-die discovery ---
     IPBaseTable ip;

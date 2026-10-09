@@ -68,16 +68,16 @@ enum {
 #define SC_F_CONFLICT     0x2u   /* the harvest mapped these Apple bytes to different values */
 #define SC_F_HASH_ONLY    0x4u   /* only the key is known (no Apple bytes to compare) */
 #define SC_F_HAS_ADJUST   0x8u   /* substitution also needs register adjustments (IB hook) */
-/* 0.0.311 (notes §565): WE HOLD CODE FOR THIS KEY, BUT IT DOES NOT FIT APPLE'S ALLOCATION.
+/* 0.0.311: WE HOLD CODE FOR THIS KEY, BUT IT DOES NOT FIT APPLE'S ALLOCATION.
  * SC_F_SUBSTITUTE means "may replace Apple's program in place", which is a claim about SIZE as much as about content.
  * When the image is larger than the record's capacity it cannot be written there; with this flag the image still ships,
  * the relocation arena places it in memory WE own, and the translated draw points SPI_SHADER_PGM_LO/HI_ES at that copy
  * instead (xlat12_ib.c case 0xb120). The two flags are alternatives, never both: one writes over Apple's program, the
  * other deliberately leaves it untouched.
  *
- * 0.0.318 (notes §569, §585) - THE EXAMPLE THIS COMMENT USED TO GIVE WAS WRONG AND IS REMOVED. It read: "Apple's
+ * 0.0.318 - THE EXAMPLE THIS COMMENT USED TO GIVE WAS WRONG AND IS REMOVED. It read: "Apple's
  * RectPosTexFast_VS is 128 bytes of code: our gfx1201 build of it measures 200 and cannot go there." The 128 was a
- * DYLIB SYMBOL EXTENT, not the allocation. §569 withdrew it (PGM_LO holds VA >> 8, so nothing can sit at +0x80, and
+ * DYLIB SYMBOL EXTENT, not the allocation. withdrew it (PGM_LO holds VA >> 8, so nothing can sit at +0x80, and
  * the cache record's own capacity has read 0x100 throughout), and the kext printed the real number on hardware in run
  * m4c9: "a value may never exceed Apple's own 256-byte allocation". 200 B into 256 B FITS, and that program is
  * substituted in place from 0.0.318.
@@ -181,7 +181,7 @@ int sc_subst_render(const sc_cache *c, const sc_match *m, int accept_adjust,
  * used to decide what to write. Refuses a non-substitutable entry (SC_E_NOSUB). */
 int sc_subst_image(const sc_cache *c, const sc_match *m, uint8_t *out, size_t out_cap, uint32_t *nbytes);
 int sc_adjust_get(const sc_cache *c, const sc_match *m, uint32_t i, sc_adjust *a);
-/* BUILD TASK 0.0.536 (notes §1322; switch 92 in the kext, gfx_rv92.h): THE ALTERNATIVE IMAGE of a verified match. An
+/* build 0.0.536 (; switch 92 in the kext, gfx_rv92.h): THE ALTERNATIVE IMAGE of a verified match. An
  * alternative is a second SUBSTITUTE entry for the same Apple program that a lookup can never verify on its own: same key,
  * mask set and key length, same flags, stage and capacity, MORE Apple dwords whose first m->apple_dwords equal the verified
  * entry's stored ones (tools/gfx-cache-build-r20.py: Apple's bytes followed by non-zero marker dwords the slot's zero padding

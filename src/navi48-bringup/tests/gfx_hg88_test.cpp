@@ -1,4 +1,4 @@
-// gfx_hg88_test.cpp — build 0.0.533 (; notes/design/HG88.md): SWITCH 88, THE RANGE-PRECISE HEAP-GENERATION
+// gfx_hg88_test.cpp — build 0.0.533 (; an internal design note): SWITCH 88, THE RANGE-PRECISE HEAP-GENERATION
 // JUDGE. Host proof of gfx_heapgen.h's switch-88 steps (the copy records, the frame's program pages, n48_hg88_eval inside
 // n48_hg_judge) and of the kext's wiring.
 //

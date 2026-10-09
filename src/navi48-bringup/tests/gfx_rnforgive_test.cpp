@@ -1,4 +1,4 @@
-// gfx_rnforgive_test.cpp — build 0.0.523 (notes/design/RING-NEUTER-FORGIVE.md, rev 2 governs; ):
+// gfx_rnforgive_test.cpp — build 0.0.523 (an internal design note, rev 2 governs; ):
 // SWITCH 77, the ring-neuter forgiveness - gfx_rnforgive.h, gfx_dep.h's fill/identity, and the kext glue's ordering.
 //     clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //         -I src/navi48-bringup/src/apple src/navi48-bringup/tests/gfx_rnforgive_test.cpp -o /tmp/rn && /tmp/rn \

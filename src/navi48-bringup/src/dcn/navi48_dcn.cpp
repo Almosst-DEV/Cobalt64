@@ -27,10 +27,13 @@
 #include <pexpert/pexpert.h>         // build 0.0.607: PE_parse_boot_argn (navi48-row120)
 #include "amd/smu_dal.h"            // build 0.0.605: amdgpu::dal_busy() - the mode trial and the DAL step refuse each other
 #include "amd/native_s1b.h"         // build 0.0.603: native_s1b_state() - the scanout path exists on native boots only
+#include "amd/native_s1c.h"         // build 0.0.635 (M4c): amdgpu::n1c_d2_alloc / n1c_d2_free - the two monitor B scanout buffers, allocated and freed under the native client lock
 #include "Navi48NativeABI.h"        // build 0.0.603: n48n_scan_query / n48n_scan_status (filled here)
 #include "navi48_scanout_pure.h"    // build 0.0.603: the decisions (host-tested)
 #include "amd/native_disp_pure.h"     // 0.0.618 (V1): vbl_period_ns / vbl_delay_ns (the vblank timing sample)
+#include "amd/native_disp.h"          // 0.0.659 (M6): n48m6_latched_on (the scan_query flag)
 #include "navi48_modetrial_pure.h"   // build 0.0.605 (native S2d): the timed mode trial - decisions AND sequences, host-tested through a Hw interface
+#include "Navi48DisplayOps.h"          // build 0.0.652 (M5): the monitor B's mode constants (fbEdid reads blocks 0 and 1 over DDC line 3)
 
 extern "C" {
 #include "dcn41.h"
@@ -39,6 +42,13 @@ extern "C" {
 #include "dcn41_modes.h"      // build 0.0.514 B2: the sink's EDID timings (pixel clock, porches) for liveRaster
 }
 #include "navi48_liveraster.h"   // build 0.0.515: the read-only raster device (no bind dependency)
+#include "navi48_dispread_flow.h"   // build 0.0.622 (M1): the sequences of ddcread / dmubring / dispcensus (host-tested over fake engines)
+#include "navi48_dmubcmd_flow.h"     // build 0.0.625 (M2/M3): the sequences of dmubsend / dmubmode / dmubctx (host-tested over a fake DMUB)
+#include "navi48_scanx_flow.h"       // build 0.0.661 (M6 Stage 1b): the sequences of instance 2's scanout (host-tested over a fake HUBP2)
+#include "navi48_disp2_flow.h"       // build 0.0.631 (M4d): the sequence of `disp2 timing|connect|off|status` (host-tested over a register-file model with the real allowlist)
+extern "C" {
+#include "dcn41_dmub.h"             // build 0.0.622: dcn41_dmub_probe (reads only)
+}
 
 namespace {
 
@@ -176,6 +186,36 @@ uint64_t now_ns() {
 	return ns;
 }
 
+// build 0.0.625: boot-arg navi48-dmubcmd=1 (default OFF) latches the three DMUB command verbs (95 / 96 / 97). Read and latched ONCE (attach() at start() reads it; the first verb call reads it if attach did not); first writer wins.
+volatile uint32_t gDmLatch = N48DM_LATCH_UNSET;
+bool dm_latched_on() {
+	uint32_t l = __atomic_load_n(&gDmLatch, __ATOMIC_ACQUIRE);
+	if (l == N48DM_LATCH_UNSET) {
+		uint32_t v = 0;
+		const bool present = PE_parse_boot_argn("navi48-dmubcmd", &v, sizeof(v));
+		uint32_t unset = N48DM_LATCH_UNSET;
+		__atomic_compare_exchange_n(&gDmLatch, &unset, n48dm_latch_value(present ? 1 : 0, v), false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+		l = __atomic_load_n(&gDmLatch, __ATOMIC_ACQUIRE);
+		N48LOG("dmubcmd: boot-arg navi48-dmubcmd %s: the DMUB command verbs (95 dmubsend, 96 dmubmode, 97 dmubctx) are %s for this boot", present ? (v == 1u ? "=1" : "present but not 1") : "absent", n48dm_latch_is_on(l) ? "ENABLED" : "OFF");
+	}
+	return n48dm_latch_is_on(l);
+}
+
+// build 0.0.631: boot-arg navi48-disp2=1 (default OFF) latches verb 98 `disp2` (the second-display test pattern, stage M4d). Same shape as the dmubcmd latch: read once, first writer wins.
+volatile uint32_t gD2Latch = N48D2_LATCH_UNSET;
+bool d2_latched_on() {
+	uint32_t l = __atomic_load_n(&gD2Latch, __ATOMIC_ACQUIRE);
+	if (l == N48D2_LATCH_UNSET) {
+		uint32_t v = 0;
+		const bool present = PE_parse_boot_argn("navi48-disp2", &v, sizeof(v));
+		uint32_t unset = N48D2_LATCH_UNSET;
+		__atomic_compare_exchange_n(&gD2Latch, &unset, n48d2_latch_value(present ? 1 : 0, v), false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+		l = __atomic_load_n(&gD2Latch, __ATOMIC_ACQUIRE);
+		N48LOG("disp2: boot-arg navi48-disp2 %s: verb 98 (disp2 timing|connect|off|status: OTG1 -> DIG2 test pattern) is %s for this boot", present ? (v == 1u ? "=1" : "present but not 1") : "absent", n48d2_latch_is_on(l) ? "ENABLED" : "OFF");
+	}
+	return n48d2_latch_is_on(l);
+}
+
 // ---- the dcn41 device callbacks -------------------------------------------------------
 // rreg is ungated (a read cannot change the card) but counted; wreg is the allowlist gate.
 
@@ -235,6 +275,8 @@ uint32_t roScanSurface(n48_sf_dcn *s) { return n48lr_scan_surface(&gLr, s); }
 // build 0.0.515: the read-only raster device, built ONCE at start() - no register I/O (dcn41_dev_init only checks its
 // arguments) - from the same device context and IP-discovery DMU bases bind() uses. Nothing here arms the display layer.
 void attach(Navi48Bringup *owner) {
+	(void)dm_latched_on();                                   // 0.0.625: latch navi48-dmubcmd at start (no register, no memory touched)
+	(void)d2_latched_on();                                   // 0.0.631: latch navi48-disp2 at start (no register, no memory touched)
 	if (!owner || gLr.state != N48LR_NONE) return;
 	amdgpu::DeviceContext *dev = owner->deviceContext();
 	if (!dev || !dev->rmmio || dev->rmmioSize == 0) {
@@ -1635,6 +1677,43 @@ bool vblSample(uint64_t *periodNs, uint64_t *delayNs, uint64_t *nowAbs) {
 	return true;
 }   // 0.0.617 (K6): lock-free
 
+// 0.0.659 (M6 Stage 1a): the vblank sample of ONE non-DP display, from THAT display's own OTG (inst 1 = the monitor A = OTG1, inst 2 = the monitor B = OTG2; n48m6::otg_of_inst), with its own cache (gVbl per instance).
+// The raster must be lit with exactly the display's active size (the geometry table's w x h); the period comes from the OTG's totals and the table's pixel clock. Reads only (the same registers as vblSample).
+// The DP's sample stays vblSample above, byte for byte.
+namespace {
+VblCache gVblX[2] {};          // [inst - 1]
+// 0.0.660 (T1): the acceptance rule (lit, and EXACTLY the display's active size) is n48m6::raster_flow, host-tested over a fake of these two accessors.
+struct InstRasterEnv {
+	bool active_size(uint32_t otg, bool *en, uint32_t *aw, uint32_t *ah) { return dcn41_otg_get_active_size(&gLr.d, otg, en, aw, ah) == DCN41_OK; }
+	bool totals(uint32_t otg, uint32_t *ht1, uint32_t *vt1) { return dcn41_otg_get_totals(&gLr.d, otg, ht1, vt1) == DCN41_OK; }
+};
+bool vbl_refresh_inst(VblCache &c, uint32_t otg, uint32_t w, uint32_t h, uint64_t pixHz, uint64_t nowNs) {
+	c.valid = 0u;
+	InstRasterEnv renv; uint32_t hTot = 0u, vTot = 0u;
+	if (!n48m6::raster_flow(renv, otg, w, h, &hTot, &vTot)) return false;
+	const uint64_t p = n48disp::vbl_period_ns(hTot, vTot, pixHz);
+	if (p == 0ull) return false;
+	c.otg = otg; c.hTot = hTot; c.vTot = vTot; c.periodNs = p; c.atNs = nowNs; c.valid = 1u;
+	return true;
+}
+}  // namespace
+
+bool vblSampleInst(uint32_t inst, uint32_t w, uint32_t h, uint64_t pixHz, uint64_t *periodNs, uint64_t *delayNs, uint64_t *nowAbs) {
+	if ((inst != n48m6::kInstMonA && inst != n48m6::kInstMonB) || !periodNs || !delayNs || !nowAbs || gLr.state != N48LR_READY) return false;
+	if (modeTrialBusy()) return false;
+	VblCache &c = gVblX[inst - 1u];
+	const uint32_t otg = n48m6::otg_of_inst(inst);
+	const uint64_t nowNs = now_ns();
+	if (!c.valid || c.otg != otg || nowNs - c.atNs > kVblCacheNs || nowNs < c.atNs) { if (!vbl_refresh_inst(c, otg, w, h, pixHz, nowNs)) return false; }
+	uint32_t vbs = 0, vbe = 0, hh = 0, v = 0;
+	const uint64_t abs0 = mach_absolute_time();
+	if (dcn41_otg_get_scanoutpos(&gLr.d, c.otg, &vbs, &vbe, &hh, &v) != DCN41_OK) return false;
+	uint64_t delay = 0;
+	if (!n48disp::vbl_delay_ns(v, hh, vbs, c.hTot, c.vTot, c.periodNs, &delay)) { c.valid = 0u; return false; }
+	*periodNs = c.periodNs; *delayNs = delay; *nowAbs = abs0;
+	return true;
+}
+
 void scanEscape(const char *why) {
 	if (gScan.lock == nullptr) return;
 	(void)scan_restore(why, true, 0u, nullptr);
@@ -1683,6 +1762,9 @@ uint32_t scanQuery(struct n48n_scan_query *o) {
 		uint32_t ha, va, ht, vt, hf, hs, vf, vs; uint64_t pc = 0;
 		if (otg >= 0 && liveRaster(&ha, &va, &ht, &vt, &hf, &hs, &vf, &vs, &pc) != 0u) pixHz = pc;
 	}
+	if (n48m6_latched_on()) flags |= N48N_SCANQ_M6;       // 0.0.659 (M6): the bundle's second channel for the latch (the nub property is the first)
+	if (n48m6_latched_on() && n48m6flip_latched_on() && n48m6flip1_latched_on()) flags |= N48N_SCANQ_M6FLIP1;   // 0.0.662 (Stage 2): navi48-m6flip1=1 as well: ABI 1.12's instance 1 (the monitor A) is live
+	if (n48m6_latched_on() && n48m6flip_latched_on()) flags |= N48N_SCANQ_M6FLIP;   // 0.0.661 (M6 Stage 1b): navi48-m6flip=1 (with navi48-m6=1) is latched ON: ABI 1.11's selectors 22..26 (instance 2) are live
 	o->pix_clk_khz = (uint32_t)(pixHz / 1000ull);
 	o->refresh_mhz = (uint32_t)refresh_mhz(pixHz, td.h_total, td.v_total);
 	o->pitch_px = g.pitchPx; o->hubp_format = g.fmt; o->sw_mode = g.sw; o->otg = otg >= 0 ? (uint32_t)otg : 0xFFFFFFFFu;
@@ -1820,6 +1902,7 @@ uint32_t scanRegister(bool boVis, uint64_t boMc, uint64_t boSize, uint64_t offse
 		uint64_t mc = 0, bytes = 0;
 		rc = reg_bounds(BoRef{ boVis, boMc, boSize }, offset, pitchBytes, height, g.pitchPx * 4u, g.h, fb, &mc, &bytes);
 		if (rc != kOk) break;
+		if (n48m6_latched_on() && n48m6flip_latched_on() && scanXClash(mc, bytes)) { N48LOG("n48scan: REGISTER refused: MC %#llx overlaps an HDMI display's buffers or slots (0.0.661 the monitor B's; 0.0.662 also the monitor A's with navi48-m6flip1)", (unsigned long long)mc); rc = kBadArg; break; }   // 0.0.661: an instance-0 slot never aliases the monitor B's memory (with the latches OFF this line is not reached: 0.0.660's path)
 		uint32_t slot = kNoSlot;
 		rc = slot_register(gScan.tbl, mc, bytes, &slot);
 		if (rc != kOk) break;
@@ -2219,11 +2302,913 @@ static void mt_shutdown() {
 // Kext stop: restore the console (idempotent) and wait, bounded at 2 s, for every watchdog thread to finish before the caller unmaps the registers.
 void scanShutdown() {
 	mt_shutdown();                           // build 0.0.605: the mode trial ends and the golden set is put back first (before the scan-lock early return: a trial needs no scan lock)
+	scanXShutdown();                        // 0.0.661 (M6 Stage 1b): instance 2's A is restored (and its watchdog waited for) before the registers go away; inert when the latches are OFF
 	if (gScan.lock == nullptr) return;
 	uint64_t r[2] = { 1, 0 };
 	(void)scan_restore("kext stop", true, 0u, r);
 	for (uint32_t i = 0; i < 2000u && __atomic_load_n(&gScan.watchdogAlive, __ATOMIC_ACQUIRE) != 0u; i++) /*nolock*/ IOSleep(1);
 	if (__atomic_load_n(&gScan.watchdogAlive, __ATOMIC_ACQUIRE) != 0u) N48LOG("n48scan: kext stop: a watchdog thread is still alive after 2 s");
+}
+
+}  // namespace n48dcn
+
+// =====================================================================================================================================================================================================
+// build 0.0.622 (multi-monitor track, stage M1; an internal design note): THE THREE READ-ONLY INSTRUMENTS. Decisions: navi48_dispread.h; sequences: navi48_dispread_flow.h; host test:
+// tests/native_dispread_test.cpp (with planted breaks in tests/native_dispread_plant.sh).
+//   ddcread   <line> <block>  the ONLY one of the three that writes registers: the DC_I2C engine's own (BASE_IDX 2, absolute 0x5358..0x539e, allowlist range "DC..DIG6" 0x5358..0x53d3), each write through
+//             dcn41_allow_write, and only after the arbitration read says the engine is free. Needs bind() (the allowlist), like the DCN verbs 74-77.
+//   dmubring  [page]          register READS through the read-only device attach() built; ring memory only through amdgpu::RBAR0_32 (the BAR0 aperture) - NEVER MM_INDEX. This card's ring sits at VRAM offset
+//             ~15.7 GiB (REGION4, an earlier analysis), outside the 256 MiB aperture, so the verb reports RING_UNREACHABLE and the decode half is exercised by the host test only.
+//   dispcensus [page]         register READS through the same read-only device.
+// =====================================================================================================================================================================================================
+namespace {
+struct DdcStore {
+	bool     valid { false };
+	uint32_t line { 0 }, block { 0 }, status { 0 }, arb { 0 }, arbAfter { 0 }, sw { 0 }, seq { 0 };
+	bool     released { false };
+	uint8_t  data[N48DR_EDID_BLOCK] { };
+};
+DdcStore gDdc;
+volatile uint32_t gDdcBusy = 0;
+uint32_t gDdcSeq = 0;
+
+// The environment navi48_dispread_flow.h's ddc_read runs over: reads through the bound device (counted), writes ONLY through the allowlist.
+struct DdcKextEnv {
+	bool refusedFlag { false };
+	uint32_t rd(uint32_t baseIdx, uint32_t off) {
+		const uint32_t a = dcn41_abs_rd(&gDcn.d, off, baseIdx);   // 0.0.628: the READ-ONLY twin (BASE_IDX 1 = the prescale register); wr2 below keeps dcn41_abs
+		return a == DCN41_BAD_OFFSET ? 0xFFFFFFFFu : dcn_rreg(&gDcn, a);
+	}
+	void wr2(uint32_t off, uint32_t v) {
+		const uint32_t a = dcn41_abs(&gDcn.d, off, 2u);
+		if (a == DCN41_BAD_OFFSET || !dcn41_allow_write(&gDcn.allow, a, v, "ddcread")) {
+			refusedFlag = true;
+			N48LOG("ddcread: REFUSED write offset %#x = %#010x (abs %#010x) by the allowlist", off, v, a);
+			return;
+		}
+		amdgpu::WREG32(*gDcn.dev, a, v);
+	}
+	bool refused() const { return refusedFlag; }
+	void delay_us(uint32_t us) { dcn_udelay(nullptr, us); }   // the file's ONE delay glue (IODelay); tests/native_s2d_test.cpp pins that there is exactly one
+};
+// Reads only, through the read-only device (no bind needed).
+struct RoKextEnv {
+	uint32_t rd(uint32_t baseIdx, uint32_t off) {
+		const uint32_t a = dcn41_abs_rd(&gLr.d, off, baseIdx);   // 0.0.628 (M4a): BASE_IDX 1 / 3 resolve for READS; this environment has no write member
+		return a == DCN41_BAD_OFFSET ? 0xFFFFFFFFu : gLr.d.rreg(gLr.d.cookie, a);
+	}
+};
+// The ring memory reader: the BAR0 aperture and nothing else.
+struct Bar0Mem {
+	amdgpu::DeviceContext *dev;
+	uint32_t rd32(uint64_t off) { return amdgpu::RBAR0_32(*dev, off); }
+};
+}  // namespace
+
+// build 0.0.624 (stage M1.5): the kext's existing serialised MM_INDEX READER (Navi48Bringup.cpp; gVramMmLock and the MM-priority scope inside it). Declared here, defined there; region4read's ONLY VRAM access.
+bool navi48_vram_read_mm(uint64_t vramOffset, uint32_t *dst, uint32_t dwords);
+
+namespace {
+// region4read's memory: the sequence (n48dr::region4_read) can only call rd(), which is the read-only reader above. There is no write member to call.
+struct R4Mem {
+	bool rd(uint64_t vramOff, uint32_t *dst, uint32_t n) { return navi48_vram_read_mm(vramOff, dst, n); }
+};
+struct R4Store {
+	bool     valid { false };
+	uint32_t status { 0 }, seq { 0 }, off { 0 }, dwords { 0 };
+	uint64_t base { 0 };
+	uint32_t d[N48DR_R4_MAX_DWORDS] { };
+};
+R4Store gR4;
+volatile uint32_t gR4Busy = 0;
+uint32_t gR4Seq = 0;
+}  // namespace
+
+namespace n48dcn {
+
+uint32_t ddcRead(uint64_t arg, uint64_t *out, unsigned outCount) {
+	if (!out || outCount < 13u) return N48DR_BAD_ARG;
+	for (unsigned i = 0; i < 13u; i++) out[i] = 0u;
+	if (!n48dr_ddc_arg_ok(arg)) { n48dr_ddc_fill(out, N48DR_BAD_ARG, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, nullptr); return N48DR_BAD_ARG; }
+	const uint32_t block = (uint32_t)(arg & 0xFFu), line = (uint32_t)((arg >> 8) & 0xFFu), page = (uint32_t)((arg >> 16) & 0xFFu);
+	if (!__atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE) || !gDcn.dev) { n48dr_ddc_fill(out, N48DR_NO_DEVICE, page, 0u, 0u, 0u, 0u, 0u, 0u, 0u, nullptr); return N48DR_NO_DEVICE; }
+	if (__atomic_exchange_n(&gDdcBusy, 1u, __ATOMIC_ACQ_REL) != 0u) { n48dr_ddc_fill(out, N48DR_BUSY, page, 0u, 0u, 0u, 0u, 0u, 0u, 0u, nullptr); return N48DR_BUSY; }
+	uint32_t status;
+	if (page == 1u) {                                              // the stored bytes 88..127 of the last page-0 read of THIS (line, block): no bus access at all
+		if (!gDdc.valid || gDdc.line != line || gDdc.block != block) {
+			status = N48DR_NO_DATA;
+			n48dr_ddc_fill(out, status, page, 0u, 0u, 0u, 0u, 0u, 0u, 0u, nullptr);
+		} else {
+			status = gDdc.status;
+			n48dr_ddc_fill(out, status, page, n48dr_edid_sum(gDdc.data) == 0u && status == N48DR_OK, block == 0u && n48dr_edid_header_ok(gDdc.data), gDdc.released, gDdc.seq, gDdc.arbAfter, gDdc.arb, gDdc.sw, gDdc.data);
+		}
+	} else {
+		DdcKextEnv env;
+		const n48dr::DdcResult r = n48dr::ddc_read(env, line, block);
+		gDdc.valid = true; gDdc.line = line; gDdc.block = block; gDdc.status = r.status; gDdc.arb = r.arb; gDdc.arbAfter = r.arbAfter; gDdc.sw = r.swStatus;
+		gDdc.released = r.released; gDdc.seq = ++gDdcSeq;
+		for (unsigned i = 0; i < N48DR_EDID_BLOCK; i++) gDdc.data[i] = r.status == N48DR_OK ? r.data[i] : 0u;
+		status = r.status;
+		const bool csum = status == N48DR_OK && n48dr_edid_sum(gDdc.data) == 0u;
+		n48dr_ddc_fill(out, status, 0u, csum, block == 0u && status == N48DR_OK && n48dr_edid_header_ok(gDdc.data), r.released, gDdc.seq, r.arbAfter, r.arb, r.swStatus, status == N48DR_OK ? gDdc.data : nullptr);
+		N48LOG("ddcread: line %u block %u -> status %u (%s); arb %#010x after release %#010x, sw_status %#010x, polls %u, released %u, checksum %s",
+		       line, block, status, n48dr_status_name(status), r.arb, r.arbAfter, r.swStatus, r.polls, r.released ? 1u : 0u, status != N48DR_OK ? "n/a" : csum ? "OK" : "BAD");
+		if (status == N48DR_OK)
+			for (unsigned row = 0; row < 8u; row++) {
+				const uint8_t *d = gDdc.data + row * 16u;
+				N48LOG("ddcread: %03x: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", row * 16u,
+				       d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
+			}
+	}
+	__atomic_store_n(&gDdcBusy, 0u, __ATOMIC_RELEASE);
+	return status;
+}
+
+// build 0.0.633: verb 99 `scdcread <line> <off> [len]` - a READ-ONLY SCDC read from the HDMI sink (slave 0x54) over the SAME DC_I2C engine sequence as ddcread (n48dr::i2c_xfer: arbitration verdict first,
+// bounded poll, always released) and the same busy flag (one engine, one transaction at a time). The only bus write is the 1-byte register offset (n48dr_plan_scdc). Needs bind() like ddcread (the engine's registers are
+// written through the DCN allowlist). The three-line answer is also in the driver log so an unattended run is readable without the CLI.
+uint32_t scdcRead(uint64_t arg, uint64_t *out, unsigned outCount) {
+	if (!out || outCount < 13u) return N48DR_BAD_ARG;
+	for (unsigned i = 0; i < 13u; i++) out[i] = 0u;
+	if (!n48dr_scdc_arg_ok(arg)) { n48dr_scdc_fill(out, N48DR_BAD_ARG, 0u, 0u, 0u, 0u, 0u, 0u, nullptr); return N48DR_BAD_ARG; }
+	const uint32_t line = (uint32_t)(arg & 0xFFu), off = (uint32_t)((arg >> 8) & 0xFFu), len = (uint32_t)((arg >> 16) & 0xFFu);
+	if (!__atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE) || !gDcn.dev) { n48dr_scdc_fill(out, N48DR_NO_DEVICE, len, 0u, 0u, 0u, 0u, 0u, nullptr); return N48DR_NO_DEVICE; }
+	if (__atomic_exchange_n(&gDdcBusy, 1u, __ATOMIC_ACQ_REL) != 0u) { n48dr_scdc_fill(out, N48DR_BUSY, len, 0u, 0u, 0u, 0u, 0u, nullptr); return N48DR_BUSY; }
+	DdcKextEnv env;
+	const n48dr::DdcResult r = n48dr::scdc_read(env, line, off, len);
+	const uint32_t seq = ++gDdcSeq;
+	n48dr_scdc_fill(out, r.status, len, r.released, seq, r.arbAfter, r.arb, r.swStatus, r.status == N48DR_OK ? r.data : nullptr);
+	N48LOG("scdcread: line %u offset %#04x len %u -> status %u (%s); arb %#010x after release %#010x, sw_status %#010x, polls %u, released %u",
+	       line, off, len, r.status, n48dr_status_name(r.status), r.arb, r.arbAfter, r.swStatus, r.polls, r.released ? 1u : 0u);
+	if (r.status == N48DR_OK) {
+		N48LOG("scdcread: %#04x: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", off,
+		       r.data[0], len > 1u ? r.data[1] : 0u, len > 2u ? r.data[2] : 0u, len > 3u ? r.data[3] : 0u, len > 4u ? r.data[4] : 0u, len > 5u ? r.data[5] : 0u, len > 6u ? r.data[6] : 0u, len > 7u ? r.data[7] : 0u,
+		       len > 8u ? r.data[8] : 0u, len > 9u ? r.data[9] : 0u, len > 10u ? r.data[10] : 0u, len > 11u ? r.data[11] : 0u, len > 12u ? r.data[12] : 0u, len > 13u ? r.data[13] : 0u, len > 14u ? r.data[14] : 0u, len > 15u ? r.data[15] : 0u);
+	}
+	__atomic_store_n(&gDdcBusy, 0u, __ATOMIC_RELEASE);
+	return r.status;
+}
+
+uint32_t dmubRing(uint64_t arg, uint64_t *out, unsigned outCount) {
+	if (!out || outCount < 13u) return N48DR_BAD_ARG;
+	for (unsigned i = 0; i < 13u; i++) out[i] = 0u;
+	if (!n48dr_dmub_arg_ok(arg)) { out[0] = N48DR_BAD_ARG; return N48DR_BAD_ARG; }
+	if (gLr.state != N48LR_READY) { out[0] = N48DR_NO_DEVICE; return N48DR_NO_DEVICE; }
+	RoKextEnv ro;
+	if (arg == N48DR_DMUB_PAGE_SCRATCH) {                           // the SCRATCH bank, registers only
+		uint32_t vals[N48DR_DMUB_SCRATCH_COUNT];
+		for (unsigned i = 0; i < N48DR_DMUB_SCRATCH_COUNT; i++) vals[i] = ro.rd(2u, N48DR_DMUB_SCRATCH_FIRST + i);
+		out[0] = (uint64_t)N48DR_OK | ((uint64_t)N48DR_DMUB_SCRATCH_COUNT << 8);
+		n48dr_pack_regs(out, 1u, vals, N48DR_DMUB_SCRATCH_COUNT);
+		return N48DR_OK;
+	}
+	struct dcn41_dmub_state st;
+	if (dcn41_dmub_probe(&gLr.d, &st) != DCN41_OK) { out[0] = N48DR_NO_DEVICE; return N48DR_NO_DEVICE; }
+	amdgpu::DeviceContext *dev = static_cast<amdgpu::DeviceContext *>(gLr.d.cookie);
+	const uint64_t bar0Size = dev ? (uint64_t)dev->bar0Size : 0ull;
+	const bool known = st.ring_map != DCN41_DMUB_MAP_UNKNOWN && st.ring_addr != 0ull;
+	const uint64_t ringOff = (known && st.ring_addr >= st.fb_base_mc) ? st.ring_addr - st.fb_base_mc : ~0ull;
+	uint32_t sane = 0u;
+	const uint32_t ncmd = n48dr_ring_count(st.inbox1_size, st.inbox1_wptr, &sane);
+	if (arg == 0u) {
+		struct n48dr_dmub_summary s;
+		for (unsigned i = 0; i < sizeof(s); i++) ((uint8_t *)&s)[i] = 0;
+		const uint32_t pv = n48dr::ring_page_verdict(1u, known && ringOff != ~0ull, st.inbox1_size, st.inbox1_wptr, ringOff, bar0Size);
+		s.status = pv == N48DR_PAGE_RANGE ? (uint32_t)N48DR_OK : pv;
+		s.verdict = st.verdict; s.ring_map = st.ring_map; s.enabled = st.enabled; s.soft_reset = st.soft_reset; s.dal_fw = st.dal_fw; s.mailbox_rdy = st.mailbox_rdy;
+		s.reachable = (known && ringOff != ~0ull && n48dr_ring_in_bar0(ringOff, ncmd ? (uint64_t)ncmd * N48DR_DMUB_CMD_SIZE : (uint64_t)N48DR_DMUB_CMD_SIZE, bar0Size)) ? 1u : 0u;
+		s.ring_sane = sane; s.ncmd = ncmd;
+		s.cntl = st.cntl; s.cntl2 = st.cntl2; s.sec_cntl = st.sec_cntl; s.scratch0 = st.scratch0; s.scratch7 = st.scratch7; s.scratch14 = st.scratch14; s.scratch15 = st.scratch15;
+		s.fault_addr = st.fault_addr; s.inbox_base = st.inbox1_base; s.inbox_size = st.inbox1_size; s.inbox_wptr = st.inbox1_wptr; s.inbox_rptr = st.inbox1_rptr;
+		s.region4_off = st.region4_offset; s.region4_off_hi = st.region4_offset_high; s.ring_addr = st.ring_addr; s.fb_base_mc = st.fb_base_mc; s.ring_vram_off = ringOff; s.bar0_size = bar0Size;
+		n48dr_dmub_summary_pack(&s, out);
+		N48LOG("dmubring: summary status %u (%s); verdict %u map %u enabled %u reset %u dal_fw %u mailbox_rdy %u; SCRATCH0 %#010x CNTL %#010x; inbox base %#010x size %#x wptr %#x rptr %#x; "
+		       "ring GPU %#llx = VRAM offset %#llx, BAR0 aperture %#llx, %u command(s), reachable %u",
+		       s.status, n48dr_status_name(s.status), s.verdict, s.ring_map, s.enabled, s.soft_reset, s.dal_fw, s.mailbox_rdy, s.scratch0, s.cntl, s.inbox_base, s.inbox_size, s.inbox_wptr, s.inbox_rptr,
+		       (unsigned long long)s.ring_addr, (unsigned long long)s.ring_vram_off, (unsigned long long)s.bar0_size, s.ncmd, s.reachable);
+		return s.status;
+	}
+	// a command page: header + the first 32 payload bytes of command (page - 1), read through the BAR0 aperture ONLY
+	const uint32_t page = (uint32_t)arg;
+	const uint32_t pv = n48dr::ring_page_verdict(page, known && ringOff != ~0ull, st.inbox1_size, st.inbox1_wptr, ringOff, bar0Size);
+	if (pv != N48DR_OK) {
+		n48dr_dmub_cmd_pack(out, pv, page - 1u, 0u, ncmd, nullptr);
+		return pv;
+	}
+	Bar0Mem mem { dev };
+	uint32_t header = 0u, payload[8] = { 0 };
+	n48dr::ring_read_cmd(mem, ringOff, page - 1u, &header, payload);
+	n48dr_dmub_cmd_pack(out, N48DR_OK, page - 1u, header, ncmd, payload);
+	const struct n48dr_dmub_hdr h = n48dr_dmub_decode(header);
+	N48LOG("dmubring: command %u: header %#010x type %u (%s) sub %u (%s) payload_bytes %u ret_status %u multi %u reg_based %u; payload %08x %08x %08x %08x %08x %08x %08x %08x", page - 1u, header,
+	       h.type, n48dr_dmub_type_name(h.type), h.sub_type, n48dr_dmub_subtype_name(h.type, h.sub_type), h.payload_bytes, h.ret_status, h.multi_cmd_pending, h.is_reg_based,
+	       payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7]);
+	return N48DR_OK;
+}
+
+// build 0.0.624 (stage M1.5): verb 94 `region4read <offset> [dwords]`. READ-ONLY. Page 0 probes the DMCUB registers (dcn41_dmub_probe: register READS), computes the REGION4 window base live
+// (n48dr_region4_base) and reads the dwords with navi48_vram_read_mm; pages 1 and 2 return the stored rest with no hardware access at all. No register is written, no MM_INDEX path is written here.
+uint32_t region4Read(uint64_t arg, uint64_t *out, unsigned outCount) {
+	if (!out || outCount < 13u) return N48DR_BAD_ARG;
+	for (unsigned i = 0; i < 13u; i++) out[i] = 0u;
+	if (!n48dr_r4_arg_ok(arg)) { out[0] = N48DR_BAD_ARG; return N48DR_BAD_ARG; }
+	const uint32_t off = (uint32_t)(arg & 0xFFFFFFFFull), dwords = (uint32_t)((arg >> 32) & 0xFFu), page = (uint32_t)((arg >> 40) & 0xFFu);
+	if (gLr.state != N48LR_READY) { out[0] = N48DR_NO_DEVICE; return N48DR_NO_DEVICE; }
+	if (__atomic_exchange_n(&gR4Busy, 1u, __ATOMIC_ACQ_REL) != 0u) { n48dr_r4_fill(out, N48DR_BUSY, page, 0u, off, dwords, ~0ull, nullptr); return N48DR_BUSY; }
+	uint32_t status;
+	if (page != 0u) {                                              // the stored dwords of the last page-0 read of THIS (offset, dwords): no hardware access
+		if (!gR4.valid || gR4.off != off || gR4.dwords != dwords) {
+			status = N48DR_NO_DATA;
+			n48dr_r4_fill(out, status, page, 0u, off, dwords, ~0ull, nullptr);
+		} else {
+			status = gR4.status;
+			n48dr_r4_fill(out, status, page, gR4.seq, off, dwords, gR4.base, status == N48DR_OK ? gR4.d : nullptr);
+		}
+	} else {
+		struct dcn41_dmub_state st;
+		if (dcn41_dmub_probe(&gLr.d, &st) != DCN41_OK) {
+			status = N48DR_NO_DEVICE;
+			n48dr_r4_fill(out, status, 0u, 0u, off, dwords, ~0ull, nullptr);
+		} else {
+			amdgpu::DeviceContext *dev = static_cast<amdgpu::DeviceContext *>(gLr.d.cookie);
+			const uint64_t vramSize = dev ? dev->vramSizeBytes : 0ull;
+			const uint32_t enabled = (st.region4_top & DCN41_DMCUB_REGION4_TOP_ADDRESS__DMCUB_REGION4_ENABLE_MASK) != 0u ? 1u : 0u;
+			R4Mem mem;
+			uint64_t base = ~0ull;
+			uint32_t d[N48DR_R4_MAX_DWORDS] = { 0 };
+			status = n48dr::region4_read(mem, st.region4_offset, st.region4_offset_high, enabled, st.fb_base_mc, vramSize, off, dwords, &base, d);
+			gR4.valid = true; gR4.status = status; gR4.seq = ++gR4Seq; gR4.off = off; gR4.dwords = dwords; gR4.base = base;
+			for (unsigned i = 0; i < N48DR_R4_MAX_DWORDS; i++) gR4.d[i] = (status == N48DR_OK && i < dwords) ? d[i] : 0u;
+			n48dr_r4_fill(out, status, 0u, gR4.seq, off, dwords, status == N48DR_REGION4_BAD ? (((uint64_t)st.region4_offset_high << 32) | st.region4_offset) : base, status == N48DR_OK ? gR4.d : nullptr);
+			if (status == N48DR_REGION4_BAD) { out[2] = st.fb_base_mc; out[3] = vramSize; out[4] = enabled; }
+			N48LOG("region4read: +%#x x%u -> status %u (%s); REGION4 OFFSET %#010x HIGH %#010x enabled %u, FB base %#llx, window base (VRAM offset) %#llx, VRAM %#llx", off, dwords, status, n48dr_status_name(status),
+			       st.region4_offset, st.region4_offset_high, enabled, (unsigned long long)st.fb_base_mc, (unsigned long long)base, (unsigned long long)vramSize);
+			if (status == N48DR_OK)
+				for (uint32_t r = 0; r < dwords; r += 8u) {
+					char row[96];
+					unsigned len = 0;
+					row[0] = 0;
+					for (uint32_t k = 0; k < 8u && r + k < dwords && len + 10u < sizeof(row); k++) len += (unsigned)snprintf(row + len, sizeof(row) - len, " %08x", d[r + k]);
+					N48LOG("region4read: %05x:%s", off + r * 4u, row);
+				}
+		}
+	}
+	__atomic_store_n(&gR4Busy, 0u, __ATOMIC_RELEASE);
+	return status;
+}
+
+uint32_t dispCensus(uint64_t arg, uint64_t *out, unsigned outCount) {
+	if (!out || outCount < 13u) return N48DR_BAD_ARG;
+	for (unsigned i = 0; i < 13u; i++) out[i] = 0u;
+	if (!n48dr_census_arg_ok(arg)) { out[0] = N48DR_BAD_ARG; return N48DR_BAD_ARG; }
+	if (gLr.state != N48LR_READY) { out[0] = N48DR_NO_DEVICE; return N48DR_NO_DEVICE; }
+	RoKextEnv ro;
+	const uint32_t st = n48dr::census_page(ro, (uint32_t)arg, out);
+	if (st == N48DR_OK) {
+		const uint32_t n = n48dr_census_in_page((uint32_t)arg);
+		for (uint32_t i = 0; i < n; i++) {
+			const uint64_t w = out[1u + i / 2u];
+			const struct n48dr_reg *r = n48dr_census_reg((uint32_t)arg, i);
+			N48LOG("dispcensus: %-38s abs %#07x = %#010x", r->name, dcn41_abs_rd(&gLr.d, r->off, r->base_idx), (uint32_t)((i & 1u) ? (w >> 32) : (w & 0xFFFFFFFFull)));   // 0.0.628: the absolute BAR5 dword too (0xffffffff = unresolved)
+		}
+	}
+	return st;
+}
+
+}  // namespace n48dcn
+
+// =====================================================================================================================================================================================================
+// build 0.0.625 (stages M2 / M3; an internal design note "M1.5 result" section 4): verbs 95 `dmubsend`, 96 `dmubmode`, 97 `dmubctx` - the FIRST code that sends to the display firmware. All behind boot-arg
+// navi48-dmubcmd=1 (OFF: N48DR_CMD_OFF, nothing touched, not even a register read). Decisions: dcn/navi48_dmubcmd.h; sequences: dcn/navi48_dmubcmd_flow.h (host test tests/native_dmubcmd_test.cpp + native_dmubcmd_plant.sh).
+// The writes: VRAM only through navi48_vram_write_mm (the existing locked MM_INDEX writer); ONE register, DMCUB_INBOX1_WPTR, through dcn41_allow_write (needs bind(), like ddcread). One verb at a time (gDmBusy).
+// =====================================================================================================================================================================================================
+bool navi48_vram_write_mm(uint64_t vramOffset, const uint32_t *src, uint32_t dwords);
+
+namespace {
+volatile uint32_t gDmBusy = 0;
+n48dm_mode_state gDmMode;           // the `dmubmode save` copy, this boot only
+struct DmKextEnv {
+	bool probe(n48dm::Probe *p) {
+		struct dcn41_dmub_state st;
+		if (gLr.state != N48LR_READY || dcn41_dmub_probe(&gLr.d, &st) != DCN41_OK) return false;
+		amdgpu::DeviceContext *dev = static_cast<amdgpu::DeviceContext *>(gLr.d.cookie);
+		p->vramSize = dev ? dev->vramSizeBytes : 0ull;
+		p->r4Enabled = (st.region4_top & DCN41_DMCUB_REGION4_TOP_ADDRESS__DMCUB_REGION4_ENABLE_MASK) != 0u ? 1u : 0u;   // the same expression region4Read uses
+		p->r4Lo = st.region4_offset; p->r4Hi = st.region4_offset_high; p->fbBaseMc = st.fb_base_mc;
+		p->pre.enabled = st.enabled; p->pre.soft_reset = st.soft_reset;
+		p->pre.ring_region4 = st.ring_map == DCN41_DMUB_MAP_REGION4 ? 1u : 0u;
+		p->pre.ring_at_base = (st.ring_addr != 0ull && st.ring_addr == (((uint64_t)st.region4_offset_high << 32) | st.region4_offset)) ? 1u : 0u;   // ring byte 0 IS the REGION4 window base
+		p->pre.size = st.inbox1_size; p->pre.wptr = st.inbox1_wptr; p->pre.rptr = st.inbox1_rptr;
+		return true;
+	}
+	bool rd(uint64_t off, uint32_t *dst, uint32_t n) { return navi48_vram_read_mm(off, dst, n); }
+	bool wr(uint64_t off, const uint32_t *src, uint32_t n) { return navi48_vram_write_mm(off, src, n); }
+	uint32_t reg(uint32_t off) {
+		const uint32_t a = dcn41_abs(&gLr.d, off, N48DM_REG_BASE_IDX);
+		return a == DCN41_BAD_OFFSET ? 0xFFFFFFFFu : gLr.d.rreg(gLr.d.cookie, a);
+	}
+	uint32_t rptr() { return reg(N48DM_REG_INBOX1_RPTR); }
+	uint32_t wptr() { return reg(N48DM_REG_INBOX1_WPTR); }
+	uint32_t frames() { return reg(N48DM_REG_OTG0_FRAMECOUNT); }
+	bool wrWptr(uint32_t v) {      // THE register write of these verbs, through the DCN write allowlist
+		const uint32_t a = dcn41_abs(&gDcn.d, N48DM_REG_INBOX1_WPTR, N48DM_REG_BASE_IDX);
+		if (a == DCN41_BAD_OFFSET || !dcn41_allow_write(&gDcn.allow, a, v, "dmubsend")) {
+			N48LOG("dmubsend: REFUSED write offset %#x = %#010x (abs %#010x) by the allowlist", N48DM_REG_INBOX1_WPTR, v, a);
+			return false;
+		}
+		amdgpu::WREG32(*gDcn.dev, a, v);
+		return true;
+	}
+	void delay_us(uint32_t us) { dcn_udelay(nullptr, us); }
+	uint64_t now_us() { return now_ns() / 1000ull; }
+};
+// the common entry: zero out[], the latch, a bound display layer, single flight. Returns 0 = proceed (busy flag held), else the status (out[0] already filled).
+uint32_t dm_enter(uint64_t *out, unsigned outCount, bool needBound) {
+	if (!out || outCount < 13u) return N48DR_BAD_ARG;
+	for (unsigned i = 0; i < 13u; i++) out[i] = 0u;
+	if (!dm_latched_on()) { out[0] = N48DR_CMD_OFF; return N48DR_CMD_OFF; }
+	if (gLr.state != N48LR_READY || (needBound && (!__atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE) || !gDcn.dev))) { out[0] = N48DR_NO_DEVICE; return N48DR_NO_DEVICE; }
+	if (__atomic_exchange_n(&gDmBusy, 1u, __ATOMIC_ACQ_REL) != 0u) { out[0] = N48DR_BUSY; return N48DR_BUSY; }
+	return 0u;
+}
+}  // namespace
+
+namespace n48dcn {
+
+// 0.0.626 (F4): the dispatcher asks this BEFORE bind(): with navi48-dmubcmd absent (the default) verb 95 must not even bind the display layer (bind() allocates a lock, reads registers and arms gDcn).
+bool dmubCmdLatchedOn() { return dm_latched_on(); }
+
+uint32_t dmubSend(uint64_t arg, uint64_t *out, unsigned outCount) {
+	const uint32_t early = dm_enter(out, outCount, true);
+	if (early != 0u) return early;
+	uint32_t h = 0, d1 = 0, d2 = 0, replaySrc = N48DM_NO_REPLAY;
+	n48dm_send_out o;
+	DmKextEnv env;
+	if (n48dm_is_replay_arg(arg)) {       // 0.0.626 (F8): `dmubsend replay <slot_off>`
+		if (disp2Held() || disp2HeldInst(N48D2_INST_MONA)) {                // 0.0.652 (M5): a HELD monitor B plane (0.0.655: or a HELD monitor A plane): a replay could resend a teardown slot sent earlier in the boot
+			for (unsigned i = 0; i < sizeof(o); i++) ((uint8_t *)&o)[i] = 0;
+			o.status = N48DR_HELD_REFUSED; o.base = ~0ull;
+		} else if (n48dm_replay_unarg(arg, &replaySrc) != 0u) {
+			for (unsigned i = 0; i < sizeof(o); i++) ((uint8_t *)&o)[i] = 0;
+			o.status = N48DR_REPLAY_REFUSED; o.base = ~0ull;
+		} else o = n48dm::send(env, 0u, 0u, 0u, replaySrc);
+	} else if (n48dm_is_tpl_arg(arg)) {   // 0.0.630 (M4c): `dmubsend pclk|phyc ...` - a mainline VBIOS template NAMED BY ID (never raw dwords from userland)
+		uint32_t tplId = N48DM_TPL_NONE;
+		if (n48dm_tpl_unarg(arg, &tplId) != 0u) {
+			for (unsigned i = 0; i < sizeof(o); i++) ((uint8_t *)&o)[i] = 0;
+			o.status = N48DR_PAYLOAD_REFUSED; o.base = ~0ull;
+		} else if (n48dm_tpl_held_refuses(tplId) && disp2Held()) {      // 0.0.652 (M5): 0.0.653: EVERY monitor B template (ids 8..15) is REFUSED while the plane is HELD
+			for (unsigned i = 0; i < sizeof(o); i++) ((uint8_t *)&o)[i] = 0;
+			o.status = N48DR_HELD_REFUSED; o.base = ~0ull;
+		} else if (n48dm_tpl_mona_held_refuses(tplId) && disp2HeldInst(N48D2_INST_MONA)) {      // 0.0.655: EVERY monitor A template (ids 3..7: otg1 / phyc / digc - the teardowns pclk-otg1-off and phyc-disable above all) is REFUSED while the MONA's plane is HELD
+			for (unsigned i = 0; i < sizeof(o); i++) ((uint8_t *)&o)[i] = 0;
+			o.status = N48DR_HELD_REFUSED; o.base = ~0ull;
+		} else o = n48dm::send(env, 0u, 0u, 0u, N48DM_NO_REPLAY, tplId);
+		if (n48dm_tpl_get(tplId)) N48LOG("dmubsend template %s: slot %08x %08x %08x %08x %08x (11 zero dwords)", n48dm_tpl_get(tplId)->name, n48dm_tpl_get(tplId)->dw[0], n48dm_tpl_get(tplId)->dw[1], n48dm_tpl_get(tplId)->dw[2], n48dm_tpl_get(tplId)->dw[3], n48dm_tpl_get(tplId)->dw[4]);
+	} else {
+		n48dm_send_unarg(arg, &h, &d1, &d2);
+		if (n48dm_slot_held_refuses(h, d1, d2) && disp2Held()) {        // 0.0.653: a raw slot aimed at the monitor B's context 0x7800 (detect / setmode / enable / disable): REFUSED while the plane is HELD
+			for (unsigned i = 0; i < sizeof(o); i++) ((uint8_t *)&o)[i] = 0;
+			o.status = N48DR_HELD_REFUSED; o.base = ~0ull;
+		} else if (n48dm_slot_mona_held_refuses(h, d1, d2) && disp2HeldInst(N48D2_INST_MONA)) {        // 0.0.655: ... and one aimed at the monitor A's context 0x7000 (DFP3, HDMI SINK-B) while the MONA's plane is HELD
+			for (unsigned i = 0; i < sizeof(o); i++) ((uint8_t *)&o)[i] = 0;
+			o.status = N48DR_HELD_REFUSED; o.base = ~0ull;
+		} else o = n48dm::send(env, h, d1, d2);
+	}
+	n48dm_send_pack(out, &o);
+	N48LOG("dmubsend%s: header %#010x d1 %#x d2 %#x -> status %u (%s); sent %u; WPTR %#x -> %#x, RPTR %#x -> %#x after %u polls (%u us); OTG0 frames %u -> %u; VBIOS vars %u; window base %#llx; replay source %#x",
+	       replaySrc != N48DM_NO_REPLAY ? " replay" : "", o.hdr, o.d1, o.d2, o.status, n48dr_status_name(o.status), o.sent, o.old_wptr, o.new_wptr, o.rptr_start, o.rptr_end, o.polls, o.elapsed_us, o.frames0, o.frames1, o.vars, (unsigned long long)o.base, replaySrc);
+	__atomic_store_n(&gDmBusy, 0u, __ATOMIC_RELEASE);
+	return o.status;
+}
+
+uint32_t dmubMode(uint64_t arg, uint64_t *out, unsigned outCount) {
+	const uint32_t early = dm_enter(out, outCount, false);
+	if (early != 0u) return early;
+	DmKextEnv env;
+	const n48dm::ModeResult r = n48dm::mode(env, arg, gDmMode);
+	out[0] = (uint64_t)(r.status & 0xFFu) | ((arg & 0xFFFu) << 8) | ((uint64_t)(r.saved & 1u) << 24) | ((uint64_t)(r.dirty & 1u) << 25);
+	out[1] = r.base;
+	n48dm_dwords_pack(out, 2u, r.block, N48DM_MODE_DWORDS);
+	n48dm_dwords_pack(out, 6u, r.before, N48DM_MODE_DWORDS);
+	N48LOG("dmubmode: op %#llx -> status %u (%s); saved %u dirty %u; window base %#llx; block %08x %08x %08x %08x %08x %08x %08x %08x", (unsigned long long)arg, r.status, n48dr_status_name(r.status), r.saved, r.dirty,
+	       (unsigned long long)r.base, r.block[0], r.block[1], r.block[2], r.block[3], r.block[4], r.block[5], r.block[6], r.block[7]);
+	__atomic_store_n(&gDmBusy, 0u, __ATOMIC_RELEASE);
+	return r.status;
+}
+
+uint32_t dmubCtx(uint64_t arg, uint64_t *out, unsigned outCount) {
+	const uint32_t early = dm_enter(out, outCount, false);
+	if (early != 0u) return early;
+	DmKextEnv env;
+	const n48dm::CtxResult r = n48dm::ctx(env, arg);
+	out[0] = r.status & 0xFFu;
+	out[1] = r.base;
+	out[2] = (uint64_t)r.ctx | ((uint64_t)r.value << 32);
+	out[3] = (uint64_t)r.before | ((uint64_t)r.after << 32);
+	N48LOG("dmubctx: ctx %#x status dword (+0x1a0) <- %#010x -> status %u (%s); before %#010x, read back %#010x; window base %#llx", r.ctx, r.value, r.status, n48dr_status_name(r.status), r.before, r.after, (unsigned long long)r.base);
+	__atomic_store_n(&gDmBusy, 0u, __ATOMIC_RELEASE);
+	return r.status;
+}
+
+}  // namespace n48dcn
+
+// =====================================================================================================================================================================================================
+// build 0.0.631 (multi-monitor stage M4d; an internal design note "M4 design" / "M4b analysis"): verb 98 `disp2 timing|connect|off|status` - OTG1 -> ODM1 -> OPP1 (DPG1 pattern) -> DIG2 -> the
+// DMUB-enabled PHY C. Behind boot-arg navi48-disp2=1 (OFF: N48D2_OFF, nothing touched, not even a register read). Decisions, step lists and the instance guard: dcn/navi48_disp2.h; the sequence: dcn/navi48_disp2_flow.h
+// (host test tests/native_disp2_test.cpp + native_disp2_plant.sh). Every write: the instance guard (n48d2_guard_write, address AND value) and then the DCN write allowlist, then ONE WREG32. One call at a time (gD2Busy).
+// =====================================================================================================================================================================================================
+namespace {
+volatile uint32_t gD2Busy = 0;
+uint32_t gD2Dpx[2][N48D2_DPX_BUF];          // 0.0.634: the DP-plane reads before / after the op (single flight under gD2Busy); 0.0.635: 16 dwords (15 watch rows + the HUBP0 primary HIGH)
+n48d2_plane gD2Pl[2];                       // 0.0.635 (M4c): the plane's state across ops (single flight under gD2Busy, except the glue's stage resets after it released gD2Busy); 0.0.655: PER INSTANCE - [0] the monitor A's (instance 1), [1] the monitor B's (instance 2): d2i()
+n48scanx::ScanX gSX[3];                   // 0.0.661 (M6 Stage 1b) + 0.0.662 (Stage 2): the HDMI displays' scanout state, INDEXED BY INSTANCE NUMBER ([1] the monitor A's HUBP1 / OTG1, [2] the monitor B's HUBP2 / OTG2, [0] never used: the DP is instance-0 code); everything in it is inert unless the latches are ON and a native N48N client Acquires; the lock of [i] is gSXLock[i] (dcn/navi48_scanx_flow.h). Never hold two of them.
+IOLock *volatile gSXLock[3] = { nullptr, nullptr, nullptr };
+uint32_t gD2Gate[N48D2_GATES];              // 0.0.635: the op's final gate reads
+uint32_t gD2Rec[2][N48D2_REC_N];            // 0.0.638: the record page (op 8's recorded reads, the timed-out WAITs' register + last value); single flight under gD2Busy; 0.0.655: one per instance
+uint32_t gD2W2[2][N48D2_W2_BUF];            // 0.0.655: the monitor B watch of an MONA op (before / after); single flight under gD2Busy
+uint64_t gD2Off[2][2];                      // 0.0.635: the VRAM (BAR0) byte offsets of A and B; 0.0.655: per instance
+static inline uint32_t d2i(uint32_t inst) { return inst == N48D2_INST_MONA ? 0u : 1u; }      // 0.0.655: the index of an instance's plane state / record page / offsets
+n48d2_step gD2Steps[2][N48D2_MAX_STEPS];    // the op's list and the rollback's: file-scope, single flight under gD2Busy (never on the kernel stack)
+const char *d2_note_name(uint32_t w) { return w == n48d2::N48D2_N_WRITE ? "wrote" : w == n48d2::N48D2_N_REFUSED ? "REFUSED" : w == n48d2::N48D2_N_WAIT_OK ? "wait ok" : w == n48d2::N48D2_N_WAIT_TIMEOUT ? "WAIT TIMED OUT" : w == n48d2::N48D2_N_REC ? "recorded (no gate)" : "delay (no symclk)"; }
+struct D2KextEnv {
+	uint32_t inst { N48D2_INST_MONA };       // 0.0.633: which instance this call is for (its OWN guard judges every write)
+	uint32_t rd(uint32_t abs) { return (abs >= gDcn.d.mmio_dwords) ? 0xFFFFFFFFu : gDcn.d.rreg(gDcn.d.cookie, abs); }
+	bool wr(uint32_t abs, uint32_t v) {      // THE register write of this verb: the instance guard again, then the DCN write allowlist
+		const char *why = nullptr;
+		const uint32_t g = n48d2_guard_write_i(inst, abs, v, &why);
+		if (g != N48D2_G_OK) {
+			N48LOG("disp2 (instance %u): instance guard REFUSED write %#010x = %#010x (%s%s)", inst, abs, v, g == N48D2_G_FORBIDDEN ? "forbidden: " : g == N48D2_G_OTHER ? "the other instance: " : g == N48D2_G_VALUE ? "a value this verb never writes there" : "not one of the verb's registers", why ? why : "");
+			return false;
+		}
+		if (!dcn41_allow_write(&gDcn.allow, abs, v, "disp2")) {
+			N48LOG("disp2: the DCN allowlist REFUSED write %#010x = %#010x", abs, v);
+			return false;
+		}
+		amdgpu::WREG32(*gDcn.dev, abs, v);
+		return true;
+	}
+	void delay_us(uint32_t us) { dcn_udelay(nullptr, us); }
+	void sleep_ms(uint32_t ms) { /*nolock*/ IOSleep(ms); }   // no lock is held anywhere in disp2 (single flight is the atomic gD2Busy)
+	void note(uint32_t i, const n48d2_step &s, uint32_t old, uint32_t v, uint32_t what) {
+		if (s.kind == N48D2_K_SET || s.kind == N48D2_K_UPD || s.kind == N48D2_K_COPY0)
+			N48LOG("disp2 step %u: %s %s %#06x %#010x -> %#010x (mask %#010x) %s", i, d2_note_name(what), s.reg, s.abs, old, v, s.mask, s.fn);
+		else
+			N48LOG("disp2 step %u: %s %s %#06x (mask %#010x want %#010x) read %#010x after %u polls %s", i, d2_note_name(what), s.reg, s.abs, s.mask, s.val, old, v, s.fn);
+	}
+	n48d2_step *buf(unsigned k) { return gD2Steps[k & 1u]; }
+	uint32_t *dpx_buf(unsigned k) { return gD2Dpx[k & 1u]; }
+	// ---- 0.0.635 (M4c / M4d): the plane ops
+	n48d2_plane *pl_of(uint32_t i) { return &gD2Pl[d2i(i)]; }      // 0.0.655: the plane state of an INSTANCE
+	uint32_t *w2_buf(unsigned k) { return gD2W2[k & 1u]; }      // 0.0.655: the monitor B watch's two buffers
+	bool pin() { return amdgpu::n1c_d2_pin(inst, gD2Pl[d2i(inst)].mc); }      // 0.0.652 (M5, op 14): the allocator pins exactly the pair the plane reports (the helper takes the native client lock itself; no display lock is held here: gD2Busy is an atomic flag); 0.0.655: of THIS instance
+	uint32_t *gate_buf() { return gD2Gate; }
+	uint32_t *rec_buf() { return gD2Rec[d2i(inst)]; }
+	bool window(uint64_t *lo, uint64_t *hi) { *lo = gDcn.d.scanout_lo; *hi = gDcn.d.scanout_hi; return gDcn.d.scanout_hi != 0u; }
+	bool desktop_acquired() { return __atomic_load_n(&gScan.active, __ATOMIC_ACQUIRE) != 0u; }
+	bool vfill(unsigned k, uint32_t byteOff, uint32_t pattern, uint32_t bytes) {      // bounds-checked HERE (bar0_memset_vram silently returns on an out-of-range request)
+		const uint64_t off = k > 1u ? 0u : gD2Off[d2i(inst)][k];
+		if (k > 1u || off == 0u || !gDcn.dev || (uint64_t)byteOff + bytes > n48d2_surf_get(inst)->buf_bytes || off + byteOff + bytes > gDcn.dev->bar0Size) return false;
+		amdgpu::bar0_memset_vram(*gDcn.dev, off + byteOff, pattern, bytes);
+		return true;
+	}
+	void vflush() { amdgpu::amdgpu_hdp_flush(*gDcn.dev); }
+	bool vread(unsigned k, uint32_t byteOff, uint32_t *dw) { return k <= 1u && gD2Off[d2i(inst)][k] != 0u && navi48_vram_read_mm(gD2Off[d2i(inst)][k] + byteOff, dw, 1u); }
+};
+}  // namespace
+
+namespace n48dcn {
+
+// =====================================================================================================================================================================================================
+// build 0.0.652 (multi-monitor stage M5; an internal design note "M5 build spec: Navi48Framebuffer for the monitor B"): what `fbpublish 2` (Navi48DisplayNub.cpp) needs from the display layer.
+// disp2Held: the HELD plane (stage HELD, or the pair pinned): ONE atomic load of each word; no lock, no register. fbView: the software facts (no register read). fbLive: the plane's live gates (READS ONLY), re-judged by
+// n48d2_hold_verdict. fbEdid: the monitor B's EDID blocks 0 and 1 over DDC line 3 through the SAME engine sequence as `accel ddcread` (n48dr::ddc_read: arbitration verdict first, bounded poll, always released; its only register
+// writes are the DC_I2C engine's, through the DCN allowlist, exactly as ddcread). None of them writes a plane or pipe register.
+// =====================================================================================================================================================================================================
+bool disp2HeldInst(uint32_t inst) {      // 0.0.655: HELD is per instance
+	return __atomic_load_n(&gD2Pl[d2i(inst)].stage, __ATOMIC_ACQUIRE) == N48D2_PL_HELD || amdgpu::n1c_d2_pinned(inst);
+}
+bool disp2Held() {      // the MONB's (the M5 framebuffer and the monitor B's DMUB templates): unchanged
+	return disp2HeldInst(N48D2_INST_MONB);
+}
+void fbView(n48dcn::FbView *v, uint32_t inst) {      // 0.0.658: of an INSTANCE (2 = the monitor B: exactly the 0.0.657 values; 1 = the monitor A)
+	const uint32_t pi = d2i(inst);
+	v->held = __atomic_load_n(&gD2Pl[pi].stage, __ATOMIC_ACQUIRE) == N48D2_PL_HELD;
+	v->pinned = amdgpu::n1c_d2_pinned(inst);
+	v->devOk = gDcn.dev != nullptr && __atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE) != 0u;
+	v->mc[0] = gD2Pl[pi].mc[0]; v->mc[1] = gD2Pl[pi].mc[1]; v->offA = gD2Off[pi][0];
+	v->bar0Phys = gDcn.dev ? gDcn.dev->bar0Phys : 0u; v->bar0Size = gDcn.dev ? gDcn.dev->bar0Size : 0u;
+	v->cur = gD2Pl[pi].cur;
+	v->bufBytes = n48d2_surf_get(inst)->buf_bytes;
+}
+uint32_t fbLive(uint32_t inst, uint32_t *holdBad, uint32_t *gates) {
+	*holdBad = 0xFFFFFFFFu;
+	if (inst != N48D2_INST_MONB && inst != N48D2_INST_MONA) return N48D2_BAD_ARG;      // 0.0.658: the two instances only (the caller maps the verb's argument through n48fb::inst_of_arg)
+	if (!gDcn.dev || !__atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE)) return N48D2_NO_DEVICE;
+	if (__atomic_exchange_n(&gD2Busy, 1u, __ATOMIC_ACQ_REL) != 0u) return N48D2_BUSY;
+	D2KextEnv env;
+	env.inst = inst;
+	n48d2_out o;
+	for (unsigned i = 0; i < sizeof(o); i++) ((uint8_t *)&o)[i] = 0;
+	uint32_t *const g = gD2Gate;
+	n48d2_plane *const pl = &gD2Pl[d2i(inst)];
+	n48d2::plane_gates(env, inst, pl, g, o);                   // READS ONLY
+	*holdBad = n48scanx::hold_verdict_gpu(n48d2_hold_verdict(g, pl->cur, pl->mc[0]), scanXGpuHeld(inst));      // 0.0.661 (M6 Stage 1b): while instance 2 is acquired the plane is GPU-held: EARLIEST != A is not a latch failure; 0.0.662: the same for instance 1 (scanXGpuHeld answers 0 for any other instance and for a latch OFF)
+	for (uint32_t i = 0; i < N48D2_GATES; i++) gates[i] = g[i];
+	__atomic_store_n(&gD2Busy, 0u, __ATOMIC_RELEASE);
+	return N48D2_OK;
+}
+uint32_t fbEdid(uint32_t ddcLine, uint8_t out[256]) {
+	for (unsigned i = 0; i < 256u; i++) out[i] = 0u;
+	if (ddcLine != N48_DISP_DDC_LINE && ddcLine != N48_DISPA_DDC_LINE) return N48DR_NO_DEVICE;      // 0.0.658: the monitor B's line 3 or the monitor A's line 2 (the table, Navi48DisplayOps.h)
+	if (!__atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE) || !gDcn.dev) return N48DR_NO_DEVICE;
+	if (__atomic_exchange_n(&gDdcBusy, 1u, __ATOMIC_ACQ_REL) != 0u) return N48DR_BUSY;
+	uint32_t status = N48DR_OK;
+	DdcKextEnv env;
+	for (uint32_t block = 0; block < N48_DISP_EDID_BLOCKS && status == N48DR_OK; block++) {
+		const n48dr::DdcResult r = n48dr::ddc_read(env, ddcLine, block);
+		status = r.status;
+		N48LOG("fbpublish: DDC line %u block %u -> status %u (%s); released %u", ddcLine, block, r.status, n48dr_status_name(r.status), r.released ? 1u : 0u);
+		if (r.status == N48DR_OK) for (unsigned i = 0; i < N48DR_EDID_BLOCK; i++) out[block * N48DR_EDID_BLOCK + i] = r.data[i];
+	}
+	++gDdcSeq;
+	__atomic_store_n(&gDdcBusy, 0u, __ATOMIC_RELEASE);
+	return status;
+}
+
+// The dispatcher asks this BEFORE bind(): with navi48-disp2 absent (the default) verb 98 must not even bind the display layer.
+bool disp2LatchedOn() { return d2_latched_on(); }
+
+uint32_t disp2(uint64_t arg, uint64_t *out, unsigned outCount, amdgpu::BringupContext *ctx) {
+	if (!out || outCount < 13u) return N48D2_BAD_ARG;
+	for (unsigned i = 0; i < 13u; i++) out[i] = 0u;
+	if (!d2_latched_on()) { out[0] = N48D2_OFF; return N48D2_OFF; }                                 // OFF: nothing touched, not even a read
+	if (!n48d2_arg_ok(arg)) { out[0] = N48D2_BAD_ARG; return N48D2_BAD_ARG; }
+	if (!gDcn.dev || !__atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE)) { out[0] = N48D2_NO_DEVICE; return N48D2_NO_DEVICE; }
+	if (gDcn.seg[1] != N48D2_SEG1 || gDcn.seg[2] != N48D2_SEG2 || gDcn.seg[3] != N48D2_SEG3) { out[0] = N48D2_BASES; return N48D2_BASES; }   // 0.0.634: BASE_IDX 3 too (the DP-plane reads MPC_OUT0 / MPCC0 are absolute 0x9000 + offset)
+	const uint32_t op = n48d2_arg_op(arg), inst = n48d2_arg_inst(arg);   // 0.0.633: bits 8..15 name the instance (0 / 1 = the monitor A as before, 2 = the monitor B); n48d2_arg_ok already refused anything else (0.0.655: ops 8..13 for either instance, op 14 for the monitor B alone)
+	const uint32_t pi = d2i(inst);       // 0.0.655: the instance's plane state / record page / buffer offsets
+	// 0.0.635 (M4c): the plane's two buffers are ALLOCATED BEFORE gD2Busy (lock order: the native client lock, which the helper takes, then the display lock) and FREED only after gD2Busy is released again. Nothing is written yet.
+	// 0.0.652 (M5): a HELD plane (disp2 fbhold 2 ran: stage HELD, the pair pinned) refuses every op that could move, free or re-time it (n48d2_held_refuses; the monitor A's ops, the read-only status pages, crc and planerec are not affected) - BEFORE
+	// anything is allocated, read or written: op 8 must not even reach the allocator.
+	if (n48d2_held_refuses(op, inst) && disp2HeldInst(inst)) {      // 0.0.655: per instance - the monitor B's HELD plane never refuses the monitor A's ops and the reverse
+		out[0] = N48D2_HELD;
+		N48LOG("disp2 %s (instance %u): REFUSED, the plane is HELD for this boot (disp2 fbhold): %s", n48d2_op_name(op), inst, n48d2_status_name(N48D2_HELD));
+		return N48D2_HELD;
+	}
+	uint64_t pmc[2] = { 0u, 0u }, poff[2] = { 0u, 0u };
+	bool allocated = false, freeNow = false;
+	if (op == N48D2_OP_PLANE) {
+		if (ctx == nullptr || amdgpu::n1c_d2_alloc(*ctx, inst, n48d2_surf_get(inst)->buf_bytes, pmc, poff) != kIOReturnSuccess) { out[0] = N48D2_NO_BUFFER; return N48D2_NO_BUFFER; }
+		allocated = true;
+	}
+	if (__atomic_exchange_n(&gD2Busy, 1u, __ATOMIC_ACQ_REL) != 0u) { if (allocated) amdgpu::n1c_d2_free(inst); out[0] = N48D2_BUSY; return N48D2_BUSY; }
+	if (allocated) {
+		if (gD2Pl[pi].stage != N48D2_PL_NONE) { __atomic_store_n(&gD2Busy, 0u, __ATOMIC_RELEASE); amdgpu::n1c_d2_free(inst); out[0] = N48D2_PLANE_STATE; return N48D2_PLANE_STATE; }
+		gD2Pl[pi].stage = N48D2_PL_ALLOC; gD2Pl[pi].cur = 0u; gD2Pl[pi].odm_sticky = 0u; gD2Pl[pi].dp_bytes = 0u; gD2Pl[pi].mc[0] = pmc[0]; gD2Pl[pi].mc[1] = pmc[1]; gD2Off[pi][0] = poff[0]; gD2Off[pi][1] = poff[1];
+	}
+	D2KextEnv env;
+	env.inst = inst;
+	uint32_t st;
+	if (op == N48D2_OP_STATUS3) {         // 0.0.633: the third status page (reads only): the DIG's TMDS / FIFO / CRC registers, DIG1's two, SYMCLKB and the instance's SYMCLK
+		st = n48d2::status3(env, out, inst);
+		N48LOG("disp2 status3 (instance %u): CLOCK_PATTERN %#010x TEST_PATTERN %#010x FIFO_CTRL1 %#010x HDMI_STATUS %#010x TMDS_CNTL %#010x TMDS_CONTROL_CHAR %#010x TMDS_CTL_BITS %#010x DCBALANCER %#010x",
+		       inst, (uint32_t)out[1], (uint32_t)(out[1] >> 32), (uint32_t)out[2], (uint32_t)(out[2] >> 32), (uint32_t)out[3], (uint32_t)(out[3] >> 32), (uint32_t)out[4], (uint32_t)(out[4] >> 32));
+		N48LOG("disp2 status3 (instance %u): OUTPUT_CRC_CNTL %#010x OUTPUT_CRC_RESULT %#010x ; DIG1 FIFO_CTRL0 %#010x TMDS_CTL_BITS %#010x ; SYMCLKB %#010x SYMCLK<inst> %#010x",
+		       inst, (uint32_t)out[5], (uint32_t)(out[5] >> 32), (uint32_t)out[6], (uint32_t)(out[6] >> 32), (uint32_t)out[7], (uint32_t)(out[7] >> 32));
+	} else if (op == N48D2_OP_STATUS2) {         // 0.0.632: the second status page (reads only)
+		st = n48d2::status2(env, out, inst);
+		N48LOG("disp2 status2 (instance %u): SYMCLK<inst>_CLOCK_ENABLE %#010x ; OTG<inst>_PIXEL_RATE_CNTL %#010x ; OTG<inst>_V_TOTAL_CONTROL %#010x ; FMT CONTROL %#010x BIT_DEPTH %#010x DYN_EXP %#010x CLAMP_CNTL %#010x CLAMP R/G/B %#010x %#010x %#010x ; HUBP DCHUBP_CNTL %#010x HUBP_CLK_CNTL %#010x",
+		       inst, (uint32_t)out[1], (uint32_t)(out[1] >> 32), (uint32_t)out[2], (uint32_t)(out[2] >> 32), (uint32_t)out[3], (uint32_t)(out[3] >> 32), (uint32_t)out[4], (uint32_t)(out[4] >> 32),
+		       (uint32_t)out[5], (uint32_t)(out[5] >> 32), (uint32_t)out[6], (uint32_t)(out[6] >> 32));
+	} else if (op == N48D2_OP_STATUS) {
+		st = n48d2::status(env, out, inst);
+		if (st == N48D2_OK && (gD2Pl[pi].stage == N48D2_PL_HELD || amdgpu::n1c_d2_pinned(inst))) out[0] |= 1ull << N48D2_STAT_HELD_BIT;      // 0.0.652 (M5): `disp2 status 2` reports the HELD plane (bit 52 of out[0]); 0.0.655: of either instance
+		N48LOG("disp2 status (instance %u): OTG<inst>_CONTROL %#010x frames %u -> %u ; DPG_CONTROL %#010x ; DIG FE_CNTL %#010x FE_CLK %#010x FE_EN %#x FIFO %#010x ; BE_CNTL %#010x BE_CLK %#010x BE_EN %#x ; mapper %#x ; PHYPLL<inst> %#x ; OTG0 frames %u -> %u",
+		       inst, (uint32_t)out[1], (uint32_t)out[2], (uint32_t)(out[2] >> 32), (uint32_t)(out[5] >> 32), (uint32_t)(out[6] >> 32), (uint32_t)out[7], (uint32_t)(out[7] >> 32), (uint32_t)out[8], (uint32_t)(out[8] >> 32),
+		       (uint32_t)out[9], (uint32_t)(out[9] >> 32), (uint32_t)out[10], (uint32_t)out[11], (uint32_t)(out[11] >> 32), (uint32_t)out[12]);
+	} else if (op == N48D2_OP_PLANEREC) {         // 0.0.638: the record page of the last plane op (reads NO register); 0.0.655: of the instance
+		st = n48d2::planerec(env, out);
+		N48LOG("disp2 planerec (instance %u): valid %#x ; sample A (~1 ms after the HUBP clock enable) HUBP<inst>_HUBP_CLK_CNTL %#010x DCCG_GATE_DISABLE_CNTL6 %#010x DCCG_GATE_DISABLE_CNTL %#010x DOMAIN<inst>_PG_STATUS %#010x ; sample B (after the 2-frame wait) %#010x %#010x %#010x %#010x",
+		       inst, gD2Rec[pi][N48D2_RC_VALID], gD2Rec[pi][0], gD2Rec[pi][1], gD2Rec[pi][2], gD2Rec[pi][3], gD2Rec[pi][4], gD2Rec[pi][5], gD2Rec[pi][6], gD2Rec[pi][7]);
+	} else if ((op >= N48D2_OP_PLANE && op <= N48D2_OP_PLANEOFF) || op == N48D2_OP_FBHOLD) {         // 0.0.635 (M4c / M4d); 0.0.652: op 14 `fbhold` (the monitor B's alone, n48d2_arg_ok); 0.0.655: ops 8..12 for either instance
+		const n48d2_out o = n48d2::run_plane(env, op, n48d2_arg_buf(arg), inst);
+		n48d2_pack_plane(out, &o, gD2Gate);
+		st = o.status;
+		freeNow = o.free_bufs != 0u;
+		N48LOG("disp2 %s (instance %u): status %u (%s); steps written %u, failing step %u, wait timeouts %u, rolled back %u, buffers %s; plane stage %u (cur %u); DP changed %#x, DP-plane mask %#x%s; precheck %#x = %#010x; OTG0 frames %u -> %u, OTG2 frames %u -> %u",
+		       n48d2_op_name(op), inst, st, n48d2_status_name(st), o.done, o.fail, o.timeouts, o.auto_off, o.free_bufs ? "RELEASED to the allocator" : (gD2Pl[pi].stage == N48D2_PL_LEAKED ? "LEAKED (HUBP<inst> may still read them)" : "kept"),
+		       gD2Pl[pi].stage, gD2Pl[pi].cur, o.dp_changed, o.dpx_changed, o.dpx_changed != 0u ? " *** DP DISTURBED ***" : "", o.pre_abs, o.pre_val, o.f0a, o.f0b, o.f1a, o.f1b);
+		N48LOG("disp2 %s gates: HUBP<inst>_DCHUBP_CNTL %#010x (underflow %#x SEG_ALLOC_ERR %u TIMEOUT %#x) HUBP<inst>_HUBP_CLK_CNTL %#010x ODM<inst>_OPTC_INPUT_GLOBAL_CONTROL %#010x (bits 10/13 %#x, stale before %#x) DCN_VM_FAULT_STATUS %#010x DET<inst>_CTRL %#010x (current %u)",
+		       n48d2_op_name(op), gD2Gate[N48D2_GT_HUBP_CNTL], (gD2Gate[N48D2_GT_HUBP_CNTL] & N48D2_HUBP_UNDERFLOW_MASK) >> 28, (gD2Gate[N48D2_GT_HUBP_CNTL] & N48D2_HUBP_SEG_ALLOC_ERR_MASK) ? 1u : 0u, (gD2Gate[N48D2_GT_HUBP_CNTL] & N48D2_HUBP_TIMEOUT_MASK) >> 20,
+		       gD2Gate[N48D2_GT_HUBP_CLK], gD2Gate[N48D2_GT_ODM2], gD2Gate[N48D2_GT_ODM2] & N48D2_ODM_UNDERFLOW_MASK, gD2Pl[pi].odm_sticky, gD2Gate[N48D2_GT_VMFAULT], gD2Gate[N48D2_GT_DET2], (gD2Gate[N48D2_GT_DET2] & N48D2_DET_CUR_MASK) >> 8);
+		N48LOG("disp2 %s gates: EARLIEST_INUSE %#x:%#010x (A %#llx, B %#llx) FLIP_CONTROL %#010x (pending %u) MPCC<inst>_STATUS %#x MPC_OUT<inst>_MUX %#010x DIG<inst+1>_FIFO_CTRL0 %#010x ; CRC RG %#010x B %#010x ; dp_surface_bytes %llu",
+		       n48d2_op_name(op), gD2Gate[N48D2_GT_EARLY_HI] & 0xFFFFu, gD2Gate[N48D2_GT_EARLY_LO], (unsigned long long)gD2Pl[pi].mc[0], (unsigned long long)gD2Pl[pi].mc[1], gD2Gate[N48D2_GT_FLIP_CTL], (gD2Gate[N48D2_GT_FLIP_CTL] & N48D2_FLIP_PENDING_MASK) ? 1u : 0u,
+		       gD2Gate[N48D2_GT_MPCC_STATUS], gD2Gate[N48D2_GT_MPC_MUX], gD2Gate[N48D2_GT_FIFO], gD2Gate[N48D2_GT_CRC_RG], gD2Gate[N48D2_GT_CRC_B], (unsigned long long)gD2Pl[pi].dp_bytes);
+		N48LOG("disp2 %s recorded reads (no gate; valid %#x): after the HUBP clock enable HUBP<inst>_HUBP_CLK_CNTL %#010x DCCG_GATE_DISABLE_CNTL6 %#010x DCCG_GATE_DISABLE_CNTL %#010x DOMAIN<inst>_PG_STATUS %#010x ; after the 2-frame wait %#010x %#010x %#010x %#010x",
+		       n48d2_op_name(op), gD2Rec[pi][N48D2_RC_VALID], gD2Rec[pi][0], gD2Rec[pi][1], gD2Rec[pi][2], gD2Rec[pi][3], gD2Rec[pi][4], gD2Rec[pi][5], gD2Rec[pi][6], gD2Rec[pi][7]);
+		N48LOG("disp2 %s first timed-out WAIT %s %#06x last value %#010x ; rollback's first timed-out WAIT %s %#06x last value %#010x",
+		       n48d2_op_name(op), n48d2_wait_reg_name(gD2Rec[pi][N48D2_RC_WAIT_ABS]), gD2Rec[pi][N48D2_RC_WAIT_ABS], gD2Rec[pi][N48D2_RC_WAIT_VAL], n48d2_wait_reg_name(gD2Rec[pi][N48D2_RC_RB_ABS]), gD2Rec[pi][N48D2_RC_RB_ABS], gD2Rec[pi][N48D2_RC_RB_VAL]);
+		N48LOG("disp2 %s DP plane watch%s (mask %#x): MPC_OUT0_MUX %#010x -> %#010x ; HUBP0_DCHUBP_CNTL %#010x -> %#010x ; HUBP0 primary %#x:%#010x -> %#x:%#010x ; ODM0 %#x -> %#x ; DPP_TOP0 %#010x -> %#010x ; MPCC0_LOCK_SEL %#x -> %#x ; OTG2_GLOBAL_CONTROL2 %#010x -> %#010x",
+		       n48d2_op_name(op), o.dpx_changed != 0u ? " *** DP DISTURBED ***" : "", o.dpx_changed, gD2Dpx[0][0], gD2Dpx[1][0], gD2Dpx[0][4], gD2Dpx[1][4], gD2Dpx[0][15], gD2Dpx[0][14], gD2Dpx[1][15], gD2Dpx[1][14],
+		       gD2Dpx[0][10], gD2Dpx[1][10], gD2Dpx[0][11], gD2Dpx[1][11], gD2Dpx[0][12], gD2Dpx[1][12], gD2Dpx[0][13], gD2Dpx[1][13]);
+		if (inst == N48D2_INST_MONA) N48LOG(N48D2_W2_LINE1_FMT, N48D2_W2_LINE1_ARGS(n48d2_op_name(op), o.w2_changed != 0u ? " *** MONB DISTURBED ***" : "", o.w2_changed, gD2W2[0], gD2W2[1]));
+		if (inst == N48D2_INST_MONA) N48LOG(N48D2_W2_LINE2_FMT, N48D2_W2_LINE2_ARGS(n48d2_op_name(op), gD2W2[0], gD2W2[1]));
+	} else {
+		const n48d2_out o = n48d2::run(env, op, inst);
+		n48d2_pack(out, &o);
+		st = o.status;
+		N48LOG("disp2 %s (instance %u): status %u (%s); steps %u/%u, failing step %u, wait timeouts %u, auto-off %u, DP changed %#x; FIFO reset: %s; OTG0 frames %u -> %u, OTG<inst> frames %u -> %u",
+		       n48d2_op_name(op), inst, o.status, n48d2_status_name(o.status), o.done, o.total, o.fail, o.timeouts, o.auto_off, o.dp_changed, n48d2_symclk_report(&o), o.f0a, o.f0b, o.f1a, o.f1b);
+		N48LOG("disp2 %s (instance %u) after: SYMCLKB %#010x -> %#010x; precheck %#x = %#010x; OTG<inst>_CONTROL %#010x DIG FE_EN %#x BE_CNTL %#010x",
+		       n48d2_op_name(op), inst, o.symclkb_a, o.symclkb_b, o.pre_abs, o.pre_val, o.otg1_ctl, o.fe_en, o.be_cntl);
+		N48LOG("disp2 %s (instance %u) DP plane watch%s (changed mask %#x): MPC_OUT0_MUX %#010x -> %#010x ; MPCC0 TOP %#x -> %#x BOT %#x -> %#x OPP %#x -> %#x ; HUBP0_DCHUBP_CNTL %#010x -> %#010x (underflow %#x -> %#x)",
+		       n48d2_op_name(op), inst, o.dpx_changed != 0u ? " *** DP DISTURBED ***" : "", o.dpx_changed, gD2Dpx[0][0], gD2Dpx[1][0], gD2Dpx[0][1], gD2Dpx[1][1], gD2Dpx[0][2], gD2Dpx[1][2],
+		       gD2Dpx[0][3], gD2Dpx[1][3], gD2Dpx[0][4], gD2Dpx[1][4], (gD2Dpx[0][4] & N48D2_HUBP_UNDERFLOW_MASK) >> 28, (gD2Dpx[1][4] & N48D2_HUBP_UNDERFLOW_MASK) >> 28);
+		N48LOG("disp2 %s (instance %u) DP plane watch: DPPCLK0_DTO_PARAM %#010x -> %#010x ; DPPCLK_CTRL bit0 %#x -> %#x ; DET0_CTRL %#010x -> %#010x ; COMPBUF_CTRL %#010x -> %#010x",
+		       n48d2_op_name(op), inst, gD2Dpx[0][5], gD2Dpx[1][5], gD2Dpx[0][6], gD2Dpx[1][6], gD2Dpx[0][7], gD2Dpx[1][7], gD2Dpx[0][8], gD2Dpx[1][8]);
+		N48LOG("disp2 %s (instance %u) DP plane watch (15 rows): HUBP0_DCHUBP_CNTL strict %#010x -> %#010x ; ODM0 underflow %#x -> %#x ; DPP_TOP0 %#010x -> %#010x ; MPCC0_LOCK_SEL %#x -> %#x ; OTG2_GLOBAL_CONTROL2 %#010x -> %#010x ; HUBP0 primary %#x:%#010x -> %#x:%#010x",
+		       n48d2_op_name(op), inst, gD2Dpx[0][9], gD2Dpx[1][9], gD2Dpx[0][10], gD2Dpx[1][10], gD2Dpx[0][11], gD2Dpx[1][11], gD2Dpx[0][12], gD2Dpx[1][12], gD2Dpx[0][13], gD2Dpx[1][13], gD2Dpx[0][15], gD2Dpx[0][14], gD2Dpx[1][15], gD2Dpx[1][14]);
+		if (inst == N48D2_INST_MONA) N48LOG(N48D2_W2_LINE1_FMT, N48D2_W2_LINE1_ARGS(n48d2_op_name(op), o.w2_changed != 0u ? " *** MONB DISTURBED ***" : "", o.w2_changed, gD2W2[0], gD2W2[1]));
+		if (inst == N48D2_INST_MONA) N48LOG(N48D2_W2_LINE2_FMT, N48D2_W2_LINE2_ARGS(n48d2_op_name(op), gD2W2[0], gD2W2[1]));
+	}
+	if ((op == N48D2_OP_STATUS || op == N48D2_OP_CRC) && (inst == N48D2_INST_MONB || inst == N48D2_INST_MONA)) {      // 0.0.661 (M6 Stage 1b, contract item 11) + 0.0.662 (Stage 2, item 7): GPU-held is reported as such, never as a latch failure
+		const uint32_t gh = scanXGpuHeld(inst);
+		if (gh != 0u) N48LOG("disp2 %s (instance %u): GPU-HELD (this instance's scanout is acquired): %s - EARLIEST_INUSE differing from A is NOT a latch failure", n48d2_op_name(op), inst, gh <= 3u ? "the hardware fetches a client slot" : "EARLIEST_INUSE is not a registered slot (A, B or unknown)");
+	}
+	__atomic_store_n(&gD2Busy, 0u, __ATOMIC_RELEASE);
+	if (freeNow && amdgpu::n1c_d2_pinned(inst)) {      // 0.0.652 (M5): defensive - a pinned pair is never freed and its stage never reset (no op that frees can run on a HELD plane: the refusal above)
+		N48LOG("disp2: free requested while instance %u's pair is pinned: IGNORED (stage %u kept)", inst, gD2Pl[pi].stage);
+	} else if (freeNow) {      // 0.0.635: AFTER gD2Busy is released: the stage first (so no plane op can start on buffers about to be freed), then the allocator, under the native client lock
+		gD2Pl[pi].stage = N48D2_PL_NONE; gD2Pl[pi].mc[0] = 0u; gD2Pl[pi].mc[1] = 0u; gD2Off[pi][0] = 0u; gD2Off[pi][1] = 0u;
+		amdgpu::n1c_d2_free(inst);
+	}
+	return st;
+}
+
+}  // namespace n48dcn
+
+// =====================================================================================================================================================================================================
+// build 0.0.661 (M6 Stage 1b, ABI 1.11; an internal design note "Q2: Stage 1b build contract") + 0.0.662 (M6 Stage 2, ABI 1.12; "Stage 2 build contract (monitor A, instance 1)"): the HDMI displays' scanout - INSTANCE 2 = the
+// monitor B (HUBP2 / OTG2) and INSTANCE 1 = the monitor A (HUBP1 / OTG1), poll-only. THE SEQUENCES ARE dcn/navi48_scanx_flow.h (one XDesc per instance); this block is the environment (register read / write, clock, lock, thread) and the entry points.
+// Each instance writes exactly two registers, ITS OWN HUBPREQn_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH then ..._ADDRESS (instance 2: 0x3c83 / 0x3c82; instance 1: 0x3ba7 / 0x3ba6), and only through n48scanx::write_addr (which judges the whole
+// 64-bit address); the DCN write allowlist is asked again here. Behind navi48-m6=1 AND navi48-m6flip=1 (instance 2) and additionally navi48-m6flip1=1 (instance 1), all read ONCE: with a latch OFF nothing here touches a register,
+// a lock or memory for that instance (the wrappers return before the environment is built).
+// LOCK ORDER: the native client lock -> gScan.lock -> gSXLock[i]; each gSXLock[i] is a LEAF (nothing else is locked under it; no sleep under it) and NO CODE EVER HOLDS TWO OF THEM: the other display's ranges are snapshotted before this one's lock
+// is taken (sx_excl_snapshot). Instance 0's Register may ask scanXClash under gScan.lock; no flow of an HDMI instance ever takes gScan.lock.
+// =====================================================================================================================================================================================================
+namespace n48dcn {
+
+namespace {
+IOLock *sx_lock(uint32_t inst) {
+	if (inst != 1u && inst != 2u) return nullptr;
+	if (gSXLock[inst] == nullptr) {
+		IOLock *l = IOLockAlloc();
+		if (l != nullptr && !OSCompareAndSwapPtr(nullptr, l, (void *volatile *)&gSXLock[inst])) IOLockFree(l);
+	}
+	return gSXLock[inst];
+}
+// the latches of an instance: 2 needs navi48-m6 + navi48-m6flip (0.0.661), 1 additionally navi48-m6flip1 (0.0.662); any other number has none
+static inline bool sx_latched() { return n48m6_latched_on() && n48m6flip_latched_on(); }
+static inline bool sx_latched_inst(uint32_t inst) { return inst == 2u ? sx_latched() : inst == 1u ? (sx_latched() && n48m6flip1_latched_on()) : false; }
+void sx_watchdog(void *arg, wait_result_t);
+struct SXEnv {
+	const n48scanx::XDesc &d;
+	explicit SXEnv(const n48scanx::XDesc &dd) : d(dd) {}
+	uint32_t gate() {
+		if (!sx_latched_inst(d.inst)) return n48scan::kUnsupported;
+		if (!gDcn.dev || !__atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE)) return n48scan::kNotReady;
+		if (amdgpu::native_s1b_state().gate != n48native::kGateOn) return n48scan::kNotReady;      // native boots only
+		if (amdgpu::n1c_hung()) return n48scan::kNotReady;
+		if (__atomic_load_n(&gMt.busy, __ATOMIC_SEQ_CST) != 0u) return n48scan::kBusy;             // a mode trial / hold is running
+		if (sx_lock(d.inst) == nullptr) return n48scan::kNoResources;
+		return 0u;
+	}
+	uint32_t rd(uint32_t abs) { return (abs >= gDcn.d.mmio_dwords) ? 0xFFFFFFFFu : gDcn.d.rreg(gDcn.d.cookie, abs); }
+	bool wr(uint32_t abs, uint32_t v) {        // THE register write of this instance: only ITS two address registers, and the DCN allowlist again
+		if (!n48scanx::write_reg_ok(d, abs)) { N48LOG("scanx: write of %#06x REFUSED (instance %u): not this HUBP's primary address HIGH / LOW", abs, d.inst); return false; }
+		if (!dcn41_allow_write(&gDcn.allow, abs, v, "scanx")) { N48LOG("scanx: the DCN allowlist REFUSED write %#010x = %#010x (instance %u)", abs, v, d.inst); return false; }
+		amdgpu::WREG32(*gDcn.dev, abs, v);
+		return true;
+	}
+	uint64_t now_ns() { return ::now_ns(); }
+	void sleep_ms(uint32_t ms) { IOSleep(ms); }   // never called with this instance's lock held (the flows drop it first)
+	void lock() { IOLockLock(gSXLock[d.inst]); }
+	void unlock() { IOLockUnlock(gSXLock[d.inst]); }
+	uint32_t d2_stage() { return __atomic_load_n(&gD2Pl[d.d2idx].stage, __ATOMIC_ACQUIRE); }
+	uint32_t d2_cur() { return gD2Pl[d.d2idx].cur; }
+	uint64_t d2_mc(uint32_t i) { return gD2Pl[d.d2idx].mc[i & 1u]; }
+	void d2_set_cur_a() { gD2Pl[d.d2idx].cur = 0u; }
+	bool window(uint64_t *lo, uint64_t *hi) { *lo = gDcn.d.scanout_lo; *hi = gDcn.d.scanout_hi; return *hi != 0u; }   // the flip layer's window, unknown when hi is 0
+	bool start_watchdog(uint32_t gen) {
+		thread_t th = nullptr;
+		__atomic_fetch_add(&gSX[d.inst].watchdogAlive, 1u, __ATOMIC_ACQ_REL);
+		const kern_return_t kr = kernel_thread_start(&sx_watchdog, (void *)(((uintptr_t)d.inst << 32) | (uintptr_t)gen), &th);     // the thread's argument carries the INSTANCE as well as the generation
+		if (kr != KERN_SUCCESS) { __atomic_fetch_sub(&gSX[d.inst].watchdogAlive, 1u, __ATOMIC_ACQ_REL); N48LOG("scanx: Acquire(%s) refused: the watchdog thread did not start (kr %#x)", d.name, kr); return false; }
+		thread_deallocate(th);
+		return true;
+	}
+	void note(const char *f) { ::amdgpu::n48_logf("%s", f); }
+	template <class T, class... A> void note(const char *f, T t, A... a) { ::amdgpu::n48_logf(f, t, a...); }
+};
+void sx_watchdog(void *arg, wait_result_t) {
+	const uint32_t inst = (uint32_t)((uintptr_t)arg >> 32);
+	const n48scanx::XDesc *d = n48scanx::desc_of(inst);
+	if (d == nullptr) return;                                    // cannot happen: the thread is only started by SXEnv::start_watchdog with a valid instance
+	SXEnv env(*d);
+	n48scanx::watchdog_run(env, *d, gSX[inst], (uint32_t)((uintptr_t)arg & 0xFFFFFFFFu));
+	__atomic_fetch_sub(&gSX[inst].watchdogAlive, 1u, __ATOMIC_RELEASE);   // the thread touches nothing of ours after this
+}
+// disp2's per-buffer allocation size of an HDMI instance (the pair's exclusion size): the descriptor's constant is checked against it by the host test
+static inline uint64_t sx_pair_bytes(uint32_t inst) { const n48d2_surf *sf = n48d2_surf_get(inst); return sf != nullptr ? sf->buf_bytes : 0ull; }
+// The ranges instance `inst`'s Register must not overlap: the DP console and its slots (gScan, under its lock, released before this instance's lock is taken), the OTHER HDMI display's pair (disp2's plane buffers, ALLOCATION size) and
+// its registered slots (read under THAT instance's leaf lock, taken and released here: never together with this instance's lock - the caller takes its own only afterwards, under the native client lock).
+void sx_excl_snapshot(uint32_t inst, n48scanx::Excl *ex) {
+	ex->n = 0u;
+	auto add = [&](uint64_t lo, uint64_t bytes) { if (lo != 0ull && bytes != 0ull && ex->n < n48scanx::kMaxExcl) { ex->lo[ex->n] = lo; ex->bytes[ex->n] = bytes; ex->n++; } };
+	IOLock *l = scan_lock();
+	if (l != nullptr) {
+		IOLockLock(l);
+		if (gScan.haveConsole) add(gScan.consoleMc, gScan.consoleBytes);
+		else {
+			uint64_t cur = 0;
+			if (gDcn.armed && dcn41_hubp_read_primary_addr(&gDcn.d, 0u, &cur) == DCN41_OK) { ScanGeom g {}; scan_read_geom(&g); add(cur, (uint64_t)g.pitchPx * 4ull * g.h); }
+		}
+		for (uint32_t i = 0; i < n48scan::kMaxSlots; i++) if (gScan.tbl.s[i].used) add(gScan.tbl.s[i].mc, gScan.tbl.s[i].bytes);
+		IOLockUnlock(l);
+	}
+	const uint32_t other = inst == 2u ? 1u : 2u;                     // the other HDMI display (instance 1's other is the monitor B, instance 2's is the monitor A)
+	const n48scanx::XDesc *od = n48scanx::desc_of(other);
+	if (od != nullptr && __atomic_load_n(&gD2Pl[od->d2idx].stage, __ATOMIC_ACQUIRE) != N48D2_PL_NONE) { add(gD2Pl[od->d2idx].mc[0], sx_pair_bytes(other)); add(gD2Pl[od->d2idx].mc[1], sx_pair_bytes(other)); }
+	IOLock *ol = gSXLock[other];                                     // 0.0.662: and the other display's registered scanout slots (nothing when it never acquired: no lock yet)
+	if (ol != nullptr) {
+		IOLockLock(ol);
+		for (uint32_t i = 0; i < n48scan::kMaxSlots; i++) if (gSX[other].tbl.s[i].used) add(gSX[other].tbl.s[i].mc, gSX[other].tbl.s[i].bytes);
+		IOLockUnlock(ol);
+	}
+}
+}  // namespace
+
+uint32_t scanXGeneration(uint32_t inst) { return (inst == 1u || inst == 2u) ? gSX[inst].gen : 0u; }
+uint32_t scanXGpuHeld(uint32_t inst) {
+	const n48scanx::XDesc *d = n48scanx::desc_of(inst);
+	if (d == nullptr || !sx_latched_inst(inst) || gSXLock[inst] == nullptr) return 0u;
+	IOLockLock(gSXLock[inst]);
+	uint32_t code = 0u;
+	if (gSX[inst].acquired) { SXEnv env(*d); uint64_t p = 0, e = 0; bool pend = false; (void)n48scanx::read_plane(env, *d, &p, &e, &pend); code = n48scanx::gpu_held_code(true, gSX[inst].tbl, e); }
+	IOLockUnlock(gSXLock[inst]);
+	return code;
+}
+
+// out: [0] A [1] extended OTG frame count [2] the M6 table generation [3] 0 (the native client fills the free visible-VRAM figure) [4] the instance's geometry: w | h << 16 | pitchPx << 32 (the bundle cross-checks it against its own constants)
+uint32_t scanXAcquire(uint32_t inst, uint64_t out[5]) {
+	const n48scanx::XDesc *d = n48scanx::desc_of(inst);
+	if (d == nullptr || d->inst != inst) return n48scan::kBadArg;
+	if (!sx_latched_inst(inst)) return n48scan::kUnsupported;
+	SXEnv env(*d);
+	uint64_t o[2] = { 0, 0 };
+	const uint32_t rc = n48scanx::acquire(env, *d, gSX[inst], o);
+	if (rc == n48scan::kOk) { out[0] = o[0]; out[1] = o[1]; out[2] = (uint64_t)n48disp_m6_gen(); out[3] = 0ull; out[4] = (uint64_t)d->w | ((uint64_t)d->h << 16) | ((uint64_t)d->pitchPx << 32); }
+	return rc;
+}
+uint32_t scanXRegister(uint32_t inst, bool boVis, uint64_t boMc, uint64_t boSize, uint64_t offset, uint32_t pitchBytes, uint32_t width, uint32_t height, uint32_t format, uint64_t out[2]) {
+	const n48scanx::XDesc *d = n48scanx::desc_of(inst);
+	if (d == nullptr || d->inst != inst) return n48scan::kBadArg;
+	if (!sx_latched_inst(inst)) return n48scan::kUnsupported;
+	SXEnv env(*d);
+	n48scanx::Excl ex;
+	sx_excl_snapshot(inst, &ex);
+	const n48scanx::RegIn in { boVis, boMc, boSize, offset, pitchBytes, width, height, format };
+	return n48scanx::register_slot(env, *d, gSX[inst], in, ex, out);
+}
+uint32_t scanXPresent(uint32_t inst, uint64_t slotId, uint64_t flags, uint64_t out[3]) {
+	const n48scanx::XDesc *d = n48scanx::desc_of(inst);
+	if (d == nullptr || d->inst != inst) return n48scan::kBadArg;
+	if (!sx_latched_inst(inst)) return n48scan::kUnsupported;
+	SXEnv env(*d);
+	return n48scanx::present(env, *d, gSX[inst], slotId, flags, out);
+}
+uint32_t scanXStatus(uint32_t inst, struct n48n_scan_status *o, uint64_t out[4]) {
+	const n48scanx::XDesc *d = n48scanx::desc_of(inst);
+	if (d == nullptr || d->inst != inst) return n48scan::kBadArg;
+	if (!sx_latched_inst(inst)) return n48scan::kUnsupported;
+	SXEnv env(*d);
+	n48scanx::StatusOut st;
+	if (n48m6_latched_on() && n48m6flip_latched_on()) n48disp_m6_flush();   // 0.0.661 (R5): the keep-alive flushes a deferred table publish
+	const uint32_t rc = n48scanx::status(env, *d, gSX[inst], &st);
+	if (rc != n48scan::kOk) return rc;
+	bzero(o, sizeof(*o));
+	o->acquired = st.acquired; o->flags = st.flags; o->front_slot = st.frontSlot; o->pending_slot = st.pendingSlot;
+	o->frame_count = st.frameCount; o->console_mc = st.consoleMc; o->plane_mc = st.planeMc; o->earliest_mc = st.earliestMc;
+	o->presents = st.presents; o->latched = st.latched; o->replaced = st.replaced; o->repeats = st.repeats;
+	o->vupdates = 0; o->latch_irq = 0; o->latch_poll = st.latchPoll; o->refused = st.refused;          // the HDMI instances are poll-only: no VUPDATE source, no IRQ latches
+	o->first_latch_ns = st.firstLatchNs; o->last_latch_ns = st.lastLatchNs;
+	o->idle_ms = st.idleMs; o->watchdog_restores = st.wdRestores; o->storm_trips = 0; o->geom_refused = st.geomRefused;
+	for (uint32_t i = 0; i < n48scan::kMaxSlots; i++) {
+		n48n_scan_slot &sl = o->slot[i];
+		sl.mc = st.slot[i].mc; sl.latched_frame = st.slot[i].latchedFrame; sl.used = st.slot[i].used; sl.flags = st.slot[i].flags; sl.presents = st.slot[i].presents; sl.latches = st.slot[i].latches;
+	}
+	out[0] = (uint64_t)n48disp_m6_gen(); out[1] = st.reuseInuseRefused; out[2] = st.restores | (st.restoreFailures << 32); out[3] = st.writeRefused | (st.writeFailed << 32);
+	return n48scan::kOk;
+}
+uint32_t scanXRelease(uint32_t inst, const char *why, uint64_t out[2]) {
+	const n48scanx::XDesc *d = n48scanx::desc_of(inst);
+	if (d == nullptr || !sx_latched_inst(inst) || gSXLock[inst] == nullptr) { if (out) { out[0] = 1; out[1] = 0; } return 0u; }       // nothing was ever acquired (a latch is OFF, or no Acquire ran): no register, no lock
+	SXEnv env(*d);
+	return n48scanx::restore(env, *d, gSX[inst], why, 0u, out);
+}
+uint32_t scanXBoGone(uint32_t inst, uint32_t pinMask, uint32_t pinGen, bool alwaysFull, uint64_t *out) {
+	const n48scanx::XDesc *d = n48scanx::desc_of(inst);
+	if (d == nullptr || !sx_latched_inst(inst) || gSXLock[inst] == nullptr) return 0u;
+	SXEnv env(*d);
+	return n48scanx::bo_gone(env, *d, gSX[inst], pinMask, pinGen, alwaysFull, out);
+}
+// instance 0's Register asks this under gScan.lock (latches m6 + m6flip ON): does [mc, mc + bytes) overlap an HDMI display's A, B or a registered slot? One display's lock at a time, never together.
+bool scanXClash(uint64_t mc, uint64_t bytes) {
+	if (!sx_latched() || bytes == 0ull) return false;
+	bool clash = false;
+	for (uint32_t inst = 1u; inst <= 2u; inst++) {
+		const n48scanx::XDesc *d = n48scanx::desc_of(inst);
+		if (d == nullptr || !sx_latched_inst(inst)) continue;        // instance 1 only with navi48-m6flip1: with it OFF this is 0.0.661's check exactly
+		if (__atomic_load_n(&gD2Pl[d->d2idx].stage, __ATOMIC_ACQUIRE) != N48D2_PL_NONE) {
+			const uint64_t sb = sx_pair_bytes(inst);
+			for (uint32_t i = 0; i < 2u; i++) if (gD2Pl[d->d2idx].mc[i] != 0ull && n48scan::ranges_overlap(mc, bytes, gD2Pl[d->d2idx].mc[i], sb)) clash = true;
+		}
+		IOLock *l = gSXLock[inst];
+		if (l != nullptr) {
+			IOLockLock(l);
+			for (uint32_t i = 0; i < n48scan::kMaxSlots; i++) if (gSX[inst].tbl.s[i].used && n48scan::ranges_overlap(mc, bytes, gSX[inst].tbl.s[i].mc, gSX[inst].tbl.s[i].bytes)) clash = true;
+			IOLockUnlock(l);
+		}
+	}
+	return clash;
+}
+void scanXShutdown() {
+	for (uint32_t inst = 1u; inst <= 2u; inst++) {
+		if (gSXLock[inst] == nullptr) continue;
+		uint64_t r[2] = { 1, 0 };
+		(void)scanXRelease(inst, "kext stop", r);
+		for (uint32_t i = 0; i < 2000u && __atomic_load_n(&gSX[inst].watchdogAlive, __ATOMIC_ACQUIRE) != 0u; i++) /*nolock*/ IOSleep(1);
+		if (__atomic_load_n(&gSX[inst].watchdogAlive, __ATOMIC_ACQUIRE) != 0u) N48LOG("scanx: kext stop: the instance-%u watchdog thread is still alive after 2 s", inst);
+	}
+}
+
+// accel `m6xstat [page]` (action 107): READ-ONLY. The argument is page | instance << 8 (instance 0 = the default, 2 = the monitor B; 1 = the monitor A). Page 0 the state and counters, page 1 the slots, the refusal counters and the writer's record, page 2 the live
+// HUBPn / OTGn registers (the run kit's per-minute health read: underflow, ODMn bit 10, the VM fault, FLIP_PENDING, EARLIESTn). With a latch OFF only v[0] bits 0..1 / 11 (the latch words) are filled and NOTHING is read.
+// v[0] bit 11: navi48-m6flip1 latched, bits 12..13: the instance reported.
+uint32_t scanXReport(uint64_t arg, uint64_t *v, unsigned n) {
+	if (!v || n < 13u) return n48scan::kBadArg;
+	for (unsigned i = 0; i < 13u; i++) v[i] = 0ull;
+	const uint64_t page = arg & 0xFFull;
+	uint32_t inst = (uint32_t)((arg >> 8) & 0xFFull);
+	if (inst == 0u) inst = 2u;
+	const n48scanx::XDesc *d = n48scanx::desc_of(inst);
+	const bool l1 = n48m6_latched_on(), l2 = n48m6flip_latched_on(), l3 = n48m6flip1_latched_on();
+	v[0] = (l1 ? 1ull : 0ull) | (l2 ? 2ull : 0ull) | (l3 ? (1ull << 11) : 0ull) | ((uint64_t)(inst & 3u) << 12);
+	if (d == nullptr || (arg >> 16) != 0ull || page > 2ull) return n48scan::kBadArg;
+	if (!l1 || !l2 || (inst == 1u && !l3)) return n48scan::kOk;
+	SXEnv env(*d);
+	if (page == 2ull) {
+		if (!gDcn.dev || !__atomic_load_n(&gDcn.armed, __ATOMIC_ACQUIRE)) return n48scan::kNotReady;
+		v[0] |= 4ull;
+		v[1] = (uint64_t)env.rd(d->regHubpCntl) | ((uint64_t)env.rd(d->regVmFault) << 32);
+		v[2] = (uint64_t)env.rd(d->regOdmGlobal) | ((uint64_t)env.rd(d->regOtgFrame) << 32);
+		v[3] = (uint64_t)env.rd(d->regFlipControl) | ((uint64_t)env.rd(d->regViewDim) << 32);
+		v[4] = (uint64_t)env.rd(d->regAddr) | ((uint64_t)env.rd(d->regAddrHigh) << 32);
+		v[5] = (uint64_t)env.rd(d->regEarlyLo) | ((uint64_t)env.rd(d->regEarlyHi) << 32);
+		v[6] = (uint64_t)env.rd(d->regPitch) | ((uint64_t)env.rd(d->regSurfConfig) << 32);
+		v[7] = (uint64_t)env.rd(d->regSurfControl) | ((uint64_t)env.rd(d->regVmid) << 32);
+		v[8] = (uint64_t)env.rd(d->regOtgControl);
+		v[9] = (uint64_t)gD2Pl[d->d2idx].stage | ((uint64_t)gD2Pl[d->d2idx].cur << 8) | ((uint64_t)(amdgpu::n1c_d2_pinned(inst) ? 1u : 0u) << 16);
+		v[10] = gD2Pl[d->d2idx].mc[0]; v[11] = gD2Pl[d->d2idx].mc[1];
+		return n48scan::kOk;
+	}
+	if (gSXLock[inst] == nullptr) return n48scan::kOk;     // nothing was ever acquired
+	IOLockLock(gSXLock[inst]);
+	const n48scanx::ScanX &x = gSX[inst];
+	if (page == 0ull) {
+		v[0] |= (x.acquired ? 4ull : 0ull) | (x.restoring ? 8ull : 0ull) | (x.wantRestore ? 16ull : 0ull) | (x.restoreFailed ? 32ull : 0ull) | (x.haveConsole ? 64ull : 0ull);
+		if (x.acquired) { uint64_t pp = 0, ee = 0; bool pd = false; (void)n48scanx::read_plane(env, *d, &pp, &ee, &pd); v[0] |= (uint64_t)n48scanx::gpu_held_code(true, x.tbl, ee) << 8; }      // bits 8..10: GPU-held code (0 not, 1..3 slot k+1 is fetched, 4 not a slot)
+		v[1] = (uint64_t)x.gen | (x.acquires << 32);
+		v[2] = x.bufA; v[3] = x.bufB;
+		v[4] = x.tbl.presents | (x.tbl.latched << 32);
+		v[5] = x.tbl.replaced | (x.refused << 32);
+		v[6] = x.latchPoll | (x.reuseInuseRefused << 32);
+		v[7] = x.wdRestores | (x.restores << 32);
+		v[8] = x.restoreFailures | (x.acquireRefused << 32);
+		v[9] = (uint64_t)x.lastAcquireWhy | ((uint64_t)n48disp_m6_gen() << 32);
+		v[10] = x.lastActivityNs ? (::now_ns() - x.lastActivityNs) / 1000000ull : 0ull;
+		v[11] = x.lastRestoreUs; v[12] = x.lastWritten;
+	} else {
+		for (uint32_t i = 0; i < n48scan::kMaxSlots; i++) { v[1 + i] = x.tbl.s[i].used ? x.tbl.s[i].mc : 0ull; v[4 + i] = (uint64_t)x.tbl.s[i].presents | ((uint64_t)x.tbl.s[i].latches << 32); }
+		v[7] = x.writeRefused | (x.writeFailed << 32);
+		v[8] = x.untaggedRefused | (x.geomRefused << 32);
+		v[9] = x.firstLatchNs; v[10] = x.lastLatchNs;
+		v[11] = (uint64_t)(x.tbl.front == n48scan::kNoSlot ? 0xFFFFFFFFu : n48scanx::id_of(*d, x.tbl.front)) | ((uint64_t)(x.tbl.pendActive ? n48scanx::id_of(*d, x.tbl.pendSlot) : 0xFFFFFFFFu) << 32);
+		v[12] = x.lastWritten;
+	}
+	IOLockUnlock(gSXLock[inst]);
+	return n48scan::kOk;
 }
 
 }  // namespace n48dcn

@@ -1,0 +1,5 @@
+#!/bin/bash
+case "${1:-}" in
+  publish) touch "$SIM_DIR/kv/nub"; echo "publish: 0 (Success)" ;;
+  status) if [ -f "$SIM_DIR/kv/nub" ]; then echo "Navi48MetalNub published"; else echo "NO Navi48MetalNub"; fi ;;
+esac

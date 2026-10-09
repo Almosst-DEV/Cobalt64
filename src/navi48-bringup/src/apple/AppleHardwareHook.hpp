@@ -531,7 +531,7 @@ uint32_t hw_hook_vm_root_dump(uint64_t arg, uint64_t *out, unsigned count);
 uint32_t hw_hook_ring_map(uint64_t arg, uint64_t *out, unsigned count);
 
 // Action 54 (`vmctx`, 0.0.247): MILESTONE 3 step 4, the OBSERVE BOOT that
-// notes/M3-ROOT-WRITE-REVIEW.md.1 requires before increment (iii)'s single
+// notes/an internal review note.1 requires before increment (iii)'s single
 // 8-byte root PDE write. *** READ-ONLY: neither this verb nor the VMM slot-40/41
 // hooks it reports on write anything - not Apple's page tables, not Apple's
 // objects, not a register, not VRAM. *** Run it WHILE A METAL CLIENT IS ALIVE.
@@ -614,7 +614,7 @@ uint32_t hw_resprov_note_copy(n48_rp_copy *c, int32_t pid, uint64_t *ctxOut, uin
 // 256B_D@8bpp) through n48_rp_retile_kind/n48_rp_shape_check_kind, in addition to the always-on 32bpp 4KB_D_X path.
 // Acts only while hw_resprov_on() is also true, exactly like every other resprov behaviour.
 bool hw_resprov_kinds_on();
-// build 0.0.486, switch 59 (DEFAULT OFF; notes/design/STATIC-RETILE.md): the backing-sourced copy of a texture whose
+// build 0.0.486, switch 59 (DEFAULT OFF; an internal design note): the backing-sourced copy of a texture whose
 // system-memory backing is LINEAR (ws_resprov.h section 6). hw_resprov_lin_on: hw_resprov_on() AND switch 59.
 // hw_resprov_lin_note: one copy-side event (ws_resprov.h N48_RP_LINEV_*), counted for switch 59's report line.
 bool hw_resprov_lin_on();
@@ -666,7 +666,7 @@ bool hw_hg_on();
 // takes the copy's patch count (whatever `clean` says) and that sequence, and prunes (n48_hg_reg_prune) before it completes.
 // build 0.0.511 (MEDIUM-1 of the 0.0.510 review): `mayWait` = gfx_heapgen.h n48_hg_copy_may_wait (the copy is
 // fully patched); switch 72's wait is taken only then - any other copy bumps at once, as 0.0.509 did.
-// build 0.0.533 (switch 88, notes/design/HG88.md): `id` is the copy's identity (the resource, its GPU VA and length, the
+// build 0.0.533 (switch 88, an internal design note): `id` is the copy's identity (the resource, its GPU VA and length, the
 // copying pid); hw_hg_copy_begin records the copy under gHgLock in the bump's own section and returns the record's token in
 // `id->tok` (null `id`: the untracked copy, an UNKNOWN range); hw_hg_copy_end closes that record by `tok88`.
 uint32_t hw_hg_copy_begin(uint64_t vramLo, uint64_t vramHi, const n48_hg_patch *p, uint32_t np, uint32_t npoison, uint64_t *regSeqOut,
@@ -678,7 +678,7 @@ void hw_hg_note_substituted(uint64_t vram, uint32_t nb);
 // build 0.0.509 item 2 (F-2): a fast-copy chunk of a copy that bumped (switch 63) whose fence did not land: its range is
 // poisoned for the rest of the boot (gfx_heapgen.h n48_hg_poison_add_sticky; no clean copy clears it). Leaf lock only.
 void hw_hg_poison_sticky(const n48_hg_poison *e);
-// build 0.0.527 (notes/design/SKIP82.md; gfx_sk82.h), switch 82's reads of this file's state, READ-ONLY: the arm level
+// build 0.0.527 (an internal design note; gfx_sk82.h), switch 82's reads of this file's state, READ-ONLY: the arm level
 // (gXdArm), the ring neuter (gGfxNeuter), whether a committed frame is still PENDING/COMMITTED in the flight ring (gKsRing), and
 // WindowServer's binding (gen << 32 | the bound context's seq, 0 when not bound). None takes a lock.
 uint32_t hw_sk82_arm_level();

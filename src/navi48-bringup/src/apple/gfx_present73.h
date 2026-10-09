@@ -53,7 +53,7 @@
 enum { N48_P73_ST_UNKNOWN = 0u, N48_P73_ST_PENDING = 1u, N48_P73_ST_COMMITTED = 2u, N48_P73_ST_REFUSED = 3u,
        N48_P73_ST_WITHDRAWN = 4u, N48_P73_STATES = 5u };
 /* build 0.0.521 Part E: N48_P73_HOLD_OLDER - the plane's COMMITTED P is not NEWER than the P last delivered to the glass. */
-/* build 0.0.525 (switch 80, notes/design/CYCLE80.md C6): N48_P73_HOLD_INCOMPLETE - APPENDED at index 5: the plane's COMMITTED
+/* build 0.0.525 (switch 80, an internal design note C6): N48_P73_HOLD_INCOMPLETE - APPENDED at index 5: the plane's COMMITTED
  * P is not a COMPLETE cycle under switch 80 (gfx_cycle80.h). Only switch 80 ON produces it; OFF and SHADOW never do. */
 enum { N48_P73_HOLD_REFUSED = 0u, N48_P73_HOLD_WITHDRAWN = 1u, N48_P73_HOLD_UNKNOWN = 2u, N48_P73_HOLD_NOMATCH = 3u,
        N48_P73_HOLD_OLDER = 4u, N48_P73_HOLD_INCOMPLETE = 5u, N48_P73_HOLDS = 6u };
@@ -306,7 +306,7 @@ static inline uint32_t n48_p73_retired(n48_p73 *t, uint32_t seq)
     t->retireNoSlot++;
     return 0u;
 }
-/* build 0.0.525 (switch 80, notes/design/CYCLE80.md C6) - IS THIS COMMITTED P AN INCOMPLETE CYCLE? Asked by the present for a
+/* build 0.0.525 (switch 80, an internal design note C6) - IS THIS COMMITTED P AN INCOMPLETE CYCLE? Asked by the present for a
  * COMMITTED slot, BEFORE Part E's newer-than check and before anything of Part E is set. ONE load of c80on: OFF (the default)
  * answers 0 and touches nothing else. ON or SHADOW: the P is INCOMPLETE unless switch 80 judged THIS P (c80seq == the slot's
  * seq) COMPLETE. ON answers 1 (hold, reason INCOMPLETE); SHADOW counts "would hold" and answers 0 (the present proceeds exactly

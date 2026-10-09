@@ -1,0 +1,248 @@
+From 97aaa5af867194873fd04273b9fc79614c9b73f5 Mon Sep 17 00:00:00 2001
+From: Navi48-MacOS contributors <noreply@example.invalid>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH 6/9] radv/darwin: report the kext's per-session VRAM budget
+ (ABI 1.10) as the app's VRAM heap
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/darwin/navi48_native_abi.h           | 19 ++++-
+ src/amd/common/darwin/ac_darwin_budget.h     | 66 +++++++++++++++++
+ src/amd/common/darwin/ac_darwin_drm.c        |  5 +-
+ src/amd/common/darwin/test/acd_budget_test.c | 74 ++++++++++++++++++++
+ 4 files changed, 160 insertions(+), 4 deletions(-)
+ create mode 100644 src/amd/common/darwin/ac_darwin_budget.h
+ create mode 100644 src/amd/common/darwin/test/acd_budget_test.c
+
+diff --git a/include/darwin/navi48_native_abi.h b/include/darwin/navi48_native_abi.h
+index d7008417185..58ce3739e20 100644
+--- a/include/darwin/navi48_native_abi.h
++++ b/include/darwin/navi48_native_abi.h
+@@ -26,7 +26,7 @@
+ 
+ #define N48N_UC_TYPE       0x4E34384Eu      /* 'N48N' */
+ #define N48N_ABI_VERSION   1u            /* the MAJOR: unchanged, so every v1.0 client (Mesa, n48native, s1d-replay) still handshakes */
+-#define N48N_ABI_MINOR     9u            /* 1.9 (kext 0.0.612): selector 21 N48N_SEL_BO_IMPORT_HOST (milestone #11 step 11c: import a page-aligned range of the CALLER's address space as a SYSTEM-memory BO; limits 64 MiB per BO, 256 MiB per client), the class of the N48N user client is renamed IOAccelNavi48NativeClient (WindowServer's sandbox admits iokit-open only for IOAccel* classes; the service name and type 'N48N' are unchanged), and a uid-88 caller is admitted behind the boot-arg navi48-metal-ws=1; 1.8 (kext 0.0.610): selectors 19 N48N_SEL_METAL_NUB_PUBLISH and 20 N48N_SEL_METAL_NUB_WITHDRAW (milestone #9 route A: the software Navi48MetalNub the aux accelerator kext matches; published only on demand, only with the boot-arg navi48-metal=1); 1.7 (kext 0.0.609): HELD mode for row 120: selector 17 N48N_SEL_MODE_HOLD (enter row 120 and RETURN with the mode up, a scanout client may then Acquire and present at 120 Hz) and selector 18 N48N_SEL_MODE_RELEASE (end it, wait, return the final result); verdict 16 HELD, deny 25 / 26, N48N_HOLD_* words; the result's former reserved0 / reserved1 (offsets 204 / 252) are hold_end / hold_flags (the size stays 512 B); 1.6 (kext 0.0.608): row 120's blanked-transition underflow reads, DIO attribution and lock-hold witness code in the result's former reserved[8] (the size stays 512 B); 1.5 (kext 0.0.607): row 120 (the 1440p 120 Hz trial) runs behind the boot-arg navi48-row120=1 with the clock hold (P4); the result's ext.reserved words carry the hold report (its size is unchanged); new deny reasons 22 / 23, verdict 15, flags 22..24; 1.4 (kext 0.0.606): selector 16's result grows from 256 to 512 B (underflow / resync / OTG-lock report) and it accepts the rows 1 (DP1 resync) and 2 (V_TOTAL under the OTG lock) and a flags word; 1.3 (kext 0.0.605): the timed mode-trial selector 16, native-S2d; 1.2 (kext 0.0.604): the DAL experiment selector 15, native-S2-DISPCLK; 1.1 (kext 0.0.603): the scanout selectors 9..14, native-S2a. Reported when Hello asks (below) and in n48n_info.reserved[2]. */
++#define N48N_ABI_MINOR     10u           /* 1.10 (kext 0.0.640, GPU-apps G4): n48n_info.reserved[3..7] report the session's VRAM budget (N48N_INFO_R_* / N48N_BUDGET_* below), so a user-space allocator (Mesa/RADV) can size its VRAM heap; no selector, no struct size changes. A third client role (APP, a non-root uid >= 501 process on the kernel allow-list) exists behind the boot-args navi48-apps=1 + navi48-multisession=1: it reaches selectors 0, 1, 3..8 and 21 only (never ReadRegs 2, never scanout 9..14, never 15..20); a refused selector is kIOReturnNotPrivileged. 1.9 (kext 0.0.612): selector 21 N48N_SEL_BO_IMPORT_HOST (milestone #11 step 11c: import a page-aligned range of the CALLER's address space as a SYSTEM-memory BO; limits 64 MiB per BO, 256 MiB per client), the class of the N48N user client is renamed IOAccelNavi48NativeClient (WindowServer's sandbox admits iokit-open only for IOAccel* classes; the service name and type 'N48N' are unchanged), and a uid-88 caller is admitted behind the boot-arg navi48-metal-ws=1; 1.8 (kext 0.0.610): selectors 19 N48N_SEL_METAL_NUB_PUBLISH and 20 N48N_SEL_METAL_NUB_WITHDRAW (milestone #9 route A: the software Navi48MetalNub the aux accelerator kext matches; published only on demand, only with the boot-arg navi48-metal=1); 1.7 (kext 0.0.609): HELD mode for row 120: selector 17 N48N_SEL_MODE_HOLD (enter row 120 and RETURN with the mode up, a scanout client may then Acquire and present at 120 Hz) and selector 18 N48N_SEL_MODE_RELEASE (end it, wait, return the final result); verdict 16 HELD, deny 25 / 26, N48N_HOLD_* words; the result's former reserved0 / reserved1 (offsets 204 / 252) are hold_end / hold_flags (the size stays 512 B); 1.6 (kext 0.0.608): row 120's blanked-transition underflow reads, DIO attribution and lock-hold witness code in the result's former reserved[8] (the size stays 512 B); 1.5 (kext 0.0.607): row 120 (the 1440p 120 Hz trial) runs behind the boot-arg navi48-row120=1 with the clock hold (P4); the result's ext.reserved words carry the hold report (its size is unchanged); new deny reasons 22 / 23, verdict 15, flags 22..24; 1.4 (kext 0.0.606): selector 16's result grows from 256 to 512 B (underflow / resync / OTG-lock report) and it accepts the rows 1 (DP1 resync) and 2 (V_TOTAL under the OTG lock) and a flags word; 1.3 (kext 0.0.605): the timed mode-trial selector 16, native-S2d; 1.2 (kext 0.0.604): the DAL experiment selector 15, native-S2-DISPCLK; 1.1 (kext 0.0.603): the scanout selectors 9..14, native-S2a. Reported when Hello asks (below) and in n48n_info.reserved[2]. */
+ #define N48N_HELLO_F_MINOR (1u << 8)     /* Hello flags bit 8: "report the minor": out[0] = ABI | (MINOR << 16). Without it out[0] is exactly the major, as in v1.0. Bit 8, not 0: flags = 1, which T1 leg 1 sends and expects refused, still is. */
+ #define N48N_MAX_IBS       64u
+ #define N48N_MAX_BOS       4096u            /* handles 1..4095; 0 is never valid */
+@@ -69,7 +69,7 @@ enum {
+     N48N_SEL_COUNT_1_8     = 21,
+     /* ---- ABI 1.9 (kext 0.0.612): host-memory import, milestone #11 step 11c. Needs Hello first. ---- */
+     N48N_SEL_BO_IMPORT_HOST = 21, /* in: [0] host VA (4 KiB aligned, in the CALLER's address space) [1] size (4 KiB multiple, 1 page .. 64 MiB) [2] flags (0, or with [3] != 0 the GemVa vm flags R/W/X/MTYPE of the mapping) [3] GPU VA to map at (0 = do not map: map later with GemVa MAP on the handle, as RADV does)
+-                                     out: [0] BO handle [1] size [2] GPU VA mapped at import (canonical; 0 when [3] was 0) [3] placed bits (N48N_PLACED_HOST_IMPORT). Wires the pages (IOMemoryDescriptor::withAddressRange(task) + prepare()) and records their physical addresses; a mapping (here or by GemVa MAP) is SYSTEM|SNOOPED, per page. Total imported <= 256 MiB per client (separate from the GTT cap).
++                                     out: [0] BO handle [1] size [2] GPU VA mapped at import (canonical; 0 when [3] was 0) [3] placed bits (N48N_PLACED_HOST_IMPORT). Wires the pages (IOMemoryDescriptor::withAddressRange(task) + prepare()) and records their physical addresses; a mapping (here or by GemVa MAP) is SYSTEM|SNOOPED, per page. Total imported <= 4 GiB per client (0.0.621; 2 GiB in 0.0.620, 256 MiB before; separate from the GTT cap).
+                                      BoFree, and the close of the client, unmap the PTEs, flush the TLB, then complete() and release the pages (under the HUNG latch they are leaked, never released). A host BO cannot be a scanout slot, a user-fence target or CPU-mapped by clientMemoryForType (NotPermitted). Errors: BadArgument (alignment, size 0, > 64 MiB, user range, flags), NoMemory (the per-client cap, no descriptor, no page table space), NotReady (no Hello), Aborted / Timeout (HUNG). */
+     N48N_SEL_COUNT_1_9     = 22
+ };
+@@ -183,13 +183,26 @@ struct n48n_info {                 /* 192 B */
+ #define N48N_INFO_HUNG          (1u << 0)
+ #define N48N_INFO_S1B_POSITIVE  (1u << 1)
+ #define N48N_INFO_NATIVE_BOOT   (1u << 2)
++/* ABI 1.10 (kext 0.0.640): n48n_info.reserved[] words (an older kext leaves them 0, which reads as "no budget reported").
++ *   reserved[0],[1] = native write counter (diagnostic)   reserved[2] = ABI minor (1.1)
++ *   reserved[3] = N48N_BUDGET_* flags
++ *   reserved[4],[5] = the VRAM budget CAP in bytes, low / high dword: what ALL non-WindowServer sessions together may hold (25 % of the VRAM pools). 0 when N48N_BUDGET_VALID is clear.
++ *   reserved[6],[7] = the bytes still AVAILABLE to this session now = min(cap - held by all non-WindowServer sessions, free bytes of the VRAM pools), low / high dword. A user-space
++ *                     allocator should treat (bytes this session already holds + AVAILABLE) as its heap size; the budget is SHARED, so AVAILABLE can shrink between two queries. */
++#define N48N_INFO_R_BUDGET_FLAGS 3u
++#define N48N_INFO_R_BUDGET_CAP_LO 4u
++#define N48N_INFO_R_BUDGET_CAP_HI 5u
++#define N48N_INFO_R_BUDGET_AVAIL_LO 6u
++#define N48N_INFO_R_BUDGET_AVAIL_HI 7u
++#define N48N_BUDGET_VALID (1u << 0)   /* a VRAM budget applies to this session (multi-session boot, not WindowServer's session) */
++#define N48N_BUDGET_APP   (1u << 1)   /* this session was admitted as an APP (the kernel allow-list role) */
+ /* BoCreate scalar out [3] */
+ #define N48N_PLACED_CPU_MAPPABLE (1u << 0)
+ #define N48N_PLACED_ZEROED       (1u << 1)
+ #define N48N_PLACED_HI_POOL      (1u << 2)
+ #define N48N_PLACED_HOST_IMPORT  (1u << 3)   /* ABI 1.9: the BO is an import of caller memory (SYSTEM pages) */
+ #define N48N_IMPORT_MAX_BO       (64ull << 20)   /* ABI 1.9: per BoImportHost call */
+-#define N48N_IMPORT_CAP          (256ull << 20)  /* ABI 1.9: per client, separate from the 512 MiB GTT cap */
++#define N48N_IMPORT_CAP          (4096ull << 20) /* ABI 1.9: per client, 4 GiB since kext 0.0.621 (2 GiB in 0.0.620, 256 MiB before), separate from the 512 MiB GTT cap */
+ 
+ /* ---- ABI 1.1: native scanout (kext 0.0.603) ------------------------------------------------------------------------------------ */
+ #define N48N_SCAN_MAX_SLOTS   3u
+diff --git a/src/amd/common/darwin/ac_darwin_budget.h b/src/amd/common/darwin/ac_darwin_budget.h
+new file mode 100644
+index 00000000000..e2b54e285ac
+--- /dev/null
++++ b/src/amd/common/darwin/ac_darwin_budget.h
+@@ -0,0 +1,66 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Per-session VRAM budget (kext ABI 1.10, n48n_info.reserved[3..7]).  Pure helpers so the
++ * host test can drive them without a kext.  All of them are no-ops / "not valid" when
++ * N48N_BUDGET_VALID is clear (WindowServer's session and older kexts report zeros).
++ */
++#ifndef AC_DARWIN_BUDGET_H
++#define AC_DARWIN_BUDGET_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "drm-uapi/amdgpu_drm.h"
++#include "navi48_native_abi.h"
++
++static inline bool
++acd_budget_valid(const struct n48n_info *k)
++{
++   return (k->reserved[N48N_INFO_R_BUDGET_FLAGS] & N48N_BUDGET_VALID) != 0;
++}
++
++static inline uint64_t
++acd_budget_cap(const struct n48n_info *k)
++{
++   return (uint64_t)k->reserved[N48N_INFO_R_BUDGET_CAP_LO] |
++          ((uint64_t)k->reserved[N48N_INFO_R_BUDGET_CAP_HI] << 32);
++}
++
++static inline uint64_t
++acd_budget_avail(const struct n48n_info *k)
++{
++   return (uint64_t)k->reserved[N48N_INFO_R_BUDGET_AVAIL_LO] |
++          ((uint64_t)k->reserved[N48N_INFO_R_BUDGET_AVAIL_HI] << 32);
++}
++
++/* cap - avail, clamped at 0 */
++static inline uint64_t
++acd_budget_used(const struct n48n_info *k)
++{
++   const uint64_t cap = acd_budget_cap(k), avail = acd_budget_avail(k);
++   return cap > avail ? cap - avail : 0;
++}
++
++/* Fills the VRAM and CPU-visible heaps of an AMDGPU_INFO_MEMORY answer that was built from
++ * the unbudgeted totals; returns false (touching nothing) when no budget applies. */
++static inline bool
++acd_apply_budget(struct drm_amdgpu_memory_info *m, const struct n48n_info *k, uint64_t vram_total,
++                 uint64_t vis_total)
++{
++   if (!acd_budget_valid(k))
++      return false;
++   const uint64_t cap = acd_budget_cap(k), avail = acd_budget_avail(k);
++   const uint64_t heap = vram_total < cap ? vram_total : cap;
++   const uint64_t vis_max = vis_total * 3 / 4;
++   m->vram.total_heap_size = heap;
++   m->vram.usable_heap_size = heap;
++   m->vram.heap_usage = acd_budget_used(k);
++   m->vram.max_allocation = vis_max < avail ? vis_max : avail;
++   const uint64_t vis_heap = vis_total < cap ? vis_total : cap;
++   m->cpu_accessible_vram.total_heap_size = vis_heap;
++   m->cpu_accessible_vram.usable_heap_size = vis_heap;
++   return true;
++}
++
++#endif
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+index ea100512086..0dd5fd9a992 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -6,6 +6,7 @@
+ 
+ #include "ac_darwin_drm.h"
+ #include "ac_darwin_kext.h"
++#include "ac_darwin_budget.h"
+ 
+ #include <errno.h>
+ #include <pthread.h>
+@@ -400,7 +401,7 @@ acd_info_memory(struct acd_device *dev, const struct drm_amdgpu_info *info, void
+    const uint64_t vram_free = k.vram_vis_free + k.vram_hi_free;
+    switch (info->query) {
+    case AMDGPU_INFO_VRAM_USAGE:
+-      *(uint64_t *)out = vram_total - vram_free;
++      *(uint64_t *)out = acd_budget_valid(&k) ? acd_budget_used(&k) : vram_total - vram_free;
+       return 0;
+    case AMDGPU_INFO_VIS_VRAM_USAGE:
+       *(uint64_t *)out = k.vram_vis_total - k.vram_vis_free;
+@@ -422,6 +423,8 @@ acd_info_memory(struct acd_device *dev, const struct drm_amdgpu_info *info, void
+    m->cpu_accessible_vram.usable_heap_size = k.vram_vis_total;
+    m->cpu_accessible_vram.heap_usage = k.vram_vis_total - k.vram_vis_free;
+    m->cpu_accessible_vram.max_allocation = k.vram_vis_total * 3 / 4;
++   /* ABI 1.10: a per-session VRAM budget (apps) caps the VRAM heaps; no-op when the flag is clear */
++   acd_apply_budget(m, &k, vram_total, k.vram_vis_total);
+    m->gtt.total_heap_size = k.gtt_cap;
+    m->gtt.usable_heap_size = k.gtt_cap;
+    m->gtt.heap_usage = k.gtt_used;
+diff --git a/src/amd/common/darwin/test/acd_budget_test.c b/src/amd/common/darwin/test/acd_budget_test.c
+new file mode 100644
+index 00000000000..0563eba5d57
+--- /dev/null
++++ b/src/amd/common/darwin/test/acd_budget_test.c
+@@ -0,0 +1,74 @@
++/*
++ * SPDX-License-Identifier: MIT
++ * Host test of acd_apply_budget (ac_darwin_budget.h).  Build and run:
++ *   clang -std=gnu11 -I include -I include/darwin -I src/amd/common/darwin \
++ *     src/amd/common/darwin/test/acd_budget_test.c -o acd_budget_test && ./acd_budget_test
++ */
++#include "ac_darwin_budget.h"
++
++#include <stdio.h>
++#include <string.h>
++
++static int failures, checks;
++#define CHECK(c) do { checks++; if (!(c)) { failures++; printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
++
++#define GiB (1ull << 30)
++
++static void
++set64(struct n48n_info *k, uint32_t lo, uint32_t hi, uint64_t v)
++{
++   k->reserved[lo] = (uint32_t)v;
++   k->reserved[hi] = (uint32_t)(v >> 32);
++}
++
++int
++main(void)
++{
++   const uint64_t vis = 256ull << 20, total = 16 * GiB;
++   struct n48n_info k;
++   struct drm_amdgpu_memory_info m, ref;
++
++   /* flag clear: untouched, even with nonzero cap words */
++   memset(&k, 0, sizeof(k));
++   set64(&k, N48N_INFO_R_BUDGET_CAP_LO, N48N_INFO_R_BUDGET_CAP_HI, 4 * GiB);
++   memset(&m, 0x5a, sizeof(m));
++   ref = m;
++   CHECK(!acd_apply_budget(&m, &k, total, vis));
++   CHECK(memcmp(&m, &ref, sizeof(m)) == 0);
++   memset(&k, 0, sizeof(k));
++   CHECK(!acd_apply_budget(&m, &k, total, vis) && !acd_budget_valid(&k));
++
++   /* flag set: cap 4 GiB (above the 32-bit range), 3 GiB available */
++   memset(&k, 0, sizeof(k));
++   k.reserved[N48N_INFO_R_BUDGET_FLAGS] = N48N_BUDGET_VALID | N48N_BUDGET_APP;
++   set64(&k, N48N_INFO_R_BUDGET_CAP_LO, N48N_INFO_R_BUDGET_CAP_HI, 4 * GiB);
++   set64(&k, N48N_INFO_R_BUDGET_AVAIL_LO, N48N_INFO_R_BUDGET_AVAIL_HI, 3 * GiB);
++   memset(&m, 0, sizeof(m));
++   CHECK(acd_apply_budget(&m, &k, total, vis));
++   CHECK(m.vram.total_heap_size == 4 * GiB && m.vram.usable_heap_size == 4 * GiB);
++   CHECK(m.vram.heap_usage == 1 * GiB);
++   CHECK(m.vram.max_allocation == vis * 3 / 4);
++   CHECK(m.cpu_accessible_vram.total_heap_size == vis && m.cpu_accessible_vram.usable_heap_size == vis);
++   CHECK(acd_budget_used(&k) == 1 * GiB);
++
++   /* avail smaller than 3/4 vis -> max_allocation = avail */
++   set64(&k, N48N_INFO_R_BUDGET_AVAIL_LO, N48N_INFO_R_BUDGET_AVAIL_HI, 1ull << 20);
++   acd_apply_budget(&m, &k, total, vis);
++   CHECK(m.vram.max_allocation == (1ull << 20));
++   CHECK(m.vram.heap_usage == 4 * GiB - (1ull << 20));
++
++   /* avail > cap clamps usage at 0; cap above total -> total; cap below vis caps the visible heap */
++   set64(&k, N48N_INFO_R_BUDGET_AVAIL_LO, N48N_INFO_R_BUDGET_AVAIL_HI, 5 * GiB);
++   acd_apply_budget(&m, &k, total, vis);
++   CHECK(m.vram.heap_usage == 0);
++   set64(&k, N48N_INFO_R_BUDGET_CAP_LO, N48N_INFO_R_BUDGET_CAP_HI, 64 * GiB);
++   acd_apply_budget(&m, &k, total, vis);
++   CHECK(m.vram.total_heap_size == total);
++   set64(&k, N48N_INFO_R_BUDGET_CAP_LO, N48N_INFO_R_BUDGET_CAP_HI, 100ull << 20);
++   set64(&k, N48N_INFO_R_BUDGET_AVAIL_LO, N48N_INFO_R_BUDGET_AVAIL_HI, 40ull << 20);
++   acd_apply_budget(&m, &k, total, vis);
++   CHECK(m.cpu_accessible_vram.total_heap_size == (100ull << 20) && m.vram.heap_usage == (60ull << 20));
++
++   printf("acd_budget_test: %d checks, %d failures\n", checks, failures);
++   return failures != 0;
++}

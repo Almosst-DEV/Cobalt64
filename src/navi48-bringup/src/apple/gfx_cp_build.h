@@ -36,7 +36,7 @@ static inline void n48_cp_build_consumer(n48_cp_consumer *c, const xlat12_draw_s
     if (!c || !ds) return;
     *c = n48_cp_consumer {};
     c->n = ds->in_n > N48_CP_IN_MAX ? N48_CP_IN_MAX : ds->in_n;
-    /* 0.0.438 (FINDING 4 INTERIM REFUSAL; notes/design/D4-PRIME.md Finding 4) — a segment whose
+    /* 0.0.438 (FINDING 4 INTERIM REFUSAL; an internal design note Finding 4) — a segment whose
      * translate reports MORE THAN ONE DRAW exported only its LAST draw's inputs (xlat12_ib.c's d_in_clear runs on
      * EVERY draw, never accumulating), so an earlier draw's own pointer was never checked. Until D4' lands (per-draw
      * accumulation), such a segment's own consumer list must be treated as INCOMPLETE - the same `over` a list that
@@ -67,7 +67,7 @@ static inline void n48_cp_build_consumer(n48_cp_consumer *c, const xlat12_draw_s
     c->enumerated = 1u;
 }
 
-/* 0.0.421 (notes/design/MIB-COMMIT.md H4) — THE FRAME'S READ-SET IS THE UNION OF EVERY SEGMENT'S.
+/* 0.0.421 (an internal design note H4) — THE FRAME'S READ-SET IS THE UNION OF EVERY SEGMENT'S.
  *
  * THE HAZARD. The kext captures the consumer list per SEGMENT (`n48_cp_build_consumer(&gXpIn, &ds)` inside the
  * policy's segment loop), and through 0.0.420 the gate read whatever `gXpIn` the LAST segment left. A multi-segment
@@ -141,13 +141,13 @@ static inline void n48_cp_merge_consumer(n48_cp_consumer *dst, const n48_cp_cons
  * 0 before it) and COMMITS as arm22 did, so the keystone writes root[511] and the twin fill is then enumerated and clean.
  * It is a POSITIVE condition: a caller that cannot answer it passes 0 and the frame stays off this path.
  *
- * 0.0.438 (FINDING 4 INTERIM REFUSAL; notes/design/D4-PRIME.md Finding 4) — `draws` is the frame's ONE
+ * 0.0.438 (FINDING 4 INTERIM REFUSAL; an internal design note Finding 4) — `draws` is the frame's ONE
  * segment's own draw count (xlat12_draw_stats.draws, `nseg == 1` already requires exactly one). A segment's translate
  * exports only its LAST draw's inputs, and this builder's whole premise is that the frame reads NOTHING beyond the
  * one named pointer page - a premise a GPUPass-then-ColorFill segment (or any other multi-draw segment whose last
  * draw happens to bind the fill program) would silently violate, because the EARLIER draw's own reads were never
  * exported at all. Refusing whenever `draws != 1` keeps this builder fail-closed until D4' lands: a single-draw
- * fill segment (every committed fill measured so far, per notes/design/D4-PRIME.md) is unchanged.
+ * fill segment (every committed fill measured so far, per an internal design note) is unchanged.
  *
  * Returns 1 when the consumer was built, 0 (leaving `*c` zeroed) otherwise. Pure; the kext and the host suite compile the
  * SAME function. */
@@ -166,7 +166,7 @@ static inline uint32_t n48_cp_build_input_free(n48_cp_consumer *c, uint32_t nseg
 }
 
 /* =====================================================================================================================
- * D4' (notes/design/D4-PRIME.md item 3/4/G, notes/design/R1-MEMDST.md Q5) — THE D4' CONSUMER'S OWN BUILD AND MERGE.
+ * D4' (an internal design note item 3/4/G, an internal design note Q5) — THE D4' CONSUMER'S OWN BUILD AND MERGE.
  * Entirely separate from n48_cp_build_consumer / n48_cp_merge_consumer above: gated ENTIRELY by switch 40, called
  * from a DIFFERENT branch of gfxsrc_policy's segment loop (the `else if (gXpOn && gD4On)` sibling of the ds.in_abi
  * capture), and never touching gXpAcc/gXpIn or their caps. ===================================================== */
@@ -315,7 +315,7 @@ static inline void n48_cp_d4_frame_begin(n48_cp_d4_state *s)
  * SAME fail-closed reading the inline code gave it). Skips every walk when the union is already `over` or was never
  * enumerated (a pure clause below has already refused it - the same "no walk for a row already refused" discipline
  * R1 (gfx_memdst.h) applies). `mdEnforce`/`mdOk` are the SAME R1 discharge the table-ABI consumer's own rung takes
- * (notes/design/R1-MEMDST.md Q2 item C): under R1 ENFORCE with a clean memory-destination scan, R4's wait/write
+ * (an internal design note Q2 item C): under R1 ENFORCE with a clean memory-destination scan, R4's wait/write
  * refusal is redundant and is discharged for the D4' consumer exactly as it already is for the table-ABI one.
  *
  * THE ROUTING (D4-PRIME-FIXES.md item 2's own name, "a declined union keeps today's rung"):

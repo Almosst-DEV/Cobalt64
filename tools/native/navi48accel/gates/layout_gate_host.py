@@ -11,9 +11,10 @@ import kextimg, exports
 def sym_addr_table():
     """name -> (lvl, va) for every exported symbol (family kext: level 1; boot KC / kernel: level 0), the same encoding the model uses."""
     import model as M
-    from kcmod import FAMILY, BOOT_KC
+    from kcmod import FAMILY, BOOT_KC, SYS_KC
     tab = {}
-    for lvl, p in ((1, FAMILY), (0, BOOT_KC)):
+    # aux 0.0.4 (M5): the System KC too - IOFramebuffer's methods (IOGraphicsFamily, level 1) are not in the carved family kext; the family kext stays FIRST so every earlier class resolves exactly as before (setdefault)
+    for lvl, p in ((1, FAMILY), (0, BOOT_KC), (1, SYS_KC)):
         for l in subprocess.run(['nm', '-gU', p], capture_output=True, text=True).stdout.splitlines():
             q = l.split(' ', 2)
             if len(q) == 3 and all(c in '0123456789abcdef' for c in q[0]) and q[0]:
@@ -31,6 +32,7 @@ def main():
     TEXT_LO, TEXT_HI = 0x100000, 0x200000       # the fake window our defined slots map into
     lines = []
     neg = None
+    negfb = None
     for leaf, parent, extra in LEAVES:
         n = C[parent]['nslots']
         ovr = override_slots(leaf, parent, extra, C, fwd)
@@ -59,6 +61,8 @@ def main():
         lines.append(' '.join('%x' % x for x in fam))
         if leaf == NEGATIVE_CLASS:
             neg = (leaf, parent, n, ovr, list(ours), list(fam))
+        if leaf == FB_LEAF:
+            negfb = (leaf, parent, n, ovr, list(ours), list(fam))
     d = tempfile.mkdtemp(prefix='n48twin')
     inp, exe = os.path.join(d, 'in.txt'), os.path.join(d, 'twin')
     open(inp, 'w').write('\n'.join(lines) + '\n')
@@ -97,6 +101,31 @@ def main():
     if escaped:
         print('NEGATIVE CONTROLS: %d of %d mismatched %s tables ACCEPTED' % (escaped, len(cases), parent)); return 1
     print('NEGATIVE CONTROLS: all %d mismatched %s tables refused' % (len(cases), parent))
+    # aux 0.0.4 (M5): the same for Navi48Framebuffer vs IOFramebuffer over EVERY slot 305..348 (the slots the M5 spec lists: isConsoleDevice 305 ... interrupts 346-348): a family slot that moved is refused when we inherit it, and a
+    # slot we override that points outside our text, or at the family's own code, is refused. Plus a longer / shorter family vtable.
+    if negfb is None:
+        print('NEGATIVE CONTROLS: class %s not found' % FB_LEAF); return 1
+    leaf, parent, n, ovr, ours, fam = negfb
+    fcases = []
+    for i in range(305, 349):
+        if i in ovr:
+            o2 = list(ours); o2[i] = TEXT_HI + 0x10; fcases.append(('override slot %d points outside our text' % i, o2, fam))
+            o3 = list(ours); o3[i] = fam[i]; fcases.append(('override slot %d IS the family slot' % i, o3, fam))
+        else:
+            f2 = list(fam); f2[i] ^= 0x10; fcases.append(('inherited slot %d differs from the family' % i, ours, f2))
+    f4 = list(fam); f4[n] = 0x1234; fcases.append(('the family vtable is longer (351 slots)', ours, f4))
+    f5 = list(fam); f5[n - 1] = 0; fcases.append(('the family vtable is shorter (a NULL at slot %d)' % (n - 1), ours, f5))
+    escaped = 0
+    for what, o, f in fcases:
+        body = ['CLASS %s %s %d %x %x %d' % (leaf, parent, n, TEXT_LO, TEXT_HI, len(ovr)), ' '.join(str(x) for x in ovr), ' '.join('%x' % x for x in o), ' '.join('%x' % x for x in f)]
+        open(inp, 'w').write('\n'.join(body) + '\n')
+        q = subprocess.run([exe, inp], capture_output=True, text=True)
+        refused = q.returncode != 0 and q.stdout.startswith('FAIL')
+        if not refused:
+            print('NEGATIVE CONTROL %-62s *** ACCEPTED ***' % (what + ':')); escaped += 1
+    if escaped:
+        print('NEGATIVE CONTROLS: %d of %d mismatched %s tables ACCEPTED' % (escaped, len(fcases), parent)); return 1
+    print('NEGATIVE CONTROLS: all %d mismatched %s tables refused (every slot 305..348, overridden and inherited)' % (len(fcases), parent))
     return 0
 
 if __name__ == '__main__':

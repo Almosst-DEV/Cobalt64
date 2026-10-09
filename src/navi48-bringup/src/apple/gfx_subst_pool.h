@@ -1,4 +1,4 @@
-// gfx_subst_pool.h — build 0.0.484 (notes/design/GLASS.md Q2 K2, (2)). THE RECOGNITION POOL'S BUILD, pure.
+// gfx_subst_pool.h — build 0.0.484 (an internal design note Q2 K2, (2)). THE RECOGNITION POOL'S BUILD, pure.
 //
 // gfxsrc_xlat_open (AppleHardwareHook.cpp) renders, once, the image every substitutable shader-cache entry writes over
 // Apple's program, so a byte compare at a program VA can say "these bytes are already OURS" (n48_xd_ours_find,

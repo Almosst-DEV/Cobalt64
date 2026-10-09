@@ -1,0 +1,2 @@
+#!/bin/bash
+D=${FAKE_DIR:?}; [ "$1 $2 $3" = "-f %Su /dev/console" ] && { cat "$D/console" 2>/dev/null || echo root; exit 0; }; exec /usr/bin/stat "$@"

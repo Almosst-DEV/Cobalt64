@@ -1,4 +1,4 @@
-// sdma_gcr_test.cpp — 0.0.416 (notes/design/SDMA-GCR.md,), binding G5. The pure half of the SDMA
+// sdma_gcr_test.cpp — 0.0.416 (an internal design note,), binding G5. The pure half of the SDMA
 // cache-rinse build, host-tested:
 //   1. G1 — the ONE emitter's five dwords are EXACTLY 0x00000011, 0x00000000, 0xC3A10000, 0x00000000,
 //      0x00000000, and Linux's gcr_cntl is the sum its own flags name;

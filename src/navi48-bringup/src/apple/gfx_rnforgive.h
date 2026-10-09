@@ -1,4 +1,4 @@
-// gfx_rnforgive.h — build 0.0.523 (notes/design/RING-NEUTER-FORGIVE.md, REVISION 2 governs; ).
+// gfx_rnforgive.h — build 0.0.523 (an internal design note, REVISION 2 governs; ).
 // SWITCH 77: THE RING-NEUTER FORGIVENESS, PURE HALF.
 //
 // THE HAZARD: `w->ring_neuters = v[N48_DEPC_GN_IBS]` is gGn.ibs, boot-global and written only by

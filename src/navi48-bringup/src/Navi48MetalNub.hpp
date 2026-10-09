@@ -1,5 +1,5 @@
 //
-//  Navi48MetalNub.hpp - the software nub the Aux-KC accelerator kext (Navi48Accel) matches, kext 0.0.610, milestone #9 route A (notes/design/NATIVE-S3.md sec. 1).
+//  Navi48MetalNub.hpp - the software nub the Aux-KC accelerator kext (Navi48Accel) matches, kext 0.0.610, milestone #9 route A (an internal design note sec. 1).
 //
 //  Navi48MetalNub : IOService, attached to Navi48Bringup, published ONLY on demand by the native client's selector N48N_SEL_METAL_NUB_PUBLISH (ABI 1.8), and
 //  only with boot-arg navi48-metal=1 on a native boot whose S1b reported POSITIVE PASS, the GPU not HUNG and a Hello'd session. NEVER at boot. It matches
@@ -35,6 +35,11 @@ public:
 	static void hungLatched();
 	// 0.0.613: the published nub (NOT retained: an identity for the display glue's provider check), or NULL when none is published.
 	static IOService *published();
+	// 0.0.659 (M6 Stage 1a): write a property on the published nub (the bundle reads "Navi48,M6" and "Navi48,M6Surf" there; native_m6_pure.h). false = no nub is published.
+	static bool setPublishedData(const char *key, const void *bytes, uint32_t len);
+	static bool setPublishedNumber(const char *key, uint64_t v);
+	// 0.0.656 (G6): the accelerator the aux kext registered through device_open (identity only, NOT retained), or NULL while there is no device. The native client's start() accepts it as the accelerator route's provider.
+	static IOService *registeredAccelerator();
 
 	IOReturn callPlatformFunction(const OSSymbol *functionName, bool waitForFunction, void *param1, void *param2, void *param3, void *param4) override;
 	void free() override;

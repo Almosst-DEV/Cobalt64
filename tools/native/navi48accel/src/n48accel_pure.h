@@ -1,6 +1,6 @@
 //
 //  n48accel_pure.h - the pure (no IOKit, no kernel) decisions of the Navi48Accel aux kext (route A, milestone #9). Compiled into the kext AND into
-//  tests/host_test.cpp, which drives these very functions (with planted breaks: tests/plant.sh). Design: notes/design/NATIVE-S3.md.
+//  tests/host_test.cpp, which drives these very functions (with planted breaks: tests/plant.sh). Design: an internal design note.
 //
 //  THIN BY DESIGN (K3: every rebuild of this kext requires a security approval (Allow click) from the user): only the safety gates, the fixed class graph and the
 //  fail-closed defaults live here. All values, stamp / task / config / factory decisions and logging live in the bring-up kext behind
@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "Navi48MetalOps.h"
+#include "Navi48DisplayOps.h"   // aux 0.0.4 (M5): the framebuffer's snapshot / ops table (byte-identical copy of the bring-up kext's)
 
 namespace n48accel {
 
@@ -88,7 +89,7 @@ inline EmPlan em_init_plan(bool superInitOk, bool haveStampVA) {
     return p;
 }
 
-// ---- the display pipe (ABI 2, aux 0.0.3; notes/design/NATIVE-S4-M11H.md section 3.4 and the "11h.1 RE facts" section) ---------------------------------
+// ---- the display pipe (ABI 2, aux 0.0.3; an internal design note section 3.4 and the "11h.1 RE facts" section) ---------------------------------
 // Display is ON only with a table of abi >= 2 whose OWN size covers the ABI-2 members, the ON flag set by the bring-up kext (boot-arg navi48-metal-disp=1
 // latched), and the hook present. The order of the tests matters: nothing past byte 120 is read unless the table says it has it. OFF (an ABI-1 table from the
 // 0.0.612 bring-up kext, a short table, flag 0, no hook, no table) = every display entry point behaves exactly as aux 0.0.2 did: the family's own display pipe,
@@ -104,6 +105,122 @@ inline void *dm_walk_provider(bool dispOn, bool providerIsNub, void *provider, v
 // (11h.1 correction 4: found_framebuffer stores the pipe without a NULL check).
 enum PipeChoice : uint32_t { kPipeOurs = 1, kPipeFamily = 2 };
 inline PipeChoice pipe_choice(bool dispOn, bool allocated) { return (dispOn && allocated) ? kPipeOurs : kPipeFamily; }
+
+// ---- the 'N48N' user client on the accelerator (aux 0.0.5, G6; an internal design note "G6 design", section 2) ---------------------------------------------------------------------------------------------
+// Navi48Accelerator overrides IOGraphicsAccelerator2::newUserClient (slot 239, the 4-argument form). A sandboxed application may open any user client on a service that conforms to IOAccelerator; this is how it reaches the
+// bring-up kext's native client. The decision for one open is nuc_plan:
+//   * type != 'N48N'                         -> kNucFamily: the family's own newUserClient, untouched (its per-PID limits and bookkeeping are the family's);
+//   * type == 'N48N', everything usable      -> kNucNative: the ops table's native_open (ABI 3, capability N48_CAP_NATIVE_OPEN), whose IOReturn is returned UNCHANGED;
+//   * type == 'N48N', anything else          -> kNucUnsupported (kIOReturnUnsupported): kill switch off, layout gate not passed, no ops table, an ABI < 3 / short table, the capability bit clear, no hook, no device.
+//     It NEVER falls through to the family: the family hands every unknown type to newContext (slot 331) and would give the caller a generic IOAccelContext2 (design section 2, CONFIRMED in the disassembly).
+enum NucPlan : uint32_t { kNucFamily = 1, kNucNative = 2, kNucUnsupported = 3 };
+inline bool native_open_usable(const N48MetalOps *o) {
+    return o && o->abi >= 3u && o->size >= N48_METAL_OPS_V3 && cap_has(o, N48_CAP_NATIVE_OPEN) && o->native_open != nullptr;
+}
+inline NucPlan nuc_plan(uint32_t type, bool auxOn, bool gatePass, const N48MetalOps *o, bool haveDevice) {
+    if (type != N48_METAL_UC_N48N) return kNucFamily;
+    if (!auxOn || !gatePass || !haveDevice || !native_open_usable(o)) return kNucUnsupported;
+    return kNucNative;
+}
+// The hook's answer is an IOReturn, passed through as is (kIOReturnSuccess = 0). A non-zero value is a refusal, a zero with no client object is an internal error: a "1 = handled" reading is wrong here.
+constexpr int32_t kIoSuccess = 0, kIoInternalError = (int32_t)0xE00002C9, kIoUnsupported = (int32_t)0xE00002C7, kIoBadArgument = (int32_t)0xE00002C2;
+inline int32_t nuc_result(int32_t rc, bool haveClient) { return rc != kIoSuccess ? rc : (haveClient ? kIoSuccess : kIoInternalError); }
+
+// ---- the monitor B framebuffer (aux 0.0.4, milestone M5; an internal design note "M5 build spec: Navi48Framebuffer for the monitor B", section 2) ----------------------------------------------------------------
+// Navi48Framebuffer answers IOFramebuffer's questions from the IMMUTABLE N48DispSnap the bring-up kext took at `fbpublish 2` (Navi48DisplayOps.h). Every answer below is a pure function of the snapshot, host-tested; the class in
+// Navi48Accel.cpp only copies the results into IOKit structures. No register is read or written, nothing is looked up at run time. The shared validators (n48disp_ops_check, n48disp_snap_valid) are in Navi48DisplayOps.h.
+
+// start: refuse unless EVERYTHING holds, in this order: the kill switch (navi48-aux=0), boot-arg navi48-metal-ws present (any value: that boot gives the DP to the GPU desktop, the monitor B would race it), the provider is a
+// Navi48DisplayNub, the RUNTIME LAYOUT GATE passed (all 13 classes, IOFramebuffer's 350 slots included: on an fb2 boot no accelerator is probed, so the framebuffer must run the gate itself), the ops table is good (magic / ABI / size /
+// hooks), the snapshot hook answered (rc 0) and the snapshot is valid. Only then does the class call IOFramebuffer::start.
+enum FbStart : uint32_t { kFbStartOk = 0, kFbStartAuxOff = 1, kFbStartMetalWs = 2, kFbStartNotNub = 3, kFbStartOps = 4, kFbStartSnapshot = 5, kFbStartLayout = 6 };
+// 0.0.7 (M6 Stage 1a, R1): boot-arg navi48-m6 == 1 (present AND exactly 1) lifts the framebuffers' refusal to start beside navi48-metal-ws: under that latch the GPU desktop composites EVERY display through its own IOPresentment pipe (the
+// bring-up kext's routing guard keeps a monitor B frame off the DP). Without it (the default, and any other value) the refusal is exactly aux 0.0.6's. The verdict function below is unchanged: start() passes it
+// fb_metal_ws_blocks(), which is "navi48-metal-ws present" with the latch OFF and false with it ON.
+constexpr bool m6_on(bool present, uint32_t value) { return present && value == 1u; }
+constexpr bool fb_metal_ws_blocks(bool metalWsPresent, bool m6On) { return metalWsPresent && !m6On; }
+inline FbStart fb_start_verdict(bool auxOn, bool metalWsPresent, bool providerIsNub, bool layoutOk, uint32_t opsVerdict, int snapRc, uint32_t snapVerdict) {
+    if (!auxOn) return kFbStartAuxOff;
+    if (metalWsPresent) return kFbStartMetalWs;
+    if (!providerIsNub) return kFbStartNotNub;
+    if (!layoutOk) return kFbStartLayout;
+    if (opsVerdict != N48_DOV_OK) return kFbStartOps;
+    if (snapRc != 0 || snapVerdict != N48_DSV_OK) return kFbStartSnapshot;
+    return kFbStartOk;
+}
+
+// 0.0.6 (ABI 2, the monitor A): ONE class, TWO personalities (Navi48DisplayIndex 1 = the monitor B, 2 = the monitor A). The provider's index property decides which geometry the snapshot MUST carry: the ops table is checked FOR THAT INDEX
+// (n48disp_ops_check_for: index 2 needs an ABI-2 table, so an ABI-1 bring-up kext is refused cleanly) and the snapshot must be valid for its own index (n48disp_snap_valid: the per-index geometry table of Navi48DisplayOps.h)
+// AND carry exactly the index of the nub it was fetched from. Nothing is hard-wired to the monitor B's resolution here: the mode, the pixel format, the aperture and the EDID all come from the snapshot.
+inline uint32_t fb_provider_index(bool haveNumber, uint64_t value) { return (haveNumber && (value == N48_DISP_INDEX || value == N48_DISPA_INDEX)) ? (uint32_t)value : 0u; }
+inline uint32_t fb_snap_for_index(const N48DispSnap *s, uint32_t providerIndex) {
+    const uint32_t v = n48disp_snap_valid(s);
+    if (v != N48_DSV_OK) return v;
+    return s->index == providerIndex ? (uint32_t)N48_DSV_OK : (uint32_t)N48_DSV_INDEX;
+}
+
+// The one display mode: id 1, depth 0. The display's one mode (the monitor B: its CTA DTD at 59.95 Hz; the monitor A: 1920x1080 @ 60 Hz) comes from the snapshot; maxDepthIndex 0; Valid | Safe | Default.
+constexpr uint32_t kFbModeId = 1u;
+constexpr uint32_t fb_mode_count() { return 1u; }
+constexpr bool fb_mode_ok(uint32_t mode, uint32_t depth) { return mode == kFbModeId && depth == 0u; }
+struct FbModeInfo { uint32_t w, h, refresh1616, maxDepthIndex; bool valid, safe, isDefault; };
+inline bool fb_mode_info(const N48DispSnap *s, uint32_t mode, FbModeInfo *o) {
+    if (!s || !o || mode != kFbModeId) return false;
+    o->w = s->w; o->h = s->h; o->refresh1616 = s->refresh1616; o->maxDepthIndex = 0u; o->valid = true; o->safe = true; o->isDefault = true;
+    return true;
+}
+// setDisplayMode accepts only (1, 0); getCurrentDisplayMode / getStartupDisplayMode answer (1, 0) (the base startup getter would return 0xE00002C7).
+
+// The pixel format, matching SURFACE_CONFIG 8 and the kext's 0xFFRRGGBB fill: 32 bpp direct RGB, 3 x 8 bits, masks R 0xFF0000 / G 0xFF00 / B 0xFF, "--------RRRRRRRRGGGGGGGGBBBBBBBB" (the same bytes RDNA4FB's channel map 0 answers).
+struct FbPixel { uint32_t bytesPerRow, bitsPerPixel, componentCount, bitsPerComponent, masks[3], w, h; char format[33]; };
+inline bool fb_pixel_info(const N48DispSnap *s, uint32_t mode, uint32_t depth, bool systemAperture, FbPixel *o) {
+    if (!s || !o || !fb_mode_ok(mode, depth) || !systemAperture) return false;
+    o->bytesPerRow = s->pitchBytes; o->bitsPerPixel = 32u; o->componentCount = 3u; o->bitsPerComponent = 8u;
+    o->masks[0] = 0x00FF0000u; o->masks[1] = 0x0000FF00u; o->masks[2] = 0x000000FFu;
+    o->w = s->w; o->h = s->h;
+    static const char fmt[] = "--------RRRRRRRRGGGGGGGGBBBBBBBB";
+    for (unsigned i = 0; i < sizeof(fmt); i++) o->format[i] = fmt[i];
+    return true;
+}
+// The aperture: the system aperture (and getVRAMRange) is buffer A as the CPU sees it, 14,745,600 bytes at BAR0 + off[0]; any other aperture has no range.
+inline bool fb_aperture(const N48DispSnap *s, bool systemAperture, uint64_t *phys, uint64_t *len) {
+    if (!s || !phys || !len || !systemAperture || s->aperPhys == 0u || s->aperLen == 0u) return false;
+    *phys = s->aperPhys; *len = s->aperLen;
+    return true;
+}
+// Connection attributes (RDNA4FB framebuffer.cpp:2385-2417): Enable 1, CheckEnable 1, Flags 0, SupportsHLDDCSense = success (no value) when an EDID is cached; anything else goes to super (kFbRcSuper).
+constexpr uint32_t fb_fourcc(char a, char b, char c, char d) { return ((uint32_t)(uint8_t)a << 24) | ((uint32_t)(uint8_t)b << 16) | ((uint32_t)(uint8_t)c << 8) | (uint32_t)(uint8_t)d; }
+constexpr uint32_t kFbAttrEnable = fb_fourcc('e', 'n', 'a', 'b'), kFbAttrCheckEnable = fb_fourcc('c', 'e', 'n', 'a'), kFbAttrFlags = fb_fourcc('f', 'l', 'g', 's'), kFbAttrHlDdc = fb_fourcc('h', 'd', 'd', 'c');
+constexpr uint32_t kFbAttrPower = fb_fourcc('p', 'o', 'w', 'r'), kFbAttrCursor = fb_fourcc('c', 'r', 's', 'r');     // kConnectionPower / kIOPowerAttribute are 'powr'; kIOHardwareCursorAttribute is 'crsr'
+enum FbRc : uint32_t { kFbRcSuccess = 0, kFbRcUnsupported = 1, kFbRcSuper = 2 };
+struct FbAttr { FbRc rc; bool hasValue; uintptr_t value; };
+inline FbAttr fb_connection_attr(const N48DispSnap *s, uint32_t attribute) {
+    FbAttr r = { kFbRcSuper, false, 0u };
+    if (attribute == kFbAttrEnable || attribute == kFbAttrCheckEnable) { r.rc = kFbRcSuccess; r.hasValue = true; r.value = 1u; }
+    else if (attribute == kFbAttrFlags) { r.rc = kFbRcSuccess; r.hasValue = true; r.value = 0u; }
+    else if (attribute == kFbAttrHlDdc) r.rc = (s && s->edidLen != 0u) ? kFbRcSuccess : kFbRcUnsupported;
+    return r;
+}
+// getAttribute: the hardware cursor attribute answers 0 (software cursor, no 'vbl ' timer, no hardware plane); everything else is super's.
+inline FbAttr fb_attr(uint32_t attribute) {
+    FbAttr r = { kFbRcSuper, false, 0u };
+    if (attribute == kFbAttrCursor) { r.rc = kFbRcSuccess; r.hasValue = true; r.value = 0u; }
+    return r;
+}
+// setAttribute(kIOPowerAttribute) / setAttributeForConnection(kConnectionPower): record the value and succeed; NO hardware action in M5. Others are super's.
+constexpr bool fb_power_attr(uint32_t attribute) { return attribute == kFbAttrPower; }
+
+// DDC: one connection (index 0); blocks are 1-based (1 = base EDID, 2 = the CTA extension) over the cached 256 bytes; only the EDID block type. Same answers as RDNA4FB's.
+constexpr uint32_t kFbDdcBlock = 128u;
+enum FbDdc : uint32_t { kFbDdcOk = 0, kFbDdcUnsupported = 1, kFbDdcNotFound = 2 };
+inline bool fb_has_ddc(const N48DispSnap *s, int32_t connect) { return s && connect == 0 && s->edidLen != 0u; }
+inline FbDdc fb_ddc_block(const N48DispSnap *s, int32_t connect, uint32_t blockNumber, bool typeIsEdid, bool haveOut, uint64_t outCap, const uint8_t **src, uint64_t *n) {
+    if (!s || connect != 0 || !typeIsEdid || !haveOut || !src || !n) return kFbDdcUnsupported;
+    if (blockNumber < 1u || (uint64_t)blockNumber * kFbDdcBlock > s->edidLen) return kFbDdcNotFound;
+    *src = s->edid + (uint64_t)(blockNumber - 1u) * kFbDdcBlock;
+    *n = outCap < kFbDdcBlock ? outCap : kFbDdcBlock;
+    return kFbDdcOk;
+}
 
 // ---- task window (only the shape check; the values come from the bring-up kext) ------------------------------------------------------------
 constexpr uint64_t kPage = 0x1000ull;

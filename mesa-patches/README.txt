@@ -1,7 +1,7 @@
 Mesa patches (RADV Darwin / macOS port for the Navi 48 native kext)
 ===================================================================
 
-These five patches add a macOS backend to Mesa's RADV Vulkan driver so that it
+These nine patches add a macOS backend to Mesa's RADV Vulkan driver so that it
 talks to the Navi48 bring-up kext (user-client ABI "N48N") instead of a DRM
 node. Only our changes are included, not the Mesa tree.
 
@@ -21,6 +21,6 @@ Apply:
 (The patch author and date headers are placeholders; "git am" works as-is,
 or use "git apply" / "patch -p1" in order.)
 
-Order matters: 0001 .. 0005. The kext ABI header that patches 0002-0004 mirror
+Order matters: 0001 .. 0009. The kext ABI header that patches 0002-0004 mirror
 is src/navi48-bringup/src/Navi48NativeABI.h in this repository; Mesa's copy and
-the kext's copy must be the same ABI version (currently 1.9 or newer).
+the kext's copy must be the same ABI version (currently 1.11 or newer).

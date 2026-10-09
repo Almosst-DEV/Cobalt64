@@ -3,7 +3,7 @@
  *
  * ONE plain-C header shared by three consumers: the kext (Navi48NativeClient), the Mesa Darwin backend
  * (copied byte for byte to mesa-mac/include/darwin/navi48_native_abi.h) and the PC test tools
- * (tools/native/n48native.c, s1d_replay.c). The contract is notes/design/NATIVE-S1C-ABI.md: where this
+ * (tools/native/n48native.c, s1d_replay.c). The contract is an internal design note: where this
  * file and the contract disagree, the contract wins (and this file is the bug).
  *
  * Transport: IOServiceOpen(svc, task, N48N_UC_TYPE, &conn), then IOConnectCallMethod(conn, selector, ...).
@@ -26,7 +26,7 @@
 
 #define N48N_UC_TYPE       0x4E34384Eu      /* 'N48N' */
 #define N48N_ABI_VERSION   1u            /* the MAJOR: unchanged, so every v1.0 client (Mesa, n48native, s1d-replay) still handshakes */
-#define N48N_ABI_MINOR     9u            /* 1.9 (kext 0.0.612): selector 21 N48N_SEL_BO_IMPORT_HOST (milestone #11 step 11c: import a page-aligned range of the CALLER's address space as a SYSTEM-memory BO; limits 64 MiB per BO, 256 MiB per client), the class of the N48N user client is renamed IOAccelNavi48NativeClient (WindowServer's sandbox admits iokit-open only for IOAccel* classes; the service name and type 'N48N' are unchanged), and a uid-88 caller is admitted behind the boot-arg navi48-metal-ws=1; 1.8 (kext 0.0.610): selectors 19 N48N_SEL_METAL_NUB_PUBLISH and 20 N48N_SEL_METAL_NUB_WITHDRAW (milestone #9 route A: the software Navi48MetalNub the aux accelerator kext matches; published only on demand, only with the boot-arg navi48-metal=1); 1.7 (kext 0.0.609): HELD mode for row 120: selector 17 N48N_SEL_MODE_HOLD (enter row 120 and RETURN with the mode up, a scanout client may then Acquire and present at 120 Hz) and selector 18 N48N_SEL_MODE_RELEASE (end it, wait, return the final result); verdict 16 HELD, deny 25 / 26, N48N_HOLD_* words; the result's former reserved0 / reserved1 (offsets 204 / 252) are hold_end / hold_flags (the size stays 512 B); 1.6 (kext 0.0.608): row 120's blanked-transition underflow reads, DIO attribution and lock-hold witness code in the result's former reserved[8] (the size stays 512 B); 1.5 (kext 0.0.607): row 120 (the 1440p 120 Hz trial) runs behind the boot-arg navi48-row120=1 with the clock hold (P4); the result's ext.reserved words carry the hold report (its size is unchanged); new deny reasons 22 / 23, verdict 15, flags 22..24; 1.4 (kext 0.0.606): selector 16's result grows from 256 to 512 B (underflow / resync / OTG-lock report) and it accepts the rows 1 (DP1 resync) and 2 (V_TOTAL under the OTG lock) and a flags word; 1.3 (kext 0.0.605): the timed mode-trial selector 16, native-S2d; 1.2 (kext 0.0.604): the DAL experiment selector 15, native-S2-DISPCLK; 1.1 (kext 0.0.603): the scanout selectors 9..14, native-S2a. Reported when Hello asks (below) and in n48n_info.reserved[2]. */
+#define N48N_ABI_MINOR     12u           /* 1.12 (kext 0.0.662, M6 Stage 2): selectors 22..26 also accept INSTANCE 1 (the monitor A: HUBP1 / OTG1; slot ids tagged 0x10 | k) behind the boot-arg navi48-m6flip1=1 (with navi48-m6=1 and navi48-m6flip=1; with it OFF instance 1 is answered kIOReturnBadArgument exactly as 1.11 did); SCANX_ACQUIRE returns the instance's geometry in a fifth output word (a call with four output words still works: the fifth is not written); N48N_SCANQ_M6FLIP1 in scan_query.flags says all three latches are on; no struct changes. 1.11 (kext 0.0.661, M6 Stage 1b): selectors 22..26 N48N_SEL_SCANX_* - the scanout of INSTANCE 2 (the monitor B: HUBP2 / OTG2), poll-only, behind the boot-args navi48-m6=1 AND navi48-m6flip=1 (a latch OFF answers every one with Unsupported and touches nothing); N48N_SCANQ_M6FLIP in scan_query.flags says both are on; no struct changes. 1.10 (kext 0.0.640, GPU-apps G4): n48n_info.reserved[3..7] report the session's VRAM budget (N48N_INFO_R_* / N48N_BUDGET_* below), so a user-space allocator (Mesa/RADV) can size its VRAM heap; no selector, no struct size changes. A third client role (APP, a non-root uid >= 501 process on the kernel allow-list) exists behind the boot-args navi48-apps=1 + navi48-multisession=1: it reaches selectors 0, 1, 3..8 and 21 only (never ReadRegs 2, never scanout 9..14, never 15..20); a refused selector is kIOReturnNotPrivileged. 1.9 (kext 0.0.612): selector 21 N48N_SEL_BO_IMPORT_HOST (milestone #11 step 11c: import a page-aligned range of the CALLER's address space as a SYSTEM-memory BO; limits 64 MiB per BO, 256 MiB per client), the class of the N48N user client is renamed IOAccelNavi48NativeClient (WindowServer's sandbox admits iokit-open only for IOAccel* classes; the service name and type 'N48N' are unchanged), and a uid-88 caller is admitted behind the boot-arg navi48-metal-ws=1; 1.8 (kext 0.0.610): selectors 19 N48N_SEL_METAL_NUB_PUBLISH and 20 N48N_SEL_METAL_NUB_WITHDRAW (milestone #9 route A: the software Navi48MetalNub the aux accelerator kext matches; published only on demand, only with the boot-arg navi48-metal=1); 1.7 (kext 0.0.609): HELD mode for row 120: selector 17 N48N_SEL_MODE_HOLD (enter row 120 and RETURN with the mode up, a scanout client may then Acquire and present at 120 Hz) and selector 18 N48N_SEL_MODE_RELEASE (end it, wait, return the final result); verdict 16 HELD, deny 25 / 26, N48N_HOLD_* words; the result's former reserved0 / reserved1 (offsets 204 / 252) are hold_end / hold_flags (the size stays 512 B); 1.6 (kext 0.0.608): row 120's blanked-transition underflow reads, DIO attribution and lock-hold witness code in the result's former reserved[8] (the size stays 512 B); 1.5 (kext 0.0.607): row 120 (the 1440p 120 Hz trial) runs behind the boot-arg navi48-row120=1 with the clock hold (P4); the result's ext.reserved words carry the hold report (its size is unchanged); new deny reasons 22 / 23, verdict 15, flags 22..24; 1.4 (kext 0.0.606): selector 16's result grows from 256 to 512 B (underflow / resync / OTG-lock report) and it accepts the rows 1 (DP1 resync) and 2 (V_TOTAL under the OTG lock) and a flags word; 1.3 (kext 0.0.605): the timed mode-trial selector 16, native-S2d; 1.2 (kext 0.0.604): the DAL experiment selector 15, native-S2-DISPCLK; 1.1 (kext 0.0.603): the scanout selectors 9..14, native-S2a. Reported when Hello asks (below) and in n48n_info.reserved[2]. */
 #define N48N_HELLO_F_MINOR (1u << 8)     /* Hello flags bit 8: "report the minor": out[0] = ABI | (MINOR << 16). Without it out[0] is exactly the major, as in v1.0. Bit 8, not 0: flags = 1, which T1 leg 1 sends and expects refused, still is. */
 #define N48N_MAX_IBS       64u
 #define N48N_MAX_BOS       4096u            /* handles 1..4095; 0 is never valid */
@@ -69,10 +69,23 @@ enum {
     N48N_SEL_COUNT_1_8     = 21,
     /* ---- ABI 1.9 (kext 0.0.612): host-memory import, milestone #11 step 11c. Needs Hello first. ---- */
     N48N_SEL_BO_IMPORT_HOST = 21, /* in: [0] host VA (4 KiB aligned, in the CALLER's address space) [1] size (4 KiB multiple, 1 page .. 64 MiB) [2] flags (0, or with [3] != 0 the GemVa vm flags R/W/X/MTYPE of the mapping) [3] GPU VA to map at (0 = do not map: map later with GemVa MAP on the handle, as RADV does)
-                                     out: [0] BO handle [1] size [2] GPU VA mapped at import (canonical; 0 when [3] was 0) [3] placed bits (N48N_PLACED_HOST_IMPORT). Wires the pages (IOMemoryDescriptor::withAddressRange(task) + prepare()) and records their physical addresses; a mapping (here or by GemVa MAP) is SYSTEM|SNOOPED, per page. Total imported <= 2 GiB per client (0.0.620; 256 MiB before; separate from the GTT cap).
+                                     out: [0] BO handle [1] size [2] GPU VA mapped at import (canonical; 0 when [3] was 0) [3] placed bits (N48N_PLACED_HOST_IMPORT). Wires the pages (IOMemoryDescriptor::withAddressRange(task) + prepare()) and records their physical addresses; a mapping (here or by GemVa MAP) is SYSTEM|SNOOPED, per page. Total imported <= 4 GiB per client (0.0.621; 2 GiB in 0.0.620, 256 MiB before; separate from the GTT cap).
                                      BoFree, and the close of the client, unmap the PTEs, flush the TLB, then complete() and release the pages (under the HUNG latch they are leaked, never released). A host BO cannot be a scanout slot, a user-fence target or CPU-mapped by clientMemoryForType (NotPermitted). Errors: BadArgument (alignment, size 0, > 64 MiB, user range, flags), NoMemory (the per-client cap, no descriptor, no page table space), NotReady (no Hello), Aborted / Timeout (HUNG). */
-    N48N_SEL_COUNT_1_9     = 22
+    N48N_SEL_COUNT_1_9     = 22,
+    /* ---- ABI 1.11 (kext 0.0.661, M6 Stage 1b): the scanout of INSTANCE 2 (the monitor B, HUBP2 / OTG2). Every selector takes in[0] = the instance, which must be 2 (anything else, a non-zero flag word or a foreign session is refused before any register read). Need Hello and
+          the session must already hold instance 0 (the plane Acquire of selector 10). Slot ids of instance 2 are TAGGED: 0x20 | k. Behind navi48-m6=1 AND navi48-m6flip=1: with either OFF each answers Unsupported. Not for APP clients or the accelerator route. ---- */
+    N48N_SEL_SCANX_ACQUIRE  = 22, /* in: [0] instance (2) [1] flags (0)   out: [0] A (instance 2's console MC) [1] OTG2 frame count (extended) [2] the M6 surface-table generation [3] the allocator's FREE visible-VRAM bytes at that moment (the bundle's pool budget, review S4) */
+    N48N_SEL_SCANX_REGISTER = 23, /* in: [0] instance (2)   struct in: n48n_scan_reg (32 B)   out: [0] tagged slot id (0x20|k) [1] slot MC */
+    N48N_SEL_SCANX_PRESENT  = 24, /* in: [0] instance (2) [1] tagged slot id [2] flags (0)   out: [0] present id [1] target frame [2] 0 */
+    N48N_SEL_SCANX_STATUS   = 25, /* in: [0] instance (2)   struct out: n48n_scan_status (256 B; console_mc = A; slot ids tagged)   out: [0] M6 table generation [1] reuse_inuse_refused [2] restores | restore failures << 32 [3] write refusals | write failures << 32. A call IS the keep-alive. */
+    N48N_SEL_SCANX_RELEASE  = 26, /* in: [0] instance (2)   out: [0] restore of A verified (1/0) [1] plane MC after; idempotent */
+    N48N_SEL_COUNT_1_11     = 27,
+    N48N_SEL_COUNT_1_12     = 27  /* ABI 1.12 (kext 0.0.662, M6 Stage 2): no new selector. Selectors 22..26 take in[0] = 1 (the monitor A, behind navi48-m6flip1=1 as well) or 2 (the monitor B); slot ids of instance 1 are 0x10 | k. SCANX_ACQUIRE: out[4] = the instance's geometry w | h << 16 | pitch_px << 32 when the caller asked for five output words (four still work). */
 };
+#define N48N_SCANX_INSTANCE   2u
+#define N48N_SCANX_SLOT_TAG   0x20u
+#define N48N_SCANX_INSTANCE_MONA   1u        /* ABI 1.12: the monitor A (HUBP1 / OTG1); behind navi48-m6flip1=1 */
+#define N48N_SCANX_SLOT_TAG_MONA   0x10u
 
 /* ---- the drm values the kernel interprets (identical to include/drm-uapi/amdgpu_drm.h) ----------------------- */
 #define N48N_GEM_DOMAIN_CPU        0x1u
@@ -183,13 +196,26 @@ struct n48n_info {                 /* 192 B */
 #define N48N_INFO_HUNG          (1u << 0)
 #define N48N_INFO_S1B_POSITIVE  (1u << 1)
 #define N48N_INFO_NATIVE_BOOT   (1u << 2)
+/* ABI 1.10 (kext 0.0.640): n48n_info.reserved[] words (an older kext leaves them 0, which reads as "no budget reported").
+ *   reserved[0],[1] = native write counter (diagnostic)   reserved[2] = ABI minor (1.1)
+ *   reserved[3] = N48N_BUDGET_* flags
+ *   reserved[4],[5] = the VRAM budget CAP in bytes, low / high dword: what ALL non-WindowServer sessions together may hold (25 % of the VRAM pools). 0 when N48N_BUDGET_VALID is clear.
+ *   reserved[6],[7] = the bytes still AVAILABLE to this session now = min(cap - held by all non-WindowServer sessions, free bytes of the VRAM pools), low / high dword. A user-space
+ *                     allocator should treat (bytes this session already holds + AVAILABLE) as its heap size; the budget is SHARED, so AVAILABLE can shrink between two queries. */
+#define N48N_INFO_R_BUDGET_FLAGS 3u
+#define N48N_INFO_R_BUDGET_CAP_LO 4u
+#define N48N_INFO_R_BUDGET_CAP_HI 5u
+#define N48N_INFO_R_BUDGET_AVAIL_LO 6u
+#define N48N_INFO_R_BUDGET_AVAIL_HI 7u
+#define N48N_BUDGET_VALID (1u << 0)   /* a VRAM budget applies to this session (multi-session boot, not WindowServer's session) */
+#define N48N_BUDGET_APP   (1u << 1)   /* this session was admitted as an APP (the kernel allow-list role) */
 /* BoCreate scalar out [3] */
 #define N48N_PLACED_CPU_MAPPABLE (1u << 0)
 #define N48N_PLACED_ZEROED       (1u << 1)
 #define N48N_PLACED_HI_POOL      (1u << 2)
 #define N48N_PLACED_HOST_IMPORT  (1u << 3)   /* ABI 1.9: the BO is an import of caller memory (SYSTEM pages) */
 #define N48N_IMPORT_MAX_BO       (64ull << 20)   /* ABI 1.9: per BoImportHost call */
-#define N48N_IMPORT_CAP          (2048ull << 20) /* ABI 1.9: per client, 2 GiB since kext 0.0.620 (256 MiB before), separate from the 512 MiB GTT cap */
+#define N48N_IMPORT_CAP          (4096ull << 20) /* ABI 1.9: per client, 4 GiB since kext 0.0.621 (2 GiB in 0.0.620, 256 MiB before), separate from the 512 MiB GTT cap */
 
 /* ---- ABI 1.1: native scanout (kext 0.0.603) ------------------------------------------------------------------------------------ */
 #define N48N_SCAN_MAX_SLOTS   3u
@@ -201,6 +227,9 @@ struct n48n_info {                 /* 192 B */
 #define N48N_SCANQ_ACQUIRED   (1u << 2)    /* the plane is taken (by this or an earlier call of this client) */
 #define N48N_SCANQ_GEOM_OK    (1u << 3)    /* linear ARGB8888, no DCC, plausible viewport/pitch: Acquire would proceed */
 #define N48N_SCANQ_DTO_VALID  (1u << 4)    /* refresh derived from the DP DTO; else from the EDID row matching the raster, else 0 */
+#define N48N_SCANQ_M6FLIP1    (1u << 7)    /* 0.0.662 (M6 Stage 2): boot-arg navi48-m6flip1=1 is latched ON as well as navi48-m6=1 and navi48-m6flip=1: ABI 1.12's instance 1 (the monitor A) is live; a flag bit in an existing word */
+#define N48N_SCANQ_M6FLIP     (1u << 6)    /* 0.0.661 (M6 Stage 1b): boot-arg navi48-m6flip=1 is latched ON as well as navi48-m6=1: ABI 1.11's selectors 22..26 (instance 2) are live; a flag bit in an existing word */
+#define N48N_SCANQ_M6         (1u << 5)    /* 0.0.659 (M6 Stage 1a): boot-arg navi48-m6=1 is latched ON: the bundle presents only surfaces the kernel maps to instance 0 (property Navi48,M6Surf of the Metal nub); ABI minor unchanged (a flag bit in an existing word) */
 /* n48n_scan_slot.flags */
 #define N48N_SCANSLOT_PENDING  (1u << 0)   /* this slot's Present is programmed and has not latched */
 #define N48N_SCANSLOT_INUSE    (1u << 1)   /* HUBP0 EARLIEST_INUSE equals this slot's MC: the hardware is still fetching it */
@@ -287,7 +316,7 @@ struct n48n_dal_result {           /* 256 B */
 };
 
 /* ---- ABI 1.3: the timed mode trial (kext 0.0.605, native S2d) --------------------------------------------------------------------------
- * ABI 1.3 addendum (proposed text for notes/design/NATIVE-S1C-ABI.md; the header is the only place it lives until the reviewer merges it):
+ * ABI 1.3 addendum (proposed text for an internal design note; the header is the only place it lives until the reviewer merges it):
  *   Selector 16 N48N_SEL_MODE_TRIAL. Native boots only (navi48-native=1 with S1b POSITIVE PASS), scanout plane NOT acquired, DISPCLK/DPPCLK at least what the row's DML
  *   needs (read from the DFS registers, never assumed), the live mode the 60 Hz census raster. It programs the display to the row's refresh (row 50 = the 60 Hz raster at a
  *   201 MHz pixel clock, 49.90 Hz, the live 60 Hz DLG/TTU stays; row 120 = 497.75 MHz, 2720x1525, the DML DLG/TTU/prefetch goldens; row 120 needs a passed row-50 trial on
@@ -299,7 +328,7 @@ struct n48n_dal_result {           /* 256 B */
  *   Time in the trial mode is about 0.5 s + 3 s + dwell. The hardware writes are the ones listed in navi48_modetrial_tables.h (the generated golden tables), nothing else.
  *   It never raises a clock: a row whose DML clocks exceed the live DFS readback is DENIED (n48dal / navi48-dalsmc is the only clock path).
  *   n48n_mode_result: verdict N48N_MODE_V_*, deny N48N_MODE_D_* (verdict DENIED: nothing was written), flags N48N_MODE_F_*. Tool: tools/native/n48mode.c.
- * ABI 1.4 addendum (kext 0.0.606, native S2-120HZ; design notes/design/NATIVE-S2-120HZ.md P1 / P2 / P3):
+ * ABI 1.4 addendum (kext 0.0.606, native S2-120HZ; design an internal design note P1 / P2 / P3):
  *   The result is 512 B: the first 256 B are the 1.3 layout unchanged, the second 256 B are `ext` (below). A client built for 1.3 must not call selector 16 on a 1.4 kext (the output size differs).
  *   Two new rows, both at 60 Hz with no clock or DTO change: row 1 = the DP1 stream resync (blank, then unblank, exactly Linux's order: field-exact writes of DP1_DP_VID_STREAM_CNTL,
  *   DP1_DP_STEER_FIFO and DIG1_DIG_FIFO_CTRL0 only; one retry; the stream is left blanked only if both attempts failed, and then the restore / watchdog / `dcnmode 0` / kext stop unblank it);
@@ -309,7 +338,7 @@ struct n48n_dal_result {           /* 256 B */
  *   The underflow registers (HUBP0_DCHUBP_CNTL, ODM0_OPTC_INPUT_GLOBAL_CONTROL) are read before the trial (must be clean), after the settle (reported), every 250 ms during the rate window and
  *   the dwell (an underflow ends the trial: verdict UNDERFLOW, restored, latched) and after the restore (an underflow there makes the verdict RESTORE). They are cleared with their write-1
  *   strobes (never while ODM0_OPTC_INPUT_GLOBAL_CONTROL.INPUT_SOFT_RESET is set). Row 120 stays hard-denied. */
-/* ABI 1.5 addendum (kext 0.0.607, native S2-120HZ; design notes/design/NATIVE-S2-120HZ.md P4 / P5):
+/* ABI 1.5 addendum (kext 0.0.607, native S2-120HZ; design an internal design note P4 / P5):
  *   Row 120 (2560x1440, 2720x1525, 497.75 MHz = 119.998 Hz) is DENIED (N48N_MODE_D_ROW120_OFF) unless the boot-arg navi48-row120=1 is present. With it, the trial needs: a native boot with S1b POSITIVE PASS and
  *   navi48-dalsmc=4; E1b (n48dal e1b) run on THIS boot; a passed row-50 trial, a passed row-1 resync and a row-2 PASS with N48N_MODE_F_LOCK_HELD_PROVEN on THIS boot (deny 15 / 23); the F6 / F7 / P1 baselines
  *   (OTG lock usable, FIFO health, underflow clean); the clock hold available (deny 22: the reason is ext.hold_pre, n48dal::HoldPre 1 level, 2 no E1b, 3 DAL latch, 4 hold state, 5 mailbox owner busy). The operator keeps the
@@ -321,7 +350,7 @@ struct n48n_dal_result {           /* 256 B */
  *   underflow; (14) only then release the clock hold (DPPCLK then DISPCLK to the 272 MHz floor). A restore that did not verify never releases (hold state STUCK: the clocks stay up, harmless at 60 Hz; cold power cycle).
  *   Any failure at any step goes to the restore. The watchdog restores registers only; it never touches a clock. New words: verdict 12 CLOCK_LOST (the DFS readback fell under the need while held), verdict 15 HOLD (the release
  *   did not verify), flags 22..24, the hold report in ext (hold_*). The result struct keeps its 512 B; the hold report lives in what 1.4 called ext.reserved. */
-/* ABI 1.7 addendum (kext 0.0.609, native S2 milestone #8: the cube at 120 Hz; design: the "0.0.609" section of notes/design/NATIVE-S2-120HZ.md and the comments of dcn/navi48_modetrial_pure.h):
+/* ABI 1.7 addendum (kext 0.0.609, native S2 milestone #8: the cube at 120 Hz; design: the "0.0.609" section of an internal design note and the comments of dcn/navi48_modetrial_pure.h):
  *   A mode trial and a scanout client exclude each other (scanAcquire refuses while a trial is busy; the trial refuses while the plane is acquired). The HELD mode lets a scanout client present WHILE the display runs at 1440p 120 Hz.
  *   Selector 17 N48N_SEL_MODE_HOLD (row 120 only, needs everything `n48mode 120` needs): runs the SAME trial on a kernel thread - deny gate, clock hold, blank, lock, writes, unlock, latch, DTO, MSA, unblank, 500 ms settle, the
  *   3 s judged rate window - and, when that is clean (no failure, rate inside 1 %, no underflow judged), does NOT dwell for a fixed time: it publishes the entry snapshot and returns it (verdict N48N_MODE_V_HELD) with the mode UP.

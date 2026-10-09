@@ -1,0 +1,15 @@
+;; n48-translate.sb - sandbox profile for ONE translation (pc-translate.sh runs: sandbox-exec -f this -D SRC=.. -D HERE=.. -D OUT=.. -D STATE=.. python3 pc-translate.py ...).
+;; Deny by default. READ: the system (python3, clang, dyld cache, CLT), the translator directory, and the dump area /private/tmp/n48m (every uid's subdirectory).
+;; WRITE: only the side spvcache (OUT = /private/var/tmp/n48m-spv) and the daemon's own state directory (STATE, which also holds TMPDIR). NO network. No other write anywhere.
+(version 1)
+(deny default)
+(import "system.sb")
+(allow process-fork)
+(allow file-read-metadata)   ; stat/realpath of any path component (the python3 and clang shims walk /Library/Developer/CommandLineTools); NO content read outside the list below
+(allow process-exec* (subpath "/usr/bin") (subpath "/bin") (subpath "/Library/Developer/CommandLineTools") (subpath (param "HERE")))
+(allow file-read* (subpath "/usr") (subpath "/bin") (subpath "/System") (subpath "/Library/Developer/CommandLineTools") (subpath "/private/var/db/xcode_select_link")
+       (subpath "/private/var/db/timezone") (subpath "/private/etc") (literal "/dev/null") (literal "/dev/random") (literal "/dev/urandom") (literal "/private/var/select/developer_dir"))
+(allow file-read* (subpath (param "SRC")) (subpath (param "HERE")))
+(allow file-read* file-write* (subpath (param "OUT")) (subpath (param "STATE")))
+(allow file-write* (literal "/dev/null"))
+(deny network*)

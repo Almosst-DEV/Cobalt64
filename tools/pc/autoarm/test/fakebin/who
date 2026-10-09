@@ -1,0 +1,2 @@
+#!/bin/bash
+D=${FAKE_DIR:?}; cat "$D/who" 2>/dev/null; exit 0

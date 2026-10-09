@@ -74,9 +74,9 @@ test: $(BUILD)/test_xlat12 $(BUILD)/fuzz_xlat12 $(BUILD)/test_xlat12_ib $(BUILD)
 	$(BUILD)/test_xlat12_ib 100000
 	$(BUILD)/test_headless
 	$(BUILD)/test_xlat12_b7b
-	@# notes/design/D4-PRIME.md item 2: tools/gfx-readset.py's generator + xlat12_readset.h regeneration and proof tests.
+	@# an internal design note item 2: tools/gfx-readset.py's generator + xlat12_readset.h regeneration and proof tests.
 	python3 tests/test_xlat12_readset.py
-	@# build 0.0.470 (notes/design/NO-SAMPLER-CLASS10.md N5): every kDTableAbi row and its ABI-pointer row against
+	@# build 0.0.470 (an internal design note N5): every kDTableAbi row and its ABI-pointer row against
 	@# the program's own ABI JSON and object (the guard on risk R7, a no-sampler row for a program that samples).
 	python3 tests/test_kdtableabi_rows.py
 

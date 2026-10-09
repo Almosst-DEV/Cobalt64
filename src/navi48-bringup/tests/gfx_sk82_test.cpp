@@ -1,4 +1,4 @@
-// gfx_sk82_test.cpp — build 0.0.527 (notes/design/SKIP82.md items 1-12; apple/gfx_sk82.h): switch 82, skip a byte-identical
+// gfx_sk82_test.cpp — build 0.0.527 (an internal design note items 1-12; apple/gfx_sk82.h): switch 82, skip a byte-identical
 // residency re-copy (MEASURE 338 / OFF 594 / SKIP 850).
 //     clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //         -I src/navi48-bringup/src/apple -I src/xlat12 -I src/navi48-bringup/tests src/navi48-bringup/tests/gfx_sk82_test.cpp \

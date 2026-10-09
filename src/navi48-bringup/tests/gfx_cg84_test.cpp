@@ -1,4 +1,4 @@
-// gfx_cg84_test.cpp — build 0.0.529 (notes/design/CG84.md items 1-12, X1-X4; apple/gfx_copyguard.h + apple/gfx_cg84.h):
+// gfx_cg84_test.cpp — build 0.0.529 (an internal design note items 1-12, X1-X4; apple/gfx_copyguard.h + apple/gfx_cg84.h):
 // switch 84, the granule copy guard and the delta residency write (SHADOW 340 / OFF 596 / ON 852).
 //     clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //         -I src/navi48-bringup/src/apple -I src/xlat12 -I src/navi48-bringup/tests src/navi48-bringup/tests/gfx_cg84_test.cpp \

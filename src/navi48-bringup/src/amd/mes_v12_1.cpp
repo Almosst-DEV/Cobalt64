@@ -870,6 +870,13 @@ mes_kick_doorbell(const DeviceContext &dev, const MESInstance &inst)
 // QUERY_SCHEDULER_STATUS frame for fence acknowledgement, kick the
 // doorbell, poll the status slot.
 //------------------------------------------------------------------
+// 0.0.626 (G1 review F1 / F3): the per-call fence sequence and the sticky timeout flag. The sequence is the value MES must write into THIS call's status slot
+// (upstream mes_v12_0_submit_pkt_and_poll_completion uses an incrementing seq): a late completion of an earlier frame writes an earlier value and is never read as
+// this frame's ack. Kept in 1..0x7fffffff (never 0 = the cleared slot, never bit 31 = the error flag the poll tests).
+static volatile uint32_t gMesFenceSeq = 0;
+static volatile uint32_t gMesTimeoutSeen = 0;
+bool mes_timeout_seen() { return __atomic_load_n(&gMesTimeoutSeen, __ATOMIC_SEQ_CST) != 0u; }
+
 kern_return_t
 mes_submit_pkt(const DeviceContext &dev, MESContext &mes, MESPipe pipe,
                const uint32_t *pkt, uint32_t api_status_off_dw,
@@ -890,7 +897,9 @@ mes_submit_pkt(const DeviceContext &dev, MESContext &mes, MESPipe pipe,
         wb_bytes + 0xC0);
     *status_slot = 0;
     const uint64_t status_gpu = inst.wb_bus + 0xC0;
-    const uint64_t fence_value = 1;
+    uint32_t fence_seq;
+    do { fence_seq = __atomic_add_fetch(&gMesFenceSeq, 1u, __ATOMIC_SEQ_CST) & 0x7FFFFFFFu; } while (fence_seq == 0u);
+    const uint64_t fence_value = fence_seq;   // 0.0.626 (F1): this frame's own value, compared below (it was the constant 1)
 
     // Patch the embedded MES_API_Status fence_addr / fence_value.
     uint32_t frame[kMES_API_FRAME_DWORDS];
@@ -936,7 +945,7 @@ mes_submit_pkt(const DeviceContext &dev, MESContext &mes, MESPipe pipe,
     kern_return_t r = mes_kick_doorbell(dev, inst);
     if (r != kIOReturnSuccess) return r;
 
-    // Poll status_slot. Success = lower 32 bits == 1.
+    // Poll status_slot. Success = lower 32 bits == this frame's fence_value (0.0.626: it used to be the constant 1).
     //
     // Deviation 6: the reference "waited" 100 us per iteration with a
     // 2000-iteration dummy-read loop. We use a real IODelay(100) for
@@ -968,6 +977,7 @@ mes_submit_pkt(const DeviceContext &dev, MESContext &mes, MESPipe pipe,
             elapsed += 1000;
         }
     }
+    __atomic_store_n(&gMesTimeoutSeen, 1u, __ATOMIC_SEQ_CST);   // 0.0.626 (F3): sticky for the boot
     MES_LOG("submit_pkt: pipe %u timeout (last status=%#llx, query=%#llx, "
             "CP_MES_INSTR_PNTR=%#x)",
             p, (unsigned long long)*status_slot,
@@ -1187,6 +1197,18 @@ mes_remove_hw_queue(const DeviceContext &dev, MESContext &mes,
                     uint32_t queue_type, uint32_t pipe_id,
                     uint32_t queue_id, uint32_t doorbell_offset)
 {
+    return mes_remove_hw_queue_flags(dev, mes, queue_type, pipe_id, queue_id, doorbell_offset,
+                                     kRemoveQueueFlag_unmap_legacy_queue);
+}
+
+// 0.0.623 (G1): the same frame with the flags word given. mes_remove_hw_queue above is exactly this with unmap_legacy_queue (the frame it sent
+// before 0.0.623, byte for byte).
+kern_return_t
+mes_remove_hw_queue_flags(const DeviceContext &dev, MESContext &mes,
+                          uint32_t queue_type, uint32_t pipe_id,
+                          uint32_t queue_id, uint32_t doorbell_offset,
+                          uint32_t flags)
+{
     if (!mes.pipe[0].inited || !mes.pipe[0].enabled) return kIOReturnNotReady;
     if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
 
@@ -1200,10 +1222,11 @@ mes_remove_hw_queue(const DeviceContext &dev, MESContext &mes,
     pkt.pipe_id           = pipe_id;
     pkt.queue_id          = queue_id;
     pkt.queue_type        = queue_type;
-    pkt.flags             = kRemoveQueueFlag_unmap_legacy_queue;
+    pkt.flags             = flags;
 
     MES_LOG("remove_hw_queue: type=%u pipe=%u queue=%u doorbell=%#x "
-            "(unmap_legacy_queue)", queue_type, pipe_id, queue_id, doorbell_offset);
+            "flags=%#x (unmap_legacy_queue%s)", queue_type, pipe_id, queue_id, doorbell_offset,
+            flags, (flags & kRemoveQueueFlag_remove_after_reset) ? " + remove_queue_after_reset" : "");
 
     const uint32_t api_status_dw = offsetof(MES_RemoveQueue, api_status) / 4;
     kern_return_t r = mes_submit_pkt(dev, mes, MESPipe::Sched,
@@ -1211,6 +1234,53 @@ mes_remove_hw_queue(const DeviceContext &dev, MESContext &mes,
                                      api_status_dw,
                                      /*timeout_us=*/1000000);
     MES_LOG("remove_hw_queue: %s (%#x)",
+            r == kIOReturnSuccess ? "acked" : "not acked", r);
+    return r;
+}
+
+// ----- mes_reset_legacy_gfx_queue — mes_v12_0_reset_hw_queue, legacy_gfx -----
+//
+// 0.0.623 (G1, hang recovery). mes_v12_0.c:1096-1140 with input->use_mmio false and input->legacy_gfx true (the path gfx_v12_0_reset_kgq ->
+// amdgpu_gfx_mes_reset_queue -> amdgpu_mes_reset_legacy_queue takes for the kernel GFX ring: gfx_v12_0.c:1608 me.use_mmio_for_reset = false):
+//
+//     header RESET; queue_type = GFX; reset_legacy_gfx = 1; pipe_id_lp = ring->pipe; queue_id_lp = ring->queue;
+//     mqd_mc_addr_lp = MQD gpu addr; doorbell_offset_lp = ring->doorbell_index; wptr_addr_lp = ring->wptr_gpu_addr; vmid_id_lp = vmid
+//
+// on the SCHED pipe through mes_v12_0_submit_pkt_and_poll_completion (our mes_submit_pkt, 2 s bound). Nothing else in the frame is set.
+// No register is written by this function itself: the frame goes into the MES ring and mes_submit_pkt kicks the MES doorbell (one doorbell write), exactly as every other MES API call.
+kern_return_t
+mes_reset_legacy_gfx_queue(const DeviceContext &dev, MESContext &mes,
+                           uint32_t pipe_id, uint32_t queue_id, uint32_t vmid,
+                           uint64_t mqd_addr, uint32_t doorbell_offset,
+                           uint64_t wptr_addr)
+{
+    if (!mes.pipe[0].inited || !mes.pipe[0].enabled) return kIOReturnNotReady;
+    if (!dev.ip.isResolved(IPBlock::GC)) return kIOReturnNotReady;
+
+    MES_ResetQueue pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.header.u32All      = mes_api_header(kMES_API_TYPE_SCHEDULER,
+                                            MESSchOp::RESET,
+                                            kMES_API_FRAME_DWORDS);
+    pkt.queue_type         = kMESQueueType_GFX;
+    pkt.flags              = kResetFlag_reset_legacy_gfx;
+    pkt.pipe_id_lp         = pipe_id;
+    pkt.queue_id_lp        = queue_id;
+    pkt.vmid_id_lp         = vmid;
+    pkt.mqd_mc_addr_lp     = mqd_addr;
+    pkt.doorbell_offset_lp = doorbell_offset;
+    pkt.wptr_addr_lp       = wptr_addr;
+
+    MES_LOG("reset_legacy_gfx_queue: pipe=%u queue=%u vmid=%u doorbell=%#x "
+            "mqd_mc=%#llx wptr_mc=%#llx (RESET reset_legacy_gfx)", pipe_id, queue_id, vmid,
+            doorbell_offset, (unsigned long long)mqd_addr, (unsigned long long)wptr_addr);
+
+    const uint32_t api_status_dw = offsetof(MES_ResetQueue, api_status) / 4;
+    kern_return_t r = mes_submit_pkt(dev, mes, MESPipe::Sched,
+                                     reinterpret_cast<const uint32_t *>(&pkt),
+                                     api_status_dw,
+                                     /*timeout_us=*/2000000);
+    MES_LOG("reset_legacy_gfx_queue: %s (%#x)",
             r == kIOReturnSuccess ? "acked" : "not acked", r);
     return r;
 }

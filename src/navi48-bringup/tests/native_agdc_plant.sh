@@ -10,9 +10,13 @@ import os, shutil, subprocess, sys, tempfile, time
 
 ROOT, FIRST, LAST = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 K = 'src/navi48-bringup'
-FILES = [f'{K}/src/amd/native_agdc_pure.h', f'{K}/src/amd/native_agdc_flow.h', f'{K}/src/amd/native_disp_pure.h', f'{K}/src/amd/native_disp.cpp', f'{K}/src/amd/native_disp.h',
+FILES = [f'{K}/src/dcn/navi48_dispread.h', f'{K}/src/dcn/navi48_dmubcmd.h', f'{K}/src/amd/native_agdc_pure.h', f'{K}/src/amd/native_agdc_flow.h', f'{K}/src/amd/native_disp_pure.h', f'{K}/src/amd/native_disp.cpp', f'{K}/src/amd/native_disp.h',
          f'{K}/src/amd/native_metal_pure.h', f'{K}/src/Navi48MetalOps.h', f'{K}/src/apple/DisplayPipeGuard.cpp', f'{K}/src/apple/Navi48Ttl.hpp', f'{K}/src/dcn/navi48_dcn.cpp', f'{K}/src/dcn/navi48_dcn.hpp',
-         f'{K}/src/Navi48Bringup.cpp', f'{K}/src/Navi48UserClient.cpp', f'{K}/tests/native_agdc_test.cpp', f'{K}/tests/native_agdc_plant.sh', 'tools/pc/navi48test.c']
+         f'{K}/src/Navi48Bringup.cpp', f'{K}/src/Navi48UserClient.cpp', f'{K}/tests/native_agdc_test.cpp', f'{K}/tests/native_agdc_plant.sh', 'tools/pc/navi48test.c',
+         # native_disp_pure.h includes the disp2 header (0.0.631) and, since 0.0.652, native_fb_pure.h -> Navi48DisplayOps.h: without them the control FAILED UNMODIFIED at 0.0.651
+         f'{K}/src/dcn/navi48_disp2.h', f'{K}/src/amd/native_fb_pure.h', f'{K}/src/Navi48DisplayOps.h',
+         # 0.0.659 (M6 Stage 1a): native_disp_pure.h includes native_m6_pure.h (-> display_pipe_guard.h) and DisplayPipeGuard.cpp includes Navi48DisplayNub.hpp
+         f'{K}/src/amd/native_m6_pure.h', f'{K}/src/apple/display_pipe_guard.h', f'{K}/src/Navi48DisplayNub.hpp']
 PURE, FLOW, DISPP, DGLUE, DPG, TTL, DCN, DCNH, BRG, UCL, CLI = (f'{K}/src/amd/native_agdc_pure.h', f'{K}/src/amd/native_agdc_flow.h', f'{K}/src/amd/native_disp_pure.h', f'{K}/src/amd/native_disp.cpp',
         f'{K}/src/apple/DisplayPipeGuard.cpp', f'{K}/src/apple/Navi48Ttl.hpp', f'{K}/src/dcn/navi48_dcn.cpp', f'{K}/src/dcn/navi48_dcn.hpp', f'{K}/src/Navi48Bringup.cpp', f'{K}/src/Navi48UserClient.cpp', 'tools/pc/navi48test.c')
 AUX = os.environ.get('N48_AUX_ROOT', ROOT)
@@ -88,10 +92,10 @@ plant(11, PURE, 'argument 2 is legal', 'constexpr bool arg_ok(uint64_t arg) { re
 plant(12, PURE, 'the held status number moves', 'kAlready = 12, kBadArg = 13, kHeld = 14, kNoFamily = 15, kStatusCount = 16', 'kAlready = 12, kBadArg = 13, kHeld = 16, kNoFamily = 15, kStatusCount = 17')
 plant(13, PURE, 'the verb number moves', 'constexpr uint32_t kActAgdc = 88u;    // accel action 88:', 'constexpr uint32_t kActAgdc = 89u;    // accel action 88:')
 plant(14, PURE, 'the unused status loses its name', 's == kUnused2 ? "(unused here', 's == 99u ? "(unused here')
-plant(15, DISPP, 'the last admitted action is 87 again', 'constexpr uint32_t kLastAction = 90u;', 'constexpr uint32_t kLastAction = 87u;')
+plant(15, DISPP, 'the last admitted action is 87 again', 'constexpr uint32_t kLastAction = 99u;', 'constexpr uint32_t kLastAction = 87u;')
 plant(16, DISPP, 'pipeagdc has no legal arguments', '(action == kActAgdc && arg <= 1ull) ||', 'false ||')
 plant(17, DISPP, 'pipeagdc accepts argument 2', '(action == kActAgdc && arg <= 1ull) ||', '(action == kActAgdc && arg <= 2ull) ||')
-plant(18, DISPP, 'n48disp_verb is taught to answer 88', 'constexpr bool is_pipe_verb(uint32_t action) { return (action >= kActAdopt && action <= kActShortcut) || action == kActVbl || action == kActReload; }', 'constexpr bool is_pipe_verb(uint32_t action) { return action >= kActAdopt && action <= kActAgdc; }')
+plant(18, DISPP, 'n48disp_verb is taught to answer 88', 'constexpr bool is_pipe_verb(uint32_t action) { return (action >= kActAdopt && action <= kActShortcut) || action == kActVbl || action == kActReload || action == kActM6Stat; }', 'constexpr bool is_pipe_verb(uint32_t action) { return action >= kActAdopt && action <= kActAgdc; }')
 plant(19, PURE, 'a forbidden pipe-offset spelling is introduced in the pure header', 'constexpr bool arg_ok(uint64_t arg) { return arg <= 1ull; }', 'constexpr bool arg_ok(uint64_t arg) { return arg <= 1ull; }   // see pipe+' + '0x299')
 # ---- the flow (amd/native_agdc_flow.h) --------------------------------------------------------------------------------------------------------------------------------
 plant(20, FLOW, 'the latch is not consulted', '    if (!e.latch_on()) return kOff;\n', '')
@@ -127,7 +131,7 @@ plant(50, DPG, 'the shared build forgets slot 266', '    copy[kVtHdr + 266] = re
 plant(51, DPG, 'the translation route drops its pipe-guard requirement', '    if (!navi48_pipeguard_armed_all()) return 2;\n', '')
 plant(52, DPG, 'the translation route drops its wrangler check', '    if (!agdc_have_wrangler()) return 9;\n    return agdc_build_locked(mc, slide, fb, pci, provider);', '    return agdc_build_locked(mc, slide, fb, pci, provider);')
 plant(53, DPG, 'the env looks the framebuffer up under one name only', 'static const char *const kNames[2] = { "RDNA4FB", "AMDRDNA4FB" };', 'static const char *const kNames[2] = { "RDNA4FB", "RDNA4FB" };')
-plant(54, DPG, 'the env skips the framebuffer name check', 'const bool ok = fb && mc && n48agdc::fb_name_ok(mc->getClassName()) && pci && provider;', 'const bool ok = fb && mc && pci && provider;')
+plant(54, DPG, 'the env skips the framebuffer name check', 'bool ok = fb && mc && n48agdc::fb_name_ok(mc->getClassName()) && pci && provider;', 'bool ok = fb && mc && pci && provider;')
 plant(55, DPG, 'the glue anchor differs from the pure header\'s', 'kAgdcGMetaClass   = 0x13d418e8;', 'kAgdcGMetaClass   = 0x13d418e0;')
 plant(56, DPG, 'the native control does not return the shared scalars', 'DPGLOG("agdc: native publish -> status %u (%s)", st, n48agdc::status_name(st));\n    agdc_fill_out(st, out, count);', 'DPGLOG("agdc: native publish -> status %u (%s)", st, n48agdc::status_name(st));\n    (void)out; (void)count;')
 plant(57, DPG, 'finish is never called', '    env.finish(st);\n', '')
@@ -142,7 +146,7 @@ plant(63, TTL, 'the native control is not declared', 'uint32_t navi48_agdc_nativ
 plant(70, BRG, 'the action-88 branch is unreachable', '	if (action == 88) {', '	if (action == 880) {')
 plant(71, BRG, 'the action-88 branch skips the argument table', 'n48disp::verb_args_ok(action, argScalar) ? navi48_agdc_native_control(argScalar, v, 13) : (uint32_t)n48agdc::kBadArg;', 'navi48_agdc_native_control(argScalar, v, 13);')
 plant(72, BRG, 'a bad argument is reported as success', 'return st == n48agdc::kBadArg ? kIOReturnBadArgument : kIOReturnSuccess;', 'return kIOReturnSuccess;')
-plant(73, BRG, 'action 88 is routed to the pipe-verb handler', 'if (action == 83 || action == 84 || action == 85 || action == 86 || action == 87 || action == 89 || action == 90) {', 'if (action == 83 || action == 84 || action == 85 || action == 86 || action == 87 || action == 88 || action == 89 || action == 90) {')
+plant(73, BRG, 'action 88 is routed to the pipe-verb handler', 'if (action == 83 || action == 84 || action == 85 || action == 86 || action == 87 || action == 89 || action == 90 || action == n48disp::kActM6Stat) {', 'if (action == 83 || action == 84 || action == 85 || action == 86 || action == 87 || action == 88 || action == 89 || action == 90 || action == n48disp::kActM6Stat) {')
 plant(74, BRG, 'the native control is not called from the branch', 'navi48_agdc_native_control(argScalar, v, 13) : (uint32_t)n48agdc::kBadArg;', 'navi48_agdc_control(argScalar, v, 13) : (uint32_t)n48agdc::kBadArg;')
 plant(75, DGLUE, 'n48disp_verb answers any new action', '!n48disp::is_pipe_verb(action)', '!n48disp::is_new_action(action)')
 plant(76, UCL, 'the user client bound is fixed at 88', 'if (action > 82 && !n48disp::action_admitted(n48disp_latched_on(), action)) return kIOReturnBadArgument;', 'if (action > 88) return kIOReturnBadArgument;')

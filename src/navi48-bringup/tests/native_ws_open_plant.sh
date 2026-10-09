@@ -81,7 +81,7 @@ plant 6 $W $OP "root is refused when a client is open (a changed return code)" '
 plant 7 $W $OP "any non-zero boot-arg value latches ON" 'return (present && value == 1u) ? kLatchOn : kLatchOff;' 'return (present && value != 0u) ? kLatchOn : kLatchOff;'
 plant 8 $W $OP "an absent boot-arg latches ON" 'return (present && value == 1u) ? kLatchOn : kLatchOff;' 'return (value == 1u || !present) ? kLatchOn : kLatchOff;'
 plant 9 $W $C "the client ignores the latched boot-arg" 'n48native::policy::latch_is_on(gMetalWsLatch)' 'true'
-plant 10 $W $C "the client forgets to log a refusal" '		NCLOG("open refused: uid %u, reason: %s", uid, n48native::policy::open_reason_text(d.reason));
+plant 10 $W $C "the client forgets to log a refusal" '				NCLOG("open refused: uid %u, reason: %s", uid, n48native::policy::open_reason_text(d.reason));
 ' ''
 plant 11 $W $C "the client forgets to log an admit" '	NCLOG("open admitted: uid %u, reason: %s", uid, n48native::policy::open_reason_text(d.reason));
 ' ''
@@ -89,11 +89,11 @@ plant 12 $W $C "the boot-arg is re-read on every open" '	if (gMetalWsLatch == n4
 	{ uint32_t again = 0; (void)PE_parse_boot_argn("navi48-metal-ws", &again, sizeof(again)); }'
 plant 13 $W $C "the uid is a constant" 'kauth_cred_getuid(kauth_cred_get())' '88'
 plant 14 $W $C "privileged is set before the decision" '	if (!d.admit) {
-		NCLOG' '	privileged = true;
+		if (d.reason' '	privileged = true;
 	if (!d.admit) {
-		NCLOG'
+		if (d.reason'
 plant 15 $W $C "the class is not IOAccel-prefixed" 'OSDefineMetaClassAndStructors(IOAccelNavi48NativeClient, IOUserClient)' 'OSDefineMetaClassAndStructors(Navi48NativeClient, IOUserClient)'
-plant 16 $W $SR/Navi48Bringup.cpp "newUserClient creates the old class" 'return IOAccelNavi48NativeClient::create(this, owningTask' 'return Navi48NativeClient::create(this, owningTask'
+plant 16 $W $SR/Navi48Bringup.cpp "newUserClient creates the old class" 'return IOAccelNavi48NativeClient::create(this, this, n48native::policy::kRouteBringup, owningTask' 'return Navi48NativeClient::create(this, this, n48native::policy::kRouteBringup, owningTask'
 plant 17 $W $SR/Navi48Bringup.cpp "the boot-arg is never latched at start" '	IOAccelNavi48NativeClient::latchBootArgs();   // 0.0.612: boot-arg navi48-metal-ws is read ONCE here' '	// (no latch)   // 0.0.612: boot-arg navi48-metal-ws is read ONCE here'
 # ---- W3: the Ready property ----
 plant 20 $W $MP "Ready is 1 after a latch (publish ignores the sticky state)" 'return (stickyNo || hungNow) ? kReadyNo : kReadyYes;' 'return hungNow ? kReadyNo : kReadyYes;'
@@ -121,7 +121,7 @@ plant 28 $W $E "the announce runs BEFORE the latch (unconditionally)" '    const
     IOLockUnlock(gHangLock);'
 # ---- W4: BoImportHost ----
 plant 40 $H $HP "the per-BO cap is 128 MiB" 'constexpr uint64_t kImportMaxBo   = 64ull << 20;' 'constexpr uint64_t kImportMaxBo   = 128ull << 20;'
-plant 41 $H $HP "the client cap is 512 MiB (the GTT cap)" 'constexpr uint64_t kImportCap     = 2048ull << 20;' 'constexpr uint64_t kImportCap     = 512ull << 20;'
+plant 41 $H $HP "the client cap is 512 MiB (the GTT cap)" 'constexpr uint64_t kImportCap     = 4096ull << 20;' 'constexpr uint64_t kImportCap     = 512ull << 20;'
 plant 42 $H $HP "the host va alignment is not checked" '    if (((hostVa | size) & (kPage - 1ull)) != 0ull) return ImportChk{ kBadArg, 0, 0 };' '    if ((size & (kPage - 1ull)) != 0ull) return ImportChk{ kBadArg, 0, 0 };'
 plant 43 $H $HP "size 0 is accepted" '    if (size == 0ull || hostVa == 0ull) return ImportChk{ kBadArg, 0, 0 };' '    if (hostVa == 0ull) return ImportChk{ kBadArg, 0, 0 };'
 plant 44 $H $HP "the cap check is off by one page" '    if (would_exceed(importedNow, size, kImportCap)) return ImportChk{ kNoMemory, 0, 0 };' '    if (would_exceed(importedNow, size + kPage, kImportCap)) return ImportChk{ kNoMemory, 0, 0 };'
@@ -135,8 +135,8 @@ plant 51 $H $HP "the page collector accepts a short run" '        if (pa == 0ull
 plant 52 $H $HP "the scattered mapper maps consecutive pages (the pt_map shape)" 'm.wr(ptb, idx_ptb(v) + (uint32_t)k, pte_encode(pagePa[p + k], leafFlagsIn));' 'm.wr(ptb, idx_ptb(v) + (uint32_t)k, pte_encode(pagePa[0] + (p + k) * kPage, leafFlagsIn));'
 plant 53 $H $HP "the scattered mapper does not validate first (a partial mapping on a bad page)" '    for (uint64_t i = 0; i < pages; i++) if (pte_encode(pagePa[i], leafFlagsIn) == 0ull || (pagePa[i] & (kPage - 1ull)) != 0ull) return kBadArg;' '    (void)0;'
 plant 54 $H $HP "the HUNG leak releases the pages" 'constexpr bool host_may_release(uint32_t mode) { return mode == kHostRelNormal || mode == kHostRelClosing; }' 'constexpr bool host_may_release(uint32_t mode) { return mode <= kHostRelClosing; }'
-plant 55 $H $E "BoFree leaks the import (never completes it)" '        else if (b.kind == kBoHost && host_may_release(kHostRelNormal) && memOk) host_release(b);' '        else if (b.kind == kBoHost && !host_may_release(kHostRelNormal) && memOk) host_release(b);'
-plant 56 $H $E "close does not free the imports" '        else if (b.kind == kBoHost && host_may_release(kHostRelClosing)) host_release(b);' '        else if (b.kind == kBoHost && !host_may_release(kHostRelClosing)) host_release(b);'
+plant 55 $H $E "BoFree leaks the import (never completes it)" '        else if (b.kind == kBoHost && host_may_release(kHostRelNormal) && memOk) { host_release(b); sys_release(b); }' '        else if (b.kind == kBoHost && !host_may_release(kHostRelNormal) && memOk) { host_release(b); sys_release(b); }'
+plant 56 $H $E "close does not free the imports" '        else if (b.kind == kBoHost && host_may_release(kHostRelClosing)) { host_release(b); sys_release(b); }' '        else if (b.kind == kBoHost && !host_may_release(kHostRelClosing)) { host_release(b); sys_release(b); }'
 plant 57 $H $E "host_release releases before it completes" '    if (b.hmd != nullptr) { b.hmd->complete(); b.hmd->release(); b.hmd = nullptr; }' '    if (b.hmd != nullptr) { b.hmd->release(); b.hmd->complete(); b.hmd = nullptr; }'
 plant 58 $H $E "the leak branch completes the pages" '        for (uint32_t i = 0; i < N48N_FENCE_SLOTS; i++) if (s->fslot[i].used && s->fslot[i].handle == h) s->fslot[i].used = 0;
     }' '        for (uint32_t i = 0; i < N48N_FENCE_SLOTS; i++) if (s->fslot[i].used && s->fslot[i].handle == h) s->fslot[i].used = 0;
@@ -161,29 +161,24 @@ plant 68 $H $C "selector 21 checks the wrong shape" 'if (!shape(4, 4, 0, 0)) ret
 		// 0.0.612 (review item B)'
 plant 69 $H $SR/Navi48NativeABI.h "the selector number moves" 'N48N_SEL_BO_IMPORT_HOST = 21,' 'N48N_SEL_BO_IMPORT_HOST = 22,'
 plant 70 $H $E "the descriptor is the kernel's, not the caller's" 'kIODirectionInOut, task)' 'kIODirectionInOut, kernel_task)'
-plant 71 $H $E "prepare() moves under the client lock" '    IOLockLock(gCliLock);
-    do {
-        if (!sess_hello()) { rc = kIOReturnNotReady; break; }   // closed while we waited for the lock
-        if (!session_unchanged(' '    IOLockLock(gCliLock);
+plant 71 $H $E "prepare() moves under the client lock" '    if (s != nullptr) IOLockLock(gCliLock);   // the page-table reserve is shared
+    do {' '    if (s != nullptr) IOLockLock(gCliLock);   // the page-table reserve is shared
     (void)md->prepare();
-    do {
-        if (!sess_hello()) { rc = kIOReturnNotReady; break; }   // closed while we waited for the lock
-        if (!session_unchanged('
+    do {'
 plant 72 $H $E "a failed import leaks the descriptor" '        md->complete(); md->release();                            // never mapped: safe even when HUNG' '        (void)md;                                                  // never mapped: safe even when HUNG'
 plant 73 $H $E "the import has a big local page array" '    uint64_t *pages = static_cast<uint64_t *>(IOMalloc((vm_size_t)(pre.pages * sizeof(uint64_t))));' '    uint64_t pagesLocal[16384]; uint64_t *pages = pagesLocal; (void)IOMalloc;'
 plant 74 $H $E "the import writes a register" '        const ImportChk c = import_check(hostVa, size, flags, gpuVa, s->importedBytes);' '        WREG32(*gCtx->dev, 0, 0);
         const ImportChk c = import_check(hostVa, size, flags, gpuVa, s->importedBytes);'
 plant 75 $H $E "close releases before the park" '    if (!leak) {
-        // No client owns a tree from here: park CONTEXT8 on the kernel'"'"'s zeroed page, then free everything.
-        if (program_root(gPark.pa) != kOk) leak = true;
+        // No client owns this tree from here: park the context on the kernel'"'"'s zeroed page, then free everything.
+        if (program_root(s->vmid, gPark.pa) != kOk) leak = true; else parked = true;
     }
     if (!leak) {
-        for (uint32_t h = 1; h < N48N_MAX_BOS; h++) if (s->boUsed[h]) bo_release(h, kRelClosing);' '    if (!leak) {
-        for (uint32_t h = 1; h < N48N_MAX_BOS; h++) if (s->boUsed[h]) bo_release(h, kRelClosing);
-        if (program_root(gPark.pa) != kOk) leak = true;
+        for (uint32_t h = 1; h < N48N_MAX_BOS; h++) if (s->boUsed[h]) bo_release(s, h, kRelClosing);' '    if (!leak) {
+        for (uint32_t h = 1; h < N48N_MAX_BOS; h++) if (s->boUsed[h]) bo_release(s, h, kRelClosing);
+        if (program_root(s->vmid, gPark.pa) != kOk) leak = true; else parked = true;
     }
     if (!leak) {'
-
 # ---- review round on 0.0.612: A device pages, B owning task, C session change, D flush failure, E selector reach ----
 BR=$SR/Navi48Bringup.cpp
 HK=$SR/apple/AppleHardwareHook.cpp
@@ -213,43 +208,40 @@ plant 104 $W $C "B: a wrong caller gets BadArgument (not NotPermitted)" '			retu
 		return amdgpu::n1c_bo_import_host' '			return kIOReturnBadArgument;
 		}
 		return amdgpu::n1c_bo_import_host'
-plant 110 $H $E "C: the session sequence is not re-checked under the lock" 'if (!session_unchanged(seq0, __atomic_load_n(&gSessSeq, __ATOMIC_SEQ_CST))) { rc = kIOReturnNotReady; break; }' '(void)seq0;'
-plant 111 $H $E "C: the sequence is read under the lock, not at entry" 'const uint32_t seq0 = __atomic_load_n(&gSessSeq, __ATOMIC_SEQ_CST);   // review item C: the session this import belongs to, read BEFORE anything is wired' 'uint32_t seq0 = 0;' '    IOLockLock(gCliLock);
-    do {
-        if (!sess_hello()) { rc = kIOReturnNotReady; break; }   // closed while we waited for the lock
-        if (!session_unchanged(' '    IOLockLock(gCliLock);
-    seq0 = __atomic_load_n(&gSessSeq, __ATOMIC_SEQ_CST);
-    do {
-        if (!sess_hello()) { rc = kIOReturnNotReady; break; }   // closed while we waited for the lock
-        if (!session_unchanged('
+plant 110 $H $E "C: the session sequence is not re-checked under the lock" 'if (!session_unchanged(seq0, s->id)) { rc = kIOReturnNotReady; break; }' '(void)seq0;'
+plant 111 $H $E "C: the sequence is read under the lock, not at entry" 'const uint32_t seq0 = ref.id;   // review item C' 'uint32_t seq0 = 0;   // review item C' '    if (s != nullptr) IOLockLock(gCliLock);   // the page-table reserve is shared
+' '    if (s != nullptr) { IOLockLock(gCliLock); seq0 = s->id; }   // the page-table reserve is shared
+'
 plant 112 $H $HP "C: no session at entry (0) counts as unchanged" 'return seqAtEntry != 0u && seqAtEntry == seqNow;' 'return seqAtEntry == seqNow;'
 plant 113 $H $HP "C: any non-zero entry sequence counts as unchanged" 'return seqAtEntry != 0u && seqAtEntry == seqNow;' 'return seqAtEntry != 0u;'
-plant 114 $H $E "C: the check runs after the record (too late)" '        if (!session_unchanged(seq0, __atomic_load_n(&gSessSeq, __ATOMIC_SEQ_CST))) { rc = kIOReturnNotReady; break; }   // review item C: a different (or no) session now: these pages are the old client'"'"'s
-' '' '        out[0] = h; out[1] = size; out[2] = mapped ? va_canonicalize(c.gpuStripped) : 0ull; out[3] = N48N_PLACED_HOST_IMPORT;' '        if (!session_unchanged(seq0, __atomic_load_n(&gSessSeq, __ATOMIC_SEQ_CST))) { rc = kIOReturnNotReady; break; }
+plant 114 $H $E "C: the check runs after the record (too late)" '        if (!session_unchanged(seq0, s->id)) { rc = kIOReturnNotReady; break; }   // review item C: a different (or no) session now: these pages are the old client'"'"'s
+' '' '        out[0] = h; out[1] = size; out[2] = mapped ? va_canonicalize(c.gpuStripped) : 0ull; out[3] = N48N_PLACED_HOST_IMPORT;' '        if (!session_unchanged(seq0, s->id)) { rc = kIOReturnNotReady; break; }
         out[0] = h; out[1] = size; out[2] = mapped ? va_canonicalize(c.gpuStripped) : 0ull; out[3] = N48N_PLACED_HOST_IMPORT;'
-plant 120 $H $E "D: a failed VMID-8 TLB flush still frees / releases the memory" 'memOk = memory_may_free_after_flush(flush_vmid(kNativeVmid)) && memOk;' '(void)flush_vmid(kNativeVmid);'
-plant 121 $H $E "D: a failed flush still completes and releases the host pages" '&& memOk) host_release(b);' ') host_release(b);'
-plant 122 $H $E "D: a failed flush still frees the GTT pages" 'if (b.kind == kBoGtt) { if (memOk) sysmem_free(b.sm); }' 'if (b.kind == kBoGtt) sysmem_free(b.sm);'
+plant 120 $H $E "D: a failed session-VMID TLB flush still frees / releases the memory" 'memOk = memory_may_free_after_flush(flush_vmid(s->vmid)) && memOk;' '(void)flush_vmid(s->vmid);'
+plant 121 $H $E "D: a failed flush still completes and releases the host pages" '&& memOk) { host_release(b);' ') { host_release(b);'
+plant 122 $H $E "D: a failed flush still frees the GTT pages" 'if (b.kind == kBoGtt) { if (memOk) { sysmem_free(b.sm); sys_release(b); } }' 'if (b.kind == kBoGtt) { sysmem_free(b.sm); sys_release(b); }'
 plant 123 $H $HP "D: the pure verdict always frees" 'constexpr bool memory_may_free_after_flush(uint32_t flushRc) { return flushRc == 0u; }' 'constexpr bool memory_may_free_after_flush(uint32_t flushRc) { (void)flushRc; return true; }'
 plant 124 $H $E "D: a failed GART (fence slot) flush is ignored" 'memOk = memory_may_free_after_flush(flush_vmid(0)) && memOk;' '(void)flush_vmid(0);'
 plant 130 $W $OP "E: a uid-88 client may call the nub publish / withdraw (0..20)" 'sel <= (uint32_t)N48N_SEL_SCAN_RELEASE ||' 'sel <= (uint32_t)N48N_SEL_METAL_NUB_WITHDRAW ||'
 plant 131 $W $OP "E: a uid-88 client may call the DAL step (0..15)" 'sel <= (uint32_t)N48N_SEL_SCAN_RELEASE ||' 'sel <= (uint32_t)N48N_SEL_DAL_STEP ||'
-plant 132 $W $OP "E: a uid-88 client may not import (21 dropped)" ' || sel == (uint32_t)N48N_SEL_BO_IMPORT_HOST;' ';'
+plant 132 $W $OP "E: a uid-88 client may not import (21 dropped)" 'sel <= (uint32_t)N48N_SEL_SCAN_RELEASE || sel == (uint32_t)N48N_SEL_BO_IMPORT_HOST ||' 'sel <= (uint32_t)N48N_SEL_SCAN_RELEASE ||'
 plant 133 $W $OP "E: an administrator loses the selectors outside the WindowServer set" 'return admin || selector_allowed_for_windowserver(sel);' 'return selector_allowed_for_windowserver(sel);'
 plant 134 $W $OP "E: every client reaches every selector" 'return admin || selector_allowed_for_windowserver(sel);' 'return true;'
 plant 135 $W $C "E: the client never applies the selector gate" 'if (!n48native::policy::selector_allowed(adminClient, selector)) {' 'if (false) {'
 plant 136 $W $C "E: a uid-88 client is recorded as an administrator" 'adminClient = d.reason == n48native::policy::kReasonAdmin;' 'adminClient = true;'
-plant 137 $W $C "E: the gate returns BadArgument, not NotPrivileged" '		return kIOReturnNotPrivileged;
+plant 137 $W $C "E: the gate returns BadArgument, not NotPrivileged" 'selector);
+		return kIOReturnNotPrivileged;
 	}
-	switch (selector) {' '		return kIOReturnBadArgument;
+	// 0.0.640 (G4): an APP client reaches only' 'selector);
+		return kIOReturnBadArgument;
 	}
-	switch (selector) {'
+	// 0.0.640 (G4): an APP client reaches only'
 plant 138 $W $C "E: the gate refuses without a log line" '		if (gSelRefusedLogged < 16u && OSIncrementAtomic((volatile SInt32 *)&gSelRefusedLogged) < 16) NCLOG("selector %u refused: not permitted for a uid-88 (non-administrator) client", selector);
 ' ''
 plant 139 $W $SR/Navi48NativeClient.hpp "E: adminClient defaults to true in the header" 'bool           adminClient { false };' 'bool           adminClient { true };'
 
 # ---- 0.0.620: the import cap is 2 GiB ----
-plant 140 $H $HP "0.0.620: the cap is the old 256 MiB again" 'constexpr uint64_t kImportCap     = 2048ull << 20;' 'constexpr uint64_t kImportCap     = 256ull << 20;'
+plant 140 $H $HP "0.0.620: the cap is the old 256 MiB again" 'constexpr uint64_t kImportCap     = 4096ull << 20;' 'constexpr uint64_t kImportCap     = 256ull << 20;'
 plant 141 $H $HP "0.0.620: the cap check still compares against the old 256 MiB constant" '    if (would_exceed(importedNow, size, kImportCap)) return ImportChk{ kNoMemory, 0, 0 };' '    if (would_exceed(importedNow, size, 256ull << 20)) return ImportChk{ kNoMemory, 0, 0 };'
 plant 142 $H $HP "0.0.620: the cap check refuses the exact fit (off by one)" '    if (would_exceed(importedNow, size, kImportCap)) return ImportChk{ kNoMemory, 0, 0 };' '    if (would_exceed(importedNow, size, kImportCap - 1ull)) return ImportChk{ kNoMemory, 0, 0 };'
 plant 143 $H $SR/amd/native_s1c_pure.h "0.0.620: would_exceed refuses the exact fit (used >= cap - add)" 'return add > cap || used > cap - add; }' 'return add > cap || used >= cap - add; }'
@@ -257,8 +249,14 @@ plant 144 $H $SR/amd/native_s1c_pure.h "0.0.620: would_exceed is used + add > ca
 plant 145 $H $SR/amd/native_s1c_pure.h "0.0.620: would_exceed admits one byte over (used > cap - add + 1)" 'return add > cap || used > cap - add; }' 'return add > cap || used > cap - add + 1ull; }'
 plant 146 $H $E "0.0.620: the advisory cap refusal is not logged" '    if (pre.rc == kNoMemory) N1C_LOG("import refused: per-client cap of %llu MiB reached (' '    if (false) N1C_LOG("import refused: per-client cap of %llu MiB reached ('
 plant 147 $H $E "0.0.620: the authoritative cap refusal is not logged" '        if (c.rc == kNoMemory) N1C_LOG("import refused: per-client cap of %llu MiB reached under the lock (' '        if (false) N1C_LOG("import refused: per-client cap of %llu MiB reached under the lock ('
-plant 148 $H $E "0.0.620: the logged cap is a hard-coded 256" '(unsigned long long)(kImportCap >> 20), (unsigned long long)(__atomic_load_n(&gSess.importedBytes' '(unsigned long long)256, (unsigned long long)(__atomic_load_n(&gSess.importedBytes'
-plant 149 $H $SR/Navi48NativeABI.h "0.0.620: the ABI header still carries the 256 MiB cap" '#define N48N_IMPORT_CAP          (2048ull << 20)' '#define N48N_IMPORT_CAP          (256ull << 20)'
+plant 148 $H $E "0.0.620: the logged cap is a hard-coded 256" '(unsigned long long)(kImportCap >> 20), (unsigned long long)(__atomic_load_n(&s0->importedBytes' '(unsigned long long)256, (unsigned long long)(__atomic_load_n(&s0->importedBytes'
+plant 149 $H $SR/Navi48NativeABI.h "0.0.620: the ABI header still carries the 256 MiB cap" '#define N48N_IMPORT_CAP          (4096ull << 20)' '#define N48N_IMPORT_CAP          (256ull << 20)'
 plant 150 $H $HP "0.0.620: the per-BO page list grows with the cap (kImportMaxPages from the cap)" 'constexpr uint32_t kImportMaxPages = (uint32_t)(kImportMaxBo / kPage);' 'constexpr uint32_t kImportMaxPages = (uint32_t)(kImportCap / kPage);'
+# ---- 0.0.621: the import cap is 4 GiB ----
+plant 151 $H $HP "0.0.621: the cap check still compares against the 0.0.620 2 GiB constant" '    if (would_exceed(importedNow, size, kImportCap)) return ImportChk{ kNoMemory, 0, 0 };' '    if (would_exceed(importedNow, size, 2048ull << 20)) return ImportChk{ kNoMemory, 0, 0 };'
+plant 152 $H $HP "0.0.621: the cap is the 0.0.620 2 GiB again" 'constexpr uint64_t kImportCap     = 4096ull << 20;' 'constexpr uint64_t kImportCap     = 2048ull << 20;'
+plant 153 $H $SR/Navi48NativeABI.h "0.0.621: the ABI header still carries the 2 GiB cap" '#define N48N_IMPORT_CAP          (4096ull << 20)' '#define N48N_IMPORT_CAP          (2048ull << 20)'
+plant 154 $H $SR/amd/native_s1c_pure.h "0.0.621: the page-table pool is halved (4 GiB spread no longer fits)" 'constexpr uint64_t kPtCap      = 32ull << 20;' 'constexpr uint64_t kPtCap      = 16ull << 20;'
+plant 155 $H $HP "0.0.621: the cap is 4 GiB minus one page (the exact-fit total is refused)" 'constexpr uint64_t kImportCap     = 4096ull << 20;' 'constexpr uint64_t kImportCap     = (4096ull << 20) - 4096ull;'
 echo "plants: $total run, $escaped escaped/failed"
 [ "$escaped" -eq 0 ]

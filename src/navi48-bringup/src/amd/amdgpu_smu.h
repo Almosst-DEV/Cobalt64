@@ -57,7 +57,7 @@ kern_return_t smu_send_msg_with_param(const DeviceContext &dev,
 //
 kern_return_t smu_send_msg(const DeviceContext &dev, uint32_t msgId);
 
-// 0.0.604 (notes/design/NATIVE-S2-DISPCLK.md C6): the ONE lock shared by every PPSMC message (smu_send_msg_with_param takes it itself), the
+// 0.0.604 (an internal design note C6): the ONE lock shared by every PPSMC message (smu_send_msg_with_param takes it itself), the
 // DAL sender (smu_dal.cpp) and any caller that needs several messages back to back. Recursive for the owning thread. smu_lock_enter()
 // returns false only when the lock could not be allocated (nothing is held then; smu_lock_exit must not be called).
 bool smu_lock_enter();

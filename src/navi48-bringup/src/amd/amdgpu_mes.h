@@ -55,6 +55,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>   // 0.0.623: offsetof (MES_ResetQueue)
 #include <IOKit/IOReturn.h>
 
 #include "amdgpu_ip.h"
@@ -488,6 +489,7 @@ namespace MESSchOp {
     constexpr uint32_t SET_SCHEDULING_CONFIG     = 1;
     constexpr uint32_t ADD_QUEUE                 = 2;
     constexpr uint32_t REMOVE_QUEUE              = 3;
+    constexpr uint32_t RESET                     = 8;   // 0.0.623 (G1): MES_SCH_API_RESET (mes_v12_api_def.h enum MES_SCH_API_OPCODE)
     constexpr uint32_t QUERY_SCHEDULER_STATUS    = 11;
     constexpr uint32_t SET_HW_RSRC_1             = 19;
 }
@@ -505,8 +507,9 @@ mes_api_header(uint32_t type, uint32_t opcode, uint32_t dwsize)
 //------------------------------------------------------------------
 // Per-call API status footprint that lives inside every MES message.
 // The dext sets `fence_addr` to a 64-bit GPU-side WB slot and
-// `fence_value` to 1; MES writes that value into the slot once the
-// API completes. (Failure encoding lives in the high 32 bits — see
+// `fence_value` to a per-call sequence value (0.0.626: it was the constant 1;
+// upstream mes_v12_0 increments it); MES writes that value into the slot once
+// the API completes. (Failure encoding lives in the high 32 bits — see
 // upstream comment in mes_v12_api_def.h.)
 //------------------------------------------------------------------
 struct MES_API_Status {
@@ -525,14 +528,21 @@ struct MES_API_Status {
 // second fence on the ring's own fence area, kick the ring's
 // doorbell, then poll the status slot.
 //
-// Returns kIOReturnSuccess if the status slot latches lower-32 == 1
-// (the MES success indicator) within timeout_us.
+// Returns kIOReturnSuccess if the status slot latches lower-32 == THIS
+// frame's own fence value (0.0.626: a per-call sequence in 1..0x7fffffff,
+// never the constant 1) within timeout_us. A late completion of an
+// EARLIER frame carries an earlier value, so it can never be read as the
+// ack of this one.
 //------------------------------------------------------------------
 kern_return_t mes_submit_pkt(const DeviceContext &dev, MESContext &mes,
                              MESPipe pipe,
                              const uint32_t *pkt,
                              uint32_t api_status_off_dw,
                              uint64_t timeout_us);
+
+// 0.0.626 (G1 review F3): true once ANY mes_submit_pkt in this boot returned kIOReturnTimeout (0xe00002d6): the firmware may still own what that
+// frame touched. Sticky for the boot; the G1 recovery verbs refuse every further MES method when it is set.
+bool mes_timeout_seen();
 
 // Convenience wrapper — sends MES_SCH_API_QUERY_SCHEDULER_STATUS to
 // the given pipe. Returns kIOReturnSuccess on a successful echo.
@@ -736,6 +746,61 @@ constexpr uint32_t kRemoveQueueFlag_preempt_legacy_gfx      = 1u << 2;
 constexpr uint32_t kRemoveQueueFlag_unmap_legacy_queue      = 1u << 3;
 constexpr uint32_t kRemoveQueueFlag_remove_after_reset      = 1u << 4;
 
+// 0.0.623 (G1, hang recovery): MESAPI__RESET (mes_v12_api_def.h:544-618). Only the legacy-GFX form is built: reset_legacy_gfx = 1 with the
+// low-priority (_lp) queue fields, exactly what mes_v12_0_reset_hw_queue sends when input->legacy_gfx (the path gfx_v12_0_reset_kgq takes:
+// gfx_v12_0.c:1608 use_mmio_for_reset = false for the ME). The offsets below were CONFIRMED by compiling the upstream header with clang and
+// printing offsetof: header 0, gang_context_addr 8, doorbell_offset 16, doorbell_offset_addr 24, queue_type 32, pipe_id_lp 36,
+// queue_id_lp 40, vmid_id_lp 44, mqd_mc_addr_lp 48, doorbell_offset_lp 56, wptr_addr_lp 64, pipe_id_hp 72, api_status 112, active_vmids 128,
+// timestamp 136, size 256; reset_legacy_gfx is bit 3 of dword 1.
+struct MES_ResetQueue {
+    MES_Header_Wire header;
+    uint32_t flags;                 // packed bitfield, see kResetFlag_*
+    uint64_t gang_context_addr;
+    uint32_t doorbell_offset;       // valid only with reset_queue_only
+    uint32_t _pad0;
+    uint64_t doorbell_offset_addr;
+    uint32_t queue_type;
+    uint32_t pipe_id_lp;
+    uint32_t queue_id_lp;
+    uint32_t vmid_id_lp;
+    uint64_t mqd_mc_addr_lp;
+    uint32_t doorbell_offset_lp;
+    uint32_t _pad1;
+    uint64_t wptr_addr_lp;
+    uint32_t pipe_id_hp;
+    uint32_t queue_id_hp;
+    uint32_t vmid_id_hp;
+    uint32_t _pad2;
+    uint64_t mqd_mc_addr_hp;
+    uint32_t doorbell_offset_hp;
+    uint32_t _pad3;
+    uint64_t wptr_addr_hp;
+    MES_API_Status api_status;
+    uint32_t active_vmids;
+    uint32_t _pad4;
+    uint64_t timestamp;
+    uint32_t gang_context_array_index;
+    uint32_t connected_queue_index;
+    uint32_t connected_queue_index_p1;
+    uint32_t pad[25];               // to 64 dwords
+};
+static_assert(sizeof(MES_ResetQueue) == 64 * 4, "MES_ResetQueue must be 64 dwords");
+static_assert(offsetof(MES_ResetQueue, flags) == 4 && offsetof(MES_ResetQueue, gang_context_addr) == 8 &&
+              offsetof(MES_ResetQueue, doorbell_offset) == 16 && offsetof(MES_ResetQueue, doorbell_offset_addr) == 24 &&
+              offsetof(MES_ResetQueue, queue_type) == 32 && offsetof(MES_ResetQueue, pipe_id_lp) == 36 &&
+              offsetof(MES_ResetQueue, queue_id_lp) == 40 && offsetof(MES_ResetQueue, vmid_id_lp) == 44 &&
+              offsetof(MES_ResetQueue, mqd_mc_addr_lp) == 48 && offsetof(MES_ResetQueue, doorbell_offset_lp) == 56 &&
+              offsetof(MES_ResetQueue, wptr_addr_lp) == 64 && offsetof(MES_ResetQueue, pipe_id_hp) == 72 &&
+              offsetof(MES_ResetQueue, api_status) == 112 && offsetof(MES_ResetQueue, active_vmids) == 128 &&
+              offsetof(MES_ResetQueue, timestamp) == 136 && offsetof(MES_ResetQueue, gang_context_array_index) == 144 &&
+              offsetof(MES_ResetQueue, connected_queue_index_p1) == 152,
+              "MES_ResetQueue: the upstream MESAPI__RESET offsets (measured with clang on mes_v12_api_def.h)");
+// RESET flags (bit positions, mes_v12_api_def.h:550-560): 0 reset_queue_only, 1 hang_detect_then_reset, 2 hang_detect_only, 3 reset_legacy_gfx,
+// 4 use_connected_queue_index, 5 use_connected_queue_index_p1.
+constexpr uint32_t kResetFlag_reset_legacy_gfx = 1u << 3;
+// mes_v12_0_unmap_legacy_queue (mes_v12_0.c:762-766): remove_queue_after_reset is set only for a reset-time unmap and only from sched version 0x5a.
+constexpr uint32_t kMES_RemoveAfterResetMinVersion = 0x5au;
+
 // MES queue types (mirrors enum MES_QUEUE_TYPE).
 constexpr uint32_t kMESQueueType_GFX     = 0;
 constexpr uint32_t kMESQueueType_COMPUTE = 1;
@@ -790,6 +855,19 @@ kern_return_t mes_add_hw_queue(const DeviceContext &dev, MESContext &mes,
 kern_return_t mes_remove_hw_queue(const DeviceContext &dev, MESContext &mes,
                                   uint32_t queue_type, uint32_t pipe_id,
                                   uint32_t queue_id, uint32_t doorbell_offset);
+
+// 0.0.623 (G1): mes_remove_hw_queue with the REMOVE_QUEUE flags word given (kRemoveQueueFlag_*). mes_remove_hw_queue is this with
+// kRemoveQueueFlag_unmap_legacy_queue; G1's remap adds kRemoveQueueFlag_remove_after_reset after an acked RESET (mes_v12_0.c:762-766).
+kern_return_t mes_remove_hw_queue_flags(const DeviceContext &dev, MESContext &mes,
+                                        uint32_t queue_type, uint32_t pipe_id,
+                                        uint32_t queue_id, uint32_t doorbell_offset,
+                                        uint32_t flags);
+// 0.0.623 (G1): mes_v12_0_reset_hw_queue for a legacy (kernel) GFX queue: RESET { queue_type GFX, reset_legacy_gfx = 1, pipe_id_lp, queue_id_lp,
+// vmid_id_lp, mqd_mc_addr_lp, doorbell_offset_lp, wptr_addr_lp } on the SCHED pipe, bounded at 2 s by mes_submit_pkt. Sends nothing but the frame.
+kern_return_t mes_reset_legacy_gfx_queue(const DeviceContext &dev, MESContext &mes,
+                                         uint32_t pipe_id, uint32_t queue_id, uint32_t vmid,
+                                         uint64_t mqd_addr, uint32_t doorbell_offset,
+                                         uint64_t wptr_addr);
 
 // Program CP_MES_DOORBELL_CONTROL{1..5} with the 5 aggregated
 // doorbell offsets + CP_HQD_GFX_CONTROL.DB_UPDATED_MSG_EN.

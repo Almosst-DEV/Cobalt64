@@ -1,4 +1,4 @@
-// n48_cblog.h: pure bookkeeping of the Stage 0 cross-queue RAW-inversion counter (notes/design/NATIVE-S5-TXN.md, 0b). Host test: test-cblog.c.
+// n48_cblog.h: pure bookkeeping of the Stage 0 cross-queue RAW-inversion counter (an internal design note, 0b). Host test: test-cblog.c.
 // A command buffer is COMMITTED (registered here with the IOSurface ids it writes and reads, stamped with the commit time) and later SUBMITTED (removed).
 // At each submit of X, for every sid X reads (samples or loads), every OTHER entry that is still registered (= committed, not yet submitted), was committed
 // before X, and writes that sid is one inversion: X may run on the GPU before a producer the app ordered ahead of it. No Vulkan, no ObjC, no locking

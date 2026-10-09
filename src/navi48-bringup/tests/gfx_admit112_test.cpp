@@ -1,4 +1,4 @@
-// gfx_admit112_test.cpp - build 0.0.554 (; notes/design/ADMIT-STALE-112.md): SWITCH 112 "admit112", ADMIT STALE, offline.
+// gfx_admit112_test.cpp - build 0.0.554 (; an internal design note): SWITCH 112 "admit112", ADMIT STALE, offline.
 //
 // THE PROPERTY. A tiled, NOT-DCC, table-path texture read of an allow-listed program that every proof ask refused is admitted ONLY when its
 // surface was demonstrably written earlier this arm (the EVER ledger: a committed frame's colour target or a RECORDED residency copy, matched

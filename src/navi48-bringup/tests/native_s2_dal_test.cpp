@@ -1194,7 +1194,7 @@ static void s_pins(const std::string &root) {
     const std::string K = root + "/src/navi48-bringup/";
     const std::string dal = slurp(K + "src/amd/smu_dal.cpp"), smu = slurp(K + "src/amd/smu_v14_0.cpp"), smuh = slurp(K + "src/amd/amdgpu_smu.h"), pure = slurp(K + "src/amd/smu_dal_pure.h");
     const std::string eng = slurp(K + "src/amd/native_s1c.cpp"), engh = slurp(K + "src/amd/native_s1c.h"), cli = slurp(K + "src/Navi48NativeClient.cpp"), uc = slurp(K + "src/Navi48UserClient.cpp");
-    const std::string abi = slurp(K + "src/Navi48NativeABI.h"), plist = slurp(K + "Info.plist"), mk = slurp(K + "Makefile"), doc = slurp(root + "/notes/design/NATIVE-S1C-ABI.md");
+    const std::string abi = slurp(K + "src/Navi48NativeABI.h"), plist = slurp(K + "Info.plist"), mk = slurp(K + "Makefile"), doc = slurp(root + "/an internal design note");
     const std::string tool = slurp(root + "/tools/native/n48dal.c"), bld = slurp(root + "/tools/native/build.sh"), dcnc = slurp(K + "src/dcn/navi48_dcn.cpp"), bringup = slurp(K + "src/Navi48Bringup.cpp");
     expect(!dal.empty() && !smu.empty() && !pure.empty() && !eng.empty() && !cli.empty() && !uc.empty() && !abi.empty() && !plist.empty() && !tool.empty() && !doc.empty(), "every source file the pins read exists (and the repo root argument is right)");
     // the sender writes exactly the three DAL dwords
@@ -1261,7 +1261,7 @@ static void s_pins(const std::string &root) {
         expect(bringup.find("smu_dal") == std::string::npos && bringup.find("dal_run_step") == std::string::npos && dcnc.find("smu_dal_send") == std::string::npos && dcnc.find("dal_run_step") == std::string::npos && count_of(dcnc, "smu_dal") == 1 && dcnc.find("#include \"amd/smu_dal.h\"") != std::string::npos && count_of(dcnc, "dal_busy()") == 2 && count_of(dcnc, "amdgpu::dal_hold_") == 6, "the interrupt handler's file and the display layer never call the DAL sender (0.0.605: the display layer includes smu_dal.h for the read-only dal_busy() only; 0.0.607 adds the four clock-hold wrappers mt_hold_pre / raise / release / state, plus the emergency-restore log line reading the state)");
         expect(cli.find("case N48N_SEL_DAL_STEP:") != std::string::npos && cli.find("if (!shape(2, 0, 0, sizeof(n48n_dal_result))) return kIOReturnBadArgument;") != std::string::npos, "selector 15: exactly two scalars in, a 256 B struct out");
         const std::string nb = fn_body(eng, "IOReturn n1c_dal_step(");
-        expect(nb.find("if (!sess_hello()) return kIOReturnNotReady;") != std::string::npos && nb.find("flags != 0ull") != std::string::npos && nb.find("IOLockLock") == std::string::npos, "n1c_dal_step: Hello first, flags 0, and no client lock held across the step");
+        expect(nb.find("if (!sess_hello(ref)) return kIOReturnNotReady;") != std::string::npos && nb.find("flags != 0ull") != std::string::npos && nb.find("IOLockLock") == std::string::npos, "n1c_dal_step: Hello first, flags 0, and no client lock held across the step");
     }
     // lock sharing
     {
@@ -1275,7 +1275,7 @@ static void s_pins(const std::string &root) {
     }
     // the ABI
     expect_u("N48N_SEL_DAL_STEP", N48N_SEL_DAL_STEP, 15); expect_u("selector count 1.2", N48N_SEL_COUNT_1_2, 16); expect_u("v1.1 count unchanged", N48N_SEL_COUNT_1_1, 15); expect_u("v1.0 count unchanged", N48N_SEL_COUNT, 9);
-    expect_u("ABI major unchanged", N48N_ABI_VERSION, 1); expect_u("ABI minor 9 (1.9 since 0.0.612: BoImportHost; 1.8 since 0.0.610: the Metal nub selectors; 1.7 since 0.0.609; 1.6 was 0.0.608; 1.5 was 0.0.607; 1.4 grew the mode-trial result, the mode-trial selector arrived in 1.3, the DAL step selector in 1.2)", N48N_ABI_MINOR, 9);
+    expect_u("ABI major unchanged", N48N_ABI_VERSION, 1); expect_u("ABI minor 12 (1.12 since 0.0.662; 1.11 since 0.0.661; 1.10 since 0.0.640: the VRAM budget words; 1.9 since 0.0.612: BoImportHost; 1.8 since 0.0.610: the Metal nub selectors; 1.7 since 0.0.609; 1.6 was 0.0.608; 1.5 was 0.0.607; 1.4 grew the mode-trial result, the mode-trial selector arrived in 1.3, the DAL step selector in 1.2)", N48N_ABI_MINOR, 12);
     expect_u("result size", sizeof(n48n_dal_result), 256);
     expect(N48N_DAL_V_PASS == kPass && N48N_DAL_V_REFUSED == kRefused && N48N_DAL_V_TIMEOUT == kTimeout && N48N_DAL_V_REGRESSED == kRegressed && N48N_DAL_V_GLITCH == kGlitch && N48N_DAL_V_DENIED == kDenied && N48N_DAL_V_SHORT == kShort, "the ABI verdict values are the pure header's");
     expect(N48N_DAL_STEP_E1B == kE1b && N48N_DAL_STEP_E2 == kE2 && N48N_DAL_STEP_E3 == kE3 && N48N_DAL_STEP_E4 == kE4, "the ABI step numbers are the pure header's");
@@ -1292,7 +1292,7 @@ static void s_pins(const std::string &root) {
     {
         const size_t p = engh.find("kN1cKextBuild = "); const int build = p == std::string::npos ? -1 : std::atoi(engh.c_str() + p + 16);
         const size_t v = plist.find("<string>0.0."); const int ver = v == std::string::npos ? -2 : std::atoi(plist.c_str() + v + 12);
-        expect(build > 0 && build == ver, "kN1cKextBuild equals the Info.plist patch version"); expect_u("Info.plist is 0.0.620", (uint64_t)ver, 620); expect_u("the plist carries the version twice", count_of(plist, "0.0.620"), 2);
+        expect(build > 0 && build == ver, "kN1cKextBuild equals the Info.plist patch version"); expect_u("Info.plist is 0.0.664", (uint64_t)ver, 664); expect_u("the plist carries the version twice", count_of(plist, "0.0.664"), 2);
     }
     expect(mk.find("$(wildcard src/amd/*.cpp)") != std::string::npos, "the Makefile builds src/amd/*.cpp (smu_dal.cpp)");
     // the tool

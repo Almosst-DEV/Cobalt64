@@ -142,6 +142,7 @@ run rootwrite_guards clang++ $Wn -I $A $T/rootwrite_guards_test.cpp --
 run native_metal clang++ $W $SAN -I src/navi48-bringup/src -I src/navi48-bringup/src/amd $T/native_metal_test.cpp -- . "${N48_AUX_ROOT:-.}"   # build 0.0.610: the Metal nub + ops table (milestone #9); the plant script is tests/native_metal_plant.sh
 run native_disp clang++ $W $SAN -I src/navi48-bringup/src -I src/navi48-bringup/src/amd $T/native_disp_test.cpp -- . "${N48_AUX_ROOT:-.}"   # build 0.0.613: the display pipe (#11 11h.2); the plant script is tests/native_disp_plant.sh
 run native_agdc clang++ $W $SAN -I src/navi48-bringup/src -I src/navi48-bringup/src/amd $T/native_agdc_test.cpp -- .   # build 0.0.614: the native AGDC service (#11 11h.3, accel action 88); the plant script is tests/native_agdc_plant.sh
+run native_rebar clang++ $W $SAN -I src/navi48-bringup/src -I src/navi48-bringup/src/amd $T/native_rebar_test.cpp -- .   # build 0.0.663: Resizable BAR planning, the census, the latch union, the aperture points, vramstat (REBAR.md section 3); the plant script is tests/native_rebar_plant.sh
 if clang -std=c11 -O1 -c src/shadercache/shadercache.c -o "$B/shadercache.o" 2> "$L/sc.build"; then
   run sc_census clang++ $Wn -I $A -I src/shadercache $T/sc_census_test.cpp "$B/shadercache.o" --
 else

@@ -1,5 +1,5 @@
 // gfx_fence828_test.cpp — the offline proof for the one-dword un-NOP and (0.0.413) the OWNED SLOT.
-// (; notes/design/FENCE-OWNED-SLOT.md,).
+// (; an internal design note,).
 //
 // The properties under test are the specification of the change:
 //
@@ -99,7 +99,7 @@ enum {
     MUT_REGION_MOVED_RUNS,  // M21 (0.0.418, E3): REGION-MOVED drops the candidate but lets the frame run (0.0.417's rule)
     MUT_PROMOTE_STORE_FLIGHT_FIRST, // M22 (0.0.420, follow-up): the copy/flight stamp precede the watch reset,
                                     // leaving a window where a reader answers end-of-pipe for a flight never promoted
-    MUT_HANDOFF_STALE_PENDING,     // M23 (0.0.444, C5-RING-REVIEW.md (B) item 1): the ring push reads gXdF828Pending
+    MUT_HANDOFF_STALE_PENDING,     // M23 (0.0.444, an internal review note (B) item 1): the ring push reads gXdF828Pending
                                     // AFTER the gate block has already cleared it (0.0.443's actual defect)
     MUT_COUNT
 };
@@ -296,7 +296,7 @@ static uint32_t mregion_reason(uint32_t region_moved)
     return n48_f828_region_moved_reason(region_moved);
 }
 
-// 0.0.444 (C5-RING-REVIEW.md (B) item 1) — THE GATE BLOCK, AS THE KEXT RUNS IT, so the handoff test drives the REAL
+// 0.0.444 (an internal review note (B) item 1) — THE GATE BLOCK, AS THE KEXT RUNS IT, so the handoff test drives the REAL
 // order rather than a hand-picked snapshot. Mirrors AppleHardwareHook.cpp's `if (gXdF828Pending) { gXdF828Pending =
 // 0u; gXdF828GateOk = 0u; ... if (live && reason == OK) { gXdF828GateOk = 1u; gXdF828GateSeq = seq; } ... }` for the
 // ONE branch this test needs (GATE OK). `pending` is cleared FIRST, exactly as the kext does, before the caller ever
@@ -831,7 +831,7 @@ static void run_checks()
         }
     }
 
-    // ---- 15. 0.0.444 (C5-RING-REVIEW.md (B) item 1) — THE FLIGHT-RING FENCE HANDOFF, DRIVEN THROUGH THE REAL
+    // ---- 15. 0.0.444 (an internal review note (B) item 1) — THE FLIGHT-RING FENCE HANDOFF, DRIVEN THROUGH THE REAL
     // ORDER: the gate block runs FIRST (clearing "pending", then setting gateOk/gateSeq only on GATE OK), and ONLY
     // THEN does the push site's handoff run - exactly the two-step sequence AppleHardwareHook.cpp performs, and
     // exactly the order the 0.0.443 headline defect depended on (reading `gXdF828Pending` AFTER its own clear
@@ -870,7 +870,7 @@ static void run_checks()
                                        candWant, &oOrd3, &oVram3, &oWant3);
         ck("item 1: a stale GATE OK from a DIFFERENT seq never leaks into this push", has3, 0u);
         ck("item 1: ... ordinal 0", oOrd3, 0u);
-        // M23 (0.0.444, C5-RING-REVIEW.md (B) item 1) is caught by check (a) above through the SAME real
+        // M23 (0.0.444, an internal review note (B) item 1) is caught by check (a) above through the SAME real
         // gate-then-push order this whole block drives: mhandoff() branches on the file's own `gMut`, exactly as
         // every other m-prefixed wrapper here does, so when the outer driver (main(), below) selects
         // MUT_HANDOFF_STALE_PENDING and re-runs this whole function, check (a)'s `has == 1` and `oWant ==

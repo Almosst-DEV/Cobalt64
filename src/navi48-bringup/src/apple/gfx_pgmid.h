@@ -1,4 +1,4 @@
-// gfx_pgmid.h — 0.0.434 (notes/design/PGMID-COPYGUARD.md Part 1). PROGRAM-IDENTITY COST, THE PURE HALF.
+// gfx_pgmid.h — 0.0.434 (an internal design note Part 1). PROGRAM-IDENTITY COST, THE PURE HALF.
 //
 // measured decide37's 41.9 ms 2-IB pass as WORK, not waiting: ~90% of it is `gfxsrc_pgm_profile` reading 512
 // dwords through the MM window (~2 us/dword) on EVERY call, with no memo. Design T (this file): read the 4-dword
@@ -24,7 +24,7 @@
 
 // The HEAD-FIRST read's own cap: no read this design asks for may ever exceed it, whatever a future identity row's
 // own `ndw` claims. Through 0.0.483 it was 512, equal to AppleHardwareHook.cpp's kXdIdDwords (the OFF/SHADOW window).
-// build 0.0.484 (notes/design/GLASS.md Q2 K4): 1344. glass_background_lph's gfx1201 images are 1271 (BD) and 1269
+// build 0.0.484 (an internal design note Q2 K4): 1344. glass_background_lph's gfx1201 images are 1271 (BD) and 1269
 // (BE) dwords, so at 512 xlat12_shader_id_match's `s->ndw > n` skip made them unmatchable under mode T/T+M too. The two
 // caps are now DIFFERENT numbers with different jobs: kXdIdDwords (gfx_subst_caps.h N48_XD_ID_DWORDS, still 512) is
 // what mode OFF/SHADOW reads and what the no-identity witness is grown to; N48_PGMID_CAP bounds a head-first read of
@@ -71,12 +71,12 @@ enum {
 };
 
 // =====================================================================================================================
-// 0.0.436 (notes/design/PGMID-COPYGUARD.md Part 1, design "2. M") — THE PER-PASS PROGRAM-IDENTITY MEMO.
+// 0.0.436 (an internal design note Part 1, design "2. M") — THE PER-PASS PROGRAM-IDENTITY MEMO.
 // =====================================================================================================================
 // Keyed by (stage, VA); cleared once per gfxsrc_policy pass (AppleHardwareHook.cpp, before the segment loop). A row
 // also carries the copy-guard ring mark taken BEFORE the read that filled it (n48_cg_ring_mark, gfx_copyguard.h) and
 // at most N48_PM_PAGES VRAM pages that read touched.
-// build 0.0.484 (notes/design/GLASS.md Q2 K4) — THE PAGE PROOF, REDONE FOR THE NEW CAP. Through 0.0.483 a row held
+// build 0.0.484 (an internal design note Q2 K4) — THE PAGE PROOF, REDONE FOR THE NEW CAP. Through 0.0.483 a row held
 // 2 pages, and 2 was provably enough because N48_PGMID_CAP was 512 dwords = 2048 bytes: a byte range that short crosses
 // at most one 4 KiB boundary. At 1344 dwords (5376 bytes) that proof no longer holds: a 5084-byte glass read from a
 // 256-byte-aligned VA at page offset 0xd00 or later ends in a THIRD page, and a 2-page row would refuse to store it

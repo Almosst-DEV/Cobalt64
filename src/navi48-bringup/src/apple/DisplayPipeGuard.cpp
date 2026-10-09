@@ -44,7 +44,9 @@
 #include "../dcn/navi48_dcn.hpp"   // build 0.0.514 B2: n48dcn::liveRaster (read-only)
 #include "../amd/native_disp.h"      // 0.0.614: n48disp_latched_on (the native AGDC route is behind boot-arg navi48-metal-disp=1)
 #include "../amd/native_agdc_flow.h"  // 0.0.614: the native publish sequence (host-tested, tests/native_agdc_test.cpp)
-#include "sdma_gcr.h"   // 0.0.416 (notes/design/SDMA-GCR.md): the GCR_REQ dword count for the control line (G3)
+#include "../Navi48DisplayNub.hpp"       // 0.0.659 (M6): framebufferOf(index)
+#include "../amd/native_m6_pure.h"    // 0.0.659 (M6 Stage 1a): the AGDC list of several framebuffers and the per-endpoint 0x921 / 0x711 answers
+#include "sdma_gcr.h"   // 0.0.416 (an internal design note): the GCR_REQ dword count for the control line (G3)
 
 #define DPGLOG(fmt, ...) ::amdgpu::n48_logf("DisplayPipeGuard: " fmt "\n", ##__VA_ARGS__)
 
@@ -311,7 +313,7 @@ static struct {
     // 0.0.412: force a swizzle-3 plane down the EXISTING linear row path (the one swizzle 0 already
     // uses). DEFAULT 0, set only by `pipeshim 4`, cleared by every other argument, so 0.0.411's tiled call is untouched.
     uint32_t forceLinear;
-    // 0.0.416 (notes/design/SDMA-GCR.md, G3): prepend the SDMA GCR_REQ (GL2 write-back + invalidate) to the same
+    // 0.0.416 (an internal design note, G3): prepend the SDMA GCR_REQ (GL2 write-back + invalidate) to the same
     // submission as the tiled copy. DEFAULT 0, set only by `pipeshim 5`, cleared by every other argument, so ARG 2
     // (and every pre-0.0.416 caller) emits exactly the 0.0.415 packet.
     uint32_t gcr;
@@ -1225,7 +1227,7 @@ static uint32_t dpg_perform(void *self, void *txn) {
     // navi48_scanout_copy_vram call the swizzle-0 branch already makes, with the same arguments (pw/ph/stride) and the
     // same destination. No new copy mechanism, no new destination. DEFAULT OFF: gSh.forceLinear is 0 for every other
     // argument, so with S1 off this is 0.0.411's tiled call, byte for byte.
-    // 0.0.416 (notes/design/SDMA-GCR.md, G3): ARG 5 is a TILED copy with the GCR_REQ in the same submission. It
+    // 0.0.416 (an internal design note, G3): ARG 5 is a TILED copy with the GCR_REQ in the same submission. It
     // is meaningful only for the tiled path (there is no COPY_TILED_SUB_WINDOW on the linear path, and the live
     // plane is swizzle 3); gSh.gcr is reported in the control line either way.
     const bool linearCopy = (swz != 3u) || (gSh.forceLinear != 0u);
@@ -1692,6 +1694,10 @@ static struct {
     uint32_t holdMs, holdFired, holdEntered, holdSkipped;
     AgdcD2Fn d2; AgdcOpDeleteFn opDelete;
 } gAg {};
+// 0.0.659 (M6): the list the 0x980 reply declares when the navi48-m6 latch is ON and the native route built it: nfb framebuffers (the DP first, then the monitor B, then the monitor A), inst[i] = the instance of list entry i. nfb is 0 otherwise and the
+// 0.0.658 single-framebuffer answers are used byte for byte. fbObj[i] are the references that keep the listed framebuffers alive (the reply declares their pointers for the life of the AGDC object).
+static n48m6::AgdcList gAgm {};
+static IOService *gAgmObj[n48m6::kInstCount];
 
 static void agdc_count_cmd(uint32_t cmd) {
     for (unsigned i = 0; i < 16; i++) {
@@ -1762,6 +1768,16 @@ static __attribute__((noinline)) uint32_t agdc_link_config(uint8_t *out, size_t 
                lt.live ? "LIVE raster (lit OTG + EDID row)" : "CEA 1080p blanking");
     return kr;
 }
+void navi48_agdc_m6_stat(uint64_t o[8]) {
+    o[0] = gAgm.lastNfb; o[1] = gAgm.n921; o[2] = gAgm.n711; o[3] = gAgm.lastEp; o[4] = gAgm.nfb; o[5] = gAgm.nOor; o[6] = gAgm.lastOor; o[7] = 0;     // 0.0.660: o[5] / o[6] = the 0x921 / 0x711 endpoint dwords outside the 0x980 list, and the last one
+}
+
+// 0.0.662 (Stage 2, item 10): the 0x921 / 0x711 replies per instance, the bitmask of endpoint dwords seen, nfb, the out-of-range count and the last endpoint (m6stat page 4)
+void navi48_agdc_m6_stat2(uint64_t o[12]) {
+    for (unsigned i = 0; i < n48m6::kInstCount; ++i) { o[i] = gAgm.n921i[i]; o[3 + i] = gAgm.n711i[i]; }
+    o[6] = gAgm.epSeen; o[7] = gAgm.nfb; o[8] = gAgm.nOor; o[9] = gAgm.lastEp; o[10] = 0; o[11] = 0;
+}
+
 static uint32_t agdc_vendor(void *self, uint32_t cmd, unsigned long *in, unsigned long inLen, unsigned long *outp,
                             unsigned long *outLen, void *args) {
     (void)in; (void)inLen; (void)args;
@@ -1792,11 +1808,19 @@ static uint32_t agdc_vendor(void *self, uint32_t cmd, unsigned long *in, unsigne
     }
     uint32_t kr = 0xe00002c7u;   // kIOReturnUnsupported
     const size_t len = outLen ? (size_t)*outLen : 0;
+    // 0.0.659 (M6): with several framebuffers listed (the latch ON) the 0x980 / 0x921 / 0x711 replies are answered PER ENDPOINT by n48m6::agdc_answer (host-tested over the same code); false = the DP's endpoint: the 0.0.658 branches below.
+    const uint64_t oor0 = gAgm.nOor;
+    const bool m6done = gAgm.nfb > 1u && n48m6::agdc_answer(gAgm, cmd, reinterpret_cast<uint8_t *>(outp), len, reinterpret_cast<uint64_t>(gAg.pci), &kr);
+    if (gAgm.nOor != oor0 && (gAgm.nOor <= 4u || (gAgm.nOor & 0x3ffu) == 0u))
+        DPGLOG("agdc: m6: endpoint dword %llu is OUTSIDE the %u-entry 0x980 list (cmd %#x): answered as the DP; #%llu", (unsigned long long)gAgm.lastOor, gAgm.nfb, (unsigned)cmd, (unsigned long long)gAgm.nOor);
     // LOG ONLY: the 0x711 capability type arrives in the OUT buffer at +0x04 and the fill zeroes it (in == out),
     // so read it here to label the dump below. Same read n48_agdc_fill_pipeline_caps already does; nothing written.
     const uint32_t capType = (cmd == N48_AGDC_CMD_PIPELINE_CAPS && outp && len >= 8u)
                                  ? n48_agdc_rd32(reinterpret_cast<const uint8_t *>(outp), 4u) : 0u;
-    if (cmd == N48_AGDC_CMD_VENDOR_INFO) {
+    if (m6done) {
+        if (cmd == N48_AGDC_CMD_GPU_CAPABILITY) gAg.gpuCap++; else if (cmd == N48_AGDC_CMD_LINK_CONFIG) gAg.linkCfg++; else gAg.pipeCaps++;
+        if (kr) gAg.badLen++;
+    } else if (cmd == N48_AGDC_CMD_VENDOR_INFO) {
         gAg.vendorInfo++;
         kr = n48_agdc_fill_vendor_info(reinterpret_cast<uint8_t *>(outp), len) ? 0xe00002c2u : 0u;
         if (kr) gAg.badLen++;
@@ -2057,6 +2081,8 @@ uint32_t navi48_agdc_control(uint64_t arg, uint64_t *out, unsigned count) {
 struct AgdcNativeEnv {
     IOService *fb = nullptr;            // the lookup's reference: kept by gAg on success (the AGDC reply declares this pointer for the life of the object), dropped otherwise
     IOService *pci = nullptr, *provider = nullptr;
+    IOService *mfb[n48m6::kInstCount] = { nullptr, nullptr, nullptr };   // 0.0.659 (M6): the framebuffer of each published display nub (RETAINED); mn > 1 only with the latch ON and at least one nub published
+    uint32_t mn = 0;
     static const OSMetaClass *meta(const char *name) {
         const OSSymbol *nm = OSSymbol::withCString(name);
         const OSMetaClass *mc = nm ? OSMetaClass::getMetaClassWithName(nm) : nullptr;
@@ -2084,16 +2110,37 @@ struct AgdcNativeEnv {
         pci = navi48_bringup_pci();
         provider = navi48_bringup_service();
         const OSMetaClass *mc = fb ? fb->getMetaClass() : nullptr;
-        const bool ok = fb && mc && n48agdc::fb_name_ok(mc->getClassName()) && pci && provider;
+        bool ok = fb && mc && n48agdc::fb_name_ok(mc->getClassName()) && pci && provider;
         if (!ok) DPGLOG("agdc: native: REFUSED - framebuffer %p (%s), PCI %p, provider %p", fb, fb ? dpg_class(fb) : "none", pci, provider);
+        if (ok && n48m6_latched_on()) ok = collect_m6();
         return ok;
     }
+    // 0.0.659 (M6): with the latch ON the list is the DP plus the framebuffer of every PUBLISHED display nub (the monitor B first, then the monitor A: display index order). A published nub whose framebuffer has not started yet
+    // is a refusal (the list would disagree with the display machine's pipes), never a shorter list.
+    // 0.0.660 (T1): the decision lives in n48m6::collect_flow (host-tested over a fake of exactly these three members): a published nub whose framebuffer has not started REFUSES, a missing nub is skipped.
+    bool nub_published(uint32_t inst) { return n48fb_nub_exists_idx(n48m6::index_of_inst(inst)); }
+    bool fb_started(uint32_t inst) { mfb[inst] = Navi48DisplayNub::framebufferOf(n48m6::index_of_inst(inst)); return mfb[inst] != nullptr; }
+    void refuse(uint32_t inst) { DPGLOG("agdc: native: REFUSED - the display nub of index %u is published but its framebuffer has not started", n48m6::index_of_inst(inst)); }
+    bool collect_m6() { mn = 1u; return n48m6::collect_flow(*this, &mn); }
     bool wrangler() { return agdc_have_wrangler(); }
     uint32_t build(uint64_t am, uint64_t slide) {
-        return agdc_build_locked(reinterpret_cast<const OSMetaClass *>(static_cast<uintptr_t>(am)), static_cast<uintptr_t>(slide), fb, pci, provider);
+        if (mn > 1u) {                                                   // 0.0.659 (M6): the list is set BEFORE the object starts (AGDC::start may already ask 0x980)
+            bool have[n48m6::kInstCount] = { true, mfb[n48m6::kInstMonA] != nullptr, mfb[n48m6::kInstMonB] != nullptr };
+            uint32_t order[n48m6::kInstCount];
+            const uint32_t k = n48m6::list_insts(have, order);                 // 0.0.660 (T1): the DP, then the monitor B, then the monitor A (host-tested order)
+            for (uint32_t j = 0; j < k; ++j) {
+                IOService *o = order[j] == n48m6::kInstDp ? fb : mfb[order[j]];
+                gAgm.fb[j] = reinterpret_cast<uint64_t>(o); gAgm.inst[j] = order[j]; gAgmObj[j] = o;
+            }
+            gAgm.nfb = k;
+        }
+        const uint32_t st = agdc_build_locked(reinterpret_cast<const OSMetaClass *>(static_cast<uintptr_t>(am)), static_cast<uintptr_t>(slide), fb, pci, provider);
+        if (st != 0u) gAgm.nfb = 0u;                                     // a failed build leaves the single-framebuffer answers
+        return st;
     }
-    void finish(uint32_t st) {          // after the flow: a published object keeps the framebuffer reference; every other outcome gives it back
+    void finish(uint32_t st) {          // after the flow: a published object keeps the framebuffer references; every other outcome gives them back
         if (fb && st != n48agdc::kPublished) fb->release();
+        for (uint32_t i = 0; i < n48m6::kInstCount; ++i) { if (mfb[i] && st != n48agdc::kPublished) mfb[i]->release(); mfb[i] = nullptr; }
         fb = nullptr;
     }
 };
@@ -2564,7 +2611,7 @@ uint32_t navi48_pipeshim_control(uint64_t arg, uint64_t *out, unsigned count) {
     else if ((arg == 2 || arg == 4 || arg == 5) && !navi48_scanout_pc_passed()) st = 3;
     else {
         // ARG 4 is NOT a fourth mode: it is mode 2 plus S1's forced-linear flag. ARG 5 is mode 2 with
-        // the GCR_REQ (notes/design/SDMA-GCR.md G3). Every other accepted argument clears both, so the default and
+        // the GCR_REQ (an internal design note G3). Every other accepted argument clears both, so the default and
         // all pre-0.0.416 callers keep the tiled swizzle-3 call exactly (18 dwords, no GCR).
         IOLockLock(gDpgLock);
         const uint32_t wasLinear = gSh.forceLinear;
@@ -2652,7 +2699,7 @@ uint32_t navi48_pipeshim_control(uint64_t arg, uint64_t *out, unsigned count) {
     // each line below is under 480 body bytes at its maximum argument widths.
     DPGLOG("pipeshim: control %llu -> status %u (0 ok, 1 safety core not armed, 2 ARG out of range, 3 mode 2/4/5 "
            "refused: scanout positive control not passed; 3 also = READ ONLY, 0.0.338; 4 = mode 2 + forced linear, "
-           "; 5 = mode 2 + GCR_REQ before the tiled copy, notes/design/SDMA-GCR.md G3); "
+           "; 5 = mode 2 + GCR_REQ before the tiled copy, an internal design note G3); "
            "mode %u forceLinear %u GCR %u (tiled copy now %u dwords); S2 verify runs %u of at most %u",
            (unsigned long long)arg, st, gSh.mode, (unsigned)gSh.forceLinear, (unsigned)gSh.gcr,
            (unsigned)n48_sdma_tiled_copy_dwords(gSh.gcr != 0u), (unsigned)gSh.verifyRuns,

@@ -1,7 +1,7 @@
 From b98a1a6f6d17792eeff9305ba9c9121b0712550f Mon Sep 17 00:00:00 2001
 From: Navi48-MacOS contributors <noreply@example.invalid>
 Date: Thu, 1 Jan 2026 00:00:00 +0000
-Subject: [PATCH 4/5] darwin: host-pointer import (userptr) via N48N
+Subject: [PATCH 4/9] darwin: host-pointer import (userptr) via N48N
  BoImportHost when the kernel ABI is >= 1.9; ABI header synced to 1.9
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -121,7 +121,7 @@ index 7ec88e8776e..d7008417185 100644
 +};
 +
 +/* ---- ABI 1.3: the timed mode trial (kext 0.0.605, native S2d) --------------------------------------------------------------------------
-+ * ABI 1.3 addendum (proposed text for notes/design/NATIVE-S1C-ABI.md; the header is the only place it lives until the reviewer merges it):
++ * ABI 1.3 addendum (proposed text for an internal design note; the header is the only place it lives until the reviewer merges it):
 + *   Selector 16 N48N_SEL_MODE_TRIAL. Native boots only (navi48-native=1 with S1b POSITIVE PASS), scanout plane NOT acquired, DISPCLK/DPPCLK at least what the row's DML
 + *   needs (read from the DFS registers, never assumed), the live mode the 60 Hz census raster. It programs the display to the row's refresh (row 50 = the 60 Hz raster at a
 + *   201 MHz pixel clock, 49.90 Hz, the live 60 Hz DLG/TTU stays; row 120 = 497.75 MHz, 2720x1525, the DML DLG/TTU/prefetch goldens; row 120 needs a passed row-50 trial on
@@ -133,7 +133,7 @@ index 7ec88e8776e..d7008417185 100644
 + *   Time in the trial mode is about 0.5 s + 3 s + dwell. The hardware writes are the ones listed in navi48_modetrial_tables.h (the generated golden tables), nothing else.
 + *   It never raises a clock: a row whose DML clocks exceed the live DFS readback is DENIED (n48dal / navi48-dalsmc is the only clock path).
 + *   n48n_mode_result: verdict N48N_MODE_V_*, deny N48N_MODE_D_* (verdict DENIED: nothing was written), flags N48N_MODE_F_*. Tool: tools/native/n48mode.c.
-+ * ABI 1.4 addendum (kext 0.0.606, native S2-120HZ; design notes/design/NATIVE-S2-120HZ.md P1 / P2 / P3):
++ * ABI 1.4 addendum (kext 0.0.606, native S2-120HZ; design an internal design note P1 / P2 / P3):
 + *   The result is 512 B: the first 256 B are the 1.3 layout unchanged, the second 256 B are `ext` (below). A client built for 1.3 must not call selector 16 on a 1.4 kext (the output size differs).
 + *   Two new rows, both at 60 Hz with no clock or DTO change: row 1 = the DP1 stream resync (blank, then unblank, exactly Linux's order: field-exact writes of DP1_DP_VID_STREAM_CNTL,
 + *   DP1_DP_STEER_FIFO and DIG1_DIG_FIFO_CTRL0 only; one retry; the stream is left blanked only if both attempts failed, and then the restore / watchdog / `dcnmode 0` / kext stop unblank it);
@@ -143,7 +143,7 @@ index 7ec88e8776e..d7008417185 100644
 + *   The underflow registers (HUBP0_DCHUBP_CNTL, ODM0_OPTC_INPUT_GLOBAL_CONTROL) are read before the trial (must be clean), after the settle (reported), every 250 ms during the rate window and
 + *   the dwell (an underflow ends the trial: verdict UNDERFLOW, restored, latched) and after the restore (an underflow there makes the verdict RESTORE). They are cleared with their write-1
 + *   strobes (never while ODM0_OPTC_INPUT_GLOBAL_CONTROL.INPUT_SOFT_RESET is set). Row 120 stays hard-denied. */
-+/* ABI 1.5 addendum (kext 0.0.607, native S2-120HZ; design notes/design/NATIVE-S2-120HZ.md P4 / P5):
++/* ABI 1.5 addendum (kext 0.0.607, native S2-120HZ; design an internal design note P4 / P5):
 + *   Row 120 (2560x1440, 2720x1525, 497.75 MHz = 119.998 Hz) is DENIED (N48N_MODE_D_ROW120_OFF) unless the boot-arg navi48-row120=1 is present. With it, the trial needs: a native boot with S1b POSITIVE PASS and
 + *   navi48-dalsmc=4; E1b (n48dal e1b) run on THIS boot; a passed row-50 trial, a passed row-1 resync and a row-2 PASS with N48N_MODE_F_LOCK_HELD_PROVEN on THIS boot (deny 15 / 23); the F6 / F7 / P1 baselines
 + *   (OTG lock usable, FIFO health, underflow clean); the clock hold available (deny 22: the reason is ext.hold_pre, n48dal::HoldPre 1 level, 2 no E1b, 3 DAL latch, 4 hold state, 5 mailbox owner busy). The operator keeps the
@@ -155,7 +155,7 @@ index 7ec88e8776e..d7008417185 100644
 + *   underflow; (14) only then release the clock hold (DPPCLK then DISPCLK to the 272 MHz floor). A restore that did not verify never releases (hold state STUCK: the clocks stay up, harmless at 60 Hz; cold power cycle).
 + *   Any failure at any step goes to the restore. The watchdog restores registers only; it never touches a clock. New words: verdict 12 CLOCK_LOST (the DFS readback fell under the need while held), verdict 15 HOLD (the release
 + *   did not verify), flags 22..24, the hold report in ext (hold_*). The result struct keeps its 512 B; the hold report lives in what 1.4 called ext.reserved. */
-+/* ABI 1.7 addendum (kext 0.0.609, native S2 milestone #8: the cube at 120 Hz; design: the "0.0.609" section of notes/design/NATIVE-S2-120HZ.md and the comments of dcn/navi48_modetrial_pure.h):
++/* ABI 1.7 addendum (kext 0.0.609, native S2 milestone #8: the cube at 120 Hz; design: the "0.0.609" section of an internal design note and the comments of dcn/navi48_modetrial_pure.h):
 + *   A mode trial and a scanout client exclude each other (scanAcquire refuses while a trial is busy; the trial refuses while the plane is acquired). The HELD mode lets a scanout client present WHILE the display runs at 1440p 120 Hz.
 + *   Selector 17 N48N_SEL_MODE_HOLD (row 120 only, needs everything `n48mode 120` needs): runs the SAME trial on a kernel thread - deny gate, clock hold, blank, lock, writes, unlock, latch, DTO, MSA, unblank, 500 ms settle, the
 + *   3 s judged rate window - and, when that is clean (no failure, rate inside 1 %, no underflow judged), does NOT dwell for a fixed time: it publishes the entry snapshot and returns it (verdict N48N_MODE_V_HELD) with the mode UP.

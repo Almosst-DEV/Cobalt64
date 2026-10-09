@@ -1,0 +1,191 @@
+From 2c2ead0685763a9033acf1076ca52c48b01d2bb1 Mon Sep 17 00:00:00 2001
+From: Navi48-MacOS contributors <noreply@example.invalid>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH 8/9] radv/darwin: radv_darwin_set_service_class (Navi48Bringup
+ default | Navi48Accelerator for sandboxed apps through the IOAccelerator
+ connection, G6)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/amd/common/darwin/ac_darwin_iokit.c       | 14 ++++++----
+ src/amd/common/darwin/ac_darwin_kext.c        | 23 +++++++++++++++
+ src/amd/common/darwin/ac_darwin_kext.h        |  9 ++++++
+ src/amd/common/darwin/test/acd_kext_test.c    | 28 +++++++++++++++++++
+ .../winsys/amdgpu/radv_darwin_scanout.c       |  6 ++++
+ .../winsys/amdgpu/radv_darwin_scanout.h       |  6 ++++
+ 6 files changed, 80 insertions(+), 6 deletions(-)
+
+diff --git a/src/amd/common/darwin/ac_darwin_iokit.c b/src/amd/common/darwin/ac_darwin_iokit.c
+index 7e81081e530..5fe860ce29e 100644
+--- a/src/amd/common/darwin/ac_darwin_iokit.c
++++ b/src/amd/common/darwin/ac_darwin_iokit.c
+@@ -2,7 +2,8 @@
+  * SPDX-License-Identifier: MIT
+  *
+  * IOKit transport of the native kext ABI: IOServiceOpen of class Navi48Bringup
+- * with user-client type 'N48N' (NATIVE-S1C-ABI.md section 1).
++ * (G6: or Navi48Accelerator, acd_kext_set_service_class) with user-client type
++ * 'N48N' (NATIVE-S1C-ABI.md section 1).
+  */
+ 
+ #include "ac_darwin_kext.h"
+@@ -67,10 +68,11 @@ iokit_close(void *ctx)
+ int
+ acd_kext_open_iokit(struct acd_kext **out)
+ {
+-   io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("Navi48Bringup"));
++   const char *svc_class = acd_kext_service_class(); /* G6: Navi48Bringup unless the bundle chose the accelerator */
++   io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(svc_class));
+    if (!svc) {
+-      fprintf(stderr, "radv-darwin: IOServiceGetMatchingService(Navi48Bringup) found nothing: the Navi48 kext is "
+-                      "not loaded (native backend unavailable)\n");
++      fprintf(stderr, "radv-darwin: IOServiceGetMatchingService(%s) found nothing: the Navi48 kext is "
++                      "not loaded (native backend unavailable)\n", svc_class);
+       return -ENODEV;
+    }
+ 
+@@ -86,8 +88,8 @@ acd_kext_open_iokit(struct acd_kext **out)
+    }
+    IOObjectRelease(svc);
+    if (kr != KERN_SUCCESS) {
+-      fprintf(stderr, "radv-darwin: IOServiceOpen(Navi48Bringup, type 'N48N') failed: IOReturn 0x%08x%s\n",
+-              (unsigned)kr,
++      fprintf(stderr, "radv-darwin: IOServiceOpen(%s, type 'N48N') failed: IOReturn 0x%08x%s\n",
++              svc_class, (unsigned)kr,
+               (unsigned)kr == ACD_KR_EXCLUSIVE_ACCESS ? " (another native client is open)"
+               : (unsigned)kr == ACD_KR_NOT_PRIVILEGED ? " (needs root)"
+               : (unsigned)kr == ACD_KR_NOT_READY      ? " (native mode not available this boot)"
+diff --git a/src/amd/common/darwin/ac_darwin_kext.c b/src/amd/common/darwin/ac_darwin_kext.c
+index 45cc36fbac2..eb0bb648acc 100644
+--- a/src/amd/common/darwin/ac_darwin_kext.c
++++ b/src/amd/common/darwin/ac_darwin_kext.c
+@@ -74,6 +74,29 @@ struct acd_kext {
+    void *ctx;
+ };
+ 
++/* G6: the service class of the N48N open. A pointer to one of the two string literals below (never to the caller's buffer). */
++static const char *volatile acd_service_class = ACD_SERVICE_BRINGUP;
++
++int
++acd_kext_set_service_class(const char *cls)
++{
++   if (!cls)
++      return -EINVAL;
++   if (!strcmp(cls, ACD_SERVICE_BRINGUP))
++      acd_service_class = ACD_SERVICE_BRINGUP;
++   else if (!strcmp(cls, ACD_SERVICE_ACCELERATOR))
++      acd_service_class = ACD_SERVICE_ACCELERATOR;
++   else
++      return -EINVAL;
++   return 0;
++}
++
++const char *
++acd_kext_service_class(void)
++{
++   return acd_service_class;
++}
++
+ struct acd_kext *
+ acd_kext_create(const struct acd_kext_ops *ops, void *ctx)
+ {
+diff --git a/src/amd/common/darwin/ac_darwin_kext.h b/src/amd/common/darwin/ac_darwin_kext.h
+index b65ea417968..dfa19a40f73 100644
+--- a/src/amd/common/darwin/ac_darwin_kext.h
++++ b/src/amd/common/darwin/ac_darwin_kext.h
+@@ -90,6 +90,15 @@ void acd_kext_destroy(struct acd_kext *k);
+  * IOKit transport (IOServiceOpen of Navi48Bringup, type 'N48N'). Logs one clear
+  * stderr line and returns -errno on failure. */
+ int acd_kext_open(struct acd_kext **out);
++
++/* G6 (sandboxed applications): the IOService class the 'N48N' connection is opened on. The default, "Navi48Bringup", is what WindowServer, root tools and
++ * command-line programs use. A sandboxed application's profile admits user clients only on a service that conforms to IOAccelerator, so the Metal bundle sets
++ * "Navi48Accelerator" (the aux kext's accelerator) for the APP class, before the Vulkan instance is created. Only these two names are accepted (-EINVAL
++ * otherwise, and the previous value stays). Process-wide; the setter is not meant to be called while a connection is being opened. */
++#define ACD_SERVICE_BRINGUP     "Navi48Bringup"
++#define ACD_SERVICE_ACCELERATOR "Navi48Accelerator"
++int acd_kext_set_service_class(const char *cls);
++const char *acd_kext_service_class(void);
+ int acd_kext_open_iokit(struct acd_kext **out);      /* ac_darwin_iokit.c */
+ int acd_mock_open(struct acd_kext **out);            /* ac_darwin_mock.c */
+ 
+diff --git a/src/amd/common/darwin/test/acd_kext_test.c b/src/amd/common/darwin/test/acd_kext_test.c
+index c3c3eec0a95..395c580c5ff 100644
+--- a/src/amd/common/darwin/test/acd_kext_test.c
++++ b/src/amd/common/darwin/test/acd_kext_test.c
+@@ -408,6 +408,33 @@ test_import_host(void)
+    acd_kext_destroy(k);
+ }
+ 
++/* G6: the service class of the N48N open */
++static void
++test_service_class(void)
++{
++   CHECK(strcmp(acd_kext_service_class(), "Navi48Bringup") == 0); /* the default is unchanged */
++   CHECK(acd_kext_set_service_class("Navi48Accelerator") == 0);
++   CHECK(strcmp(acd_kext_service_class(), "Navi48Accelerator") == 0);
++   CHECK(acd_kext_set_service_class("Navi48Bringup") == 0);
++   CHECK(strcmp(acd_kext_service_class(), "Navi48Bringup") == 0);
++   /* anything else is refused and changes nothing, even a name that merely starts like an accepted one */
++   CHECK(acd_kext_set_service_class("Navi48Accelerator") == 0);
++   CHECK(acd_kext_set_service_class(NULL) == -EINVAL);
++   CHECK(acd_kext_set_service_class("") == -EINVAL);
++   CHECK(acd_kext_set_service_class("IOAccelerator") == -EINVAL);
++   CHECK(acd_kext_set_service_class("Navi48AcceleratorX") == -EINVAL);
++   CHECK(acd_kext_set_service_class("Navi48Accelerato") == -EINVAL);
++   CHECK(acd_kext_set_service_class("navi48bringup") == -EINVAL);
++   CHECK(strcmp(acd_kext_service_class(), "Navi48Accelerator") == 0);
++   /* the stored pointer is the constant, not the caller's buffer */
++   char buf[32];
++   strcpy(buf, "Navi48Bringup");
++   CHECK(acd_kext_set_service_class(buf) == 0);
++   strcpy(buf, "Navi48Accelerator");
++   CHECK(strcmp(acd_kext_service_class(), "Navi48Bringup") == 0);
++   CHECK(strcmp(ACD_SERVICE_BRINGUP, "Navi48Bringup") == 0 && strcmp(ACD_SERVICE_ACCELERATOR, "Navi48Accelerator") == 0);
++}
++
+ int
+ main(void)
+ {
+@@ -418,6 +445,7 @@ main(void)
+    test_wait();
+    test_misc();
+    test_import_host();
++   test_service_class();
+    printf("acd_kext_test: %d checks, %d failures\n", checks, failures);
+    return failures != 0;
+ }
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.c b/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.c
+index 0ed1cd6a4bd..15b98bc45e0 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.c
+@@ -29,6 +29,12 @@ scan_kext(VkDevice _dev)
+    return (k && minor >= 1) ? k : NULL;
+ }
+ 
++API int
++radv_darwin_set_service_class(const char *cls)
++{
++   return acd_kext_set_service_class(cls);
++}
++
+ API int
+ radv_darwin_scanout_query(VkDevice dev, struct n48n_scan_query *q)
+ {
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.h b/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.h
+index 6daf9eb248c..8e21bccecbe 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.h
++++ b/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.h
+@@ -31,6 +31,12 @@ int radv_darwin_scanout_status(VkDevice dev, struct n48n_scan_status *st);
+ /* Restores the console; out[0] = restore verified, [1] plane MC after (out may be NULL). Idempotent. */
+ int radv_darwin_scanout_release(VkDevice dev, uint64_t out[2]);
+ 
++/* G6 (sandboxed applications): choose the IOService the 'N48N' connection is opened on. cls is "Navi48Bringup" (the default: WindowServer, root tools,
++ * command-line programs) or "Navi48Accelerator" (the aux kext's IOAccelerator, the only service a sandboxed application's profile lets it open a user client
++ * on). Returns 0, or -EINVAL for any other name (the previous choice stays). The Metal bundle calls it, for the APP class only, after dlopen and BEFORE
++ * vkCreateInstance (the connection is opened when the physical devices are enumerated); it is process-wide. No VkDevice is needed. */
++int radv_darwin_set_service_class(const char *cls);
++
+ #ifdef __cplusplus
+ }
+ #endif

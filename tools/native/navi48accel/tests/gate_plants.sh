@@ -81,7 +81,7 @@ public:' 'class Navi48DisplayMachine : public IOAccelDisplayMachine {
 public:
 	bool start(IOService *provider) override { return IOService::start(provider); }'
 plant 6 $H "the generated header is stale (one asm label changed)" none 'virtual bool start(IOService *) override __asm__("__ZN22IOGraphicsAccelerator25startEP9IOService");' 'virtual bool start(IOService *) override __asm__("__ZN22IOGraphicsAccelerator24stopEP9IOService");'
-plant 7 $A/gates/leaves.py "the expected-override list forgets probe / start / free" none "[183, 184, 18, 322, 348, 329]),   # IOService::probe" "[]),   # IOService::probe"
+plant 7 $A/gates/leaves.py "the expected-override list forgets probe / start / free" none "[183, 184, 18, 322, 348, 329, 239]),   # IOService::probe" "[]),   # IOService::probe"
 plant 9 $S "a leaf inherits a slot by a placeholder name (a reference to a symbol the family never defined)" none '	N48_R_IOAccelDisplayMachine_269 displayModeWillChange() override;' '	N48_R_IOAccelDisplayMachine_269 displayModeWillChange() override;
 	virtual void _vslot300();'
 plant 10 $L/gen_header.py "the generator stops labelling family slots (the vtable would reference _vslotN)" none "    asm = ' __asm__(\"%s\")' % lab" "    asm = ''"
@@ -92,9 +92,39 @@ plant 12 $A/gates/leaves.py "a trampoline leaf's hooked slot is renumbered (over
 P=$A/src/n48accel_pure.h
 plant 13 $P "FAIL-OPEN: the runtime gate accepts an IOAccelDisplayPipe whose inherited slot differs (the twin's mismatched-pipe controls run the SAME gate_compare)" none '} else if (ours[i] != fam[i]) {' '} else if (false) {'
 plant 14 $P "FAIL-OPEN: the runtime gate accepts a longer IOAccelDisplayPipe vtable (the twin's control: 307 slots)" none '    if (fam[nslots] != 0) { r.v = kGateFamilyLonger;' '    if (false) { r.v = kGateFamilyLonger;'
-plant 15 $A/gates/leaves.py "the display pipe leaf is left out of the gate's leaf list (12 classes / 2370 slots expected)" none "    ('Navi48DisplayPipe',   'IOAccelDisplayPipe',       [277]),            # aux 0.0.3: performTransaction, hand-written (its generated declaration is a placeholder)
+plant 15 $A/gates/leaves.py "the display pipe leaf is left out of the gate's leaf list (13 classes / 2720 slots expected)" none "    ('Navi48DisplayPipe',   'IOAccelDisplayPipe',       [277]),            # aux 0.0.3: performTransaction, hand-written (its generated declaration is a placeholder)
 " ""
-plant 16 $A/gates/leaves.py "the expected totals still say 11 classes" none "EXPECT_CLASSES = 12" "EXPECT_CLASSES = 11"
+plant 16 $A/gates/leaves.py "the expected totals still say 11 classes" none "EXPECT_CLASSES = 13" "EXPECT_CLASSES = 11"
+
+# ---- aux 0.0.4: Navi48Framebuffer vs IOFramebuffer in the gates (350 slots; the slots 305-348 of the M5 spec are covered one by one by the twin's 65 negative controls) ----
+plant 17 $S "the framebuffer introduces a virtual (its vtable grows past IOFramebuffer's 350 slots)" twin 'class Navi48Framebuffer : public IOFramebuffer {
+	OSDeclareDefaultStructors(Navi48Framebuffer)
+public:' 'class Navi48Framebuffer : public IOFramebuffer {
+	OSDeclareDefaultStructors(Navi48Framebuffer)
+public:
+	virtual void extraFb();' 'bool Navi48Framebuffer::start(IOService *provider) {' 'void Navi48Framebuffer::extraFb() {}
+bool Navi48Framebuffer::start(IOService *provider) {'
+plant 18 $S "the framebuffer overrides isConsoleDevice (slot 305: it would claim the console)" twin 'class Navi48Framebuffer : public IOFramebuffer {
+	OSDeclareDefaultStructors(Navi48Framebuffer)
+public:' 'class Navi48Framebuffer : public IOFramebuffer {
+	OSDeclareDefaultStructors(Navi48Framebuffer)
+public:
+	bool isConsoleDevice() override { return true; }'
+plant 19 $S "the framebuffer overrides setInterruptState (slot 348: an interrupt source of its own)" twin 'class Navi48Framebuffer : public IOFramebuffer {
+	OSDeclareDefaultStructors(Navi48Framebuffer)
+public:' 'class Navi48Framebuffer : public IOFramebuffer {
+	OSDeclareDefaultStructors(Navi48Framebuffer)
+public:
+	IOReturn setInterruptState(void *interruptRef, UInt32 state) override { return IOFramebuffer::setInterruptState(interruptRef, state); }'
+plant 20 $A/gates/leaves.py "the framebuffer's expected-override list forgets getDDCBlock (slot 345)" twin "FB_EXTRA = [184, 310, 311, 319, 322, 325, 326, 330, 331, 332, 344, 345]" "FB_EXTRA = [184, 310, 311, 319, 322, 325, 326, 330, 331, 332, 344]"
+plant 21 $A/gates/leaves.py "the framebuffer's expected-override list claims an override that is not there (slot 305)" twin "FB_EXTRA = [184, 310, 311, 319, 322, 325, 326, 330, 331, 332, 344, 345]" "FB_EXTRA = [184, 305, 310, 311, 319, 322, 325, 326, 330, 331, 332, 344, 345]"
+plant 22 $A/gates/layout_gate_host.py "the host twin cannot resolve IOGraphicsFamily symbols (the System KC dropped from its table)" none "    for lvl, p in ((1, FAMILY), (0, BOOT_KC), (1, SYS_KC)):" "    for lvl, p in ((1, FAMILY), (0, BOOT_KC)):"
+plant 23 $L/gen_header.py "the generated header drops IOFramebuffer's size / slot count (the SDK class is no longer checked against the kernel)" none "EXTRA_SDK = {'IOFramebuffer': 'IOKit/graphics/IOFramebuffer.h'}" "EXTRA_SDK = {}"
+
+# ---- aux 0.0.5 (G6): slot 239, newUserClient, in the gates ----
+plant 24 $S "SLOT 239 NOT OVERRIDDEN: the class has no newUserClient override but the expected list says it does (the vtable slot is the family's)" twin 'IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) override;' 'IOReturn n48NotNewUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler);' 'IOReturn Navi48Accelerator::newUserClient(' 'IOReturn Navi48Accelerator::n48NotNewUserClient('
+plant 25 $A/gates/leaves.py "slot 239 is overridden but the expected-override list forgets it (an unexpected override)" twin "[183, 184, 18, 322, 348, 329, 239])" "[183, 184, 18, 322, 348, 329])"
+plant 26 $A/gates/leaves.py "a class is added to the expected totals for the 239 change (the slot count must NOT change)" none "EXPECT_SLOTS = 2720" "EXPECT_SLOTS = 2721"
 
 echo "gate plants: $total run, $escaped escaped/failed"
 [ "$escaped" -eq 0 ]

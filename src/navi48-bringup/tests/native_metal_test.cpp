@@ -1,4 +1,4 @@
-// native_metal_test.cpp - build 0.0.610, extended 0.0.611 (milestone #9, route A, notes/design/NATIVE-S3.md): the pure half of the Metal nub and its ops table, plus source pins.
+// native_metal_test.cpp - build 0.0.610, extended 0.0.611 (milestone #9, route A, an internal design note): the pure half of the Metal nub and its ops table, plus source pins.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //       -I src/navi48-bringup/src -I src/navi48-bringup/src/amd src/navi48-bringup/tests/native_metal_test.cpp -o /tmp/native_metal && /tmp/native_metal .
 //   (run from the repo root; the argument is the repo root the source pins read from; an optional second argument is the tree that holds the aux kext
@@ -189,9 +189,9 @@ static void m4_misc() {
     expect_u("factory mask 0 with the arg 0", factory_mask(true, 0), 0);
     expect_u("factory mask from the arg", factory_mask(true, 3), 3);
     expect_u("factory mask ignores unknown bits", factory_mask(true, 0xff), 0x7f);
-    expect_u("ops flags: software only", kOpsFlags, N48_METAL_F_SOFTWARE_ONLY); expect_u("caps: the generic hook", kOpsCaps, N48_CAP_VHOOK);
+    expect_u("ops flags: software only", kOpsFlags, N48_METAL_F_SOFTWARE_ONLY); expect_u("caps: the generic hook and (0.0.656) native_open", kOpsCaps, N48_CAP_VHOOK | N48_CAP_NATIVE_OPEN);
     // the ops struct layout (both kexts are built against it)
-    expect_u("sizeof(N48MetalOps): ABI 2", sizeof(N48MetalOps), 144);
+    expect_u("sizeof(N48MetalOps): ABI 3", sizeof(N48MetalOps), 152);
     expect_u("offsetof size", offsetof(N48MetalOps, size), 8);
     expect_u("offsetof device_open", offsetof(N48MetalOps, device_open), 24);
     expect_u("offsetof populate_config", offsetof(N48MetalOps, populate_config), 40);
@@ -200,7 +200,7 @@ static void m4_misc() {
     expect_u("offsetof trace", offsetof(N48MetalOps, trace), 88);
     expect_u("offsetof vhook", offsetof(N48MetalOps, vhook), 96); expect_u("offsetof caps", offsetof(N48MetalOps, caps), 104); expect_u("offsetof reserved1", offsetof(N48MetalOps, reserved1), 112);
     expect_u("offsetof disp_flags", offsetof(N48MetalOps, disp_flags), 120); expect_u("offsetof disp_hook", offsetof(N48MetalOps, disp_hook), 128); expect_u("offsetof pci_device", offsetof(N48MetalOps, pci_device), 136);
-    expect_u("magic", N48_METAL_OPS_MAGIC, 0x4F38344Eu); expect_u("abi", N48_METAL_ABI, 2); expect_u("the oldest accepted abi", N48_METAL_ABI_MIN, 1); expect_u("ABI 1 was 120 bytes", N48_METAL_OPS_MIN, 120); expect_u("ABI 2 is 144", N48_METAL_OPS_V2, 144);
+    expect_u("magic", N48_METAL_OPS_MAGIC, 0x4F38344Eu); expect_u("abi", N48_METAL_ABI, 3); expect_u("the oldest accepted abi", N48_METAL_ABI_MIN, 1); expect_u("ABI 1 was 120 bytes", N48_METAL_OPS_MIN, 120); expect_u("ABI 2 is 144", N48_METAL_OPS_V2, 144); expect_u("ABI 3 is 152", N48_METAL_OPS_V3, 152);
 }
 
 // ---- M5: source pins -------------------------------------------------------------------------------------------------------------------------------------
@@ -348,14 +348,14 @@ static void m5_pins(const std::string &root, const std::string &auxroot) {
     expect_u("selector count 1.8", N48N_SEL_COUNT_1_8, 21); expect_u("selector count 1.9", N48N_SEL_COUNT_1_9, 22); expect_u("BoImportHost is selector 21", N48N_SEL_BO_IMPORT_HOST, 21);
     expect_u("selector count 1.7 unchanged", N48N_SEL_COUNT_1_7, 19);
     expect_u("ABI major unchanged", N48N_ABI_VERSION, 1);
-    expect_u("ABI minor 9", N48N_ABI_MINOR, 9);
+    expect_u("ABI minor 12 (1.12 since 0.0.662: instance 1 behind navi48-m6flip1; 1.11 since 0.0.661: the instance-2 scanout selectors 22..26)", N48N_ABI_MINOR, 12);
     expect(cli.find("case N48N_SEL_METAL_NUB_PUBLISH:\n\t\tif (!shape(1, 4, 0, 0)) return kIOReturnBadArgument;") != std::string::npos, "publish: shape 1 scalar in, 4 out, no structs");
     expect(cli.find("case N48N_SEL_METAL_NUB_WITHDRAW:\n\t\tif (!shape(1, 1, 0, 0)) return kIOReturnBadArgument;") != std::string::npos, "withdraw: shape 1 in, 1 out, no structs");
     {   // the selectors sit behind the same guard as every other native selector
         const std::string e = fn_body(cli, "IOReturn IOAccelNavi48NativeClient::externalMethod(");
         const size_t g = e.find("if (!args || !opened) return kIOReturnNotReady;"), sw = e.find("switch (selector)"), p = e.find("case N48N_SEL_METAL_NUB_PUBLISH:");
         expect(g != std::string::npos && sw != std::string::npos && p != std::string::npos && g < sw && sw < p, "the nub selectors are inside the opened-session switch");
-        expect(count_of(e, "case N48N_SEL_") == 22, "the native client dispatches exactly the 22 selectors of ABI 1.9");
+        expect(count_of(e, "case N48N_SEL_") == 27, "the native client dispatches exactly the 27 selectors of ABI 1.11 (0.0.661: + the five instance-2 scanout selectors 22..26)");
     }
     // -- the hooks are the pure code --
     expect(nub.find("n48metal::config_populate(cfg, bytes, (uint64_t)(uintptr_t)kAccelName)") != std::string::npos, "populate_config is the pure config_populate on the kext's own name string");
@@ -363,9 +363,9 @@ static void m5_pins(const std::string &root, const std::string &auxroot) {
     expect(nub.find("n48metal::task_window(kind, size, reserve)") != std::string::npos, "task_window is the pure one");
     expect(nub.find("n48metal::factory_mask(present, v)") != std::string::npos && nub.find("\"navi48-metal-fact\"") != std::string::npos, "factory_mask is the pure one behind navi48-metal-fact");
     expect(nub.find("return (int)kIOReturnUnsupported;") != std::string::npos, "mm_hook refuses (no map entry point before #10)");
-    expect(nub.find("N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 620u, n48metal::kOpsFlags, 0u,") != std::string::npos && nub.find("op_vhook, n48metal::kOpsCaps, 0,") != std::string::npos && nub.find("N48_DISP_F_ON, 0u, op_disp_hook, op_pci_device,") != std::string::npos, "the ABI-2 ops table identity: magic, abi 2, 144 bytes, build 615, flags, the generic hook and its cap, the display flag and the two display members");
-    expect(nub.find("N48_METAL_OPS_MAGIC, N48_METAL_ABI_MIN, N48_METAL_OPS_MIN, 620u, n48metal::kOpsFlags, 0u,") != std::string::npos && nub.find("0u, 0u, nullptr, nullptr,\n};") != std::string::npos, "the OFF table is the ABI-1, 120-byte table with no display members");
-    expect(nub.find("functionName->isEqualTo(N48_METAL_FN_SYMBOL)") != std::string::npos && nub.find("*(const N48MetalOps **)param1 = n48disp::ops_shape(n48disp_latched_on()).abi >= 2u ? &gOps : &gOpsV1;") != std::string::npos, "callPlatformFunction n48.metal.ops hands out the static table the latch chooses (ABI 1 unless boot-arg navi48-metal-disp=1)");
+    expect(count_of(nub, "N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 664u, n48metal::kOpsFlags, 0u,") == 2 && nub.find("op_vhook, n48metal::kOpsCaps, 0,") != std::string::npos && nub.find("N48_DISP_F_ON, 0u, op_disp_hook, op_pci_device,\n\top_native_open,\n};") != std::string::npos, "the ABI-3 ops table identity: magic, abi 3, 152 bytes, build 657, flags, the generic hook and the caps, the display flag and the two display members, native_open");
+    expect(nub.find("const N48MetalOps gOpsOff = {\n\tN48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 664u, n48metal::kOpsFlags, 0u,") != std::string::npos && nub.find("0u, 0u, nullptr, nullptr,\n\top_native_open,\n};") != std::string::npos, "the OFF table is ABI 3 / 152 bytes with no display members (flags 0, no hook, no PCI getter) and native_open");
+    expect(nub.find("functionName->isEqualTo(N48_METAL_FN_SYMBOL)") != std::string::npos && nub.find("*(const N48MetalOps **)param1 = n48disp::ops_shape(n48disp_latched_on()).dispFlags != 0u ? &gOps : &gOpsOff;") != std::string::npos, "callPlatformFunction n48.metal.ops hands out the static table the latch chooses (the display-OFF ABI-3 table unless boot-arg navi48-metal-disp=1)");
     expect(nub.find("if (!d || d != gDev || d->magic != kDevMagic) return;") != std::string::npos, "device_close is idempotent and identity-checked");
     // -- 0.0.611: the vhook and the config are the pure code --
     expect(nub.find("n48metal::vhook_handle(mask, cls, slot, args, nargs, ret, n48metal::kKernelMin)") != std::string::npos && nub.find("n48metal::vhook_count(gVhCounts, cls, slot)") != std::string::npos &&
@@ -386,12 +386,12 @@ static void m5_pins(const std::string &root, const std::string &auxroot) {
         const size_t p = engh.find("kN1cKextBuild = "); const int build = p == std::string::npos ? -1 : std::atoi(engh.c_str() + p + 16);
         const size_t v = plist.find("<string>0.0."); const int ver = v == std::string::npos ? -2 : std::atoi(plist.c_str() + v + 12);
         expect(build > 0 && build == ver, "kN1cKextBuild equals the Info.plist patch version");
-        expect_u("Info.plist is 0.0.620", (uint64_t)ver, 620); expect_u("the plist carries the version twice", count_of(plist, "0.0.620"), 2);
-        expect(nub.find("620u") != std::string::npos && nub.find("613u") == std::string::npos, "both ops tables carry the build 620");
+        expect_u("Info.plist is 0.0.664", (uint64_t)ver, 664); expect_u("the plist carries the version twice", count_of(plist, "0.0.664"), 2);
+        expect(nub.find("664u") != std::string::npos && nub.find("658u") == std::string::npos && nub.find("613u") == std::string::npos, "both ops tables carry the build 664");
     }
     expect(mk.find("src/Navi48MetalNub.cpp") != std::string::npos, "the Makefile builds Navi48MetalNub.cpp");
     expect(abi.find("N48N_SEL_METAL_NUB_PUBLISH") != std::string::npos && abi.find("Never done at boot") != std::string::npos, "the ABI header documents the publish selector");
-    { const std::string doc = slurp(root + "/notes/design/NATIVE-S1C-ABI.md");
+    { const std::string doc = slurp(root + "/an internal design note");
       expect(doc.find("ABI 1.8 addendum") != std::string::npos && doc.find("N48N_SEL_METAL_NUB_PUBLISH") != std::string::npos && doc.find("N48N_SEL_METAL_NUB_WITHDRAW") != std::string::npos && doc.find("navi48-metal") != std::string::npos,
              "NATIVE-S1C-ABI.md carries the ABI 1.8 addendum"); }
     // -- the ops header: identical to the aux kext's copy --

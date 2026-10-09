@@ -78,7 +78,7 @@ plant 29 $P 'constexpr uint64_t kIdleNs        = 5000000000ull;' 'constexpr uint
 plant 30 $P 'constexpr bool lock_order_ok(uint32_t held, uint32_t taking) { return taking > held; }' 'constexpr bool lock_order_ok(uint32_t held, uint32_t taking) { return taking != held; }' "the lock-order predicate admits the inversion"
 # ---- the kext sources (source pins) ----
 plant 31 $E 'if (b.pinMask != 0u && scan_unpin(h, b, mode)) b.pinLeak = 1u;' ';' "BoFree / release of a pinned BO frees or leaks without restoring the console"
-plant 32 $E '{ uint64_t tr[2]; scan_teardown(s, how, tr); }' '{ }' "the N48N close (and death) does not restore the console"
+plant 32 $E '{ uint64_t tr[2]; scan_teardown(s, how, tr); if (multi) __atomic_store_n(&gScanOwner, 0u, __ATOMIC_RELEASE); }' '{ }' "the N48N close (and death) does not restore the console"
 plant 33 $E 'n48dcn::scanBoGone(b.pinMask, b.pinGen, mode != kRelNormal, r)' 'n48dcn::scanBoGone(b.pinMask, b.pinGen, false, r)' "HUNG leak / close no longer forces the console restore first"
 plant 34 $SR/Navi48Bringup.cpp 'if (!n48scan::accel_exempt(action, argScalar) && !n48disp::native_exempt(n48disp_latched_on(), action, argScalar)) {
 	if (action != 0 && amdgpu::native_s1b_refuse(0)) return kIOReturnNotPermitted;
@@ -93,33 +93,49 @@ plant 38 $D '__atomic_load_n(&gScan.active, __ATOMIC_ACQUIRE) == 0u &&
 	    gDcn.dceEntries - gDcn.entriesAtEnable > kDceStormCap' 'gDcn.dceEntries - gDcn.entriesAtEnable > kDceStormCap' "the cumulative storm cap still trips while the plane is taken"
 plant 39 $D 'if (!gDcn.goldenValid && amdgpu::native_s1b_state().gate == n48native::kGateOn) {' 'if (false) {' "no dcnmode golden copy at bind"
 plant 40 $D 'scanEscape("explicit dcnflip 0");' ';' "dcnflip 0 does nothing on a native boot"
-plant 41 $SR/amd/native_s1c.h 'kN1cKextBuild = 620;' 'kN1cKextBuild = 601;' "Hello reports a stale kext build"
-plant 42 $E 'IOLockLock(gCliLock);
-    if (!sess_hello()) { IOLockUnlock(gCliLock); return kIOReturnNotReady; }   // closed while we waited for the lock
-    const IOReturn rc = (IOReturn)n48dcn::scanAcquire(out, __atomic_load_n(&gSessSeq, __ATOMIC_SEQ_CST));   // 0.0.609: the session id lets a row-120 hold be Acquired
-    IOLockUnlock(gCliLock);' 'const IOReturn rc = (IOReturn)n48dcn::scanAcquire(out, 0u);' "Acquire without the client lock (a racing close could leave the plane taken)"
+plant 41 $SR/amd/native_s1c.h 'kN1cKextBuild = 664;' 'kN1cKextBuild = 601;' "Hello reports a stale kext build"
+plant 42 $E '    Session *s = sess_lock(ref, true);
+    if (s == nullptr) return kIOReturnNotReady;   // closed while we waited for the lock
+    IOLockLock(gCliLock);
+    IOReturn rc = kIOReturnExclusiveAccess;
+    if (!scan_foreign(s)) {
+        rc = (IOReturn)n48dcn::scanAcquire(out, s->id);   // 0.0.609: the session id lets a row-120 hold be Acquired
+        if (rc == kIOReturnSuccess && multi_on()) __atomic_store_n(&gScanOwner, s->id, __ATOMIC_RELEASE);
+    }
+    IOLockUnlock(gCliLock);
+    sess_unlock(s);' '    const IOReturn rc = (IOReturn)n48dcn::scanAcquire(out, 0u);' "Acquire without the client lock (a racing close could leave the plane taken)"
 plant 43 $D 'else if (n48scan::idle_expired(now_ns(), gScan.lastActivityNs)) why = "idle watchdog: 5 s without a scanout call";' ';' "the 5 s idle watchdog is gone"
 plant 44 $D 'if (mc == 0ull || !flip_target_ok(gScan.tbl, mc)) {' 'if (mc == 0ull) {' "Present skips the exact flip-target set"
 plant 45 $D 'const uint32_t gw = geom_check(g.w, g.h, g.pitchPx, g.fmt, g.sw, g.dcc);' 'const uint32_t gw = geom_check(g.w, g.h, g.pitchPx, g.fmt, g.sw, false);' "Acquire does not refuse a DCC plane"
 plant 46 $E '(flags & ~(uint64_t)N48N_HELLO_F_MINOR) != 0ull' 'false' "Hello accepts any flags"
-plant 47 $SR/Navi48NativeClient.cpp 'if (!shape(2, 3, 0, 0)) return kIOReturnBadArgument;' ';' "ScanoutPresent does not check its shape"
+plant 47 $SR/Navi48NativeClient.cpp 'case N48N_SEL_SCAN_PRESENT:
+		if (!shape(2, 3, 0, 0)) return kIOReturnBadArgument;' 'case N48N_SEL_SCAN_PRESENT:
+		;' "ScanoutPresent does not check its shape"
 plant 48 $D '(void)scan_poll_locked(false);                      // resolve the previous Present first: a latch that the IRQ has not delivered yet is not "replaced"' ';' "Present counts a replace without first resolving the previous latch"
 plant 49 $D 'if (gScan.wantRestore) why = gScan.wantWhy ? gScan.wantWhy : "requested";' ';' "the watchdog ignores the restores the IRQ handler requests"
 plant 50 $D 'gScan.wantRestore = true; gScan.wantWhy = "IRQ storm guard (rate)";' ';' "the rate guard trips but never asks for the console restore"
 # ---- the 0.0.603 review fixes, and the lock order inverted in the source ----
 plant 51 $E 'if (in->reserved0 != 0u) return kIOReturnBadArgument;
+    Session *s = sess_lock(ref, true);
+    if (s == nullptr) return kIOReturnNotReady;   // closed while we waited for the lock
     IOLockLock(gCliLock);' 'if (in->reserved0 != 0u) return kIOReturnBadArgument;
     { uint64_t o2x[2]; (void)n48dcn::scanRegister(false, 0, 0, 0, 0, 0, 0, 0, o2x); }
+    Session *s = sess_lock(ref, true);
+    if (s == nullptr) return kIOReturnNotReady;   // closed while we waited for the lock
     IOLockLock(gCliLock);' "LOCK ORDER: Register reaches the DCN lock BEFORE taking gCliLock"
 plant 52 $D 'uint32_t scanGeneration() { return gScan.gen; }' 'uint32_t scanGeneration() { IOLockLock(gCliLock); return gScan.gen; }' "LOCK ORDER: the DCN layer takes gCliLock (after its own lock in the interrupt / restore paths)"
 plant 53 $E 'return (IOReturn)n48dcn::scanStatus(out);' 'IOLockLock(gCliLock); return (IOReturn)n48dcn::scanStatus(out);' "LOCK ORDER: Status takes gCliLock (a lock-free selector would now wait behind a long restore)"
-plant 54 $E 'IOLockLock(gCliLock);
-    if (!sess_hello()) { IOLockUnlock(gCliLock); return kIOReturnNotReady; }   // closed while we waited for the lock
-    uint64_t r[2] = { 1, 0 };
-    scan_teardown(gS, "ScanoutRelease", r);' 'uint64_t r[2] = { 1, 0 };
-    scan_teardown(gS, "ScanoutRelease", r);
-    IOLockLock(gCliLock);
-    if (!sess_hello()) { IOLockUnlock(gCliLock); return kIOReturnNotReady; }   // closed while we waited for the lock' "LOCK ORDER: Release runs the teardown (DCN lock) before taking gCliLock"
+plant 54 $E '    IOLockLock(gCliLock);
+    IOReturn rc = kIOReturnSuccess;
+    if (scan_foreign(s)) rc = kIOReturnNotPermitted;
+    else {
+        uint64_t r[2] = { 1, 0 };
+        scan_teardown(s, "ScanoutRelease", r);' '    IOReturn rc = kIOReturnSuccess;
+    if (scan_foreign(s)) rc = kIOReturnNotPermitted;
+    else {
+        uint64_t r[2] = { 1, 0 };
+        scan_teardown(s, "ScanoutRelease", r);
+        IOLockLock(gCliLock);' "LOCK ORDER: Release runs the teardown (DCN lock) before taking gCliLock"
 plant 55 $P 'return vmid == 0u && !tmz && flipType == 0u && viewportStart == 0u;' 'return vmid == 0u && !tmz && flipType == 0u && (viewportStart & 0ull) == 0u;' "the restore-exactness check ignores PRI_VIEWPORT_START"
 plant 56 $D 'return r[0] != 0ull ? 1u : 2u;' 'return 1u;' "an unverified restore is reported as fine (the BO would be freed while possibly scanned)"
 plant 57 $E 'if (b.pinLeak != 0u) mode = kRelLeak;' ';' "a BO pinned across an unverified restore is freed instead of leaked"

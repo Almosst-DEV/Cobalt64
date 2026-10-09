@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""gen_fs85_fixture.py - build 0.0.530 (notes/design/SRCFILL85.md, "Replay"): build tests/fixture_fs85_runs.h from the
+"""gen_fs85_fixture.py - build 0.0.530 (an internal design note, "Replay"): build tests/fixture_fs85_runs.h from the
 REAL captures of the four switch-33/35 boots the design cites - Z2 run11i, Z3 run11j, AB run11l, AB2 run11m - never by hand.
 
 usage: gen_fs85_fixture.py <runs-dir> <shader-ids-header> > fixture_fs85_runs.h

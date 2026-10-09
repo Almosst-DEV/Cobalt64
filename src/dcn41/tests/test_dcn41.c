@@ -94,6 +94,36 @@ static void test_init(void)
     free(m);
 }
 
+/* 0.0.628 (M4a): the READ-ONLY address twin. BASE_IDX 1 and 3 resolve for reads; every write-side address (dcn41_abs, which every
+ * DCN41_ADDR / DCN41_ADDR_I helper and the allowlist callers use) keeps refusing them. */
+static void test_abs_rd(void)
+{
+    struct dcn41_dev d, u;
+    struct model *m = new_model();
+    uint32_t off;
+    dcn41_dev_init(&d, m, m_read, m_write, m_udelay, SEG, MMIO_DWORDS, 0);
+    CHECK(dcn41_abs_rd(&d, 0x81, 1) == 0xc0 + 0x81, "abs_rd: DP_DTO0_PHASE (BASE_IDX 1) = 0x141");
+    CHECK(dcn41_abs_rd(&d, 0x7b, 1) == 0xc0 + 0x7b, "abs_rd: MICROSECOND_TIME_BASE_DIV (BASE_IDX 1)");
+    CHECK(dcn41_abs_rd(&d, 0x10, 3) == 0x9000 + 0x10, "abs_rd: BASE_IDX 3 maps (0x9000 + off)");
+    CHECK(dcn41_abs_rd(&d, DCN41_OTG_OTG_CONTROL(0), 2) == dcn41_abs(&d, DCN41_OTG_OTG_CONTROL(0), 2), "abs_rd: BASE_IDX 2 equals dcn41_abs");
+    CHECK(dcn41_abs_rd(&d, 0x10, 0) == DCN41_BAD_OFFSET && dcn41_abs_rd(&d, 0x10, 4) == DCN41_BAD_OFFSET && dcn41_abs_rd(&d, 0x10, 5) == DCN41_BAD_OFFSET && dcn41_abs_rd(&d, 0x10, 0xffffffffu) == DCN41_BAD_OFFSET,
+          "abs_rd: BASE_IDX 0, 4 and out-of-range stay refused");
+    CHECK(dcn41_abs_rd(&d, DCN41_BAD_OFFSET, 1) == DCN41_BAD_OFFSET, "abs_rd: the bad-offset sentinel is refused");
+    CHECK(dcn41_abs_rd(&d, MMIO_DWORDS - 0xc0, 1) == DCN41_BAD_OFFSET && dcn41_abs_rd(&d, MMIO_DWORDS - 0xc0 - 1, 1) == MMIO_DWORDS - 1, "abs_rd: the window edge (a >= mmio_dwords refused)");
+    memset(&u, 0, sizeof(u));
+    CHECK(dcn41_abs_rd(&u, 0x81, 1) == DCN41_BAD_OFFSET, "abs_rd: an uninitialised device refuses");
+    /* the write side: dcn41_abs refuses BASE_IDX 1 and 3 for every offset that abs_rd resolves */
+    for (off = 0; off < 0x400; off++) {
+        CHECK(dcn41_abs(&d, off, 1) == DCN41_BAD_OFFSET, "WRITE SIDE refuses BASE_IDX 1 (offset 0x%x)", off);
+        CHECK(dcn41_abs(&d, off, 3) == DCN41_BAD_OFFSET, "WRITE SIDE refuses BASE_IDX 3 (offset 0x%x)", off);
+        CHECK(dcn41_abs_rd(&d, off, 1) == 0xc0 + off, "abs_rd maps BASE_IDX 1 (offset 0x%x)", off);
+    }
+    CHECK(dcn41_abs(&d, 0x81, 0) == DCN41_BAD_OFFSET && dcn41_abs(&d, 0x81, 4) == DCN41_BAD_OFFSET, "dcn41_abs still refuses BASE_IDX 0 and 4");
+    CHECK(DCN41_BASE_IDX_USED_MASK == 0x4u && DCN41_BASE_IDX_READ_MASK == 0xEu, "the write mask is still BASE_IDX 2 only; the read mask is 1, 2, 3");
+    CHECK(m->nops == 0, "abs_rd does no register I/O: %d ops", m->nops);
+    free(m);
+}
+
 static void test_addresses(void)
 {
     struct dcn41_dev d;
@@ -315,6 +345,7 @@ int main(void)
 {
     test_init();
     test_addresses();
+    test_abs_rd();
     test_ih();
     test_irq_sequences();
     test_flip();

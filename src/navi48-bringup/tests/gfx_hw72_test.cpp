@@ -1,4 +1,4 @@
-// gfx_hw72_test.cpp — build 0.0.532 (; notes/design/HW72M3.md): SWITCH 72 M3 (840), THE HEAP COPY HELD FOR
+// gfx_hw72_test.cpp — build 0.0.532 (; an internal design note): SWITCH 72 M3 (840), THE HEAP COPY HELD FOR
 // START-UP FILLS UNTIL THE FILL RETIRES, BY ITS OWN FENCE. Host proof of gfx_heapgen.h's M3 steps and the kext's wiring.
 //
 // T27 (the design's name; tests/gfx_copyguard_test.cpp's T27 is 0.0.511's, untouched) is T26's scripted two-thread scheduler grown

@@ -1,4 +1,4 @@
-// gfx_cgredo_test.cpp — build 0.0.523 (notes/design/RING-NEUTER-FORGIVE.md, rev 2 governs, items 8-12; ,
+// gfx_cgredo_test.cpp — build 0.0.523 (an internal design note, rev 2 governs, items 8-12; ,
 //): SWITCH 78, the copy-guard redo - gfx_copyguard.h (per-page since, n48_cg_check_ex, the plan, the bounded wait, the
 // rebase and the ordered sequence), gfx_cgredo.h (the undo), the kext glue's ordering, and reviewer items C1-C3.
 //     clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \

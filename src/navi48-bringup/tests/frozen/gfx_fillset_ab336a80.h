@@ -85,7 +85,7 @@ static const uint64_t kN48FsMemberVa[N48_FS_MEMBERS] = { 0x400800000ull, 0x40480
  * window; expiry is the backstop for a boot where no reserved fill even reaches the gate. */
 #define N48_FS_EXPIRE_JUDGED 60u
 
-/* 0.0.420 (notes/design/STEP10-PLAN.md P1) — THE SECOND WINDOW: HOLD A SHOT FOR THE PLANE.'s
+/* 0.0.420 (an internal design note P1) — THE SECOND WINDOW: HOLD A SHOT FOR THE PLANE.'s
  * retirement closes the FILL window once every member is committed or retired, and the NEXT eligible frame under today's
  * rule is whatever comes first: arm29 and arm31 measured a "second pair" - two non-plane frames drawing
  * into the same two surfaces (IB `0x400750000`, PS `0x400595600`) - taking the shots the plane frame needed, so NO plane

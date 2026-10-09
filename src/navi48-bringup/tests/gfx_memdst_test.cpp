@@ -1,4 +1,4 @@
-// gfx_memdst_test.cpp — R1's own tests (notes/design/R1-MEMDST.md Q3,  (B),). Pure C++,
+// gfx_memdst_test.cpp — R1's own tests (an internal design note Q3,  (B),). Pure C++,
 // links the REAL translator so T1 runs over REAL captured producer bytes, exactly as gfx_dep_test.cpp's C5 does
 // for D4'.
 //
@@ -746,7 +746,7 @@ static void r9_checks()
 
 
 // ---------------------------------------------------------------------------------------------------------------------
-// build 0.0.487 (notes/design/COMPUTE-N.md Q8 T3 and the gate rule, Q4/Q6 item 5) — R1 OVER THE ELIDED CANDIDATE, AND
+// build 0.0.487 (an internal design note Q8 T3 and the gate rule, Q4/Q6 item 5) — R1 OVER THE ELIDED CANDIDATE, AND
 // THE KEXT'S ORDER TO THE GATE. Every captured N segment (fixture_compute_n.h, decide49/run10c capture.bin) translated
 // with XLAT12_EXTRA_CS_ELIDE and a program answer: R1 scans the output CLEAN - Apple's triplet (WRITE_DATA, RELEASE_MEM,
 // WAIT_REG_MEM) kept byte for byte and self-satisfied, 1 wait and 2 writes, equal to the translator's own r4 (COUNT).

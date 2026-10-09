@@ -12,16 +12,16 @@ static n48df_t active(void) { n48df_t s; n48df_init(&s, 0); n48df_mark_acquired(
 
 // ---- native #12 P3 present hold: a simulated clock; submissions land at their own times, a wait advances the clock and lets the submissions due by then happen ----
 #define MS 1000000ull
-typedef struct { n48df_t *s; uint64_t clock; struct { uint64_t t, seq; uint32_t sid; int done; } sub[4]; int nsub; uint64_t waited_sum, waited_max; int nwait; } hsim_t;
-static void hsim_arrive(hsim_t *h, uint64_t upto) { for (int i = 0; i < h->nsub; i++) if (!h->sub[i].done && h->sub[i].t <= upto) { h->sub[i].done = 1; n48df_submit(h->s, h->sub[i].sid, h->sub[i].seq); } }
+typedef struct { n48df_t *s; uint64_t clock; struct { uint64_t t, seq; uint32_t sid; int slot, done; } sub[4]; int nsub; uint64_t waited_sum, waited_max; int nwait; } hsim_t;
+static void hsim_arrive(hsim_t *h, uint64_t upto) { for (int i = 0; i < h->nsub; i++) if (!h->sub[i].done && h->sub[i].t <= upto) { h->sub[i].done = 1; n48df_submit(h->s, h->sub[i].slot, h->sub[i].sid, h->sub[i].seq); } }
 static void hsim_wait(void *c, uint64_t ns) { hsim_t *h = (hsim_t *)c; h->clock += ns; h->nwait++; h->waited_sum += ns; if (ns > h->waited_max) h->waited_max = ns; hsim_arrive(h, h->clock); }
 // CoreDisplay's frame: G (seq 1, commit 0, GPU done 1.5 ms) then optionally C (seq 2, commit/submit at tc, GPU done 1 ms after). Returns bit0 = G presented, bit1 = C presented.
 static int hold_frame(int on, int hms, int with_c, uint64_t tc, hsim_t *h, n48df_t *s) {
     *s = active(); memset(h, 0, sizeof *h); h->s = s;
     uint32_t all[3] = { R, R, R };
     int sg = n48df_pick(s, all), sc = with_c ? n48df_pick(s, all) : -1;
-    n48df_submit(s, 7, 1);
-    if (with_c) { h->sub[h->nsub].t = tc; h->sub[h->nsub].seq = 2; h->sub[h->nsub].sid = 7; h->nsub++; }
+    n48df_submit(s, sg, 7, 1);
+    if (with_c) { h->sub[h->nsub].slot = sc; h->sub[h->nsub].t = tc; h->sub[h->nsub].seq = 2; h->sub[h->nsub].sid = 7; h->nsub++; }
     int res = 0; uint64_t w;
     h->clock = 3 * MS / 2; hsim_arrive(h, h->clock);
     if (n48df_complete_held(s, sg, 0, 1, 7, on, hms, 0 + 1, h->clock, hsim_wait, h, &w)) { res |= 1; n48df_present_result(s, 0); }   // tcommit = 1 ns (0 means "unknown")
@@ -127,46 +127,45 @@ int main(void) {
     // ---- #12: superseded per-surface present skip ----
     {
         n48df_t o = active(); int a0 = n48df_pick(&o, all), a1 = n48df_pick(&o, all);      // seq 1 and 2 for surface 77, both with a slot
-        n48df_submit(&o, 77, 1); n48df_submit(&o, 77, 2);
+        n48df_submit(&o, a0, 77, 1); n48df_submit(&o, a1, 77, 2);
         CHECK("superseded: the earlier frame is skipped", n48df_complete_surf(&o, a0, 0, 1, 77) == 0 && o.superseded == 1 && o.stale == 0 && o.inflight[a0] == 0 && o.last_seq == 0, "seq 1 skipped, slot released, last_seq unchanged");
         CHECK("superseded: the later frame presents", n48df_complete_surf(&o, a1, 0, 2, 77) == 1 && o.last_seq == 2, "seq 2 presented");
         // the later one is the highest: it is not superseded by itself; a different surface is independent
-        int b0 = n48df_pick(&o, all), b1 = n48df_pick(&o, all); n48df_submit(&o, 5, 3); n48df_submit(&o, 77, 4);
+        int b0 = n48df_pick(&o, all), b1 = n48df_pick(&o, all); n48df_submit(&o, b0, 5, 3); n48df_submit(&o, b1, 77, 4);
         CHECK("superseded: another surface is independent", n48df_complete_surf(&o, b0, 0, 3, 5) == 1 && n48df_complete_surf(&o, b1, 0, 4, 77) == 1 && o.superseded == 1, "both present");
         // later DROPPED (no slot): never submitted with a slot -> the earlier frame is NOT skipped
-        n48df_t d = active(); int c0 = n48df_pick(&d, all); n48df_submit(&d, 9, 10);       // seq 10 has a slot; seq 11 had none: no submit() call for it
+        n48df_t d = active(); int c0 = n48df_pick(&d, all); n48df_submit(&d, c0, 9, 10);       // seq 10 has a slot; seq 11 had none: no submit() call for it
         CHECK("later dropped: the earlier frame still presents", n48df_complete_surf(&d, c0, 0, 10, 9) == 1 && d.superseded == 0, "no skip when the later cb had no slot");
         // later FAILED (GPU error): the frame that failed is forgotten, so a still-pending earlier frame presents
-        n48df_t f2 = active(); int e0 = n48df_pick(&f2, all), e1 = n48df_pick(&f2, all); n48df_submit(&f2, 3, 20); n48df_submit(&f2, 3, 21);
+        n48df_t f2 = active(); int e0 = n48df_pick(&f2, all), e1 = n48df_pick(&f2, all); n48df_submit(&f2, e0, 3, 20); n48df_submit(&f2, e1, 3, 21);
         CHECK("later failed first: gpu_fail counted, nothing presented", n48df_complete_surf(&f2, e1, -4, 21, 3) == 0 && f2.gpu_fail == 1 && f2.superseded == 0, "seq 21 failed");
         CHECK("later failed: the pending earlier frame presents", n48df_complete_surf(&f2, e0, 0, 20, 3) == 1 && f2.last_seq == 20 && f2.superseded == 0, "seq 20 presented (hi forgotten)");
         // later failed AFTER the earlier was already skipped: documented -> nothing shown until the next frame; the next frame presents
-        n48df_t f3 = active(); int g0 = n48df_pick(&f3, all), g1 = n48df_pick(&f3, all); n48df_submit(&f3, 3, 30); n48df_submit(&f3, 3, 31);
+        n48df_t f3 = active(); int g0 = n48df_pick(&f3, all), g1 = n48df_pick(&f3, all); n48df_submit(&f3, g0, 3, 30); n48df_submit(&f3, g1, 3, 31);
         n48df_complete_surf(&f3, g0, 0, 30, 3); n48df_complete_surf(&f3, g1, -4, 31, 3);
-        int g2 = n48df_pick(&f3, all); n48df_submit(&f3, 3, 32);
+        int g2 = n48df_pick(&f3, all); n48df_submit(&f3, g2, 3, 32);
         CHECK("later failed after skip: the next frame presents", f3.superseded == 1 && f3.presents == 0 && n48df_complete_surf(&f3, g2, 0, 32, 3) == 1 && f3.last_seq == 32, "skipped 30, failed 31, 32 presents");
         // monotonic rule still holds: out-of-order completion of newer first, older is stale (not superseded) and unknown sid 0 / full table is never skipped
-        n48df_t m2 = active(); int h0 = n48df_pick(&m2, all), h1 = n48df_pick(&m2, all); n48df_submit(&m2, 4, 40); n48df_submit(&m2, 4, 41);
+        n48df_t m2 = active(); int h0 = n48df_pick(&m2, all), h1 = n48df_pick(&m2, all); n48df_submit(&m2, h0, 4, 40); n48df_submit(&m2, h1, 4, 41);
         CHECK("monotonic: newest first presents", n48df_complete_surf(&m2, h1, 0, 41, 4) == 1, "seq 41");
         CHECK("monotonic: the older then is stale, not superseded", n48df_complete_surf(&m2, h0, 0, 40, 4) == 0 && m2.stale == 1 && m2.superseded == 0, "stale 1");
-        n48df_t u0 = active(); int k0 = n48df_pick(&u0, all); n48df_submit(&u0, 0, 5);
+        n48df_t u0 = active(); int k0 = n48df_pick(&u0, all); n48df_submit(&u0, k0, 0, 5);
         CHECK("unknown surface id is never tracked or skipped", n48df_complete_surf(&u0, k0, 0, 1, 0) == 1 && u0.superseded == 0, "sid 0");
-        n48df_t ft = active(); for (uint32_t i = 1; i <= 8; i++) n48df_submit(&ft, 100 + i, i);
-        int k1 = n48df_pick(&ft, all); n48df_submit(&ft, 999, 50);                        // ninth surface: untracked
-        CHECK("table full: the ninth surface is untracked, never skipped", n48df_surf_hi(&ft, 999) == 0 && n48df_complete_surf(&ft, k1, 0, 49, 999) == 1, "no skip");
-        n48df_t q3 = active(); int k2 = n48df_pick(&q3, all); n48df_submit(&q3, 6, 9); n48df_fail(&q3, N48DF_R_PLANELOST);
+        n48df_t ft = active(); int k1 = n48df_pick(&ft, all); n48df_submit(&ft, -1, 101, 1); n48df_submit(&ft, 2, 102, 2); n48df_submit(&ft, k1, 999, 50);   // a submission with no slot in flight is untracked (bundle 20: no surface table to fill)
+        CHECK("untracked submissions are counted and never skip", ft.surf_untracked == 2 && !n48df_is_superseded(&ft, k1) && n48df_complete_surf(&ft, k1, 0, 49, 999) == 1 && ft.superseded == 0, "no skip, surf_untracked %llu", (unsigned long long)ft.surf_untracked);
+        n48df_t q3 = active(); int k2 = n48df_pick(&q3, all); n48df_submit(&q3, k2, 6, 9); n48df_fail(&q3, N48DF_R_PLANELOST);
         CHECK("OFF: no present, no superseded count", n48df_complete_surf(&q3, k2, 0, 8, 6) == 0 && q3.superseded == 0, "closed");
         // 100k random soak: submissions in seq order over 3 surfaces (random drop = no submit), completions in any order, random GPU failures
         srand(4242); n48df_t r3 = active(); int held3[3] = { 0, 0, 0 }; uint64_t sq3[3] = { 0, 0, 0 }, next3 = 0, lastp3 = 0, viol3 = 0, np3 = 0, nsk = 0; uint32_t sid3[3] = { 0, 0, 0 };
         for (int i = 0; i < 100000; i++) {
             int pk = n48df_pick(&r3, all);
-            if (pk >= 0) { held3[pk] = 1; sq3[pk] = ++next3; sid3[pk] = 1 + (uint32_t)(rand() % 3); n48df_submit(&r3, sid3[pk], sq3[pk]); }
+            if (pk >= 0) { held3[pk] = 1; sq3[pk] = ++next3; sid3[pk] = 1 + (uint32_t)(rand() % 3); n48df_submit(&r3, pk, sid3[pk], sq3[pk]); }
             int cs = rand() % 3;
             if (held3[cs] && (rand() & 1)) {
                 int fail = (rand() % 13) == 0; uint64_t sup0 = r3.superseded;
                 int w = n48df_complete_surf(&r3, cs, fail ? -3 : 0, sq3[cs], sid3[cs]); held3[cs] = 0; nsk += r3.superseded - sup0;
                 if (w) { np3++; n48df_present_result(&r3, 0); if (sq3[cs] <= lastp3 || fail) viol3++; lastp3 = sq3[cs]; }
-                else if (!fail && r3.superseded == sup0 && sq3[cs] > lastp3 && n48df_surf_hi(&r3, sid3[cs]) && *n48df_surf_hi(&r3, sid3[cs]) <= sq3[cs]) viol3++;   // a newest, successful frame must present
+                else if (!fail && r3.superseded == sup0 && sq3[cs] > lastp3) viol3++;   // a successful frame newer than the last presented and not superseded must present
             }
             for (int k = 0; k < 3; k++) if (held3[k] != r3.inflight[k]) viol3++;
         }
@@ -200,11 +199,11 @@ int main(void) {
             CHECK("  presentall kill switch presents it", n48df_account(&pa, t[i].m) == 1 && pa.nonfinal[c] == 0 && pa.cls[c] == 1, "class counted, never skipped");
         }
         // composition with the other rules: a skipped (non-final) cb takes no slot, is never submit()ed, so it does not supersede an earlier final frame of the same surface
-        n48df_t d = active(); int s0 = n48df_pick(&d, all); n48df_submit(&d, 55, 1);          // final frame, seq 1, surface 55
+        n48df_t d = active(); int s0 = n48df_pick(&d, all); n48df_submit(&d, s0, 55, 1);          // final frame, seq 1, surface 55
         int nf = n48df_account(&d, P | CL);                                                   // a later clear-only write of surface 55: refused, so no pick / submit / seq
         CHECK("non-final does not supersede the earlier final frame", nf == 0 && n48df_complete_surf(&d, s0, 0, 1, 55) == 1 && d.superseded == 0 && d.picks == 1, "final frame presents, no slot taken by the non-final");
         // a later FINAL frame still supersedes an earlier final frame (existing rule kept) and monotonic order still holds
-        n48df_t m = active(); int a0 = n48df_pick(&m, all), a1 = n48df_pick(&m, all); n48df_submit(&m, 9, 1); n48df_submit(&m, 9, 2);
+        n48df_t m = active(); int a0 = n48df_pick(&m, all), a1 = n48df_pick(&m, all); n48df_submit(&m, a0, 9, 1); n48df_submit(&m, a1, 9, 2);
         CHECK("final frames keep the superseded rule", n48df_account(&m, P | DF) && n48df_complete_surf(&m, a0, 0, 1, 9) == 0 && m.superseded == 1 && n48df_complete_surf(&m, a1, 0, 2, 9) == 1, "seq 1 skipped, seq 2 presents");
         // a 10000-cb mixed stream: slots taken == final count
         srand(777); n48df_t st = active(); uint64_t nfin = 0;
@@ -283,23 +282,23 @@ int main(void) {
         for (int dmg = 0; dmg < 2; dmg++) {   // native #12 scanout flag: the m13-s0 sid pattern, damage off and on
             n48df_t d = active(); d.damage = dmg; int pres[4] = { 0, 0, 0, 0 };
             const uint32_t sids[4] = { 1, 198, 2, 3 };
-            CHECK("scanout: unflagged composite refused", n48df_account_sid(&d, P_ | DO_ | CO_, 1) == 0 && !n48df_is_scan(&d, 1) && d.nonscan_total == 1, "sid 1 composite-only never presented (damage %d)", dmg);
+            CHECK("scanout: unflagged composite refused", n48df_account_sid(&d, P_ | DO_ | CO_, 1, 0) == 0 && !n48df_is_scan(&d, 1) && d.nonscan_total == 1, "sid 1 composite-only never presented (damage %d)", dmg);
             for (int r = 0; r < 50; r++) {
-                pres[0] += n48df_account_sid(&d, P_ | DO_ | CO_, 1);          // SkyLight composite sources, never GPUPass
-                pres[1] += n48df_account_sid(&d, P_ | DO_ | CO_, 198);
+                pres[0] += n48df_account_sid(&d, P_ | DO_ | CO_, 1, 0);          // SkyLight composite sources, never GPUPass
+                pres[1] += n48df_account_sid(&d, P_ | DO_ | CO_, 198, 0);
                 int ds = (r & 1) ? 3 : 2;                                      // CoreDisplay's display surfaces alternate, GPUPass + composite
-                pres[2] += n48df_account_sid(&d, P_ | DF_, ds); pres[3] += n48df_account_sid(&d, P_ | DO_ | CO_, ds);
+                pres[2] += n48df_account_sid(&d, P_ | DF_, ds, 0); pres[3] += n48df_account_sid(&d, P_ | DO_ | CO_, ds, 0);
             }
             CHECK("scanout: m13-s0 pattern", pres[0] == 0 && pres[1] == 0 && pres[2] == 50 && pres[3] == 50 && !n48df_is_scan(&d, sids[0]) && !n48df_is_scan(&d, sids[1]) && n48df_is_scan(&d, 2) && n48df_is_scan(&d, 3),
                   "1/198 composite-only: 0 presented; 2/3 GPUPass+composite: 100 presented (damage %d)", dmg);
             uint64_t s1 = 0, s198 = 0; for (int i = 0; i < N48DF_MAX_SURF; i++) { if (d.nonscan_skip[i] && d.nonscan_sid[i] == 1) s1 = d.nonscan_skip[i]; if (d.nonscan_skip[i] && d.nonscan_sid[i] == 198) s198 = d.nonscan_skip[i]; }
             CHECK("scanout: skips counted by sid; flag log", s1 == 51 && s198 == 50 && d.nonscan_total == 101 && d.nflag_log == 2 && d.flag_log[0] == 2 && d.flag_log[1] == 3 && d.nscan == 2, "sid1 %llu sid198 %llu total %llu, flag events %d", (unsigned long long)s1, (unsigned long long)s198, (unsigned long long)d.nonscan_total, d.nflag_log);
-            CHECK("scanout: fill-only never presents, even when flagged", n48df_account_sid(&d, P_ | DO_ | FL_, 2) == 0 && n48df_account_sid(&d, P_ | BL_, 3) == 0 && d.nonscan_total == 101, "ColorFill/blit stay non-final");
+            CHECK("scanout: fill-only never presents, even when flagged", n48df_account_sid(&d, P_ | DO_ | FL_, 2, 0) == 0 && n48df_account_sid(&d, P_ | BL_, 3, 0) == 0 && d.nonscan_total == 101, "ColorFill/blit stay non-final");
             n48df_t pa = active(); pa.presentall = 1;
-            CHECK("scanout: presentall restores the old rule", n48df_account_sid(&pa, P_ | DO_ | CO_, 198) == 1 && n48df_account_sid(&pa, P_ | DO_ | FL_, 1) == 1 && pa.nonscan_total == 0, "everything presents");
-            n48df_t u = active(); CHECK("scanout: sid 0 (unknown) final presents, composite does not", n48df_account_sid(&u, P_ | DF_, 0) == 1 && !n48df_is_scan(&u, 0) && n48df_account_sid(&u, P_ | DO_ | CO_, 0) == 0, "no flag for sid 0");
-            n48df_t f = active(); int fl = 0; for (uint32_t k = 1; k <= 12; k++) fl += n48df_account_sid(&f, P_ | DF_, 100 + k) == 1;
-            CHECK("scanout: flag table full -> composite refused, final still presents", fl == 12 && f.nscan == N48DF_MAX_SURF && f.nflag_log == 8 && n48df_account_sid(&f, P_ | DO_ | CO_, 111) == 0, "8 flagged, flag log %d", f.nflag_log);
+            CHECK("scanout: presentall restores the old rule", n48df_account_sid(&pa, P_ | DO_ | CO_, 198, 0) == 1 && n48df_account_sid(&pa, P_ | DO_ | FL_, 1, 0) == 1 && pa.nonscan_total == 0, "everything presents");
+            n48df_t u = active(); CHECK("scanout: sid 0 (unknown) final presents, composite does not", n48df_account_sid(&u, P_ | DF_, 0, 0) == 1 && !n48df_is_scan(&u, 0) && n48df_account_sid(&u, P_ | DO_ | CO_, 0, 0) == 0, "no flag for sid 0");
+            n48df_t f = active(); int fl = 0; for (uint32_t k = 1; k <= 12; k++) fl += n48df_account_sid(&f, P_ | DF_, 100 + k, 0) == 1;
+            CHECK("scanout: flag table full -> composite refused, final still presents", fl == 12 && f.nscan == N48DF_MAX_SURF && f.nflag_log == 8 && n48df_account_sid(&f, P_ | DO_ | CO_, 111, 0) == 0, "8 flagged, flag log %d", f.nflag_log);
         }
 
         // ---- D1 accounting ----
@@ -428,19 +427,19 @@ int main(void) {
         CHECK("hold OFF: identical to today (no wait, G presented before C exists)", r == 3 && hb.nwait == 0 && base.superseded == 0 && base.presents == 2, "result %d waits %d", r, hb.nwait);
         // OFF identity: the same event stream through the plain complete_surf gives the same state
         n48df_t p = active(); uint32_t all3[3] = { R, R, R }; int a1 = n48df_pick(&p, all3), a2 = n48df_pick(&p, all3);
-        n48df_submit(&p, 7, 1); int g = n48df_complete_surf(&p, a1, 0, 1, 7); if (g) n48df_present_result(&p, 0);
-        n48df_submit(&p, 7, 2); int c = n48df_complete_surf(&p, a2, 0, 2, 7); if (c) n48df_present_result(&p, 0);
+        n48df_submit(&p, a1, 7, 1); int g = n48df_complete_surf(&p, a1, 0, 1, 7); if (g) n48df_present_result(&p, 0);
+        n48df_submit(&p, a2, 7, 2); int c = n48df_complete_surf(&p, a2, 0, 2, 7); if (c) n48df_present_result(&p, 0);
         CHECK("hold OFF: state equals plain complete_surf", g && c && p.presents == base.presents && p.superseded == base.superseded && p.last_seq == base.last_seq && p.stale == base.stale, "presents %llu superseded %llu last_seq %llu", (unsigned long long)p.presents, (unsigned long long)p.superseded, (unsigned long long)p.last_seq);
         // bound: never more than H, whatever the clocks say
         int boundok = 1;
         for (int hm = 1; hm <= 8; hm++) for (uint64_t tcm = 0; tcm < 40; tcm++) for (uint64_t nw = 0; nw < 40; nw += 3) { uint64_t w = n48df_hold_ns(1, hm, tcm * MS / 2 + 1, nw * MS / 2); if (w > (uint64_t)hm * MS) boundok = 0; }
         CHECK("hold: wait never exceeds H (incl. commit time in the future)", boundok && n48df_hold_ns(1, 3, 100 * MS, 1 * MS) == 3 * MS && n48df_hold_ns(1, 3, 1 * MS, 10 * MS) == 0 && n48df_hold_ns(1, 3, 0, 1) == 0 && n48df_hold_ns(0, 3, 1 * MS, 1 * MS) == 0, "future commit gives exactly H, past deadline 0, unknown commit 0, off 0");
         // not held when already superseded, failed, or stale
-        n48df_t q = active(); int q1 = n48df_pick(&q, all3); hsim_t hq; memset(&hq, 0, sizeof hq); hq.s = &q; uint64_t wq;
-        n48df_submit(&q, 7, 1); n48df_submit(&q, 7, 2);
+        n48df_t q = active(); int q1 = n48df_pick(&q, all3), q1b = n48df_pick(&q, all3); hsim_t hq; memset(&hq, 0, sizeof hq); hq.s = &q; uint64_t wq;
+        n48df_submit(&q, q1, 7, 1); n48df_submit(&q, q1b, 7, 2);
         int rq = n48df_complete_held(&q, q1, 0, 1, 7, 1, 3, 1, 2 * MS, hsim_wait, &hq, &wq);
         CHECK("hold: already superseded -> no wait, skipped at once", !rq && hq.nwait == 0 && wq == 0 && q.superseded == 1, "waits %d superseded %llu", hq.nwait, (unsigned long long)q.superseded);
-        n48df_t q2 = active(); int qa = n48df_pick(&q2, all3); hsim_t h2; memset(&h2, 0, sizeof h2); h2.s = &q2; n48df_submit(&q2, 7, 1);
+        n48df_t q2 = active(); int qa = n48df_pick(&q2, all3); hsim_t h2; memset(&h2, 0, sizeof h2); h2.s = &q2; n48df_submit(&q2, qa, 7, 1);
         int r2 = n48df_complete_held(&q2, qa, -4, 1, 7, 1, 3, 1, 2 * MS, hsim_wait, &h2, &wq);
         CHECK("hold: GPU failure -> no wait", !r2 && h2.nwait == 0 && q2.gpu_fail == 1, "waits %d", h2.nwait);
         int r3 = n48df_complete_held(&q2, 0, 0, 1, 0, 1, 3, 1, 2 * MS, hsim_wait, &h2, &wq);
@@ -483,6 +482,96 @@ int main(void) {
         CHECK("classify cache: base-less key (base 0) hits for itself", n48cc_lookup(&cc, 376, 0, 2560, 1440, P, n48df_nobase_alloc(0, P, 1440), &cv) && cv == 1, "hit");
         CHECK("classify cache: a mapped surface of the same id (real base) does not take the base-less verdict", !n48cc_lookup(&cc, 376, 0x7f0000000000ull, 2560, 1440, P, 14745600ull, &cv), "miss");
         CHECK("nobase alloc: reported size kept, 0 -> bpr*h", n48df_nobase_alloc(14745600, P, 1440) == 14745600 && n48df_nobase_alloc(0, P, 1440) == 14745600ull, "%llu", (unsigned long long)n48df_nobase_alloc(0, P, 1440));
+    }
+
+    // ---- bundle 12 (M6, queue 290 S3): n48df_skip_content - a frame whose copy is another display's content is released without a present and WITHOUT touching last_seq ----
+    {
+        uint32_t all[3] = { R, R, R };
+        n48df_t k = active(); int a = n48df_pick(&k, all), b = n48df_pick(&k, all);
+        k.fid[a] = 10; k.fid[b] = 11; k.head = b; k.last_seq = 3; k.presents = 2;
+        n48df_skip_content(&k, a);
+        CHECK("skip: the slot is released, nothing presented, last_seq untouched, no GPU failure counted", k.inflight[a] == 0 && k.fid[a] == 0 && k.presents == 2 && k.last_seq == 3 && k.gpu_fail == 0 && k.m6_skip == 1 && k.stale == 0, "m6_skip %llu last_seq %llu", (unsigned long long)k.m6_skip, (unsigned long long)k.last_seq);
+        CHECK("skip: the chain restarts (head -1) and the LATER chained frame still in flight is poisoned (it read this slot as its base)", k.head == -1 && k.poison[b] == 1 && k.inflight[b] == 1, "head %d poison[b] %d", k.head, k.poison[b]);
+        CHECK("skip: the poisoned later frame is never presented", n48df_complete_seq(&k, b, 0, 5) == 0 && k.chain_invalid == 1, "chain_invalid %llu", (unsigned long long)k.chain_invalid);
+        n48df_skip_content(&k, a); n48df_skip_content(&k, -1); n48df_skip_content(&k, N48DF_MAX_SLOTS);
+        CHECK("skip: a slot that is not in flight, and out-of-range slots, change nothing", k.m6_skip == 1 && k.last_seq == 3, "m6_skip %llu", (unsigned long long)k.m6_skip);
+        n48df_t o = active(); int x = n48df_pick(&o, all), y = n48df_pick(&o, all);
+        n48df_skip_content(&o, x);                                           // seq 9 is another display's frame: skipped
+        CHECK("skip: an OLDER real frame completing afterwards is still PRESENTED (a skipped frame never made it stale; complete_held would have moved last_seq to 9)", n48df_complete_seq(&o, y, 0, 4) == 1 && o.last_seq == 4 && o.stale == 0, "last_seq %llu stale %llu", (unsigned long long)o.last_seq, (unsigned long long)o.stale);
+        n48df_t q = active(); int u = n48df_pick(&q, all); n48df_skip_content(&q, u); int u2 = n48df_pick(&q, all);
+        CHECK("skip: the released slot is free for the next frame at once", u2 >= 0 && q.m6_skip == 1, "picked %d", u2);
+    }
+    // ---- bundle 20: HDMI rubberband fix (an internal design note Q3): F1 known scanout surfaces, F2 per-slot supersede marks, F3 re-copy with the noted seq, F4 counters ----
+    {
+        const uint32_t PS = N48DF_W_PASS, DFN = N48DF_W_DRAW_FINAL, DOT = N48DF_W_DRAW_OTHER, CMP = N48DF_W_DRAW_COMP;
+        const uint32_t G_ = PS | DFN, C_ = PS | DOT | CMP;
+        // F1: the table of 8 proxy flags is full; a 9th surface
+        n48df_t a = active(); for (uint32_t k = 1; k <= 8; k++) n48df_account_sid(&a, G_, 100 + k, 0);
+        CHECK("F1: 8 proxy flags set, the ninth is refused and counted", a.nscan == 8 && n48df_account_sid(&a, G_, 209, 0) == 1 && !n48df_is_scan(&a, 209) && a.scan_full_refused == 1, "scan_full_refused %llu", (unsigned long long)a.scan_full_refused);
+        CHECK("F1: before the fix a composite into the 9th surface was refused (tentative / latch-off frame keeps the proxy rule)", n48df_account_sid(&a, C_, 209, 0) == 0 && a.nonfinal[N48DF_C_RENDER_COMP] == 1, "refused");
+        CHECK("F1: known (latch on, planned non-tentatively): the composite presents with no table entry", n48df_account_sid(&a, C_, 209, 1) == 1 && a.nscan == 8 && !n48df_is_scan(&a, 209), "presented");
+        // the G+C pair into the 9th surface: C presents and supersedes G
+        int sg = n48df_pick(&a, all), sc = n48df_pick(&a, all);
+        n48df_submit(&a, sg, 209, 11); n48df_submit(&a, sc, 209, 12);
+        CHECK("F1+F2: 9th surface G+C pair: G skipped as superseded, C presents", n48df_complete_surf(&a, sg, 0, 11, 209) == 0 && a.superseded == 1 && n48df_complete_surf(&a, sc, 0, 12, 209) == 1 && a.last_seq == 12, "superseded %llu last_seq %llu", (unsigned long long)a.superseded, (unsigned long long)a.last_seq);
+        // unknown / ambiguous stay non-presentable: sid 0 never presents as a composite even when known, an unflagged composite without known is refused, ColorFill/blit never
+        n48df_t u = active();
+        CHECK("F1: sid 0 composite stays non-presentable even when known=1", n48df_account_sid(&u, C_, 0, 1) == 0 && u.nonfinal[N48DF_C_RENDER_COMP] == 1, "refused");
+        CHECK("F1: fill-only / blit into a known surface stay non-final", n48df_account_sid(&u, PS | DOT | N48DF_W_DRAW_FILL, 5, 1) == 0 && n48df_account_sid(&u, PS | N48DF_W_BLIT, 5, 1) == 0, "refused");
+        CHECK("F1: known does not set the proxy flag table (nothing to saturate)", n48df_account_sid(&u, G_, 6, 1) == 1 && u.nscan == 0 && u.nflag_log == 0 && u.scan_full_refused == 0, "nscan 0");
+        CHECK("F1: known=0 keeps the proxy flag (tentative / latch-off frames)", n48df_account_sid(&u, G_, 7, 0) == 1 && u.nscan == 1 && n48df_account_sid(&u, C_, 7, 0) == 1, "flag set, composite follows");
+        // 200 rearrangement cycles of 4 new IDs each (800 distinct surfaces): bounded state, every G whose C was submitted first is skipped
+        n48df_t r = active(); uint64_t seq = 0, viol = 0, wantp = 0; uint32_t id = 1000;
+        for (int cyc = 0; cyc < 200; cyc++) {
+            for (int k = 0; k < 4; k++) {
+                id++;
+                int okg = n48df_account_sid(&r, G_, id, 1), g = n48df_pick(&r, all); n48df_submit(&r, g, id, ++seq);
+                int okc = n48df_account_sid(&r, C_, id, 1), c = n48df_pick(&r, all); n48df_submit(&r, c, id, ++seq);     // C submitted BEFORE G's completion is handled
+                if (!okg || !okc || g < 0 || c < 0) viol++;
+                if (n48df_complete_surf(&r, g, 0, seq - 1, id) != 0) viol++;                       // G is skipped
+                if (n48df_complete_surf(&r, c, 0, seq, id) != 1) viol++; else { n48df_present_result(&r, 0); wantp++; }
+                for (int j = 0; j < 3; j++) if (r.inflight[j] || r.sup_n[j] || r.made[j]) viol++;
+            }
+        }
+        CHECK("F2: 200 rearrangement cycles x 4 new IDs: state stays bounded and every G is skipped", viol == 0 && r.nscan == 0 && r.scan_full_refused == 0 && r.surf_untracked == 0 && r.superseded == 800 && r.presents == wantp && r.stale == 0 && r.state == N48DF_ACTIVE, "%llu violations, superseded %llu presents %llu", (unsigned long long)viol, (unsigned long long)r.superseded, (unsigned long long)r.presents);
+        // an ID reused with an OLD seq
+        n48df_t o = active(); int x0 = n48df_pick(&o, all), x1 = n48df_pick(&o, all);
+        n48df_submit(&o, x0, 5, 10); n48df_submit(&o, x1, 5, 7);                                    // the same ID, a lower seq submitted after a higher one
+        CHECK("F2: a reused ID with an old seq is itself superseded; the newer one is not", n48df_is_superseded(&o, x1) && !n48df_is_superseded(&o, x0) && n48df_complete_surf(&o, x1, 0, 7, 5) == 0 && o.superseded == 1 && n48df_complete_surf(&o, x0, 0, 10, 5) == 1, "seq 7 skipped, seq 10 presents");
+        int y0 = n48df_pick(&o, all); n48df_submit(&o, y0, 5, 3);                                   // ID 5 again, nothing in flight: no mark; seq 3 is just stale
+        CHECK("F2: a reused ID with nothing in flight carries no old mark (stale, not superseded)", !n48df_is_superseded(&o, y0) && n48df_complete_surf(&o, y0, 0, 3, 5) == 0 && o.stale == 1 && o.superseded == 1, "stale %llu", (unsigned long long)o.stale);
+        // a failed later frame un-supersedes the earlier one; with two superseders one failure leaves it superseded
+        n48df_t f = active(); int e0 = n48df_pick(&f, all), e1 = n48df_pick(&f, all), e2 = n48df_pick(&f, all);
+        n48df_submit(&f, e0, 8, 1); n48df_submit(&f, e1, 8, 2); n48df_submit(&f, e2, 8, 3);
+        CHECK("F2: two later frames: seq 1 carries two marks (bounded by the slots), seq 2 one", f.sup_n[e0] == 2 && f.sup_n[e1] == 1 && f.sup_n[e2] == 0, "marks %u %u %u", f.sup_n[e0], f.sup_n[e1], f.sup_n[e2]);
+        CHECK("F2: the newest fails: seq 2 is superseded by nothing, seq 1 still by seq 2", n48df_complete_surf(&f, e2, -3, 3, 8) == 0 && f.sup_n[e0] == 1 && f.sup_n[e1] == 0 && f.gpu_fail == 1, "gpu_fail 1");
+        CHECK("F2: seq 2 presents (its superseder failed), seq 1 is never shown after it", n48df_complete_surf(&f, e1, 0, 2, 8) == 1 && n48df_complete_surf(&f, e0, 0, 1, 8) == 0 && f.stale == 1 && f.superseded == 0, "2 shown, 1 not shown (stale: a newer frame was presented first)");
+        n48df_t g = active(); int h0 = n48df_pick(&g, all), h1 = n48df_pick(&g, all); n48df_submit(&g, h0, 9, 1); n48df_submit(&g, h1, 9, 2);
+        CHECK("F2: the only superseder fails: the earlier frame presents", n48df_complete_surf(&g, h1, -3, 2, 9) == 0 && !n48df_is_superseded(&g, h0) && n48df_complete_surf(&g, h0, 0, 1, 9) == 1 && g.superseded == 0, "seq 1 presented");
+        // a slot reused for a new frame carries none of the old frame's marks
+        n48df_t m = active(); int i0 = n48df_pick(&m, all), i1 = n48df_pick(&m, all); n48df_submit(&m, i0, 4, 1); n48df_submit(&m, i1, 4, 2);
+        (void)n48df_complete_surf(&m, i0, 0, 1, 4); int i2 = n48df_pick(&m, all);   // i0 (skipped) is free again; i2 may be it
+        CHECK("F2: a released slot has no marks left", !n48df_is_superseded(&m, i0) && m.sup_n[i0] == 0 && m.made[i0] == 0 && i2 >= 0, "clean");
+        n48df_submit(&m, i2, 4, 3); (void)n48df_complete_surf(&m, i1, -3, 2, 4);     // seq 2 fails after seq 3 reused a slot: seq 3 has no marks to undo
+        CHECK("F2: marks never go negative", m.sup_n[i2] == 0 && m.sup_n[i1] == 0 && n48df_complete_surf(&m, i2, 0, 3, 4) == 1, "seq 3 presents");
+        // F2: a mark taken back by a failing superseder must never land on a LATER frame that reuses the superseded slot
+        n48df_t ru = active(); int sa = n48df_pick(&ru, all), sb = n48df_pick(&ru, all), sc2 = n48df_pick(&ru, all);
+        n48df_submit(&ru, sa, 20, 1); n48df_submit(&ru, sb, 20, 2);                      // seq 1 (slot sa) superseded by seq 2 (slot sb)
+        (void)n48df_complete_surf(&ru, sa, 0, 1, 20);                                   // seq 1 skipped, slot sa free again
+        int sd = n48df_pick(&ru, all); n48df_submit(&ru, sd, 30, 3); n48df_submit(&ru, sc2, 30, 4);   // a new frame (seq 3, another surface) reuses a slot and is superseded by seq 4
+        CHECK("F2: the reused slot starts clean and is marked only by its own superseder", sd == sa && ru.sup_n[sd] == 1 && ru.made[sb] == 0 && ru.made[sc2] == (uint8_t)(1u << sd), "slot %d marks %u", sd, ru.sup_n[sd]);
+        (void)n48df_complete_surf(&ru, sb, -3, 2, 20);                                   // seq 2 fails LATER: it made no mark on the new frame
+        CHECK("F2: a later failure of the old superseder does not un-supersede the new frame", ru.sup_n[sd] == 1 && n48df_complete_surf(&ru, sd, 0, 3, 30) == 0 && ru.superseded == 2, "seq 3 still skipped");
+        // F3: a re-copy presents with the NOTED frame's seq: after a newer present it is stale and not shown; with a fresh newest seq it would have been (the bug)
+        n48df_t rc = active(); int p0 = n48df_pick(&rc, all); n48df_submit(&rc, p0, 6, 5); int sh = n48df_complete_surf(&rc, p0, 0, 5, 6); if (sh) n48df_present_result(&rc, 0);
+        int rs = n48df_pick(&rc, all);
+        CHECK("F3: a re-copy noted at seq 3, after seq 5 was presented, is stale and NOT shown", sh && n48df_complete_seq(&rc, rs, 0, 3) == 0 && rc.stale == 1 && rc.last_seq == 5, "stale 1");
+        int rs2 = n48df_pick(&rc, all);
+        CHECK("F3: a re-copy noted at seq 8 with nothing newer is shown", n48df_complete_seq(&rc, rs2, 0, 8) == 1 && rc.last_seq == 8, "shown");
+        // F4: occupancy helpers
+        n48df_t oc = active(); int q0 = n48df_pick(&oc, all), q1 = n48df_pick(&oc, all); n48df_submit(&oc, q0, 3, 1); n48df_submit(&oc, q1, 3, 2);
+        n48df_account_sid(&oc, C_, 77, 0);
+        CHECK("F4: occupancy helpers", n48df_marked_count(&oc) == 1 && n48df_nonscan_used(&oc) == 1, "marked %d nonscan %d", n48df_marked_count(&oc), n48df_nonscan_used(&oc));
     }
 
     // ---- soak: random flags and completion order; invariants ----

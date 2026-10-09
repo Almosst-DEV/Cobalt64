@@ -1,4 +1,4 @@
-// gfx_cycle80_test.cpp — build 0.0.525 (notes/design/CYCLE80.md C1-C7, X1-X4; ): switch 80, cycle
+// gfx_cycle80_test.cpp — build 0.0.525 (an internal design note C1-C7, X1-X4; ): switch 80, cycle
 // completeness, gfx_cycle80.h + gfx_present73.h's C6 over run11c's REAL sequence, and the kext glue.
 //     clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //         -I src/navi48-bringup/src/apple -I src/navi48-bringup/tests src/navi48-bringup/tests/gfx_cycle80_test.cpp -o /tmp/c80 && \

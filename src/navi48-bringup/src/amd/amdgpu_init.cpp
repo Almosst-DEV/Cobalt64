@@ -5,8 +5,8 @@
 #include "../fw/fw_table.h"
 #include "nbif_v6_3_1.h"
 
-// Navi48Bringup.cpp: the SDMA0_DCC_CNTL no-PTE compression clear (one register write + readback + log line; idempotent
-// per boot, `navi48-sdmadcc=0` skips it). Called right after sdma_init_full, before our own SDMA copy test/sweep.
+// Navi48Bringup.cpp: the SDMA0_DCC_CNTL no-PTE compression clear (one register write + readback + log line; once per
+// boot, `navi48-sdmadcc=0` skips it). Called right after sdma_init_full, before our own SDMA copy test and sweep.
 void navi48_sdmadcc_default(void);
 
 namespace amdgpu {
@@ -474,10 +474,10 @@ kern_return_t run_stage(BringupContext &ctx, BringupStage s) {
         if (r != kIOReturnSuccess) INIT_LOG("SDMAInit: sdma_doorbell_range failed %#x (SDMA also kicks RB_WPTR via MMIO)", r);
         r = sdma_init_full(dev, ctx.psp, ctx.gmc, ctx.sdma);
         if (r != kIOReturnSuccess) return r;
-        // GitHub issue #1: the SDMA0_DCC_CNTL no-PTE compression clear (0xaabe -> 0xaaaa) must land BEFORE any SDMA copy,
-        // including the two below. With compression still ON they read back inconsistently from run to run. This is the
-        // one register write (plus readback and log line) the default has always made; only its position moved.
-        // `navi48-sdmadcc=0` skips it; the later runStages call is then a logged no-op.
+        // 0.0.657 (GitHub issue #1): the SDMA0_DCC_CNTL no-PTE compression clear (0xaabe -> 0xaaaa) lands BEFORE any SDMA copy,
+        // including the copy test and the sweep below: with compression still ON they read back inconsistently from run to run.
+        // The same single write + readback + log line the default has always made; only its position moved. `navi48-sdmadcc=0`
+        // skips it; the later runStages call is then a logged no-op.
         navi48_sdmadcc_default();
         // Phase 3 sub-milestone: the GPU copies a known pattern between two VRAM
         // buffers and we read the result back through the MM window.

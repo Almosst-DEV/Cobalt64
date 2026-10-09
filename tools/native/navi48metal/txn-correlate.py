@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""txn-correlate.py - Stage 0c of notes/design/NATIVE-S5-TXN.md: merge the DTrace transaction log (tools/pc/txnlog.d) with the bundle's command-buffer log
+"""txn-correlate.py - Stage 0c of an internal design note: merge the DTrace transaction log (tools/pc/txnlog.d) with the bundle's command-buffer log
 (/private/var/tmp/n48m-cblog.<pid>.txt) and print the inversion count, the transacted-vs-presented IOSurface id comparison, and the decision of the memo's table.
 
     txn-correlate.py txnlog.txt n48m-cblog.<pid>.txt [more cblog files] [--match-ms 100] [--inv-min 1] [--mismatch-frac 0.01] [--shift-ms 0] [--first 20]

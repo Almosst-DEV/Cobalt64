@@ -1,4 +1,4 @@
-// gfx_memdst.h — R1: THE MEMORY-DESTINATION RUNG (notes/design/R1-MEMDST.md Q2). Pure C++ header (value
+// gfx_memdst.h — R1: THE MEMORY-DESTINATION RUNG (an internal design note Q2). Pure C++ header (value
 // initialisation, like gfx_cp_build.h); host-tested by tests/gfx_memdst_test.cpp; the kext compiles the SAME header.
 //
 // WHAT THIS CLOSES. Ancestors: gfx_dep.h's n48_cp_scan_frame (R5') and xlat12_ib.c's r4_waits/r4_memwrites both COUNT

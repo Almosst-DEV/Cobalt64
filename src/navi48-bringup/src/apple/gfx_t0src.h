@@ -1,4 +1,4 @@
-// gfx_t0src.h - build 0.0.524 (notes/design/T0SRC.md items 1-7): WHO WROTE S's TEXTURE 0. Switch 79 (`t0src`),
+// gfx_t0src.h - build 0.0.524 (an internal design note items 1-7): WHO WROTE S's TEXTURE 0. Switch 79 (`t0src`),
 // default OFF. Pure, header-only, host-tested (tests/gfx_t0src_test.cpp). READ-ONLY BY CONSTRUCTION: nothing here writes a register,
 // a page table, VRAM, a translated dword, Apple's objects, or anything a rule, verdict, rung, gate, ledger or copy guard reads. Every
 // function writes only its caller's own ring / table / out-parameters.

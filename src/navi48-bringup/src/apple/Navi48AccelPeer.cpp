@@ -575,7 +575,7 @@ static_assert(sizeof(RtBufs) == 32, "build 0.0.492: RtBufs lives in hook_page_te
 static_assert(N48_RP_LIN_MAX_TOTAL == kCopyMaxBytes, "ws_resprov.h's total bound is the copy's own (kCopyMaxBytes)");
 
 // ---------------------------------------------------------------------------
-// build 0.0.486 (notes/design/STATIC-RETILE.md Q6) - THE BACKING-SOURCED COPY (ws_resprov.h section 6), GENERALISED AND
+// build 0.0.486 (an internal design note Q6) - THE BACKING-SOURCED COPY (ws_resprov.h section 6), GENERALISED AND
 // STREAMED BY build 0.0.492.
 // ---------------------------------------------------------------------------
 // Called by residency_copy_to_vram ONLY while n48::hw_resprov_on() (switch 11 with the descriptor path), BEFORE its pre-flight,
@@ -1061,7 +1061,7 @@ static struct {
 // header itself dictates so a shader straddling a window boundary is still compared
 // in full. Both buffers are file-scope: this runs on Apple's pageon thread.
 static constexpr uint32_t kScWindowBytes    = 64u * 1024u;
-// build 0.0.484 (notes/design/GLASS.md Q2 K1): 2048 -> 5376 (gfx_subst_caps.h's N48_SC_MAX_SUBST_BYTES). sc_subst_render
+// build 0.0.484 (an internal design note Q2 K1): 2048 -> 5376 (gfx_subst_caps.h's N48_SC_MAX_SUBST_BYTES). sc_subst_render
 // below writes max(our image, Apple's program) bytes and refuses SC_E_CAPACITY when `sizeof gScOut` is smaller, so at 2048 a
 // glass_background_lph value (5084/5076 B of code in Apple's 5376-byte allocation, rendered to 5376 B) could never be
 // substituted at all, whatever the blob held. gScOut stays a file-scope static (.bss 2 KiB -> 5.25 KiB; nothing on the
@@ -1884,7 +1884,7 @@ __attribute__((noinline)) void navi48_ic_chunk_dead(uint64_t pos, uint64_t dAt, 
 }
 
 // =============================================================================================================================
-// build 0.0.496 (notes/design/FAST-PAGEIN.md,) — SWITCH 63's COPIER SIDE. fastcopy.h has the argument; the SDMA
+// build 0.0.496 (an internal design note,) — SWITCH 63's COPIER SIDE. fastcopy.h has the argument; the SDMA
 // machinery (staging, positive control, submission, fence, verify, the per-copy latch) is Navi48Bringup.cpp's navi48_fc_chunk.
 // Here: the batch producer it calls - THE SAME producer the MM loop below calls, with the same (offset, take) pairs: a re-tiled
 // copy's bytes through rp_retile_bytes, every other copy's through ic_read (readBytes, then 0.0.495's in-copy overlay) - so the
@@ -1892,7 +1892,7 @@ __attribute__((noinline)) void navi48_ic_chunk_dead(uint64_t pos, uint64_t dAt, 
 // anything is submitted. fc_copy_chunk is noinline so hook_page_texture (which inlines residency_copy_to_vram) gains no local.
 // =============================================================================================================================
 // =============================================================================================================================
-// build 0.0.527 (notes/design/SKIP82.md, ; gfx_sk82.h) — SWITCH 82's COPIER SIDE. Three noinline helpers, so
+// build 0.0.527 (an internal design note, ; gfx_sk82.h) — SWITCH 82's COPIER SIDE. Three noinline helpers, so
 // hook_page_texture (which inlines residency_copy_to_vram) keeps its frame: the decision before rp_lin_prepare (sk82_try_skip), the
 // result before the scope closes (sk82_copy_result) and the establishment after it closed (sk82_scope_closed, from
 // navi48_cg_close_scope). The storage, the lock and the pure decision are Navi48Bringup.cpp's and gfx_sk82.h's.
@@ -2004,7 +2004,7 @@ static __attribute__((noinline)) uint64_t fc_copy_chunk(RtBufs *rt, bool retile,
 }
 
 // =============================================================================================================================
-// build 0.0.529 (notes/design/CG84.md item 6, ; gfx_cg84.h) — SWITCH 84's COPIER SIDE. Two noinline helpers so
+// build 0.0.529 (an internal design note item 6, ; gfx_cg84.h) — SWITCH 84's COPIER SIDE. Two noinline helpers so
 // hook_page_texture (which inlines residency_copy_to_vram) keeps its frame: G0 (d84_plan, after the pre-flight and before the copy's
 // Navi48CopyScope) and the ON delta write (d84_delta_copy, which replaces the rest of the copy). NOTHING OF APPLE'S IS WRITTEN: the
 // delta is our own shadow's diff; Apple's dirty range (res+0x138 / +0x140) is READ, only to count a delta outside it.
@@ -2187,7 +2187,7 @@ static bool residency_copy_to_vram(void *self, void *dstMap, void *srcMap) {
     // image's length and kind lived in `rt` (0.0.486: rt.nd, rt.kind; 0.0.492: the heap stream rt.ls), which this function held.
     // build 0.0.492: the prepared stream (rt.ls) carries the gfx12 length; the image itself is converted chunk by chunk
     // inside the write loop below (rp_lin_fetch), never held whole.
-    // build 0.0.527 (notes/design/SKIP82.md item 7; gfx_sk82.h): switch 82, ONCE, before rp_lin_prepare and before the copy's
+    // build 0.0.527 (an internal design note item 7; gfx_sk82.h): switch 82, ONCE, before rp_lin_prepare and before the copy's
     // scope opens. true = a TRUSTED entry's image equals the whole source and every check passed (SKIP mode): report success with
     // nothing else done - no scope, no ring event, no fast-copy slot, no provenance, no gCopy change, no COPIED line (item 8).
     // Otherwise this is the copy's G0. ONE load while switch 82 is OFF.
@@ -2199,7 +2199,7 @@ static bool residency_copy_to_vram(void *self, void *dstMap, void *srcMap) {
     const uint64_t wBytes = linBytes ? linBytes : bytes;
 
     // Pre-flight: every destination segment must pass the VRAM guard BEFORE any write. 2 (notes
-    // notes/design/PGMID-COPYGUARD.md): also track this copy's own BOUNDING range [cgLo, cgHi) across every
+    // an internal design note): also track this copy's own BOUNDING range [cgLo, cgHi) across every
     // segment here, so the guard's scope (opened right after this loop, below) covers exactly what the design
     // asks for - "the bounding range that the pre-flight loop already computes" - even for a non-contiguous copy.
     // build 0.0.486: over wBytes (== bytes unless switch 59 prepared a longer gfx12 image).
@@ -2227,7 +2227,7 @@ static bool residency_copy_to_vram(void *self, void *dstMap, void *srcMap) {
         else { if (at < cgLo) cgLo = at; if (at + n > cgHi) cgHi = at + n; }
         pos += n;
     }
-    // build 0.0.529 (notes/design/CG84.md item 6): switch 84's G0, after the pre-flight and before this copy's scope. 0 (OFF, not
+    // build 0.0.529 (an internal design note item 6): switch 84's G0, after the pre-flight and before this copy's scope. 0 (OFF, not
     // eligible, no key, busy, SHADOW, or an ON establishing copy - whose source and path d84_plan redirected by thread): the copy
     // below is 0.0.528's. Non-zero: ON with a valid key - the delta (d84_delta_copy, called by d84_plan) replaced the rest of this
     // copy, and this is its answer (1 true, 2 false). ONE load while 84 never left OFF.
@@ -2815,7 +2815,7 @@ uint32_t navi48_kernelsub_control(uint32_t mode, uint64_t *out, unsigned count) 
                     "(navi48-skip-pagecopy=1 and fire needed); cannot substitute");
         } else if (gCopyArmed && gCopy.copies > 0 && gCopy.lastDst) {
             at = gCopy.lastDst + kBlitShaderOffset;
-            // 2 (notes/design/PGMID-COPYGUARD.md): this is the STANDALONE substitute_blit_kernel_at call
+            // 2 (an internal design note): this is the STANDALONE substitute_blit_kernel_at call
             // (residency_copy_to_vram's own call, above, is already covered by that function's Navi48CopyScope) -
             // the design asks for it to have its own scope so its navi48_vram_write_mm is never counted unscoped.
             {
@@ -2903,7 +2903,7 @@ static uint8_t hook_page_texture(void *self, uint8_t toVram,
     return 1;
 }
 
-// build 0.0.524 item 7 (notes/design/T0SRC.md): hook_new_resource's "second, different resource class" path was
+// build 0.0.524 item 7 (an internal design note): hook_new_resource's "second, different resource class" path was
 // SILENT, and a resource taking it keeps Apple's own pageTexture (no residency copy of ours ever runs for it). Now it is COUNTED, and
 // the first one per boot is NAMED (getMetaClass()->getClassName(), behind kernel-pointer checks on the object, its vtable, the
 // metaclass and the name). READ-ONLY and unswitched: it patches nothing, changes no return value and writes nothing of Apple's.
@@ -3070,7 +3070,7 @@ bool Navi48AccelPeer::tryPatchAcceleratorStop() {
             gSkipPageCopy = false;
         }
     }
-    // build 0.0.503 (notes/design/HYBRID.md.2,): the newUserClient hook (slot 239) goes into THIS copy, before
+    // build 0.0.503 (an internal design note.2,): the newUserClient hook (slot 239) goes into THIS copy, before
     // the copy is published below and while the accelerator is still inside its own start() (it has not registered, so no
     // client can have matched it yet). Switch 68 OFF (the default) it only reads the caller and calls Apple.
     ucp_install_at_start(accel, vt, copy);
@@ -4834,7 +4834,7 @@ static bool ucp_build_dpuc_copy(void *uc) {
 }
 
 // =====================================================================================================================
-// build 0.0.503 (notes/design/HYBRID.md and) — SWITCH 68, THE HYBRID: WindowServer on the GPU,
+// build 0.0.503 (an internal design note and) — SWITCH 68, THE HYBRID: WindowServer on the GPU,
 // every other process kept off it. The slot-239 hook is installed at tryPatchAcceleratorStop time (ucp_install_at_start,
 // inside the accelerator's own start(), before it registers), so it sees every client from the first. The policy is
 // hybrid_policy.h's n48_hy_decide (host-tested): switch 68 OFF admits everyone and the hook calls Apple exactly as before;

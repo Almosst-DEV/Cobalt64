@@ -1,0 +1,6 @@
+#!/bin/bash
+D=${FAKE_DIR:?}; S=$D/st; echo "FAKE ioreg $*" >>"$D/cmds.log"
+a=0x100000aa1; b=0x100000aa9; [ -n "${FAKE_MONA_FIRST:-}" ] && { a=0x100000aa9; b=0x100000aa1; }
+[ -f "$S/pub2" ] && [ -z "${FAKE_NODES_STUCK:-}" ] && echo "+-o Navi48Framebuffer  <class Navi48Framebuffer, id $a, registered, matched, active, busy 0 (1 ms), retain 8>"
+[ -f "$S/pub1" ] && [ -z "${FAKE_NODES_STUCK:-}" ] && echo "+-o Navi48Framebuffer  <class Navi48Framebuffer, id $b, registered, matched, active, busy 0 (1 ms), retain 8>"
+exit 0

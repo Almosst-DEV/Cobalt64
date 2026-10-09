@@ -1,0 +1,7 @@
+#!/bin/bash
+# fake sleep: advances the virtual clock, never sleeps
+d=${1:-0}
+add=$(awk -v d="$d" 'BEGIN{printf "%d", d*1000}')
+ms=$(cat "$SIM_DIR/vclock_ms" 2>/dev/null || echo 0)
+echo $(( ms + add )) >"$SIM_DIR/vclock_ms"
+exit 0

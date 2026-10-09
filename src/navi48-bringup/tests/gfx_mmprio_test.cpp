@@ -1,4 +1,4 @@
-// gfx_mmprio_test.cpp — 0.0.433 (notes/design/MM-PRIORITY.md). MM-WINDOW PRIORITY'S HOST PROOF.
+// gfx_mmprio_test.cpp — 0.0.433 (an internal design note). MM-WINDOW PRIORITY'S HOST PROOF.
 //
 // T1-T4 drive the REAL pure functions (gfx_mmprio.h, the same header the kext compiles) against MUTANT copies with
 // each brief-named defect, and prove every mutant is CAUGHT on a planted input. T5/T6 are source pins: T5 checks (by
@@ -299,7 +299,7 @@ static uint32_t fnv1a32(const std::string &s)
 // Expected 0.0.431 hashes, computed offline by the SAME extractor over `git show 5f57ad6:<file>` and re-verified
 // identical against this branch's HEAD (aade29e, on top of 19c7881) before any 0.0.433 edit.
 //
-// 0.0.434 (notes/design/PGMID-COPYGUARD.md Part 1) — DELIBERATE RE-BASELINE OF TWO OF THE SIX:
+// 0.0.434 (an internal design note Part 1) — DELIBERATE RE-BASELINE OF TWO OF THE SIX:
 // `gfxsrc_pgm_profile` is the body switch 38 edits (the head-first read replaces its
 // `gfxc_read(...kXdIdDwords...)` + `xlat12_shader_id_match` pair; "everything from `int id =` down" is otherwise
 // untouched). `gfxsrc_desc_read` is touched too, but for a DIFFERENT reason: the nib >= 2 phase-timer extension
@@ -309,7 +309,7 @@ static uint32_t fnv1a32(const std::string &s)
 // below are the NEW bodies, computed the same way over this branch AFTER the edits; the other four (gfxc_read,
 // gfxc_page, n48_dp_read, xlat12_ib_translate_draw_ex) are still 0.0.431's - neither this brief nor the nib >= 2
 // extension touches them - and stay the review's own diff of old against new for the two that changed.
-// 0.0.435 (notes/design/PGMID-COPYGUARD.md Part 2) — DELIBERATE RE-BASELINE OF A FIFTH: `gfxc_read`
+// 0.0.435 (an internal design note Part 2) — DELIBERATE RE-BASELINE OF A FIFTH: `gfxc_read`
 // is now a thin wrapper (`return gfxc_read_core(vm, va, dst, n, sysPages, nullptr);`) over the new gfxc_read_core,
 // so gfxc_read_rs (the recording twin gfxsrc_desc_gfxc/gfxsrc_pgm_profile_headfirst/id_read now call, so the
 // copy-overlap check sees every VRAM page they touch) can share the one page-walk implementation rather than
@@ -317,7 +317,7 @@ static uint32_t fnv1a32(const std::string &s)
 // its literal body text moved. The other four below (gfxc_page, n48_dp_read, xlat12_ib_translate_draw_ex, and
 // gfxsrc_desc_read/gfxsrc_pgm_profile from 0.0.434's own re-baseline) are untouched by this brief.
 static const uint32_t kExpectGfxcRead          = 0xe9955557u;   // 0.0.435 re-baseline (was 0xb23acf16u at 0.0.431..0.0.434)
-// R1 (notes/design/R1-MEMDST.md Q2 "UNRESOLVED") re-baseline (was 0xcb3d45dfu at 0.0.435-0.0.439): gfxc_page grew
+// R1 (an internal design note Q2 "UNRESOLVED") re-baseline (was 0xcb3d45dfu at 0.0.435-0.0.439): gfxc_page grew
 // the DEFAULTED `leafOut` parameter and its two writes (0 on entry, the raw leaf on a successful walk) - the
 // reader's OWN behaviour, and every one of the 21 pre-existing call sites, are unchanged; only the body's SOURCE
 // TEXT this hash covers moved.
@@ -339,7 +339,7 @@ static const uint32_t kExpectGfxsrcDescRead    = 0x84cc6ad7u;   // 0.0.540 re-ba
 // P's row (xlat12_table_abi_is_gated) and, if switch 43 is OFF, zeroes it back to 0 - so P is untranslated exactly
 // as before that row existed. The reader's OWN behaviour (everything this hash is meant to prove untouched: the
 // program-identity read itself) is unchanged; only the body's SOURCE TEXT this hash covers moved.
-// build 0.0.470 (notes/design/NO-SAMPLER-CLASS10.md section 3) re-baseline (was 0xccebeb00u at 0.0.444-0.0.455):
+// build 0.0.470 (an internal design note section 3) re-baseline (was 0xccebeb00u at 0.0.444-0.0.455):
 // right after switch 43's gate, a SECOND gate of the same shape - switch 51 zeroes ps_table_abi1 for a row
 // xlat12_table_abi_new_shape names (no-sampler / class-10) unless gT51On. The program-identity read itself (what this
 // hash is meant to prove untouched) is unchanged; only the body's SOURCE TEXT moved.
@@ -359,14 +359,14 @@ static const uint32_t kExpectGfxsrcPgmProfile = 0x3228b271u;   // build 0.0.550 
                                                                   // AppleHardwareHook.cpp's own comment on it).
                                                                   // (0.0.436 re-baseline was 0x9fc573edu at 0.0.434-0.0.435,
                                                                   // 0x0fdf8ee0u for one build within 0.0.436 itself): mode
-                                                                  // T+M (the per-pass memo, notes/design/PGMID-COPYGUARD.md
+                                                                  // T+M (the per-pass memo, an internal design note
                                                                   // design "2. M") is tried before the read, the relocation
                                                                   // scan is skipped on a hit, a miss fills the memo row, and
                                                                   // (reviewer defect fix, post-0.0.436) the fill's pages now
                                                                   // come from a LOCAL n48_cg_pagerec over the resolving
                                                                   // read's own VRAM offsets, never from `va` directly.
 static const uint32_t kExpectN48DpRead         = 0x26fac2e5u;
-// D4' (notes/design/D4-PRIME.md item 3) re-baseline (0xf9d8a113u at 0.0.431-0.0.438, then 0x6d5e3011u at 0.0.439-
+// D4' (an internal design note item 3) re-baseline (0xf9d8a113u at 0.0.431-0.0.438, then 0x6d5e3011u at 0.0.439-
 // 0.0.440): the per-draw loop gained the XLAT12_EXTRA_READSET valid-flags bit and one call to d_readset_accum
 // (read-only over `out[]`, gated by the flag; the mmprio reader itself is byte-identical either way - only the
 // body's SOURCE TEXT this hash covers moved).
@@ -419,7 +419,7 @@ static const uint32_t kExpectN48DpRead         = 0x26fac2e5u;
 // For every row that existed before 0.0.470 the list is the same slots in the same order (a no-sampler/class-10 row
 // exists only from 0.0.470, gated by switches 43 AND 51): src/xlat12's own tests and gfx_f84's pinned hashes prove it.
 // Only the body's SOURCE TEXT this hash covers moved.
-// build 0.0.480 (notes/design/CONTINUATION-UNITS.md Q11, XLAT12_EXTRA_UNIT) DELIBERATE re-baseline (was 0x276b9797u at
+// build 0.0.480 (an internal design note Q11, XLAT12_EXTRA_UNIT) DELIBERATE re-baseline (was 0x276b9797u at
 // 0.0.470-0.0.473): the unit path's sites in the body (the flag's argument check, `U`, the region's output start `oreg`
 // at the five "written in this region" comparisons, the block range, P4's call, the pad skipped for a unit, the inline
 // invalidate, the draw and tail placement, d_unit_finish, the pool undo on a verify refusal). Every one tests U first;
@@ -429,7 +429,7 @@ static const uint32_t kExpectN48DpRead         = 0x26fac2e5u;
 // against `git archive 34019fb`): the body gains XLAT12_EXTRA_DCC_STRIP in the accepted-flags mask and one ERR_ARG line (the
 // flag without XLAT12_EXTRA_TABLE_DESC). With the flag OFF nothing else in the body runs differently; src/xlat12's own tests
 // (T2: every captured T# row byte-identical OFF) and gfx_f84's pinned hashes are unchanged. Only the SOURCE TEXT moved.
-// build 0.0.487 (notes/design/COMPUTE-N.md, XLAT12_EXTRA_CS_ELIDE, switch 57) DELIBERATE re-baseline (was 0xba15f48fu
+// build 0.0.487 (an internal design note, XLAT12_EXTRA_CS_ELIDE, switch 57) DELIBERATE re-baseline (was 0xba15f48fu
 // at 0.0.480-0.0.485): the flags validation gate gained one more bit (XLAT12_EXTRA_CS_ELIDE, 0x40000) and its own
 // "requires ex->cs_is_n" ERR_ARG check - the same "requires its own mechanism" shape as every prior flag. The elision
 // itself lives in d_region (not this body). With the flag OFF the output is byte-identical: 2,449 captured ranges of
@@ -440,7 +440,7 @@ static const uint32_t kExpectN48DpRead         = 0x26fac2e5u;
 // the accepted-flags mask (XLAT12_EXTRA_CS_ELIDE 0x40000 and XLAT12_EXTRA_DCC_STRIP 0x80000, the mask comment naming both)
 // and BOTH ERR_ARG lines (DCC_STRIP without TABLE_DESC; CS_ELIDE without cs_is_n). 0.0.486 does not touch this body
 // (its commit's own body hashes 0xba15f48fu, 34019fb's value). Computed by this file's extractor over the merged tree.
-// build 0.0.500 (notes/design/DRAW-ELIDE.md Q4, XLAT12_EXTRA_DRAW_ELIDE, switch 66) DELIBERATE re-baseline (was 0x64ccb872u
+// build 0.0.500 (an internal design note Q4, XLAT12_EXTRA_DRAW_ELIDE, switch 66) DELIBERATE re-baseline (was 0x64ccb872u
 // at 0.0.489-0.0.499): the body gains XLAT12_EXTRA_DRAW_ELIDE in the accepted-flags mask (and its comment), one ERR_ARG line
 // (the flag without TABLE_DESC or with no/unknown row class), one store of dcc_unproven before the table step, the elide's
 // branch at the table step's refusal (d_draw_elide / d_draw_elide_emit, both outside this body) and the backstop after the

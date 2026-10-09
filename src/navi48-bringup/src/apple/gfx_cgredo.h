@@ -1,4 +1,4 @@
-// gfx_cgredo.h — build 0.0.523 (notes/design/RING-NEUTER-FORGIVE.md rev 2 item 10, switch 78): THE REDO's UNDO, PURE.
+// gfx_cgredo.h — build 0.0.523 (an internal design note rev 2 item 10, switch 78): THE REDO's UNDO, PURE.
 //
 // What a refused segment's translate left behind, taken back EXACTLY as gfxsrc_defer_take (AppleHardwareHook.cpp) takes a
 // deferred unit's first attempt back, so the redo re-translates from the state the first attempt started from:

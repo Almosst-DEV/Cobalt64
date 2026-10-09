@@ -1,0 +1,2 @@
+#!/bin/bash
+touch "$SIM_DIR/kv/watcher"; exit 0

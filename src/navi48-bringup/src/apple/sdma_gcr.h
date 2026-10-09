@@ -1,5 +1,5 @@
 // sdma_gcr.h — the SDMA GCR_REQ "graphics cache rinse" packet, and the pure arithmetic and refusal
-// rules 0.0.416 (notes/design/SDMA-GCR.md;) drives it with. No kernel headers, no hardware:
+// rules 0.0.416 (an internal design note;) drives it with. No kernel headers, no hardware:
 // the kext (Navi48Bringup.cpp, DisplayPipeGuard.cpp), the host test (tests/sdma_gcr_test.cpp) and the
 // PC test client (tools/pc/navi48test.c) compile this same file, so there is no second implementation
 // that could drift from the one that runs.

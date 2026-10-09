@@ -1,9 +1,9 @@
-// native_hostimport_test.cpp - build 0.0.612 (milestone #11 step 11c, notes/design/NATIVE-S4-M11.md sections 3 and 4): W4 BoImportHost, selector 21 of ABI 1.9.
+// native_hostimport_test.cpp - build 0.0.612 (milestone #11 step 11c, an internal design note sections 3 and 4): W4 BoImportHost, selector 21 of ABI 1.9.
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
 //       -I src/navi48-bringup/src -I src/navi48-bringup/src/amd src/navi48-bringup/tests/native_hostimport_test.cpp -o /tmp/native_hostimport && /tmp/native_hostimport .
 //   (run from the repo root; the argument is the repo root the source pins read from; tests/native_ws_open_plant.sh plants breaks)
 // Covers:
-//   H1  import_check: every argument rule (4 KiB alignment of the host va and the size, size 0, > 64 MiB per BO, the user half, wrap, flags, the GPU VA), the per-client 2 GiB cap (0.0.620; 256 MiB before) and its
+//   H1  import_check: every argument rule (4 KiB alignment of the host va and the size, size 0, > 64 MiB per BO, the user half, wrap, flags, the GPU VA), the per-client 4 GiB cap (0.0.621; 2 GiB in 0.0.620, 256 MiB before) and its
 //       accounting (separate from the 512 MiB GTT cap), free restoring the room, a stray double free never wrapping the cap open;
 //   H2  collect_pages over a fake descriptor: scattered runs, every failure (no segment, short run, unaligned or zero address, an address above the PTE field, page-count mismatch);
 //   H3  pt_map_pages into a real 4-level tree (a fake memory): scattered pages resolve to their own physical pages with SYSTEM|SNOOPED (the GTT leaf flags), across PTB boundaries, in
@@ -36,6 +36,11 @@ static void expect_u(const char *what, uint64_t got, uint64_t want) {
 }
 static std::string slurp(const std::string &path) { std::ifstream f(path, std::ios::binary); std::stringstream ss; ss << f.rdbuf(); return ss.str(); }
 static size_t count_of(const std::string &s, const std::string &needle) { size_t n = 0, p = 0; while ((p = s.find(needle, p)) != std::string::npos) { n++; p += needle.size(); } return n; }
+static bool in_order(const std::string &s, std::initializer_list<const char *> parts) {   // 0.0.627
+    size_t at = 0;
+    for (const char *p : parts) { const size_t f = s.find(p, at); if (f == std::string::npos) return false; at = f + 1; }
+    return true;
+}
 static std::string fn_body(const std::string &src, const std::string &sig) {          // from the signature to its closing brace at column 0
     const size_t a = src.find(sig);
     if (a == std::string::npos) return "";
@@ -49,7 +54,7 @@ constexpr uint64_t MiB = 1ull << 20;
 
 // ---- H1 ------------------------------------------------------------------------------------------------------------------------------------------------
 static void h1_check() {
-    expect_u("limits: 64 MiB per BO", kImportMaxBo, 64 * MiB); expect_u("limits: 2 GiB per client (0.0.620)", kImportCap, 2048 * MiB);
+    expect_u("limits: 64 MiB per BO", kImportMaxBo, 64 * MiB); expect_u("limits: 4 GiB per client (0.0.621)", kImportCap, 4096 * MiB);
     expect_u("the ABI macros agree (per BO)", N48N_IMPORT_MAX_BO, kImportMaxBo); expect_u("the ABI macros agree (cap)", N48N_IMPORT_CAP, kImportCap);
     expect(kImportCap != kGttCap && kGttCap == 512 * MiB, "the import cap is separate from the 512 MiB GTT cap");
     { const ImportChk c = import_check(HV, 0x1000, 0, 0, 0);            expect(c.rc == kOk && c.pages == 1 && c.gpuStripped == 0, "one page, no map: OK"); }
@@ -78,41 +83,42 @@ static void h1_check() {
     { const ImportChk c = import_check(HV, 0x4000, N48N_VM_PAGE_READABLE, 0x0000800000000000ull, 0); expect_u("a non-canonical GPU VA: refused", c.rc, kBadArg); }
     { const ImportChk c = import_check(HV, 0x4000, N48N_VM_PAGE_READABLE, 0x8000, 0);            expect_u("a GPU VA below 0x10000: refused", c.rc, kBadArg); }
     { const ImportChk c = import_check(HV, 0x4000, N48N_VM_PAGE_READABLE | N48N_VM_MTYPE_UC, 0x200000, 0); expect_u("MTYPE UC accepted", c.rc, kOk); }
-    // the cap (0.0.620: 2 GiB; it was 256 MiB)
-    expect_u("the cap is exactly 2 GiB", kImportCap, 2ull << 30);
-    expect_u("32 64-MiB imports fill the cap exactly: the last is admitted", import_check(HV, 64 * MiB, 0, 0, 1984 * MiB).rc, kOk);
-    expect_u("an import that brings the total to EXACTLY 2 GiB is admitted", import_check(HV, 0x1000, 0, 0, 2048 * MiB - 0x1000).rc, kOk);
-    expect_u("the next page after a full 2 GiB is refused (NoMemory)", import_check(HV, 0x1000, 0, 0, 2048 * MiB).rc, kNoMemory);
-    expect_u("1 page (4 KiB) over 2 GiB is refused", import_check(HV, 0x2000, 0, 0, 2048 * MiB - 0x1000).rc, kNoMemory);
-    expect_u("64 MiB over by one page is refused", import_check(HV, 64 * MiB, 0, 0, 1984 * MiB + 0x1000).rc, kNoMemory);
-    expect_u("the old 256 MiB boundary is now admitted (total 256 MiB + 4 KiB)", import_check(HV, 0x1000, 0, 0, 256 * MiB).rc, kOk);
-    expect_u("the old boundary: 64 MiB on top of 256 MiB is admitted", import_check(HV, 64 * MiB, 0, 0, 256 * MiB).rc, kOk);
-    expect_u("the old boundary: 255 MiB held + 2 MiB is admitted", import_check(HV, 2 * MiB, 0, 0, 255 * MiB).rc, kOk);
-    expect_u("1 GiB held + 64 MiB is admitted", import_check(HV, 64 * MiB, 0, 0, 1024 * MiB).rc, kOk);
-    expect_u("the cap is checked AFTER the arguments (a bad argument beats a full cap)", import_check(HV + 1, 0x1000, 0, 0, 2048 * MiB).rc, kBadArg);
+    // the cap (0.0.621: 4 GiB; 2 GiB in 0.0.620, 256 MiB before)
+    expect_u("the cap is exactly 4 GiB", kImportCap, 4ull << 30);
+    expect_u("64 64-MiB imports fill the cap exactly: the last is admitted", import_check(HV, 64 * MiB, 0, 0, 4032 * MiB).rc, kOk);
+    expect_u("an import that brings the total to EXACTLY 4 GiB is admitted", import_check(HV, 0x1000, 0, 0, 4096 * MiB - 0x1000).rc, kOk);
+    expect_u("the next page after a full 4 GiB is refused (NoMemory)", import_check(HV, 0x1000, 0, 0, 4096 * MiB).rc, kNoMemory);
+    expect_u("4 GiB + 4 KiB (one page over) is refused", import_check(HV, 0x2000, 0, 0, 4096 * MiB - 0x1000).rc, kNoMemory);
+    expect_u("64 MiB over by one page is refused", import_check(HV, 64 * MiB, 0, 0, 4032 * MiB + 0x1000).rc, kNoMemory);
+    expect_u("the 2 GiB boundary (0.0.620's cap) is now admitted: 2 GiB held + 4 KiB", import_check(HV, 0x1000, 0, 0, 2048 * MiB).rc, kOk);
+    expect_u("the 2 GiB boundary: 64 MiB on top of 2 GiB is admitted", import_check(HV, 64 * MiB, 0, 0, 2048 * MiB).rc, kOk);
+    expect_u("just under the 2 GiB boundary: 2047 MiB held + 2 MiB is admitted", import_check(HV, 2 * MiB, 0, 0, 2047 * MiB).rc, kOk);
+    expect_u("the old 256 MiB boundary is admitted (256 MiB held + 4 KiB)", import_check(HV, 0x1000, 0, 0, 256 * MiB).rc, kOk);
+    expect_u("3 GiB held + 64 MiB is admitted", import_check(HV, 64 * MiB, 0, 0, 3072 * MiB).rc, kOk);
+    expect_u("the cap is checked AFTER the arguments (a bad argument beats a full cap)", import_check(HV + 1, 0x1000, 0, 0, 4096 * MiB).rc, kBadArg);
     expect_u("a wild running total does not wrap the check", import_check(HV, 0x1000, 0, 0, ~0ull).rc, kNoMemory);
     expect_u("a running total just under 2^64 does not wrap the check", import_check(HV, 0x1000, 0, 0, ~0ull - 0xFFFull).rc, kNoMemory);
-    expect(would_exceed(2048 * MiB, 1, kImportCap) && !would_exceed(2048 * MiB - 1, 1, kImportCap) && would_exceed(0, 2048 * MiB + 1, kImportCap) && !would_exceed(0, 2048 * MiB, kImportCap), "would_exceed at the 2 GiB edge, both directions");
+    expect(would_exceed(4096 * MiB, 1, kImportCap) && !would_exceed(4096 * MiB - 1, 1, kImportCap) && would_exceed(0, 4096 * MiB + 1, kImportCap) && !would_exceed(0, 4096 * MiB, kImportCap), "would_exceed at the 4 GiB edge, both directions");
     // every quantity that scales with the cap, at its maximum
     {
         const uint64_t pagesAtCap = kImportCap / kPage;
-        expect_u("2 GiB of pages is 524288 (fits a uint32 page count)", pagesAtCap, 524288ull);
+        expect_u("4 GiB of pages is 1048576 (fits a uint32 page count)", pagesAtCap, 1048576ull);
         expect(pagesAtCap <= 0xFFFFFFFFull, "the page count of the whole cap fits uint32");
         expect_u("one BO's page list is still 16384 entries (128 KiB), unchanged", (uint64_t)kImportMaxPages, 16384ull);
-        expect_u("all page lists at the cap are 4 MiB of kernel heap", pagesAtCap * sizeof(uint64_t), 4 * MiB);
-        expect(kImportCap % kImportMaxBo == 0 && kImportCap / kImportMaxBo == 32, "the cap is 32 whole max-size BOs");
+        expect_u("all page lists at the cap are 8 MiB of kernel heap", pagesAtCap * sizeof(uint64_t), 8 * MiB);
+        expect(kImportCap % kImportMaxBo == 0 && kImportCap / kImportMaxBo == 64, "the cap is 64 whole max-size BOs");
     }
     // accounting: separate from the GTT cap
     {
         uint64_t used = 0, gtt = 0; int n = 0;
         gtt = 500 * MiB;                                                  // GTT nearly full: irrelevant to imports
         while (import_check(HV, 64 * MiB, 0, 0, used).rc == kOk) { used += 64 * MiB; n++; }
-        expect_u("exactly thirty-two 64 MiB imports fit with the GTT at 500 MiB", (uint64_t)n, 32);
+        expect_u("exactly sixty-four 64 MiB imports fit with the GTT at 500 MiB", (uint64_t)n, 64);
         expect_u("the running total is the cap", used, kImportCap);
         expect(!would_exceed(gtt, 12 * MiB, kGttCap), "the GTT cap has its own room (nothing here touched it)");
-        used = import_after_free(used, 64 * MiB); expect_u("a free returns the room", used, 1984 * MiB);
+        used = import_after_free(used, 64 * MiB); expect_u("a free returns the room", used, 4032 * MiB);
         expect_u("and one more import fits again", import_check(HV, 64 * MiB, 0, 0, used).rc, kOk);
-        used = import_after_free(used, 64 * MiB * 33); expect_u("a stray over-free clamps at 0, never wraps", used, 0);
+        used = import_after_free(used, 64 * MiB * 65); expect_u("a stray over-free clamps at 0, never wraps", used, 0);
         expect_u("after which the whole cap is available", import_check(HV, 64 * MiB, 0, 0, used).rc, kOk);
     }
 }
@@ -192,18 +198,22 @@ static void h3_map() {
         bool gone = true; for (uint64_t i = 0; i < pages; i++) if (pt_walk(root, va + i * kPage, m, nullptr) != 0) gone = false;
         expect(gone, "pt_unmap clears every scattered leaf");
     }
-    {   // 0.0.620: the page-table cost of a FULL 2 GiB cap. The per-client page-table pool is kPtCap (32 MiB = 8192 table pages, shared with every other mapping).
-        // (a) 2 GiB packed (32 x 64 MiB, back to back): ~1024 leaf tables; (b) the worst realistic spread: ~2000 imports of 1 MiB each, every one in its OWN 2 MiB window.
+    {   // 0.0.621: the page-table cost of a FULL 4 GiB cap. The per-client page-table pool is kPtCap (32 MiB = 8192 table pages, shared with every other mapping).
+        // (a) 4 GiB packed (64 x 64 MiB, back to back): ~2048 leaf tables; (b) the worst realistic spread: 4096 imports of 1 MiB each, every one in its OWN 2 MiB window (the BO table's 4095 handles bind first);
+        // (c) the pathological case, every 1 MiB import straddling a 2 MiB boundary and none sharing a table (two leaf tables each, one per 4 MiB of VA): 4095 of them need ~8190 leaf tables and do NOT fit the 8192-page pool (a clean NoMemory, nothing half-mapped).
         const uint64_t poolPages = kPtCap / kPage;
         expect_u("the page-table pool is 8192 table pages", poolPages, 8192ull);
         { FakeMem m; const uint64_t root = m.alloc_page(); std::vector<uint64_t> pa(kImportMaxPages); for (uint64_t i = 0; i < kImportMaxPages; i++) pa[i] = 0x200000000ull + ((i * 7919ull) % 20000ull) * 0x1000ull;
           bool ok = true; for (uint64_t b = 0; b < kImportCap / kImportMaxBo; b++) ok = ok && pt_map_pages(root, 0x10000000ull + b * kImportMaxBo, kImportMaxPages, pa.data(), leafSys, m) == kOk;
           const uint64_t used = 1000000ull - m.pagesLeft;
-          expect(ok, "2 GiB packed: all 32 maps succeed"); expect(used >= 1024 && used < 1100, "2 GiB packed needs ~1024 leaf tables plus a few directories"); expect(used < poolPages / 4, "... under a quarter of the client's table pool"); }
+          expect(ok, "4 GiB packed: all 64 maps succeed"); expect(used >= 2048 && used < 2200, "4 GiB packed needs ~2048 leaf tables plus a few directories"); expect(used < poolPages / 2, "... under half of the client's table pool"); }
         { FakeMem m; const uint64_t root = m.alloc_page(); std::vector<uint64_t> pa(256); for (uint64_t i = 0; i < 256; i++) pa[i] = 0x200000000ull + i * 0x3000ull;
-          bool ok = true; for (uint64_t b = 0; b < 2048; b++) ok = ok && pt_map_pages(root, 0x10000000ull + b * 0x400000ull, 256, pa.data(), leafSys, m) == kOk;   // 1 MiB each, one per 4 MiB of VA
+          bool ok = true; for (uint64_t b = 0; b < 4096; b++) ok = ok && pt_map_pages(root, 0x10000000ull + b * 0x200000ull, 256, pa.data(), leafSys, m) == kOk;   // 1 MiB each, one per 2 MiB of VA
           const uint64_t used = 1000000ull - m.pagesLeft;
-          expect(ok, "2048 x 1 MiB spread over 8 GiB of VA: all maps succeed"); expect(used >= 2048 && used < poolPages, "... needs ~2048 leaf tables plus directories: inside the 8192-page pool"); }
+          expect(ok, "4096 x 1 MiB spread over 8 GiB of VA: all maps succeed"); expect(used >= 4096 && used < poolPages, "... needs ~4096 leaf tables plus directories: inside the 8192-page pool"); expect(used < 4200, "... about 4096 + a handful of directory pages"); }
+        { FakeMem m; m.pagesLeft = poolPages; const uint64_t root = m.alloc_page(); std::vector<uint64_t> pa(256); for (uint64_t i = 0; i < 256; i++) pa[i] = 0x200000000ull + i * 0x3000ull;
+          uint64_t okN = 0, firstFail = 0; for (uint64_t b = 0; b < 4095; b++) { const uint32_t r = pt_map_pages(root, 0x10000000ull + b * 0x400000ull + 0x180000ull, 256, pa.data(), leafSys, m); if (r == kOk) okN++; else { firstFail = b; expect_u("the straddling worst case fails CLEANLY with NoMemory", r, kNoMemory); break; } }
+          expect(okN > 4000 && okN < 4095 && firstFail == okN, "4095 straddling 1 MiB imports exhaust the 8192-page pool a few short of 4095 (documented limit: such a layout is pathological, RADV packs)"); }
     }
     {   // a sub-range: GemVa MAP with offset_in_bo maps the slice of the page list
         FakeMem m; const uint64_t root = m.alloc_page();
@@ -299,8 +309,8 @@ static void h4_lifecycle() {
     expect(host_may_release(kHostRelNormal) && host_may_release(kHostRelClosing) && !host_may_release(kHostRelLeak), "host_may_release: Normal and Closing yes, the HUNG leak never");
     expect(!host_may_release(3) && !host_may_release(0xFFFFFFFFu), "host_may_release: an unknown mode never releases");
     {   // the cap under churn: import / free many times, the total never drifts
-        Sess s; for (int round = 0; round < 20; round++) { for (int i = 0; i < 32; i++) expect_u("import in a round", s.import_(64 * MiB, false, 0), kOk); expect_u("a 33rd is refused (2 GiB held)", s.import_(0x1000, false, 0), kNoMemory);
-            for (size_t i = s.bo.size() - 32; i < s.bo.size(); i++) s.release(i, kHostRelNormal, 0); expect_u("all 32 freed", s.imported, 0); }
+        Sess s; for (int round = 0; round < 10; round++) { for (int i = 0; i < 64; i++) expect_u("import in a round", s.import_(64 * MiB, false, 0), kOk); expect_u("a 65th is refused (4 GiB held)", s.import_(0x1000, false, 0), kNoMemory);
+            for (size_t i = s.bo.size() - 64; i < s.bo.size(); i++) s.release(i, kHostRelNormal, 0); expect_u("all 64 freed", s.imported, 0); }
     }
 }
 
@@ -311,22 +321,24 @@ static void h5_pins(const std::string &root) {
     const std::string pure = slurp(K + "src/amd/native_hostimport_pure.h"), plist = slurp(K + "Info.plist");
     expect(!eng.empty() && !engh.empty() && !cli.empty() && !abi.empty() && !pure.empty(), "the sources are readable from the root given");
     // the selector: number, shape, task
-    expect_u("BoImportHost is the next free selector, 21", N48N_SEL_BO_IMPORT_HOST, 21); expect_u("ABI minor 9", N48N_ABI_MINOR, 9); expect_u("selector count 1.9", N48N_SEL_COUNT_1_9, 22);
+    expect_u("BoImportHost is the next free selector, 21", N48N_SEL_BO_IMPORT_HOST, 21); expect_u("ABI minor 12", N48N_ABI_MINOR, 12); expect_u("selector count 1.9", N48N_SEL_COUNT_1_9, 22);
     expect_u("the ABI major is unchanged", N48N_ABI_VERSION, 1);
-    { const size_t c = cli.find("case N48N_SEL_BO_IMPORT_HOST:\n\t\tif (!shape(4, 4, 0, 0)) return kIOReturnBadArgument;\n"), r = cli.find("\t\treturn amdgpu::n1c_bo_import_host(task, si[0], si[1], si[2], si[3], so);", c == std::string::npos ? 0 : c);
+    { const size_t c = cli.find("case N48N_SEL_BO_IMPORT_HOST:\n\t\tif (!shape(4, 4, 0, 0)) return kIOReturnBadArgument;\n"), r = cli.find("\t\treturn amdgpu::n1c_bo_import_host(r, task, si[0], si[1], si[2], si[3], so);", c == std::string::npos ? 0 : c);
       expect(c != std::string::npos && r != std::string::npos && cli.substr(c, r - c).find("import_caller_ok(current_task(), task)") != std::string::npos,
            "the client dispatches selector 21: exact shape (4 in, 4 out, no structs), then the owning-task check, then the import with the task the client was opened with"); }
-    expect(engh.find("IOReturn n1c_bo_import_host(task_t task, uint64_t hostVa, uint64_t size, uint64_t flags, uint64_t gpuVa, uint64_t out[4]);") != std::string::npos, "the engine declares n1c_bo_import_host");
+    expect(engh.find("IOReturn n1c_bo_import_host(const N1cRef &ref, task_t task, uint64_t hostVa, uint64_t size, uint64_t flags, uint64_t gpuVa, uint64_t out[4]);") != std::string::npos, "the engine declares n1c_bo_import_host");
     expect(abi.find("N48N_SEL_BO_IMPORT_HOST = 21,") != std::string::npos && abi.find("N48N_SEL_COUNT_1_9     = 22") != std::string::npos, "the ABI header names selector 21 and the 1.9 count");
     // n1c_bo_import_host: order
     const std::string imp = fn_body(eng, "IOReturn n1c_bo_import_host(");
     expect(!imp.empty(), "n1c_bo_import_host is found");
-    const size_t pHello = at(imp, "if (!sess_hello()) return kIOReturnNotReady;"), pPre = at(imp, "import_check("), pWith = at(imp, "IOMemoryDescriptor::withAddressRange("), pPrep = at(imp, "md->prepare()"),
-                 pMal = at(imp, "IOMalloc("), pCol = at(imp, "collect_pages(seg, size, pages, kImportMaxPages)"), pLock = at(imp, "IOLockLock(gCliLock);"), pGate = at(imp, "gpu_gate()"),
+    const size_t pHello = at(imp, "if (!sess_hello(ref)) return kIOReturnNotReady;"), pPre = at(imp, "import_check("), pWith = at(imp, "IOMemoryDescriptor::withAddressRange("), pPrep = at(imp, "md->prepare()"),
+                 pMal = at(imp, "IOMalloc("), pCol = at(imp, "collect_pages(seg, size, pages, kImportMaxPages)"), pLock = at(imp, "Session *s = sess_lock(ref, false);"), pGate = at(imp, "if (gate != kOk) { rc = (IOReturn)gate; break; }"),
                  pAuth = at(imp, "import_check(hostVa, size, flags, gpuVa, s->importedBytes)"), pMap = at(imp, "pt_map_pages("), pRec = at(imp, "s->bo[h] = b;"), pUnl = at(imp, "IOLockUnlock(gCliLock);");
     expect(pHello != std::string::npos && pPre != std::string::npos && pWith != std::string::npos && pPrep != std::string::npos && pLock != std::string::npos && pGate != std::string::npos && pAuth != std::string::npos && pMap != std::string::npos && pRec != std::string::npos && pUnl != std::string::npos, "every step of the import is present");
     expect(pHello < pPre && pPre < pWith && pWith < pPrep && pPrep < pMal && pMal < pCol && pCol < pLock, "order: Hello, argument check, descriptor, prepare(), page list, page list check - all BEFORE the client lock");
     expect(pLock < pGate && pGate < pAuth && pAuth < pMap && pMap < pRec && pRec < pUnl, "order under the lock: HUNG gate, authoritative cap check, map, record");
+    expect(at(imp, "const uint32_t gate = (s != nullptr && s->hello) ? gpu_gate(s) : kOk;") > pLock && at(imp, "const uint32_t gate = (s != nullptr && s->hello) ? gpu_gate(s) : kOk;") < at(imp, "IOLockLock(gCliLock);") && at(imp, "IOLockLock(gCliLock);") < pGate,
+           "0.0.627: the gate is evaluated under the SESSION lock only (a stall poll may run a recovery: never under gCliLock), then gCliLock, then it is acted on");
     expect(imp.find("IOMemoryDescriptor::withAddressRange((mach_vm_address_t)hostVa, (mach_vm_size_t)size, kIODirectionInOut, task)") != std::string::npos, "the descriptor is of the CALLER's task, in/out");
     expect(imp.find("kIOMemoryMapperNone") == std::string::npos && eng.find("md->getPhysicalSegment((IOByteCount)off, &seg, kIOMemoryMapperNone)") != std::string::npos, "physical segments are read as CPU physical (kIOMemoryMapperNone), in DescSeg");
     expect(imp.find("leaf_flags((uint32_t)flags, false, true)") != std::string::npos, "the import's leaves are the SYSTEM (snooped) GTT flags");
@@ -340,15 +352,15 @@ static void h5_pins(const std::string &root) {
     expect(count_of(imp, "IOFree(pages") >= 2, "the page list is freed on the failure paths");
     expect(imp.find("N48N_PLACED_HOST_IMPORT") != std::string::npos && imp.find("va_canonicalize(c.gpuStripped)") != std::string::npos, "the outputs: handle, size, canonical GPU VA, placed bit");
     // release: bo_release
-    const std::string rel = fn_body(eng, "static void bo_release(uint32_t h, RelMode mode) {");
+    const std::string rel = fn_body(eng, "static void bo_release(Session *s, uint32_t h, RelMode mode) {");
     expect(!rel.empty(), "bo_release is found");
     {
         const size_t nrm = at(rel, "} else if (mode == kRelNormal) {"), lk = at(rel, "} else {\n        // Leak:");
         expect(nrm != std::string::npos && lk != std::string::npos, "bo_release has Closing / Normal / Leak branches");
         const std::string normal = rel.substr(nrm, lk - nrm), closing = rel.substr(0, nrm), leak = rel.substr(lk);
-        expect(at(normal, "pt_unmap(s->rootPa") < at(normal, "flush_vmid(kNativeVmid)") && at(normal, "flush_vmid(kNativeVmid)") < at(normal, "host_release(b)"), "BoFree (Normal): unmap the PTEs, flush the TLB, THEN complete + release");
-        expect(normal.find("else if (b.kind == kBoHost && host_may_release(kHostRelNormal) && memOk) host_release(b);") != std::string::npos, "Normal releases through host_may_release (not negated) and only when the flushes acknowledged (0.0.612 review item D)");
-        expect(closing.find("else if (b.kind == kBoHost && host_may_release(kHostRelClosing)) host_release(b);") != std::string::npos, "Closing releases through host_may_release (not negated)");
+        expect(at(normal, "pt_unmap(s->rootPa") < at(normal, "flush_vmid(s->vmid)") && at(normal, "flush_vmid(s->vmid)") < at(normal, "host_release(b)"), "BoFree (Normal): unmap the PTEs, flush the TLB, THEN complete + release");
+        expect(normal.find("else if (b.kind == kBoHost && host_may_release(kHostRelNormal) && memOk) { host_release(b); sys_release(b); }") != std::string::npos, "Normal releases through host_may_release (not negated) and only when the flushes acknowledged (0.0.612 review item D)");
+        expect(closing.find("else if (b.kind == kBoHost && host_may_release(kHostRelClosing)) { host_release(b); sys_release(b); }") != std::string::npos, "Closing releases through host_may_release (not negated)");
         expect(leak.find("host_release") == std::string::npos && leak.find("complete") == std::string::npos && leak.find("release()") == std::string::npos, "the HUNG leak branch never completes or releases");
         expect(rel.find("else if (b.kind == kBoHost) s->importedBytes = import_after_free(s->importedBytes, b.size);") != std::string::npos, "a freed (or leaked) host BO leaves the cap accounting");
         expect(rel.find("if (b.pinLeak != 0u) mode = kRelLeak;") != std::string::npos, "unchanged: an unverified console restore turns any release into a leak");
@@ -356,15 +368,16 @@ static void h5_pins(const std::string &root) {
     const std::string hr = fn_body(eng, "static void host_release(Bo &b) {");
     expect(!hr.empty() && at(hr, "b.hmd->complete();") < at(hr, "b.hmd->release();") && at(hr, "b.hmd->release();") < at(hr, "IOFree(b.hpages"), "host_release: complete() before release(), the page list last");
     // close
-    const std::string cl = fn_body(eng, "void n1c_close(const char *how) {");
+    const std::string cl = fn_body(eng, "void n1c_close(const N1cRef &ref, const char *how) {");
     expect(!cl.empty(), "n1c_close is found");
-    expect(at(cl, "program_root(gPark.pa)") < at(cl, "bo_release(h, kRelClosing)"), "close: CONTEXT8 is parked (and the TLB flushed) BEFORE any BO is released (unmap before complete)");
-    expect(at(cl, "bool leak = hung_now();") < at(cl, "program_root(gPark.pa)") && cl.find("if (!leak) {\n        for (uint32_t h = 1; h < N48N_MAX_BOS; h++) if (s->boUsed[h]) bo_release(h, kRelClosing);") != std::string::npos, "close: the release loop runs only when not leaking (HUNG)");
+    expect(at(cl, "program_root(s->vmid, gPark.pa)") < at(cl, "bo_release(s, h, kRelClosing)"), "close: the session's context is parked (and the TLB flushed) BEFORE any BO is released (unmap before complete)");
+    expect(at(cl, "bool leak = hung_now();") < at(cl, "program_root(s->vmid, gPark.pa)") && cl.find("if (!leak) {\n        for (uint32_t h = 1; h < N48N_MAX_BOS; h++) if (s->boUsed[h]) bo_release(s, h, kRelClosing);") != std::string::npos, "close: the release loop runs only when not leaking (HUNG)");
     expect(cl.find("LEAKED (HUNG): pages stay wired, never completed or released") != std::string::npos, "close under HUNG says host imports are leaked");
-    expect_u("close releases BOs in exactly one place", count_of(cl, "bo_release(h, kRelClosing)"), 1);
+    expect_u("close releases BOs in exactly one place", count_of(cl, "bo_release(s, h, kRelClosing)"), 1);
     // free
-    const std::string fr = fn_body(eng, "IOReturn n1c_bo_free(uint64_t handle) {");
-    expect(fr.find("if (hung_now()) bo_release(h, kRelLeak);") != std::string::npos && fr.find("else if (!idle_wait()) { bo_release(h, kRelLeak); rc = kIOReturnTimeout; }") != std::string::npos && fr.find("else bo_release(h, kRelNormal);") != std::string::npos, "BoFree: HUNG and a timed-out idle wait leak; otherwise Normal (after the GPU is idle)");
+    const std::string fr = fn_body(eng, "IOReturn n1c_bo_free(const N1cRef &ref, uint64_t handle) {");
+    expect(fr.find("RelMode m = kRelNormal;") != std::string::npos && fr.find("if (hung_now()) m = kRelLeak;") != std::string::npos && fr.find("else if (!own_wait(s, &noBlame)) { m = kRelLeak; rc = kIOReturnTimeout; }") != std::string::npos && in_order(fr, { "own_wait(s, &noBlame)", "IOLockLock(gCliLock);", "bo_release(s, h, m);", "IOLockUnlock(gCliLock);" }),
+           "BoFree: HUNG and a timed-out own wait leak; otherwise Normal (after THIS session's work retired, 0.0.627); the release runs under gCliLock AFTER the wait");
     // the other consumers of a BO refuse a host BO
     expect(fn_body(eng, "static uint32_t resolve_fence(").find("if (b.kind == kBoHost) return kNotPermitted;") != std::string::npos, "a host BO is never a user-fence target");
     expect(fn_body(eng, "IOReturn n1c_scan_register(").find("if (b.kind == kBoHost) { rc = kIOReturnNotPermitted; break; }") != std::string::npos, "a host BO is never a scanout slot");
@@ -377,14 +390,14 @@ static void h5_pins(const std::string &root) {
     // the Bo record and the session
     expect(eng.find("kBoHost = 4") != std::string::npos && eng.find("IOMemoryDescriptor *hmd;") != std::string::npos && eng.find("uint64_t *hpages;") != std::string::npos && eng.find("uint64_t  importedBytes;") != std::string::npos, "the BO record and the session carry the import state");
     expect(eng.find("static_assert(kRelNormal == kHostRelNormal && kRelLeak == kHostRelLeak && kRelClosing == kHostRelClosing") != std::string::npos, "the pure release modes are the kernel's RelMode");
-    expect(pure.find("constexpr uint64_t kImportMaxBo   = 64ull << 20;") != std::string::npos && pure.find("constexpr uint64_t kImportCap     = 2048ull << 20;") != std::string::npos, "the limits in the pure header");
-    expect(plist.find("<string>0.0.620</string>") != std::string::npos, "Info.plist is 0.0.620");
+    expect(pure.find("constexpr uint64_t kImportMaxBo   = 64ull << 20;") != std::string::npos && pure.find("constexpr uint64_t kImportCap     = 4096ull << 20;") != std::string::npos, "the limits in the pure header");
+    expect(plist.find("<string>0.0.664</string>") != std::string::npos, "Info.plist is 0.0.664");
     {   // 0.0.620: the cap refusal is logged (before and under the lock) with the cap read from the constant, and nothing else in the import path hard-codes 256 MiB
         expect(imp.find("if (pre.rc == kNoMemory) N1C_LOG(\"import refused: per-client cap of %llu MiB reached (") != std::string::npos && imp.find("reached (%llu MiB held, %llu KiB asked)\", (unsigned long long)(kImportCap >> 20), ") != std::string::npos, "the advisory cap refusal is logged with kImportCap");
         expect(imp.find("if (c.rc == kNoMemory) N1C_LOG(\"import refused: per-client cap of %llu MiB reached under the lock (") != std::string::npos && imp.find("reached under the lock (%llu MiB held, %llu KiB asked)\", (unsigned long long)(kImportCap >> 20), ") != std::string::npos, "the authoritative cap refusal is logged with kImportCap");
         expect(imp.find("268435456") == std::string::npos && imp.find("256ull") == std::string::npos && imp.find("<< 20) ==") == std::string::npos, "the import path hard-codes no 256 MiB");
-        expect(abi.find("#define N48N_IMPORT_CAP          (2048ull << 20)") != std::string::npos && abi.find("(256ull << 20)") == std::string::npos, "the ABI header carries the 2 GiB cap and no 256 MiB cap");
-        expect(abi.find("#define N48N_MAX_BOS       4096u") != std::string::npos && pure.find("kImportMaxPages = (uint32_t)(kImportMaxBo / kPage)") != std::string::npos, "the handle table and the per-BO page list are unchanged (2 GiB needs ~2000 handles of 4095)");
+        expect(abi.find("#define N48N_IMPORT_CAP          (4096ull << 20)") != std::string::npos && abi.find("(256ull << 20)") == std::string::npos && abi.find("(2048ull << 20)") == std::string::npos, "the ABI header carries the 4 GiB cap and no 256 MiB or 2 GiB cap");
+        expect(abi.find("#define N48N_MAX_BOS       4096u") != std::string::npos && pure.find("kImportMaxPages = (uint32_t)(kImportMaxBo / kPage)") != std::string::npos, "the handle table and the per-BO page list are unchanged (4 GiB at ~1 MB average needs ~4000 of the 4095 handles: the BO table binds first, below ~1 MB average; raising it is NOT contained, see the 0.0.621 report)");
     }
     // no hardware register is written by the import (only the PTEs of the client's own tree through the existing PtMem, and the existing TLB flush)
     expect(imp.find("WREG32") == std::string::npos && imp.find("WBAR0") == std::string::npos && imp.find("WDOORBELL") == std::string::npos && imp.find("ring_emit") == std::string::npos, "no register, doorbell or ring write in the import");
@@ -495,14 +508,14 @@ static void h5_pins2(const std::string &root) {
     const std::string imp = fn_body(eng, "IOReturn n1c_bo_import_host(");
     expect(!imp.empty(), "n1c_bo_import_host is found (H6 pins)");
     // C: the sequence is read FIRST and re-checked under the lock, before the gate, the cap, the map and the record
-    const size_t pSeq = at(imp, "const uint32_t seq0 = __atomic_load_n(&gSessSeq, __ATOMIC_SEQ_CST);"), pHello = at(imp, "if (!sess_hello()) return kIOReturnNotReady;"), pWith = at(imp, "IOMemoryDescriptor::withAddressRange("),
-                 pLock = at(imp, "IOLockLock(gCliLock);"), pChk = at(imp, "if (!session_unchanged(seq0, __atomic_load_n(&gSessSeq, __ATOMIC_SEQ_CST))) { rc = kIOReturnNotReady; break; }"),
-                 pGate = at(imp, "gpu_gate()"), pRec = at(imp, "s->bo[h] = b;"), pUnl = at(imp, "IOLockUnlock(gCliLock);"), pTaken = at(imp, "if (!taken) {");
+    const size_t pSeq = at(imp, "const uint32_t seq0 = ref.id;"), pHello = at(imp, "if (!sess_hello(ref)) return kIOReturnNotReady;"), pWith = at(imp, "IOMemoryDescriptor::withAddressRange("),
+                 pLock = at(imp, "IOLockLock(gCliLock);"), pChk = at(imp, "if (!session_unchanged(seq0, s->id)) { rc = kIOReturnNotReady; break; }"),
+                 pGate = at(imp, "if (gate != kOk) { rc = (IOReturn)gate; break; }"), pRec = at(imp, "s->bo[h] = b;"), pUnl = at(imp, "IOLockUnlock(gCliLock);"), pTaken = at(imp, "if (!taken) {");
     expect(pSeq != std::string::npos && pChk != std::string::npos, "C: the entry read and the under-lock check exist");
     expect(pSeq < pHello && pHello < pWith, "C: the sequence is read before the Hello check and before any descriptor is created");
     expect(pLock < pChk && pChk < pGate && pGate < pRec && pRec < pUnl, "C: under the lock, after the closed-while-waiting check and BEFORE the gate, the cap, the map and the record");
-    expect(pChk > at(imp, "if (!sess_hello()) { rc = kIOReturnNotReady; break; }") && pUnl < pTaken, "C: the refusal is inside the locked block, and the !taken cleanup that completes and releases follows it");
-    expect_u("C: the sequence word is read exactly twice (entry, under the lock)", count_of(imp, "gSessSeq"), 2);
+    expect(pChk > at(imp, "if (s == nullptr || !s->hello) { rc = kIOReturnNotReady; break; }") && pUnl < pTaken, "C: the refusal is inside the locked block, and the !taken cleanup that completes and releases follows it");
+    expect_u("C: the session id fixed at entry is compared exactly once, under the lock (0.0.627: the client's own reference)", count_of(imp, "session_unchanged(seq0, s->id)"), 1);
     // A: after collect_pages, before the lock
     const size_t pCol = at(imp, "collect_pages(seg, size, pages, kImportMaxPages)"), pRef = at(imp, "import_first_refused(pages, pre.pages,"), pMsg = at(imp, "import refused: device page");
     expect(pCol != std::string::npos && pRef != std::string::npos && pMsg != std::string::npos && pCol < pRef && pRef < pMsg && pMsg < pLock, "A: the device-page refusal follows collect_pages and precedes the client lock");
@@ -528,16 +541,16 @@ static void h5_pins2(const std::string &root) {
     }
     expect(hook.find("uint64_t hw_hook_ramtop_derived_or_zero() { return (gRamTopDone != 0u && gRamTopRes.reason == N48_RT_OK) ? gRamTopDerived : 0ull; }") != std::string::npos, "A: the accessor returns the derived top only when the map was read cleanly, else 0");
     // D: bo_release Normal
-    const std::string rel = fn_body(eng, "static void bo_release(uint32_t h, RelMode mode) {");
+    const std::string rel = fn_body(eng, "static void bo_release(Session *s, uint32_t h, RelMode mode) {");
     {
         const size_t nrm = at(rel, "} else if (mode == kRelNormal) {"), lk = at(rel, "} else {\n        // Leak:");
         expect(nrm != std::string::npos && lk != std::string::npos, "D: bo_release branches are found");
         const std::string normal = rel.substr(nrm, lk - nrm);
         expect(normal.find("bool memOk = true;") != std::string::npos, "D: a memOk flag starts true");
-        expect(normal.find("memOk = memory_may_free_after_flush(flush_vmid(kNativeVmid)) && memOk;") != std::string::npos && normal.find("memOk = memory_may_free_after_flush(flush_vmid(0)) && memOk;") != std::string::npos, "D: both flushes (the VMID-8 TLB after the unmap, the GART TLB after a fence slot) feed memOk");
-        expect(normal.find("else if (b.kind == kBoHost && host_may_release(kHostRelNormal) && memOk) host_release(b);") != std::string::npos, "D: the host pages are completed and released only when memOk");
-        expect(normal.find("if (b.kind == kBoGtt) { if (memOk) sysmem_free(b.sm); }") != std::string::npos, "D: the GTT pages are freed only when memOk");
-        expect(at(normal, "memOk = memory_may_free_after_flush(flush_vmid(kNativeVmid))") < at(normal, "host_release(b)") && at(normal, "memOk = memory_may_free_after_flush(flush_vmid(0))") < at(normal, "host_release(b)"), "D: the flush verdicts are taken BEFORE the memory is released");
+        expect(normal.find("memOk = memory_may_free_after_flush(flush_vmid(s->vmid)) && memOk;") != std::string::npos && normal.find("memOk = memory_may_free_after_flush(flush_vmid(0)) && memOk;") != std::string::npos, "D: both flushes (the VMID-8 TLB after the unmap, the GART TLB after a fence slot) feed memOk");
+        expect(normal.find("else if (b.kind == kBoHost && host_may_release(kHostRelNormal) && memOk) { host_release(b); sys_release(b); }") != std::string::npos, "D: the host pages are completed and released only when memOk");
+        expect(normal.find("if (b.kind == kBoGtt) { if (memOk) { sysmem_free(b.sm); sys_release(b); } }") != std::string::npos, "D: the GTT pages are freed only when memOk");
+        expect(at(normal, "memOk = memory_may_free_after_flush(flush_vmid(s->vmid))") < at(normal, "host_release(b)") && at(normal, "memOk = memory_may_free_after_flush(flush_vmid(0))") < at(normal, "host_release(b)"), "D: the flush verdicts are taken BEFORE the memory is released");
         expect(normal.find("(void)flush_vmid") == std::string::npos, "D: no flush result is ignored in the Normal branch");
     }
 }

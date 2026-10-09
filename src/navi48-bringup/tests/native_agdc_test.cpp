@@ -1,4 +1,4 @@
-// native_agdc_test.cpp - build 0.0.614 (#11 step 11h.3, notes/design/NATIVE-S4-M11H.md section 2 row 2 and section 3.5): the NATIVE AGDC service (`pipeagdc`, accel action 88).
+// native_agdc_test.cpp - build 0.0.614 (#11 step 11h.3, an internal design note section 2 row 2 and section 3.5): the NATIVE AGDC service (`pipeagdc`, accel action 88).
 //   clang++ -std=c++17 -Wall -Wextra -Werror -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -I src/navi48-bringup/src -I src/navi48-bringup/src/amd \
 //       src/navi48-bringup/tests/native_agdc_test.cpp -o /tmp/native_agdc && /tmp/native_agdc .
 //   (run from the tree root; the argument is that root, for the source pins. tests/native_agdc_plant.sh plants breaks in the real headers and glue and demands a failure.)
@@ -72,7 +72,7 @@ int main(int argc, char **argv) {
     // The two anchors, pinned to the LITERAL numbers of the extracted kexts' symbol tables (nm: AppleGraphicsDeviceControl gMetaClass, IOAcceleratorFamily2 IOAccelDisplayPipe::gMetaClass).
     expect_u("the AGDC metaclass static", kAgdcMeta, 0x13d418e8ull);
     expect_u("the IOAccelDisplayPipe metaclass static", kPipeMeta, 0x146036d8ull);
-    expect(kActAgdc == 88u && n48disp::kActAgdc == 88u && kActAgdc == n48disp::kActAgdc && n48disp::kLastAction == 90u && n48disp::kActVbl == 89u && n48disp::kActReload == 90u, "the verb is action 88 in both headers; 90 (pipereload, 0.0.619) is the last admitted action");
+    expect(kActAgdc == 88u && n48disp::kActAgdc == 88u && kActAgdc == n48disp::kActAgdc && n48disp::kLastAction == 99u && n48disp::kActVbl == 89u && n48disp::kActReload == 90u, "the verb is action 88 in both headers; 99 (scdcread, 0.0.633; disp2 is 98) is the last admitted action");
 
     { const SlideOut s = slide_decide(AMC, PMC);
       expect(s.status == kPublished && s.slide == SLIDE, "two agreeing anchors give the slide"); }
@@ -275,7 +275,7 @@ int main(int argc, char **argv) {
         // the action-88 branch sits AFTER the generic exemption / bound (it inherits both) and before fbname's
         const size_t ex = brg.find("n48disp::native_exempt(n48disp_latched_on(), action, argScalar)"), ab = brg.find("if (action == 88) {"), fb = brg.find("if (action == 78) {");
         expect(ex != std::string::npos && ab != std::string::npos && fb != std::string::npos && ex < ab && ab < fb, "the exemption comes first; the action-88 branch sits before fbname's");
-        expect(brg.find("if (action == 83 || action == 84 || action == 85 || action == 86 || action == 87 || action == 89 || action == 90) {") != std::string::npos, "actions 83..87, 89 and 90 (0.0.619) go to n48disp_verb, and 88 is not among them");
+        expect(brg.find("if (action == 83 || action == 84 || action == 85 || action == 86 || action == 87 || action == 89 || action == 90 || action == n48disp::kActM6Stat) {") != std::string::npos, "actions 83..87, 89, 90 and (0.0.659) 106 go to n48disp_verb, and 88 is not among them");
     }
     if (!dglue.empty()) expect(dglue.find("!n48disp::is_pipe_verb(action)") != std::string::npos && dglue.find("!n48disp::is_new_action(action)") == std::string::npos, "n48disp_verb answers only the five pipe verbs");
     if (!ucl.empty()) expect(ucl.find("if (action > 82 && !n48disp::action_admitted(n48disp_latched_on(), action)) return kIOReturnBadArgument;") != std::string::npos, "the user client bound is the latched one (88 is admitted through it)");

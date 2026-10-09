@@ -1,5 +1,5 @@
 //
-//  native_metal_pure.h - the pure half of the Metal nub and its ops table (kext 0.0.610, milestone #9 route A; notes/design/NATIVE-S3.md sections 1 and 3 + the
+//  native_metal_pure.h - the pure half of the Metal nub and its ops table (kext 0.0.610, milestone #9 route A; an internal design note sections 1 and 3 + the
 //  review MUST-FIX 1, 2, 5, 6). No IOKit, no kernel: tests/native_metal_test.cpp compiles this very file and drives it, with planted breaks.
 //
 //  What lives here (and NOT in the aux kext, which every rebuild of requires a security approval (Allow click) from the user): the publish / withdraw verdicts, the nub state machine,
@@ -33,6 +33,8 @@ struct GateIn {
     bool     s1bPositive;  // ... and reported POSITIVE PASS
     bool     s1bStopped;   // a latched stop fired
     bool     hung;         // the GPU was declared HUNG this boot
+    bool     dispNub;      // 0.0.652 (M5): a Navi48DisplayNub is published (fbpublish 2): the Metal nub (and with it the display pipe's accelerator) must not appear on this boot
+    bool     m6 = false;   // 0.0.659 (M6 Stage 1a, R3): boot-arg navi48-m6 == 1 (latched): the display-nub interlock is lifted (the routing guard replaces it)
 };
 // The verdict order is part of the contract: cheapest / most specific first, the state last.
 inline uint32_t publish_verdict(const GateIn &g, State st) {
@@ -41,6 +43,7 @@ inline uint32_t publish_verdict(const GateIn &g, State st) {
     if (!g.bootarg) return kUnsupported;                    // navi48-metal absent / 0: the feature does not exist on this boot
     if (!g.s1bGateOn || !g.s1bRan || !g.s1bPositive || g.s1bStopped) return kNotReady;
     if (g.hung) return kNotReady;
+    if (g.dispNub && !g.m6) return kExclusive;                       // 0.0.652 (M5) INTERLOCK: the monitor B framebuffer and the accelerator's display machine never coexist (see native_disp_pure.h fb_interlock_refuses)
     if (st == kPublished) return kExclusive;
     if (st == kTerminating) return kBusy;
     return kOk;
@@ -195,6 +198,14 @@ constexpr bool ready_sticky_after(bool stickyNo, bool hangEvent) { return sticky
 
 // ---- the ops table's identity ----------------------------------------------------------------------------------------------------------------------------
 constexpr uint32_t kOpsFlags = N48_METAL_F_SOFTWARE_ONLY;
-constexpr uint64_t kOpsCaps = N48_CAP_VHOOK;
+constexpr uint64_t kOpsCaps = N48_CAP_VHOOK | N48_CAP_NATIVE_OPEN;   // 0.0.656 (G6): + native_open (ABI 3)
+
+// ---- native_open (ops ABI 3, 0.0.656, G6): the aux accelerator's newUserClient hands an 'N48N' open here -----------------------------------------------------------------
+// The answer is an IOReturn (kOk = 0 = "a client is being returned"); it is NEVER a bool. The checks, in order: the type is 'N48N' (anything else is Unsupported: the aux kext only calls us for it); a live device whose context
+// is the ctx the aux kext passed (identity, magic); `accel` is the accelerator that device was opened for (the pointer device_open received: nobody else is a valid provider); a nub is published (the owner is its provider).
+// Only then does the caller build the client. A refusal never touches *handler.
+constexpr uint32_t native_open_verdict(bool typeIsN48N, bool deviceLive, bool accelIsRegistered, bool nubPublished) {
+    return !typeIsN48N ? kUnsupported : !deviceLive ? kNotReady : !accelIsRegistered ? kBadArg : !nubPublished ? kNotReady : kOk;
+}
 
 } // namespace n48metal

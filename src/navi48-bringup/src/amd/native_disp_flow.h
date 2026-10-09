@@ -24,6 +24,11 @@
 //    slot 62:  void note_res62(const Res62Plan &p, bool smKnown, bool surfKnown, bool flagsKnown, bool bit4);
 //    0.0.616:  MdCache &mdc();  bool md_prepare(uint64_t md) /* retain + prepare(kIODirectionOut); true = prepared and held */;  void md_unprepare(uint64_t md) /* complete + release */;
 //              bool hung();  void note_md(uint32_t ev, uint64_t md, uint64_t detail);
+//    0.0.659 (M6 Stage 1a, behind the navi48-m6 latch):  bool m6_on() /* the latch, read ONCE */;  uint32_t pipe_inst(uint64_t pipe) /* pipe+0x98 -> instance (n48m6::kInst*), kInstNone when unknown */;
+//              n48m6::Look m6_lookup(uint32_t id);  uint32_t m6_learn(uint32_t id, uint32_t inst) /* table + the published property */;  void m6_note_submit(uint32_t inst);  void m6_note_learn_skip(uint32_t why);
+//              0.0.661: bool m6flip_on() /* navi48-m6flip (latched) */;
+//              0.0.660: void m6_reset() /* empty + republish the table (restart window, every arm) */;  void m6_touch(uint32_t id) /* a routed present saw this ID */;
+//              void m6_note_route(uint32_t verdict, uint32_t pipeInst);  void m6_note_nocopy(uint32_t pipeInst);  void m6_note_stamp(uint32_t inst, uint32_t verdict, uint64_t periodNs);  bool vbl_sample_inst(uint32_t inst, VblSample *s) /* that instance's OWN OTG */;
 //
 #pragma once
 #include "native_disp_pure.h"
@@ -48,34 +53,58 @@ inline bool guard_on_init_fb(CrashGuard &g, uint64_t nowNs) {             // tru
 
 // ---- 0.0.619 (R1): the operator restart window (the decisions are native_disp_pure.h reload_*) ---------------------------------------------------------------------------------
 // Atomics only (the close and slot-267 hooks take no lock). openNs = the uptime stamp of the verb; open = the window is open (cleared by the first of: the new client's first slot 267 with the pipe still
-// armed, expiry, a disarm of any kind); closeSeen = a uid-88 close was tolerated inside it (only then can a slot 267 close the window: the OLD WindowServer's own slot-267 calls do not).
-struct ReloadWin { uint64_t openNs; uint32_t open; uint32_t closeSeen; uint64_t opens, tolerated, closed267, expired; };
+// armed, expiry, a disarm of any kind); closeSeen = a uid-88 close was tolerated inside it (only then does a slot 267 count towards closing the window: the OLD WindowServer's own slot-267 calls do not).
+// 0.0.621: seen267 = the new client's slot 267 was seen after a tolerated close; lastTolNs = the stamp of the LAST tolerated close. The window closes (reload_settled) when closeSeen && seen267 and kReloadSettleNs
+// have passed since lastTolNs, evaluated at the next event (a close, a slot 267, the verb's look) or at the 15 s expiry. lastTolNs is stored BEFORE closeSeen so no reader sees closeSeen with a stale stamp.
+struct ReloadWin { uint64_t openNs; uint32_t open; uint32_t closeSeen; uint32_t seen267; uint32_t pad; uint64_t lastTolNs; uint64_t opens, tolerated, closed267, expired; };
 inline void reload_shut(ReloadWin &w) {                                   // silent: the pipe was disarmed (any cause) or withdrawn, so a window has nothing left to tolerate
     __atomic_store_n(&w.open, 0u, __ATOMIC_RELEASE);
     __atomic_store_n(&w.closeSeen, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&w.seen267, 0u, __ATOMIC_RELEASE);
+}
+// 0.0.621: close the window because the new client was seen and the settle time has passed (once; logged as the 267 closure). Returns true when this call closed it.
+template <class E> bool reload_close_settled(E &e) {
+    ReloadWin &w = e.rw();
+    uint32_t exp = 1u;
+    if (!__atomic_compare_exchange_n(&w.open, &exp, 0u, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return false;
+    __atomic_store_n(&w.closeSeen, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&w.seen267, 0u, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&w.closed267, 1ull, __ATOMIC_RELAXED);
+    e.note_reload(kRwClosed267);
+    return true;
 }
 // True only when the window is open, inside its 15 s, and the GPU is not HUNG. An expired window is closed (and logged) by whoever sees it first.
 template <class E> bool reload_honoured_now(E &e) {
     ReloadWin &w = e.rw();
     if (__atomic_load_n(&w.open, __ATOMIC_ACQUIRE) == 0u) return false;
     const uint64_t on = __atomic_load_n(&w.openNs, __ATOMIC_ACQUIRE);
-    if (!reload_live(1u, on, e.now_ns())) {
+    const uint64_t now = e.now_ns();
+    if (!reload_live(1u, on, now)) {
         uint32_t exp = 1u;
         if (__atomic_compare_exchange_n(&w.open, &exp, 0u, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
             __atomic_store_n(&w.closeSeen, 0u, __ATOMIC_RELEASE);
+            __atomic_store_n(&w.seen267, 0u, __ATOMIC_RELEASE);
             __atomic_add_fetch(&w.expired, 1ull, __ATOMIC_RELAXED);
             e.note_reload(kRwExpired);
         }
+        return false;
+    }
+    if (reload_settled(__atomic_load_n(&w.closeSeen, __ATOMIC_ACQUIRE) != 0u, __atomic_load_n(&w.seen267, __ATOMIC_ACQUIRE) != 0u, __atomic_load_n(&w.lastTolNs, __ATOMIC_ACQUIRE), now)) {
+        (void)reload_close_settled(e);                                       // 0.0.621: the new client was seen and the old one has been quiet for kReloadSettleNs: the window is over, this event is NOT protected
         return false;
     }
     return reload_honoured(true, e.hung());
 }
 // The verb: open a fresh one-shot window (a second call restarts the 15 s).
 template <class E> void reload_open_flow(E &e) {
+    if (e.m6_on() && !e.m6flip_on()) e.m6_reset();                          // 0.0.660 (M6, S1): the table is emptied (and republished) when the window OPENS. 0.0.661 (R1) with navi48-m6flip: NOT here - the old WindowServer is still submitting and would refill it; the reset moves to the new start's first slot-267 (reload_on_init_fb). The latch OFF never reaches it
     ReloadWin &w = e.rw();
     __atomic_store_n(&w.open, 0u, __ATOMIC_RELEASE);
     __atomic_store_n(&w.closeSeen, 0u, __ATOMIC_RELEASE);
-    __atomic_store_n(&w.openNs, e.now_ns(), __ATOMIC_RELEASE);
+    __atomic_store_n(&w.seen267, 0u, __ATOMIC_RELEASE);
+    const uint64_t now = e.now_ns();
+    __atomic_store_n(&w.lastTolNs, now, __ATOMIC_RELEASE);
+    __atomic_store_n(&w.openNs, now, __ATOMIC_RELEASE);
     __atomic_store_n(&w.open, 1u, __ATOMIC_RELEASE);
     __atomic_add_fetch(&w.opens, 1ull, __ATOMIC_RELAXED);
     e.note_reload(kRwOpened);
@@ -85,9 +114,10 @@ template <class E> uint32_t reload_state_flow(E &e, uint64_t *remainingNs) {
     ReloadWin &w = e.rw();
     *remainingNs = 0ull;
     if (__atomic_load_n(&w.open, __ATOMIC_ACQUIRE) == 0u) return 0u;
+    (void)reload_honoured_now(e);                                            // the same expiry AND settle path as the hooks (0.0.621: a settled window is closed by a look too)
+    if (__atomic_load_n(&w.open, __ATOMIC_ACQUIRE) == 0u) return 0u;
     const uint64_t on = __atomic_load_n(&w.openNs, __ATOMIC_ACQUIRE), now = e.now_ns();
-    const bool live = reload_live(1u, on, now);
-    if (!live) { (void)reload_honoured_now(e); return 0u; }                  // the same expiry path as the hooks
+    if (!reload_live(1u, on, now)) return 0u;
     *remainingNs = kReloadWindowNs - (now - on);
     return reload_state(true, __atomic_load_n(&w.closeSeen, __ATOMIC_ACQUIRE) != 0u);
 }
@@ -95,22 +125,21 @@ template <class E> uint32_t reload_state_flow(E &e, uint64_t *remainingNs) {
 template <class E> bool reload_tolerate_close(E &e) {
     if (!reload_honoured_now(e)) return false;
     ReloadWin &w = e.rw();
+    __atomic_store_n(&w.lastTolNs, e.now_ns(), __ATOMIC_RELEASE);            // 0.0.621: EVERY close inside the window is tolerated and restarts the settle time (the stamp goes first)
     __atomic_store_n(&w.closeSeen, 1u, __ATOMIC_RELEASE);
     __atomic_add_fetch(&w.tolerated, 1ull, __ATOMIC_RELAXED);
     e.note_reload(kRwTolerated);
     return true;
 }
-// K3 side: a slot-267 call while armed. true = inside the window, NOT counted by the guard. The first one after a tolerated close closes the window (the pipe is armed: the caller checked).
+// K3 side: a slot-267 call while armed. true = inside the window, NOT counted by the guard. The first one after a tolerated close is the new client's: it is remembered (seen267) and, once kReloadSettleNs have
+// passed since the last tolerated close, closes the window (0.0.621; the pipe is armed: the caller checked). A 267 that finds the window already settled (reload_honoured_now) closes it and IS counted.
 template <class E> bool reload_on_init_fb(E &e) {
     if (!reload_honoured_now(e)) return false;
     ReloadWin &w = e.rw();
     if (__atomic_load_n(&w.closeSeen, __ATOMIC_ACQUIRE) != 0u) {
-        uint32_t exp = 1u;
-        if (__atomic_compare_exchange_n(&w.open, &exp, 0u, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            __atomic_store_n(&w.closeSeen, 0u, __ATOMIC_RELEASE);
-            __atomic_add_fetch(&w.closed267, 1ull, __ATOMIC_RELAXED);
-            e.note_reload(kRwClosed267);
-        }
+        if (__atomic_load_n(&w.seen267, __ATOMIC_ACQUIRE) == 0u && e.m6_on() && e.m6flip_on()) e.m6_reset();   // 0.0.661 (R1): the FIRST slot-267 of the new WindowServer start (the old one closed): its surfaces are allocated afresh, and IOSurface IDs are reused lowest-free, so nothing the old start learned may survive into this one
+        __atomic_store_n(&w.seen267, 1u, __ATOMIC_RELEASE);
+        if (reload_settled(true, true, __atomic_load_n(&w.lastTolNs, __ATOMIC_ACQUIRE), e.now_ns())) (void)reload_close_settled(e);
     }
     return true;
 }
@@ -237,15 +266,57 @@ template <class E> void withdraw_flow(E &e) {
 
 struct SourceLog { uint64_t sw, sh, sbpr, base, unk88, smLen; uint32_t bpe, fmt, planes; uint16_t rw, rh; uint64_t rbpr; uint8_t elemW; };
 
+// ---- 0.0.659 (M6 Stage 1a): the surface table and the routing guard (decisions: native_m6_pure.h) -------------------------------------------------------------------------------------
+// The surface ID of plane 0's IOSurface, read behind a class check (IOSurface+0x10). false = not an IOSurface / unreadable / zero.
+template <class E> bool m6_surface_id(E &e, uint64_t surf, uint32_t *id) {
+    *id = 0u;
+    return kptr_ok(surf) && e.class_derives(surf, n48m6::kSurfClass) && e.rd32(surf + n48m6::kSurfId, id) && *id != 0u;
+}
+// THE GUARD: may a present of `surf` on the pipe of instance `pipeInst` go ahead? Anything but kRouteOk is a refusal (counted by reason). Used by perform for the DP's pipe.
+template <class E> uint32_t m6_route_flow(E &e, uint64_t surf, uint32_t pipeInst) {
+    uint32_t id = 0u;
+    const bool haveId = m6_surface_id(e, surf, &id);
+    const n48m6::Look l = haveId ? e.m6_lookup(id) : n48m6::Look { false, false, n48m6::kInstNone };
+    const uint32_t v = n48m6::route_verdict(l, haveId, pipeInst);
+    e.m6_note_route(v, pipeInst);
+    if (v == n48m6::kRouteOk) e.m6_touch(id);                                // 0.0.660 (S1): a routed present is a sighting: the entry's last-seen moves (LRU eviction and staleness read it)
+    return v;
+}
+// The learn, run from the SUBMIT hook (thread context): the transaction's own pipe (txn+0x28) must be the hooked pipe, plane 0's IOSurface must pass its class check, and its ID is recorded against the
+// pipe's instance. Reads only; the table (and the registry property the bundle reads) is the only thing written.
+template <class E> uint32_t m6_learn_flow(E &e, uint64_t pipe, uint64_t txn, uint32_t inst) {
+    e.m6_note_submit(inst);
+    uint64_t tp = 0, surf = 0, res = 0;
+    if (!kptr_ok(txn) || !e.rd64(txn + n48m6::kTxnPipe, &tp)) { e.m6_note_learn_skip(n48m6::kSkTxn); return n48m6::kLBadId; }
+    if (tp != pipe) { e.m6_note_learn_skip(n48m6::kSkPipeMismatch); return n48m6::kLBadId; }     // the transaction names another pipe than the one hooked: nothing is learned from it
+    if (plane0_locate(e, txn, &surf, &res) != 0u) { e.m6_note_learn_skip(n48m6::kSkPlane); return n48m6::kLBadId; }
+    uint32_t id = 0u;
+    if (!kptr_ok(surf) || !e.class_derives(surf, n48m6::kSurfClass)) { e.m6_note_learn_skip(n48m6::kSkClass); return n48m6::kLBadId; }
+    if (!e.rd32(surf + n48m6::kSurfId, &id)) { e.m6_note_learn_skip(n48m6::kSkIdRead); return n48m6::kLBadId; }
+    return e.m6_learn(id, inst);
+}
+
 // ---- the v1 present: a CPU copy of plane 0 into the console buffer ---------------------------------------------------------------------------------------------
 // Returns the reason (kPfCopied = the whole frame went). Never throws the copy past any bound: every byte written was admitted by bounds_check before the first write.
-template <class E> uint32_t perform_inner(E &e, uint64_t txn, uint64_t *bytesOut) {
+// 0.0.659 (M6): `pipe` is the hooked pipe. With the navi48-m6 latch ON a pipe on instance 1 / 2 (or on no known framebuffer) completes WITHOUT any copy, and the DP's pipe copies only a surface the table maps to instance 0.
+template <class E> uint32_t perform_inner(E &e, uint64_t txn, uint64_t *bytesOut, uint64_t pipe = 0ull) {
     *bytesOut = 0ull;
     if (!e.armed()) return kPfDisarmed;                                      // disarmed: complete the transaction (the caller returns success), copy nothing
+    const bool m6 = e.m6_on();
+    uint32_t pinst = n48m6::kInstDp;
+    if (m6) {
+        pinst = e.pipe_inst(pipe);
+        if (!n48m6::pipe_may_copy(pinst)) {
+            if (pinst == n48m6::kInstNone) { e.m6_note_route(n48m6::kRouteBadPipe, pinst); return kPfRouteRefused; }     // a pipe on no known framebuffer: the guard's refusal
+            e.m6_note_nocopy(pinst);                                          // a pipe on the monitor A / the monitor B: completed, nothing read, nothing copied
+            return kPfOtherInst;
+        }
+    }
     if (e.scan_active()) return kPfScanOwned;                                // 0.0.617 (K6): the scanout plane is a native client's: before any source read or descriptor use; the copy resumes by itself when the acquisition ends
     uint64_t surf = 0, res = 0;
     const uint32_t lr = plane0_locate(e, txn, &surf, &res);                  // 0.0.616: the accessor submit shares
     if (lr != 0u) return lr;
+    if (m6 && m6_route_flow(e, surf, pinst) != n48m6::kRouteOk) return kPfRouteRefused;     // 0.0.659: the routing guard, before any source read
     SourceLog s {};
     uint8_t bpe8 = 0; uint16_t bpe16 = 0;
     if (!e.rd64(surf + kSurfW, &s.sw) || !e.rd64(surf + kSurfH, &s.sh) || !e.rd64(surf + kSurfBpr, &s.sbpr) || !e.rd16(surf + kSurfBpe, &bpe16) ||
@@ -288,26 +359,33 @@ template <class E> uint32_t perform_inner(E &e, uint64_t txn, uint64_t *bytesOut
 struct VblSample { uint64_t periodNs, delayNs, nowAbs; uint32_t numer, denom; };
 // Writes txn+0x178 = the next vblank (mach_absolute_time units) and txn+0x188 = that + one period, the two words Apple's executeTransaction fills before completion. Every refusal is a named reason and
 // writes NOTHING; the two words are only ever written together, after the identity check, from a plan whose period is nonzero.
-template <class E> uint32_t vbl_stamp_flow(E &e, uint64_t txn, uint32_t performReason) {
+template <class E> uint32_t vbl_stamp_flow(E &e, uint64_t txn, uint32_t performReason, uint64_t pipe = 0ull) {
     if (!e.vbl_on()) return kVblOff;
     if (performReason == kPfDisarmed) return kVblDisarmed;                   // a disarmed pipe copies nothing and nobody listens
     if (!kptr_ok(txn)) return kVblBadTxn;
     if (!e.class_derives(txn, kTxnClass)) return kVblNotTxn;
     if (e.hung()) return kVblHung;                                           // the HUNG latch: no register is read
     VblSample s {};
-    if (!e.vbl_sample(&s)) return kVblNoTiming;
+    uint32_t vi = n48m6::kInstDp;                                            // 0.0.659 (M6): a pipe's stamps come from THAT pipe's own OTG; with the latch OFF always the DP's, the 0.0.658 sample
+    if (e.m6_on()) vi = e.pipe_inst(pipe);
+    if (vi == n48m6::kInstNone) return kVblNoTiming;
+    if (!(vi == n48m6::kInstDp ? e.vbl_sample(&s) : e.vbl_sample_inst(vi, &s))) return kVblNoTiming;
     const VblPlan p = vbl_plan(s.nowAbs, s.delayNs, s.periodNs, s.numer, s.denom);
     if (!p.ok) return kVblBadMath;
     if (!e.wr64(txn + kTxnVblTime, p.t) || !e.wr64(txn + kTxnVblNext, p.next)) return kVblWriteFail;
     e.note_vbl(kVblWrote, p, s.periodNs, s.delayNs);
+    if (e.m6_on()) e.m6_note_stamp(vi, kVblWrote, s.periodNs);               // 0.0.659 (M6): the stamps are counted per OTG-owning instance
     return kVblWrote;
 }
-template <class E> uint32_t perform_flow(E &e, uint64_t txn) {
+template <class E> uint32_t perform_flow(E &e, uint64_t txn, uint64_t pipe = 0ull) {
     const uint64_t t0 = e.now_ns();
     uint64_t bytes = 0;
-    const uint32_t r = perform_inner(e, txn, &bytes);
-    const uint32_t v = vbl_stamp_flow(e, txn, r);                            // 0.0.618 (V1): AFTER the copy and BEFORE the return, whatever perform_inner decided (scan-owned or copied): the family completes the transaction when we return
-    if (v != kVblWrote) e.note_vbl(v, VblPlan{}, 0ull, 0ull);
+    const uint32_t r = perform_inner(e, txn, &bytes, pipe);
+    const uint32_t v = vbl_stamp_flow(e, txn, r, pipe);                            // 0.0.618 (V1): AFTER the copy and BEFORE the return, whatever perform_inner decided (scan-owned or copied): the family completes the transaction when we return
+    if (v != kVblWrote) {
+        e.note_vbl(v, VblPlan{}, 0ull, 0ull);
+        if (e.m6_on()) e.m6_note_stamp(e.pipe_inst(pipe), v, 0ull);          // 0.0.659 (M6): a refused stamp is counted against that pipe's instance
+    }
     e.note_perform(r, bytes, e.now_ns() - t0);
     return r;
 }
@@ -324,8 +402,8 @@ template <class E> bool auto_disarm_flow(E &e, uint32_t cause) {
     e.note_autodisarm(cause);
     return true;
 }
-template <class E> bool ws_client_closed_flow(E &e, bool adminClient) {   // K1
-    if (!ws_close_disarms(e.latch_on(), adminClient)) return false;
+template <class E> bool ws_client_closed_flow(E &e, bool closingIsWsSession) {   // K1 (0.0.627: keyed on the closing session being WindowServer's)
+    if (!ws_close_disarms(e.latch_on(), closingIsWsSession)) return false;
     if (e.armed() && reload_tolerate_close(e)) return false;                 // 0.0.619 (R1): an announced operator restart (`pipereload`): the pipe stays armed; the window decides, K2 (HUNG) is never overridden
     return auto_disarm_flow(e, kAdWsClose);
 }
@@ -343,7 +421,10 @@ template <class E> int init_fb_flow(E &e, uint64_t pipe, uint64_t res, uint64_t 
     if (!e.wr8(pipe + kPipeActive, 1u)) return 0;                            // ... and the pipe is marked active only after it (the family sets this only when prepare() is true, which it is not)
     e.note_init_fb(pipe, res);
     *ret = (uint64_t)(uintptr_t)obj;
-    if (e.armed() && !reload_on_init_fb(e) && guard_on_init_fb(e.guard(), e.now_ns())) { e.disarm(); mdc_teardown(e); reload_shut(e.rw()); e.note_autodisarm(kAdGuard); }   // 0.0.619 (R1): inside an operator restart window the call is not counted   // 0.0.615 (G1), 0.0.617 (K3): three starts inside 120 s, presented or not
+    // 0.0.659 (M6): the restart-loop guard counts WindowServer STARTS, which call slot 267 once per display pipe. With the latch ON only the DP's pipe is counted (a start with three pipes is still one start); OFF there is one pipe and this is 0.0.658's line.
+    const bool m6 = e.m6_on();
+    const bool counted = n48m6::restart_guard_counts(m6, m6 ? e.pipe_inst(pipe) : n48m6::kInstDp);     // 0.0.660 (S5): fail CLOSED - only a pipe KNOWN to be the monitor A's or the monitor B's is exempt; an unplaceable pipe is counted
+    if (counted && e.armed() && !reload_on_init_fb(e) && guard_on_init_fb(e.guard(), e.now_ns())) { e.disarm(); mdc_teardown(e); reload_shut(e.rw()); e.note_autodisarm(kAdGuard); }   // 0.0.619 (R1): inside an operator restart window the call is not counted   // 0.0.615 (G1), 0.0.617 (K3): three starts inside 120 s, presented or not
     return 1;
 }
 
@@ -359,7 +440,7 @@ template <class E> int hook_dispatch(E &e, uint32_t cls, uint32_t slot, uint64_t
     case 277u:                                                               // performTransaction
         if (nargs != 1u || !e.known_pipe(self)) return 0;
         guard_on_perform(e.guard());                                         // 0.0.615 (G1): a perform has reached the pipe since the arm
-        (void)perform_flow(e, args[0]);
+        (void)perform_flow(e, args[0], self);
         *ret = 0ull;                                                         // always success: the ring slot retires whether or not a frame was copied
         return 1;
     case 278u:                                                               // isTransactionComplete
@@ -372,7 +453,11 @@ template <class E> int hook_dispatch(E &e, uint32_t cls, uint32_t slot, uint64_t
         uint32_t st = 0;
         const bool known = kptr_ok(args[0]) && e.rd32(args[0] + kTxnStatus, &st);
         *ret = submit_result(known, st);
-        if (*ret == kWillPerform) (void)submit_prepare(e, args[0]);          // 0.0.616: wire the plane-0 descriptor HERE (thread context), never in perform
+        if (*ret == kWillPerform) {
+            uint32_t inst = n48m6::kInstDp;
+            if (e.m6_on()) { inst = e.pipe_inst(self); (void)m6_learn_flow(e, self, args[0], inst); }     // 0.0.659 (M6): learn surface ID -> instance from the transaction (reads only)
+            if (inst == n48m6::kInstDp) (void)submit_prepare(e, args[0]);    // 0.0.616: wire the plane-0 descriptor HERE (thread context), never in perform. 0.0.659: only for the DP's pipe - a pipe on another instance never copies, so nothing is wired for it
+        }
         return 1;
     }
     default: return 0;
@@ -420,6 +505,7 @@ template <class E> uint32_t arm_flow(E &e, uint64_t arg) {
     if (arg == 0ull) { e.disarm(); mdc_teardown(e); reload_shut(e.rw()); return kOk; }                             // always allowed
     guard_reset(e.guard());                                                  // 0.0.615 (G1): the counter starts from zero at every arm (before the byte opens)
     ival_reset(e.ivl());                                                     // 0.0.617 (K6): the interval statistics start with the arm
+    if (e.m6_on()) e.m6_reset();                                             // 0.0.660 (M6, S1): every arm / re-arm starts from an empty surface table, BEFORE the byte opens the gate (a submit learned after it is kept)
     const bool ok = e.arm_write(1u);
     if (ok) e.clear_autodisarm();                                            // 0.0.617 (K4): an explicit arm 1 is the only thing that re-arms, and it clears the "auto-disarmed" mark
     return ok ? (uint32_t)kOk : (uint32_t)kWriteFailed;

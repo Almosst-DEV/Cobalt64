@@ -1,7 +1,7 @@
 From 9583cf0c80a4467ae013621ca592e55c3fd979a0 Mon Sep 17 00:00:00 2001
 From: Navi48-MacOS contributors <noreply@example.invalid>
 Date: Thu, 1 Jan 2026 00:00:00 +0000
-Subject: [PATCH 3/5] radv: Darwin scanout API on the N48N connection, ABI 1.1
+Subject: [PATCH 3/9] radv: Darwin scanout API on the N48N connection, ABI 1.1
  (Navi48 S2b)
 
 Header refreshed from the kext (0.0.603, ABI 1 minor 1; sha256 8f1399d7...).

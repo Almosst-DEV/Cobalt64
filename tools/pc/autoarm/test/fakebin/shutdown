@@ -1,0 +1,2 @@
+#!/bin/bash
+D=${FAKE_DIR:?}; echo "FAKE shutdown $*" >>"$D/cmds.log"

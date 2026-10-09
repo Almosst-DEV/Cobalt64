@@ -3,7 +3,7 @@
 //
 // WHY THIS IS A SEPARATE, DEPENDENCY-FREE HEADER.
 //
-// notes/M3-ROOT-WRITE-REVIEW.md.4 divides the guards sharply:
+// notes/an internal review note.4 divides the guards sharply:
 //
 //     G1-G3 fail SILENTLY and OFF-TARGET  (another process's GPU memory, no fault)
 //     G4-G6 fail LOUDLY and ON-TARGET     (a clean VM fault at an address we chose)

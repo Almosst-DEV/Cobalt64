@@ -15,6 +15,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+// ---- build 16 (app-fix round 1, P5) -------------------------------------------------------------------------------------------------
+// F2: the import cache is ON by default (one import per IOSurface instead of one per texture wrapper). The file /private/tmp/n48m-noimpcache is a KILL file (killedStat = it exists); the old presence
+// file /private/tmp/n48m-impcache is no longer read. n48ic_default_on is what Navi48Device.m's latch calls.
+static inline int n48ic_default_on(int killedStat) { return killedStat ? 0 : 1; }
+// F1: what a texture does when the import of its IOSurface is refused (out of the kernel's import budget, a bad range): NEVER return nil (SkyLight aborts on a nil texture: AbortWithTextureInfo).
+// 0 = imported, go on; 1 = fall back to the GPU-only image (the "baseless" path: the captured content is blank, the process stays up). Applies to every process that gets an import failure.
+#define N48F1_GO 0
+#define N48F1_FALLBACK 1
+static inline int n48f1_action(int vkResult) { return vkResult == 0 ? N48F1_GO : N48F1_FALLBACK; }
+// Test hook N48M_TEST_IMPORT_FAIL_EVERY=<n> (root + N48M_ALLOW=1 only): every n-th import attempt fails as if the kernel refused it. every == 0: never. *ctr counts attempts.
+static inline int n48f1_inject(unsigned every, unsigned long *ctr) { if (!every) return 0; return (++*ctr % every) == 0; }
+
 #define N48IC_IDLE_NS  2000000000ULL
 #define N48IC_CAP      (128ULL << 20)
 

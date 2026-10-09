@@ -109,7 +109,7 @@ static inline int n48_rp_retile(const uint32_t *src, uint32_t *dst, uint32_t w, 
 }
 
 /* ---- 1b. T450 = RESPROV PART 1: the census's other class-C (mode, bpp) pairs -------------------------------------------------
- * notes/design/MIB-A1-PROVENANCE.md Q3's "holes to fix first" 3 (256B_D needs its own re-tile), read together with hole 1's
+ * an internal design note Q3's "holes to fix first" 3 (256B_D needs its own re-tile), read together with hole 1's
  * fix above; item 1's census (notes/logs/runs/decide42/vmib-dumps/slot-table-A.txt, corrected by the reviewer:
  * P samples 0x400003000 (slot 10, gfx10 format 1, SW_MODE 2), 0x400032000 (slot 14, format 1, SW_MODE 2) and 0x40023c000
  * (slot 42, format 1, SW_MODE 22); AL samples 0x400025000 (slot 22, format 71, SW_MODE 22). xlat12_desc.h's
@@ -410,7 +410,7 @@ enum {
  * could land on the SAME (mode, VA) key with DIFFERENT element sizes, and the ask (n48_rp_ok/n48_rp_ok_carry) would
  * answer yes for either regardless of which one a LATER T# actually is. Compared at the ask against the T#'s own
  * declared element size (from its gfx10 format, xlat12_desc.h's xlat12_format_elem_bytes) - a mismatch refuses. */
-/* build 0.0.486 (switch 59, notes/design/STATIC-RETILE.md Q3/Q6): `lin`, `w`, `h` - 1 = this entry is a BACKING-SOURCED
+/* build 0.0.486 (switch 59, an internal design note Q3/Q6): `lin`, `w`, `h` - 1 = this entry is a BACKING-SOURCED
  * copy (section 6 below: mip 0 of a LINEAR system-memory backing written as gfx12 ADDR3_4KB_2D - since 0.0.492 in the gfx12
  * mode of its VRAM side, `mode` 1, 2 or 3, bytes = the gfx12 length), with the image's own width
  * and height. Such an entry answers ONLY the T#-aware ask n48_rp_ok_t, and only for a T# that matches it (n48_rp_lin_t_match);
@@ -856,7 +856,7 @@ static inline int n48_rp_pageout_refuse(uint32_t retiled4kbdx, uint32_t retiled2
     return (retiled4kbdx && m == N48_RP_G10_4KB_D_X) || (retiled256bd && m == N48_RP_G10_256B_D);
 }
 
-/* ---- 6. build 0.0.486 - THE BACKING-SOURCED COPY (switch 59, DEFAULT OFF; notes/design/STATIC-RETILE.md Q2-Q6) -----------
+/* ---- 6. build 0.0.486 - THE BACKING-SOURCED COPY (switch 59, DEFAULT OFF; an internal design note Q2-Q6) -----------
  * GENERALISED BY build 0.0.492: every VRAM-side mode the 41 run10f step-0 records show, the correct
  * format pairing, a STREAMED copy past N48_RP_MAX_BYTES, and priority over the gfx10 re-tiles. See "0.0.492" below.
  * WHY. The login screen's static textures (the user picture, 144x144 8_8_8_8; the name/clock mask, 209x41 8_UNORM; the

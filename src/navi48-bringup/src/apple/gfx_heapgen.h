@@ -82,7 +82,7 @@ static inline const char *n48_hg_reason_name(uint32_t r)
     return r < N48_HG_REASONS ? n[r] : "?";
 }
 
-// ---- build 0.0.533 (; notes/design/HG88.md): SWITCH 88's TYPES (the judge is further down) ------------
+// ---- build 0.0.533 (; an internal design note): SWITCH 88's TYPES (the judge is further down) ------------
 // The copier's side keeps a RECORD of every copy that bumped the generation: the generation it began at and the one it ended at
 // (0 = still writing), its VRAM range, its GPU VA range, the pid it was made for and whether it rewrote the SAME resource's SAME
 // VRAM range as that resource's previous copy (`in_place`). The frame's side maps every 4 KiB page of each program's window to
@@ -313,7 +313,7 @@ static inline int n48_hg_frame_poisoned(const n48_hg_state *s, const n48_hg_fram
     return 0;
 }
 
-// ---- build 0.0.533 (; notes/design/HG88.md): SWITCH 88, THE RANGE-PRECISE HEAP-GENERATION JUDGE ----------
+// ---- build 0.0.533 (; an internal design note): SWITCH 88, THE RANGE-PRECISE HEAP-GENERATION JUDGE ----------
 // RUN AE (run11q) and RUN AB2 (run11m) lost their start-up fill to `copy-in-progress` for a copy that could not touch the fill's
 // programs: AE's was SecurityAgent's heap (another VM, VRAM [0x12300000,0x12309000)), AB2's a WindowServer heap at VA 0x4011f0000
 // with neither program in it. The generation counter is GLOBAL, so today's judge refuses on ANY overlapping copy. Under 88
@@ -528,7 +528,7 @@ typedef struct {
     uint64_t sets, clr[N48_HG_PCLR_REASONS];
     uint64_t waits, wait_us_total, wait_us_max, timeouts, self_skips, not_bumping;
     uint64_t unpatched;        // build 0.0.511: copies that found a flag but were not fully patched: bumped at once, no wait
-    // build 0.0.532 (; notes/design/HW72M3.md): SWITCH 72 M3 (840). Appended; M1/M2 never read or write them
+    // build 0.0.532 (; an internal design note): SWITCH 72 M3 (840). Appended; M1/M2 never read or write them
     // except the two tests below (`m3` 0: one load each). PRE = the fields above; LIVE = the fields from `live` on.
     uint32_t m3;               // M3 in force (the verb, under gHgLock when it exists)
     uint32_t startup;          // latched at the judge: the pre-plane window (continuous arm, CONTINUOUS START not yet reached)

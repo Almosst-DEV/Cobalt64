@@ -54,7 +54,7 @@
 #define N48_GFX_DEP_H
 
 #include <stdint.h>
-/* 0.0.395 (notes/design/R5-REDESIGN.md v2): the R5′ predicate decodes a held-back frame's colour targets with the capture
+/* 0.0.395 (an internal design note v2): the R5′ predicate decodes a held-back frame's colour targets with the capture
  * scanner (fixed walk, under its own flag) and its hazard set is keyed by resolved physical page. Both are pure headers. */
 #include "gfx_capture_scan.h"
 #include "gfx_hazard.h"
@@ -97,7 +97,7 @@ enum {
      * only when `accel gfxneuter 28 | 1 << 8` is ON - so on a default build these two can never be returned. */
     N48_DEP_NEUTER_WRITESET,   /* R5: a neutered frame since the arm has no KNOWN write-set (or the ring lost one) */
     N48_DEP_CONSUMER_UNPROVEN, /* R1-R4: an input THIS consumer reads that no rule could prove */
-    /* 0.0.395 (notes/design/R5-REDESIGN.md v2 "R5′"): HOLD-BACK R5′'s BLIND BUCKET. A frame noted since the arm that is
+    /* 0.0.395 (an internal design note v2 "R5′"): HOLD-BACK R5′'s BLIND BUCKET. A frame noted since the arm that is
      * neither POSITIVELY `bounded` (outside the consumer's address space) nor POSITIVELY `readable` (every IB walked to
      * its declared length, targets and memory destinations recorded without truncation and resolved, and a DISPATCH
      * bounded by its compute V#) is BLIND, and blind > 0 REFUSES. APPENDED, never inserted: indices are printed. It is
@@ -154,13 +154,13 @@ typedef struct {
     uint64_t neuter_unknown_writeset;   /* R5's U: neutered frames since the arm whose write-set is not known */
     uint64_t consumer_inputs_unproven;  /* R1-R4: inputs of THIS consumer no rule could prove */
     uint64_t stale_overwrites;          /* INSTRUMENT: R1 surfaces a later neutered frame overwrote. NEVER a rung */
-    /* 0.0.395 (notes/design/R5-REDESIGN.md v2 "Switch and identity"): WHICH R5 ANSWER THE CHECK READS. `r5_mode` 1 means
+    /* 0.0.395 (an internal design note v2 "Switch and identity"): WHICH R5 ANSWER THE CHECK READS. `r5_mode` 1 means
      * the new switch (30) is ON and the R5′ rule's BLIND bucket, carried in `r5_blind`, is the answer; 0 means the
      * 0.0.394 rule, carried in `neuter_unknown_writeset`, is. Only the new switch moves this, and while it is 0 both new
      * fields are 0 and n48_dep_check below is byte for byte 0.0.394's. */
     uint32_t r5_mode;
     uint64_t r5_blind;                  /* R5′'s BLIND count; refuses under N48_DEP_NEUTER_UNREADABLE */
-    /* build 0.0.523 (notes/design/RING-NEUTER-FORGIVE.md rev 2 item 3, switch 77) — AN INSTRUMENT, never an input to
+    /* build 0.0.523 (an internal design note rev 2 item 3, switch 77) — AN INSTRUMENT, never an input to
      * any rung: how much of `ring_neuters` this fill SUBTRACTED because gfx_rnforgive.h's drain granted it. 0 on every fill
      * while 77 is OFF (the default), because the fill subtracts nothing without a positive, fitting, clause-0 grant. */
     uint64_t rn_forgiven;
@@ -563,7 +563,7 @@ static inline uint32_t n48_cp_scan_frame(const uint32_t *d, uint32_t n, n48_cp_f
 }
 
 /* =====================================================================================================================
- * 0.0.395 (notes/design/R5-REDESIGN.md v2, "R5′", "Capacity — (a)", "DISPATCH — the claim v1 got wrong", and )
+ * 0.0.395 (an internal design note v2, "R5′", "Capacity — (a)", "DISPATCH — the claim v1 got wrong", and )
  * — THE THREE BUCKETS, THE HAZARD PAGE SET, AND THE COMPUTE CLAUSE. Pure; host-tested by tests/gfx_dep_test.cpp.
  * =====================================================================================================================
  * WHAT R5′ ASKS. Every frame noted at the `action != N48_SD_ACT_TRANSLATE` site since the arm goes into exactly one of
@@ -1040,7 +1040,7 @@ typedef struct {
 } n48_cp_consumer;
 
 /* =====================================================================================================================
- * D4' (notes/design/D4-PRIME.md, notes/design/R1-MEMDST.md Q5) — A SEPARATE, WIDER CONSUMER, gated ENTIRELY by switch
+ * D4' (an internal design note, an internal design note Q5) — A SEPARATE, WIDER CONSUMER, gated ENTIRELY by switch
  * 40 (`gfxneuter 40 | M<<8`). n48_cp_consumer and every function above (n48_cp_eval, n48_cp_eval_hz,
  * n48_cp_build_input_free/n48_cp_eval_fill_hz) are UNTOUCHED by this section - same caps (N48_CP_IN_MAX/PTR_MAX),
  * same behaviour, whatever switch 40 does. This type exists ONLY to widen coverage to the programs
@@ -1223,7 +1223,7 @@ static inline uint32_t n48_cp_eval_hz(const n48_cp_consumer *c, const n48_cp_rin
 }
 
 /* =====================================================================================================================
- * D4' (notes/design/D4-PRIME.md item 5/6, notes/design/R1-MEMDST.md Q5) — R1-R4 OVER THE D4' CONSUMER. IDENTICAL to
+ * D4' (an internal design note item 5/6, an internal design note Q5) — R1-R4 OVER THE D4' CONSUMER. IDENTICAL to
  * n48_cp_eval_hz above (same clause order and names, same physical R3 over the r5 hazard set), with ONE deliberate
  * difference: `c->n == 0 && c->nptr == 0` is NOT refused as N48_CP_NOT_ENUM. For the table-ABI consumer that shape
  * means "nobody built this consumer"; for D4' it can ALSO mean the STRICT-OK-NONE proof (Const_PS_gfx1201,
@@ -1457,7 +1457,7 @@ typedef struct {
      * both are 0 and the world is 0.0.394's, whatever the instruments did. */
     uint32_t r5_mode;
     uint64_t r5_blind;
-    /* D4' (notes/design/D4-PRIME.md item 6) — THE SAME ACCOUNTING-IDENTITY GUARD cp_enabled/cp_enumerated ALREADY
+    /* D4' (an internal design note item 6) — THE SAME ACCOUNTING-IDENTITY GUARD cp_enabled/cp_enumerated ALREADY
      * GIVES THE TABLE-ABI CONSUMER, for the D4' fallback: `d4_enumerated` is 1 ONLY when n48_cp_eval_hz_d4 actually
      * judged THIS frame's consumer (gfxsrc_cprov_eval's own D4' branch), and it may be 1 only while `d4_enabled` (the
      * switch, `accel gfxneuter 40 | 1 << 8`) is also 1 - a D4'-built consumer with the switch OFF is a wiring defect,
@@ -1466,7 +1466,7 @@ typedef struct {
     uint32_t d4_enabled;
     uint32_t d4_enumerated;
     uint64_t v[N48_DEPC_COUNT];
-    /* build 0.0.523 (notes/design/RING-NEUTER-FORGIVE.md rev 2 item 3, switch 77) — THE RING-NEUTER FORGIVENESS, THE
+    /* build 0.0.523 (an internal design note rev 2 item 3, switch 77) — THE RING-NEUTER FORGIVENESS, THE
      * X9-F ARRANGEMENT AGAIN: the RULE is gfx_rnforgive.h's drain (pure, host-tested by tests/gfx_rnforgive_test.cpp), and
      * what arrives here is only its switch, its verdict and its boot-monotone AMOUNT. SCALARS, APPENDED, NEVER IN v[]: v[]
      * is monotonicity-checked and `ring_neuters` is v[N48_DEPC_GN_IBS] itself, which is never decremented (gGn.ibs is
@@ -1652,7 +1652,7 @@ static inline void n48_dep_fill(const n48_dep_src *s, n48_dep_mono *m, n48_dep_w
         w->r5_mode = s->r5_mode;
         w->r5_blind = s->r5_blind;
     }
-    /* build 0.0.523 (notes/design/RING-NEUTER-FORGIVE.md rev 2 item 3, switch 77) — THE RING-NEUTER FORGIVENESS, AFTER the
+    /* build 0.0.523 (an internal design note rev 2 item 3, switch 77) — THE RING-NEUTER FORGIVENESS, AFTER the
      * consumer block above set `consumer_enumerated` and `r5_mode` (a subtraction placed before it would read 0 there and never
      * fire: fail-closed, and the frame-21 test catches it). SIX guards, X9-F's four plus two: the switch positively ON, a
      * verdict of exactly 0, a non-zero amount, an amount that fits inside the raw count, AND the consumer path live (only the

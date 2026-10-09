@@ -3,11 +3,16 @@
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.navi48.translate</string>
+  <key>UserName</key><string>nobody</string>
+  <key>GroupName</key><string>nobody</string>
   <key>ProgramArguments</key><array><string>/bin/bash</string><string>/usr/local/navi48/pc-translate.sh</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>5</integer>
-  <key>StandardOutPath</key><string>/private/var/tmp/n48m-translate.stdout</string>
-  <key>StandardErrorPath</key><string>/private/var/tmp/n48m-translate.stdout</string>
+  <key>Nice</key><integer>5</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>256</integer></dict>
+  <key>StandardOutPath</key><string>/private/var/tmp/n48m-translate-state/stdout</string>
+  <key>StandardErrorPath</key><string>/private/var/tmp/n48m-translate-state/stdout</string>
 </dict>
 </plist>

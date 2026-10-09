@@ -336,7 +336,7 @@ static uint32_t emulate(const SegOut &s, uint32_t segNo, uint32_t *bad)
 }
 
 // =======================================================================================================================
-// build 0.0.488 (notes/design/DCC-DESC.md Q4 T3/T4; switch 60, XLAT12_EXTRA_DCC_STRIP) — THE DCC STRIP ON CAPTURED FRAMES.
+// build 0.0.488 (an internal design note Q4 T3/T4; switch 60, XLAT12_EXTRA_DCC_STRIP) — THE DCC STRIP ON CAPTURED FRAMES.
 // tests/fixture_dcc_run10e.h: run10e F56 IB0 (family a; its segment 0 is U's clock composite, the draw the kext logged as
 // `r0 0/0x106/1043`) and F44 IB1 (segment 0 draws S into the fp16 layer 0x400460000, segment 1 draws BA, which reads it
 // back through heap index 19 - a DCC T#), with the client memory and programs the translator reads, from the capture.
@@ -583,7 +583,7 @@ static void dcc_strip_captured()
 }
 
 // =======================================================================================================================
-// build 0.0.500 (notes/design/DRAW-ELIDE.md Q4 T2-T4, the reviewer's AO row; switch 66, XLAT12_EXTRA_DRAW_ELIDE) — THE DRAW
+// build 0.0.500 (an internal design note Q4 T2-T4, the reviewer's AO row; switch 66, XLAT12_EXTRA_DRAW_ELIDE) — THE DRAW
 // ELIDE ON CAPTURED FRAME-a UNITS. tests/fixture_drawelide.h: frame a (1152|14944) unit k0 (IB0: U's clock composite at unit
 // dword 1043, Y's second clock layer at 1116) of run10g F62, run10f F98 and run10p F57, and unit k3 (IB1, 4 constituents:
 // AO's two panel-material draws at 1020 and 1060) of run10p F57, each through the kext's unit path with the harness's own flag

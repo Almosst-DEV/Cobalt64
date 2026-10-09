@@ -1,0 +1,8 @@
+#!/bin/bash
+# fake date: virtual time (SIM_DIR/vclock_ms), BASE 1791470000 s. Same format arguments as the real date.
+BASE=1791470000
+ms=$(cat "$SIM_DIR/vclock_ms" 2>/dev/null || echo 0)
+e=$(( BASE + ms / 1000 ))
+fmt=""; for a in "$@"; do case "$a" in +*) fmt=$a ;; esac; done
+if [ "${1:-}" = "-j" ] || [ "${1:-}" = "-r" ]; then exec /bin/date "$@"; fi
+if [ -n "$fmt" ]; then exec /bin/date -r "$e" "$fmt"; else exec /bin/date -r "$e"; fi

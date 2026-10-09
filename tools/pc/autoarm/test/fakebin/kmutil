@@ -1,0 +1,2 @@
+#!/bin/bash
+D=${FAKE_DIR:?}; echo "FAKE kmutil $*" >>"$D/cmds.log"; [ -f "$D/st/nub" ] && echo "   123 0 0xffffff 0x1000 0x1000 com.navi48.accelprobe (0.0.7) <1 2>"; exit 0

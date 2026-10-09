@@ -1,4 +1,4 @@
-/* gfx_cgw108.h — build 0.0.550 ( PLAN step 1,, notes/design/RING-NEUTER-FORGIVE.md FIX 2):
+/* gfx_cgw108.h — build 0.0.550 ( PLAN step 1,, an internal design note FIX 2):
  * SWITCH 108 "cgwait", THE COPY-GUARD WAIT UNDER SWITCH 37. `108 | M << 8`: M 1 ON (= 364), M 2 OFF (= 620, the default and the
  * boot value); bare `108` reads. Mid-arm guarded. No SHADOW: switch 78 already counts every refusal ON would take on
  * (`IN_FLIGHT not redone under 37`), so a SHADOW mode would print that same count again.

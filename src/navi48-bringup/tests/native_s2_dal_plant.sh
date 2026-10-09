@@ -24,7 +24,7 @@ plant() {   # plant <id> <file relative to repo root> <old text> <new text> <des
   cp -R "$ROOT/$K/tests/dalshim" "$SCR/$K/tests/"
   cp "$ROOT/$K/tests/native_s2_dal_test.cpp" "$SCR/$K/tests/"
   cp "$ROOT/tools/native/n48dal.c" "$ROOT/tools/native/build.sh" "$SCR/tools/native/"
-  cp "$ROOT/notes/design/NATIVE-S1C-ABI.md" "$SCR/notes/design/"
+  cp "$ROOT/an internal design note" "$SCR/notes/design/"
   OLD="$old" NEW="$new" FILE="$SCR/$file" python3 - <<'PY'
 import os,sys
 p=os.environ['FILE']; s=open(p).read(); o=os.environ['OLD']; n=os.environ['NEW']
@@ -56,7 +56,7 @@ control() {
   cp -R "$ROOT/$K/tests/dalshim" "$SCR/$K/tests/"
   cp "$ROOT/$K/tests/native_s2_dal_test.cpp" "$SCR/$K/tests/"
   cp "$ROOT/tools/native/n48dal.c" "$ROOT/tools/native/build.sh" "$SCR/tools/native/"
-  cp "$ROOT/notes/design/NATIVE-S1C-ABI.md" "$SCR/notes/design/"
+  cp "$ROOT/an internal design note" "$SCR/notes/design/"
   local out
   out=$(cd "$SCR" && clang++ -std=c++17 -Wall -Wextra -O0 -pthread '-D__asm__=0;' '-D__volatile__(...)=' -I $K/tests/dalshim -I $SR -I $SR/amd \
         $K/tests/native_s2_dal_test.cpp $SR/amd/smu_dal.cpp $SR/amd/smu_v14_0.cpp -o "$SCR/t" 2>&1) || { echo "CONTROL: the unplanted tree does not compile: $out"; exit 2; }
@@ -149,14 +149,16 @@ plant 64 $S '    SmuSeq seq;   // the shared mailbox lock (held = false only whe
 plant 65 $S 'if (__atomic_load_n(&gSmuOwner, __ATOMIC_ACQUIRE) == me) { gSmuDepth++; return true; }' ';' "the shared lock is not recursive (deadlock)"
 plant 66 $SR/Navi48UserClient.cpp '	amdgpu::SmuSeq smuSeq;   // 0.0.604: the whole table-transfer sequence under the shared mailbox lock (PPSMC and DAL)' ';' "doMetrics does not hold the shared lock"
 plant 67 $SR/Navi48UserClient.cpp '	amdgpu::SmuSeq smuSeq;   // 0.0.604: both clock messages of the power state under the shared mailbox lock' ';' "doPowerState does not hold the shared lock"
-plant 68 $SR/amd/native_s1c.cpp '    if (!sess_hello()) return kIOReturnNotReady;
-    if (flags != 0ull || step < N48N_DAL_STEP_E1B' '    if (flags != 0ull || step < N48N_DAL_STEP_E1B' "selector 15 does not need Hello"
+plant 68 $SR/amd/native_s1c.cpp '    if (!sess_hello(ref)) return kIOReturnNotReady;
+    if (app_refused(ref, n48native::g4::kCallScanout)) return kIOReturnNotPrivileged;   // 0.0.640 (G4): the display plane / mode / DAL belong to WindowServer and the administrator
+    if (flags != 0ull || step < N48N_DAL_STEP_E1B' '    if (app_refused(ref, n48native::g4::kCallScanout)) return kIOReturnNotPrivileged;   // 0.0.640 (G4): the display plane / mode / DAL belong to WindowServer and the administrator
+    if (flags != 0ull || step < N48N_DAL_STEP_E1B' "selector 15 does not need Hello"
 plant 69 $SR/Navi48NativeClient.cpp 'if (!shape(2, 0, 0, sizeof(n48n_dal_result))) return kIOReturnBadArgument;' 'if (!shape(2, 0, 0, 0)) return kIOReturnBadArgument;' "selector 15's output shape is not checked"
-plant 70 $SR/Navi48NativeABI.h '#define N48N_ABI_MINOR     9u ' '#define N48N_ABI_MINOR     1u ' "the ABI minor is not raised"
+plant 70 $SR/Navi48NativeABI.h '#define N48N_ABI_MINOR     12u ' '#define N48N_ABI_MINOR     1u ' "the ABI minor is not raised"
 plant 71 $K/Info.plist '<key>CFBundleVersion</key>
-	<string>0.0.620</string>' '<key>CFBundleVersion</key>
+	<string>0.0.664</string>' '<key>CFBundleVersion</key>
 	<string>0.0.603</string>' "Info.plist version is stale"
-plant 72 notes/design/NATIVE-S1C-ABI.md '## ABI 1.2 addendum' '## ABI 1.2 notes' "the contract addendum is missing"
+plant 72 an internal design note '## ABI 1.2 addendum' '## ABI 1.2 notes' "the contract addendum is missing"
 plant 73 tools/native/n48dal.c '{ N48N_ABI_VERSION, N48N_HELLO_F_MINOR }' '{ N48N_ABI_VERSION, 0 }' "the tool does not ask for the minor"
 plant 74 $SR/Navi48Bringup.cpp 'n48dcn::scanShutdown();' 'n48dcn::scanShutdown(); amdgpu::smu_dal_send(*mDev, 2, 0, nullptr);' "the interrupt handler's file calls the DAL sender"
 plant 75 $SR/Navi48NativeABI.h '#define N48N_DAL_V_GLITCH    5u' '#define N48N_DAL_V_GLITCH    6u' "the ABI verdict value differs from the kernel's"
@@ -180,7 +182,7 @@ plant 89 $D 'r->flags |= at_start(b0, z) ? N48N_DAL_F_AT_START : N48N_DAL_F_ABOV
 plant 90 $D 'r->flags |= at_start(b0, z) ? N48N_DAL_F_AT_START : N48N_DAL_F_ABOVE_START;' 'r->flags |= N48N_DAL_F_ABOVE_START;' "the restore always reports ABOVE_START"
 plant 91 $D '(gQ.flags & N48N_SCANQ_ACQUIRED) != 0u) {' 'false) {' "E2..E4 run while the scanout plane is acquired"
 plant 92 $P 'constexpr bool at_start(const Decoded &base, const Decoded &now) { return now.ok && now.dispDid == base.dispDid && now.dppDid == base.dppDid; }' 'constexpr bool at_start(const Decoded &base, const Decoded &now) { return now.ok; }' "at_start is true for any readable clock"
-plant 93 notes/design/NATIVE-S1C-ABI.md 'NOT implemented**' 'implemented**' "the addendum claims the temperature stop rule"
+plant 93 an internal design note 'NOT implemented**' 'implemented**' "the addendum claims the temperature stop rule"
 plant 94 $P 'kDenyFrames = 9, kDenyAcquired = 10 };' 'kDenyFrames = 9, kDenyAcquired = 9 };' "the acquired denial shares the frames code"
 # ---- 0.0.607: the clock hold (P4) ----
 plant 95  $P 'if (restoreBad) {

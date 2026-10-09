@@ -1,7 +1,10 @@
 """The leaf classes of the Navi48Accel aux kext: one place, used by gen_gate.py (runtime gate table), gate_link.py (gates A/B) and layout_gate_host.py
 (the host twin). (leaf, family parent, extra non-pure slots the leaf overrides itself, by demangled row-name prefix or absolute slot)."""
+# the non-pure slots Navi48Framebuffer overrides (see the leaf below); tests/host_test.cpp pins this list against the spec's table
+FB_EXTRA = [184, 310, 311, 319, 322, 325, 326, 330, 331, 332, 344, 345]
+FB_PURE = [309, 312, 313, 314, 315, 316, 317, 318]
 LEAVES = [
-    ('Navi48Accelerator',   'IOGraphicsAccelerator2',   [183, 184, 18, 322, 348, 329]),   # IOService::probe, ::start, ::free, newSharedUserClient, newCommandQueue, newDisplayPipe (aux 0.0.3)
+    ('Navi48Accelerator',   'IOGraphicsAccelerator2',   [183, 184, 18, 322, 348, 329, 239]),   # IOService::probe, ::start, ::free, newSharedUserClient, newCommandQueue, newDisplayPipe (aux 0.0.3), newUserClient (aux 0.0.5, G6: 'N48N' on the accelerator)
     ('Navi48EventMachine',  'IOAccelEventMachineFast2', [35]),             # init (the hooked slots are added from TRAMP)
     ('Navi48Task',          'IOAccelTask',              []),
     ('Navi48DisplayMachine','IOAccelDisplayMachine',    [267]),            # start(IOPCIDevice*) (aux 0.0.3: the framebuffer walk starts at the GPU's PCI device when display is on)
@@ -13,6 +16,10 @@ LEAVES = [
     ('Navi48SharedUserClient', 'IOAccelSharedUserClient2', []),
     ('Navi48CommandQueue',  'IOAccelCommandQueue',      []),
     ('Navi48DisplayPipe',   'IOAccelDisplayPipe',       [277]),            # aux 0.0.3: performTransaction, hand-written (its generated declaration is a placeholder)
+    # aux 0.0.4 (M5, an internal design note "M5 build spec" section 2): the monitor B framebuffer. IOFramebuffer (IOGraphicsFamily, 350 slots, size 0x1d0, 8 pure: 309 and 312-318) is the SDK's class; the slots the leaf overrides besides
+    # the OSDefine three and the pure ones: 184 start, 310 getVRAMRange, 311 enableController, 319 setDisplayMode, 322 getStartupDisplayMode, 325 / 326 set / getAttribute, 330 getConnectionCount, 331 / 332 set / getAttributeForConnection,
+    # 344 hasDDCConnect, 345 getDDCBlock. Everything else (305 isConsoleDevice, 346-348 the interrupts, ...) is the family's own. The whole vtable (slots 0-349, so 305-348 included) is gated.
+    ('Navi48Framebuffer',   'IOFramebuffer',            FB_EXTRA),
 ]
 # Trampoline leaves (gates/gen_tramp.py): every listed slot is overridden by a generated function that first asks the ops table's generic vhook and otherwise takes its
 # default. mode: 'zero' = 0/false/NULL (pure slots: there is no base), a number = that constant, 'base' = the family's own implementation (read from its vtable).
@@ -35,10 +42,12 @@ HAND = {'Navi48EventMachine': [35], 'Navi48DisplayPipe': [277]}
 
 # The totals the gates must see (gate_link.py gate A and the host twin fail otherwise; the runtime gate logs "layout PASS <slots>/<slots>").
 # aux 0.0.2: 11 classes / 2064 slots; aux 0.0.3 adds Navi48DisplayPipe vs IOAccelDisplayPipe (306 slots, size 0x318, 0 pure virtuals): 12 / 2370.
-EXPECT_CLASSES = 12
-EXPECT_SLOTS = 2370
+# aux 0.0.4 adds Navi48Framebuffer vs IOFramebuffer (350 slots, size 0x1d0, 8 pure virtuals: slots 309 and 312-318): 13 / 2720.
+EXPECT_CLASSES = 13
+EXPECT_SLOTS = 2720
 # The negative controls of the host twin (layout_gate_host.py): for this class the twin re-runs the gate on corrupted copies of the tables and every one must FAIL.
 NEGATIVE_CLASS = 'Navi48DisplayPipe'
+FB_LEAF = 'Navi48Framebuffer'     # aux 0.0.4: the twin also runs negative controls over every slot 305..348 of this class
 
 # slots every OSDefineMetaClassAndStructors class overrides: the two destructors and getMetaClass
 OSDEFINE_SLOTS = [0, 1, 7]

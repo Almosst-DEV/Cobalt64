@@ -1,7 +1,7 @@
 From 8bf48965aa71a9139541c14bb6a1850404ef9d56 Mon Sep 17 00:00:00 2001
 From: Navi48-MacOS contributors <noreply@example.invalid>
 Date: Thu, 1 Jan 2026 00:00:00 +0000
-Subject: [PATCH 2/5] radv: Darwin native backend, Mesa half of the Navi48 kext
+Subject: [PATCH 2/9] radv: Darwin native backend, Mesa half of the Navi48 kext
  ABI (S1c)
 
 Replaces the S1a kernel stubs with the marshaller of NATIVE-S1C-ABI.md:
@@ -50,7 +50,7 @@ index 00000000000..9ffedc2253f
 + *
 + * ONE plain-C header shared by three consumers: the kext (Navi48NativeClient), the Mesa Darwin backend
 + * (copied byte for byte to mesa-mac/include/darwin/navi48_native_abi.h) and the PC test tools
-+ * (tools/native/n48native.c, s1d_replay.c). The contract is notes/design/NATIVE-S1C-ABI.md: where this
++ * (tools/native/n48native.c, s1d_replay.c). The contract is an internal design note: where this
 + * file and the contract disagree, the contract wins (and this file is the bug).
 + *
 + * Transport: IOServiceOpen(svc, task, N48N_UC_TYPE, &conn), then IOConnectCallMethod(conn, selector, ...).

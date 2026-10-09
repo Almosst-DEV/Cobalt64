@@ -1,4 +1,4 @@
-// gfx_t0src_test.cpp — build 0.0.524 (notes/design/T0SRC.md items 1-7, ; src/apple/gfx_t0src.h): switch 79, who
+// gfx_t0src_test.cpp — build 0.0.524 (an internal design note items 1-7, ; src/apple/gfx_t0src.h): switch 79, who
 // wrote S's texture 0. READ-ONLY instrumentation. What is proven here:
 //   RINGS    the newest (not the oldest) covering map / unmap is chosen, before and after a wrap; wraps drop the oldest; a slot
 //            claimed but unpublished, a slot whose seq names another slot, and a slot rewritten DURING the copy all read TORN; the

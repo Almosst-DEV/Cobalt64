@@ -126,6 +126,10 @@ int dcn41_dev_set_flip_exact(struct dcn41_dev *dev, const uint64_t *addrs, uint3
 
 /* Absolute BAR5 dword for (offset, base index); DCN41_BAD_OFFSET when either is invalid. */
 uint32_t dcn41_abs(const struct dcn41_dev *dev, uint32_t offset, uint32_t base_idx);
+/* BASE_IDX that dcn41_abs_rd (READS only) resolves: 1 (DCCG), 2, 3. Deliberately NOT in the generated dcn41_regs.h: the write layer stays on DCN41_BASE_IDX_USED_MASK (0x4). */
+#define DCN41_BASE_IDX_READ_MASK 0xEu
+/* 0.0.628: READ-ONLY twin, additionally resolving BASE_IDX 1 and 3 (dcn41_abs still refuses them). For register READS only (dispcensus, ddcread's prescale read). */
+uint32_t dcn41_abs_rd(const struct dcn41_dev *dev, uint32_t offset, uint32_t base_idx);
 
 /* ---- interrupts ------------------------------------------------------------------------------------------- */
 enum dcn41_irq_kind {

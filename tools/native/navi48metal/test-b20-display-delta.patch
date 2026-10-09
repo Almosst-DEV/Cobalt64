@@ -1,0 +1,245 @@
+diff --git a/Navi48Device.m b/Navi48Device.m
+index 34ab2c05..a3ef3aa7 100644
+--- a/Navi48Device.m
++++ b/Navi48Device.m
+@@ -1350,7 +1350,7 @@ static BOOL n48s_disp_account(uint32_t mask, uint32_t sid, const char *fns, uint
+     const int apx = n48x_desc((uint32_t)pi) != NULL;
+     n48df_t *const am = apx ? &N48XI(pi).sm : &N48S.sm;   // the machine of the planned instance accounts the frame (an HDMI machine is a full-copy machine)
+     if (apx) am->presentall = N48S.sm.presentall;
+-    int nf0 = am->nflag_log, ok = n48df_account_sid(am, mask, sid), c = n48df_class(mask);
++    int nf0 = am->nflag_log, ok = n48df_account_sid(am, mask, sid, N48S.m6.latch && !tent), c = n48df_class(mask);   // bundle 20 (F1): latch on + planned NON-tentatively = the kernel's table maps the surface to this pipe: a scanout surface (no table entry needed)
+     if (am->nflag_log > nf0) N48LOG("scanout: scanout-surface flag set #%d: surface %u (a final-GPUPass draw targeted it)", am->nflag_log, sid);
+     uint32_t W = N48S.pw, H = N48S.ph;
+     if (wr && !apx) n48df_dmg_account(&N48S.sm, c, wr, W, H);
+@@ -1388,6 +1388,19 @@ static void n48s_dirty_summary_locked(void) {
+             N48S.sm.damage ? "ON" : "off", (unsigned long long)N48S.sm.dm_part, (unsigned long long)N48S.sm.dm_empty, (unsigned long long)N48S.sm.dm_full, (unsigned long long)N48S.sm.dm_restart, (unsigned long long)N48S.sm.dm_carry,
+             (unsigned long long)N48S.sm.chain_invalid, (unsigned long long)N48S.sm.dm_regions, (unsigned long long)N48S.sm.dm_copy_px, N48S.sm.head);
+ }
++// bundle 20 (F4): per HDMI instance, every 10 s: the write classes (interval) with the non-final skips, the table occupancy (scan flags of 8, nonscan entries of 8, slots carrying a supersede mark of 3) and the cumulative
++// scan_full_refused / surf_untracked. A refused composite write is "skipped" under render-composite; occupancy 8/8 with scan_full_refused rising is the pre-bundle-20 saturation. Mutex held.
++static void n48x_rubber_summary_locked(int xi) {
++    static uint64_t pc[3][N48DF_NCLS], pn[3][N48DF_NCLS];
++    n48xi_t *const X = &N48XI(xi); char l[512]; size_t o = 0;
++    for (int i = 0; i < N48DF_NCLS; i++) {
++        uint64_t c = X->sm.cls[i] - pc[xi][i], n = X->sm.nonfinal[i] - pn[xi][i]; pc[xi][i] = X->sm.cls[i]; pn[xi][i] = X->sm.nonfinal[i];
++        if (c || n) o += (size_t)snprintf(l + o, sizeof l - o, " %s %llu(skipped %llu)", n48df_cls_name[i], (unsigned long long)c, (unsigned long long)n);
++    }
++    N48LOG("scanout (instance %d, %s): display writes by class (10 s):%s; tables: scan flags %d/%d nonscan %d/%d superseded-marked slots %d/%d; scan_full_refused %llu surf_untracked %llu",
++           xi, n48x_desc((uint32_t)xi)->name, o ? l : " (none)", X->sm.nscan, N48DF_MAX_SURF, n48df_nonscan_used(&X->sm), N48DF_MAX_SURF, n48df_marked_count(&X->sm), N48DF_MAX_SLOTS,
++           (unsigned long long)X->sm.scan_full_refused, (unsigned long long)X->sm.surf_untracked);
++}
+ // bundle 13 (review R3, bundle half): a TENTATIVE frame (unknown surface, planned to instance 0) whose completion says the surface is the MONB's was dropped; its damage must not be lost. The surface was noted
+ // (n48x_recopy_note); here, at the next 1 s keep-alive tick, the surface's CURRENT content (the IOSurface memory: the bundle writes every GPU frame back into it before the completion) is copied to a free slot of THAT instance and presented
+ // through its own machine. N48S.mu is held on entry and on return, DROPPED around the copy. A present of the instance that completes first repaints the whole surface and cancels it (complete_run). Counted; never blocks.
+@@ -1400,9 +1413,9 @@ static void n48x_recopy_locked(int inst) {
+     for (int i = 0; i < N48DF_MAX_SLOTS; i++) fl[i] = X->st.slot[X->sid[i] - d->tag].flags;
+     const int slot = n48df_pick(&X->sm, fl);
+     if (slot < 0) return;                                  // no free slot this tick: still pending, the next tick tries again
+-    const uint64_t seq = atomic_fetch_add(&N48S.seq, 1) + 1;
++    const uint64_t seq = x->recopy_seq;                    // bundle 20 (F3): the NOTED frame's own sequence, not a fresh (newest) one: if any later frame of this display was presented since, this one is stale and is not shown (no backward jump)
+     pthread_mutex_unlock(&N48S.mu);
+-    int ok = 0;
++    int ok = 0, shown = 0;
+     IOSurfaceRef ios = sid ? IOSurfaceLookup(sid) : NULL;
+     if (ios && IOSurfaceGetWidth(ios) == d->w && IOSurfaceGetHeight(ios) == d->h && IOSurfaceGetBytesPerRow(ios) == d->pitch_bytes && IOSurfaceLock(ios, kIOSurfaceLockReadOnly, NULL) == kIOReturnSuccess) {   // the INSTANCE'S geometry
+         void *dst = NULL;
+@@ -1414,11 +1427,11 @@ static void n48x_recopy_locked(int inst) {
+     if (ok && n48df_complete_seq(&X->sm, slot, 0, seq)) {
+         uint64_t o[3] = { 0, 0, 0 };
+         const int rc = n48x_k_present(inst, X->sid[slot], o);
+-        if (rc == 0) X->presents_seen++;
++        if (rc == 0) { X->presents_seen++; shown = 1; }
+         if (n48df_present_result(&X->sm, rc)) { N48LOG("scanout (instance %d): FAIL CLOSED / OFF (scanout-error): re-copy present rc %d", inst, rc); n48x_do_release_locked(inst); }
+     } else (void)n48df_complete_seq(&X->sm, slot, 1, seq);      // not copied (or stale): the slot is released without a present
+     n48x_recopy_done(x, ok);
+-    N48LOG("scanout (instance %d, %s): re-copy of IOSurface %u (a tentative DP-planned frame turned out to be this display's): %s", inst, d->name, sid, ok ? "presented" : "FAILED (the next present of this display repaints the whole surface)");
++    N48LOG("scanout (instance %d, %s): re-copy of IOSurface %u (a tentative DP-planned frame turned out to be this display's): %s", inst, d->name, sid, shown ? "presented" : ok ? "copied but NOT shown (stale: a newer frame of this display was presented since)" : "FAILED (the next present of this display repaints the whole surface)");
+ }
+ static void n48s_tick(void) {   // 1 s keep-alive (a status call counts as activity: no 5 s idle restore); counters every 10 s
+     (void)n48s_crc_on();   // keeps the 2 s file poll alive on an idle screen
+@@ -1442,7 +1455,8 @@ static void n48x_recopy_locked(int inst) {
+                 N48LOG("scanout (instance %d, %s): counters: presents %llu (kernel presents %llu latched %llu replaced %llu refused %llu watchdog_restores %llu) drops %llu gpu_fail %llu stale_skipped %llu superseded %llu; planned %llu inst_mismatch %llu inst_geom_mismatch %llu stale_retry %llu stale_drop %llu tentative %llu re-copy noted %llu done %llu failed %llu; status calls %llu (keep-alive %llu); table gen %u (cached %u, refused out-of-order %llu)", xi, n48x_descs[xi].name,
+                 (unsigned long long)X->sm.presents, (unsigned long long)X->st.presents, (unsigned long long)X->st.latched, (unsigned long long)X->st.replaced, (unsigned long long)X->st.refused, (unsigned long long)X->st.watchdog_restores,
+                 (unsigned long long)X->sm.drops, (unsigned long long)X->sm.gpu_fail, (unsigned long long)X->sm.stale, (unsigned long long)X->sm.superseded, (unsigned long long)X->plan_count, (unsigned long long)X->xs.inst_mismatch, (unsigned long long)X->xs.inst_geom_mismatch, (unsigned long long)X->xs.stale_retry, (unsigned long long)X->xs.stale_drop,
+-                (unsigned long long)X->xs.tentative_frames, (unsigned long long)X->xs.recopy_noted, (unsigned long long)X->xs.recopy_done, (unsigned long long)X->xs.recopy_fail, (unsigned long long)X->xs.status_calls, (unsigned long long)X->xs.keepalive_calls, X->gen, N48S.m6.gen, (unsigned long long)N48S.m6.store_refused); } }
++                (unsigned long long)X->xs.tentative_frames, (unsigned long long)X->xs.recopy_noted, (unsigned long long)X->xs.recopy_done, (unsigned long long)X->xs.recopy_fail, (unsigned long long)X->xs.status_calls, (unsigned long long)X->xs.keepalive_calls, X->gen, N48S.m6.gen, (unsigned long long)N48S.m6.store_refused);
++                n48x_rubber_summary_locked(xi); } }
+     }
+     for (int xi = 1; xi <= 2; xi++) {   // bundle 13/15: each HDMI instance's 1 s duties (n48x_tick_plan, host-tested). The KEEP-ALIVE comes first: a display pipe idles when nothing changes (queue 292), so a STATIC display is a static plane, and the kernel's 5 s
+         // idle watchdog would put it back on the bars unless a call counts as activity - Status is that call, once per ACTIVE instance. Then the kill file (this instance's own), a table refresh when the kernel has published a newer table than the cache, and a pending re-copy.
+@@ -1831,7 +1845,7 @@ static void n48s_complete_run(int inst, int slot, VkResult r, uint64_t seq, uint
+             }
+             if (plan != N48X_C_PRESENT) {
+                 if (plan == N48X_C_MISMATCH || plan == N48X_C_RECOPY) cx->xs.inst_mismatch++;
+-                if (plan == N48X_C_RECOPY) n48x_recopy_note(&cx->xs, sid);
++                if (plan == N48X_C_RECOPY) n48x_recopy_note(&cx->xs, sid, seq);
+                 if (plan == N48X_C_DROP && stale) cx->xs.stale_drop++;
+                 n48s_m6_skip_locked(slot, sid, plan, sm);
+                 n48cbl_skip(sid, seq, slot, plan == N48X_C_MISMATCH || plan == N48X_C_RECOPY ? "inst-mismatch" : "m6", (int)r);
+@@ -4847,7 +4861,7 @@ - (void)n48DispDone:(VkResult)r {
+ }
+ - (void)n48DispSeq {
+     if (_dslot >= 0 || (_dcrc && _dtex)) _dseq = atomic_fetch_add(&N48S.seq, 1) + 1;
+-    if (_dslot >= 0 && (_dsid || _dcid)) { pthread_mutex_lock(&N48S.mu); n48df_t *const dsm = n48x_desc((uint32_t)_dinst) ? &N48XI(_dinst).sm : &N48S.sm; if (_dsid) n48df_submit(dsm, _dsid, _dseq); n48df_chain_submit(dsm, _dslot, _dcid, _dbid); pthread_mutex_unlock(&N48S.mu); }   // #12: only frames WITH a slot supersede earlier ones
++    if (_dslot >= 0 && (_dsid || _dcid)) { pthread_mutex_lock(&N48S.mu); n48df_t *const dsm = n48x_desc((uint32_t)_dinst) ? &N48XI(_dinst).sm : &N48S.sm; if (_dsid) n48df_submit(dsm, _dslot, _dsid, _dseq); n48df_chain_submit(dsm, _dslot, _dcid, _dbid); pthread_mutex_unlock(&N48S.mu); }   // #12: only frames WITH a slot supersede earlier ones
+     if (_dcrc && _dtex && [_dtex n48IOSRef]) n48s_crc_note(IOSurfaceGetID([_dtex n48IOSRef]), _dseq);   // CRC diagnostic: which surface this submission wrote
+ }   // call with the submit lock held, right before vkQueueSubmit
+ - (BOOL)n48Finish:(NSError **)err {
+diff --git a/n48_dispflip.h b/n48_dispflip.h
+index f16b0849..b0b91ba2 100644
+--- a/n48_dispflip.h
++++ b/n48_dispflip.h
+@@ -11,7 +11,7 @@
+ #include <string.h>
+ 
+ #define N48DF_MAX_SLOTS 3
+-#define N48DF_MAX_SURF 8                         // per-surface submission table (display surfaces seen: about 5)
++#define N48DF_MAX_SURF 8                         // the scanout-flag table (proxy flag for tentative / latch-off frames) and the nonscanout counters (bundle 20: NOT the supersede bookkeeping any more, which is per in-flight slot)
+ #define N48DF_SLOT_REUSABLE (1u << 2)   // == N48N_SCANSLOT_REUSABLE (n48_scanabi.h); the host test checks the equality
+ 
+ // Write classes of a command buffer's writes to ONE display surface (bits, OR-ed while encoding), and the class names derived from them.
+@@ -30,8 +30,11 @@ typedef struct {
+     uint64_t last_seq;                               // the highest frame sequence (submission order) ever handed to present; an older one is never presented
+     uint64_t picks, drops, presents, present_fail, gpu_fail, errors, stale, superseded;
+     uint64_t m6_skip;                                // bundle 12 (M6, queue 290 S3): frames whose copy was made but whose surface the kernel maps to another display (or does not know): slot released, never presented
+-    uint32_t surf_id[N48DF_MAX_SURF];                // display surface ids seen at submission (0 = free entry)
+-    uint64_t surf_hi[N48DF_MAX_SURF];                // per surface: the highest seq SUBMITTED WITH a slot (a dropped frame is never recorded)
++    uint32_t sub_sid[N48DF_MAX_SLOTS];               // bundle 20 (F2): per IN-FLIGHT slot, the surface id and seq it was SUBMITTED with (0 = not submitted / untracked); cleared when the slot is released
++    uint64_t sub_seq[N48DF_MAX_SLOTS];
++    uint8_t sup_n[N48DF_MAX_SLOTS];                  // bundle 20 (F2): per in-flight slot, how many (not failed) frames submitted LATER for the same surface supersede it; > 0 = superseded. Bounded: only 3 slots exist
++    uint8_t made[N48DF_MAX_SLOTS];                   // bundle 20 (F2): bit j = the in-flight frame in this slot added one to sup_n[j]; used only to take it back if this frame fails on the GPU (cleared when the slot is released)
++    uint64_t scan_full_refused, surf_untracked;      // bundle 20 (F4): proxy flags refused because scan_id[] was full; submissions that could not be tracked (no slot in flight)
+     uint64_t cls[N48DF_NCLS], nonfinal[N48DF_NCLS];  // native #12 P1/P2: command buffers that wrote a display surface, by write class; those skipped as non-final
+     int damage;                                      // native #12 D2: partial-update emulation on (/private/tmp/n48m-damage); also lets SkyLight composite passes count as frames
+     int head;                                        // slot holding the content of the latest CHAINED frame (-1 none): the base of the next partial frame
+@@ -87,6 +90,8 @@ static inline int n48df_pick(n48df_t *s, const uint32_t flags[N48DF_MAX_SLOTS])
+ // The frame in `slot` is over (completed, failed, skipped or cancelled): the slot is free again and its base is unpinned.
+ static inline void n48df_release_slot(n48df_t *s, int slot) {
+     s->inflight[slot] = 0; s->poison[slot] = 0; s->fid[slot] = 0;
++    s->sub_sid[slot] = 0; s->sub_seq[slot] = 0; s->sup_n[slot] = 0; s->made[slot] = 0;   // F2: this slot's own count goes with it; the marks it MADE on older slots stay (made[] is dropped: it can no longer fail)
++    for (int k = 0; k < N48DF_MAX_SLOTS; k++) s->made[k] &= (uint8_t)~(1u << slot);
+     if (s->basep[slot] >= 0) { if (s->pin[s->basep[slot]]) s->pin[s->basep[slot]]--; s->basep[slot] = -1; }
+ }
+ // The command buffer that carried the copy into `slot` ended. vkres 0 = fence VK_SUCCESS. `seq` = its frame sequence, assigned at SUBMISSION (GPU) order.
+@@ -115,28 +120,39 @@ static inline void n48df_skip_content(n48df_t *s, int slot) {
+     if (myid) for (int j = 0; j < N48DF_MAX_SLOTS; j++) if (s->inflight[j] && s->fid[j] > myid) s->poison[j] = 1;
+     s->m6_skip++; s->head = -1;
+ }
+-// #12 superseded skip. Submission (under the submit lock) of a command buffer that carries a slot copy for display surface `sid` (IOSurface id, 0 = unknown: untracked).
+-// A later cb that writes surface S makes every earlier, not yet presented, frame of S unsafe to show (S may be mid-update): they are skipped, the later one presents.
+-static inline void n48df_submit(n48df_t *s, uint32_t sid, uint64_t seq) {
++// #12 superseded skip, bundle 20 (F2). Submission (under the submit lock) of the command buffer that carries the slot copy in `slot` for display surface `sid` (IOSurface id, 0 = unknown: untracked), with sequence `seq`.
++// Every OTHER slot that is in flight, was submitted for the same surface and has a LOWER seq is marked as superseded by `seq` (a later cb that writes surface S makes every earlier, not yet presented, frame of S unsafe
++// to show: S may be mid-update). The reverse also holds (a lower seq submitted after a higher one is itself superseded). The marks live per in-flight slot (3 x 3), so nothing saturates: the old 8-entry surface table
++// filled up after a display rearrangement and from then on nothing was ever superseded. A submission with no slot in flight cannot be tracked (surf_untracked++).
++static inline void n48df_unsupersede(n48df_t *s, int slot);
++static inline void n48df_submit(n48df_t *s, int slot, uint32_t sid, uint64_t seq) {
+     if (!sid) return;
+-    int k = -1;
+-    for (int i = 0; i < N48DF_MAX_SURF; i++) if (s->surf_id[i] == sid) { k = i; break; }
+-    if (k < 0) for (int i = 0; i < N48DF_MAX_SURF; i++) if (!s->surf_id[i]) { k = i; s->surf_id[i] = sid; break; }
+-    if (k >= 0 && seq > s->surf_hi[k]) s->surf_hi[k] = seq;     // table full: untracked, never skipped
++    if (slot < 0 || slot >= N48DF_MAX_SLOTS || !s->inflight[slot]) { s->surf_untracked++; return; }
++    n48df_unsupersede(s, slot);                                  // a second submit of the same slot replaces the first (never happens in the bundle; keeps the counts exact)
++    s->sub_sid[slot] = sid; s->sub_seq[slot] = seq;
++    for (int j = 0; j < N48DF_MAX_SLOTS; j++) {
++        if (j == slot || !s->inflight[j] || s->sub_sid[j] != sid || !s->sub_seq[j]) continue;
++        if (s->sub_seq[j] < seq) { s->sup_n[j]++; s->made[slot] |= (uint8_t)(1u << j); }       // slot's frame supersedes j's
++        else if (s->sub_seq[j] > seq) { s->sup_n[slot]++; s->made[j] |= (uint8_t)(1u << slot); }  // j's frame (already submitted, higher seq) supersedes this one
++    }
+ }
+-static inline uint64_t *n48df_surf_hi(n48df_t *s, uint32_t sid) {
+-    if (!sid) return 0;
+-    for (int i = 0; i < N48DF_MAX_SURF; i++) if (s->surf_id[i] == sid) return &s->surf_hi[i];
+-    return 0;
++static inline int n48df_is_superseded(const n48df_t *s, int slot) { return slot >= 0 && slot < N48DF_MAX_SLOTS && s->sup_n[slot] > 0; }
++// The frame in `slot` failed on the GPU (or is submitted again): every mark it made is taken back (a failed frame shows nothing, so it supersedes nothing); frames already skipped stay skipped.
++static inline void n48df_unsupersede(n48df_t *s, int slot) {
++    for (int j = 0; j < N48DF_MAX_SLOTS; j++) if ((s->made[slot] >> j) & 1u) { if (s->sup_n[j]) s->sup_n[j]--; }
++    s->made[slot] = 0;
+ }
+-// Like complete_seq, plus the superseded rule: a frame older than the highest seq submitted (with a slot) for the same surface is not presented (superseded++, slot released).
+-// A GPU failure of the frame that IS the highest submitted for its surface forgets it (hi = 0): frames of that surface still pending then present (the failed later frame
+-// never will); frames already skipped stay skipped and the screen keeps the last presented frame until the next frame of that surface completes.
++// Occupancy for the 10 s line: slots carrying a supersede mark, nonscan[] entries in use (scan_id[] is nscan).
++static inline int n48df_marked_count(const n48df_t *s) { int n = 0; for (int j = 0; j < N48DF_MAX_SLOTS; j++) n += n48df_is_superseded(s, j); return n; }
++static inline int n48df_nonscan_used(const n48df_t *s) { int n = 0; for (int i = 0; i < N48DF_MAX_SURF; i++) n += s->nonscan_skip[i] != 0; return n; }
++// Like complete_seq, plus the superseded rule: a frame that is marked superseded (a later frame of the same surface was submitted while it was in flight) is not presented (superseded++, slot released).
++// A GPU failure of a frame takes back the marks it made (n48df_unsupersede): frames of that surface still pending then present (the failed later frame never will); frames already skipped stay skipped and the
++// screen keeps the last presented frame until the next frame of that surface completes. `sid` is kept for the callers' signature: the marks already carry the surface identity.
+ static inline int n48df_complete_surf(n48df_t *s, int slot, int vkres, uint64_t seq, uint32_t sid) {
++    (void)sid;
+     if (slot < 0 || slot >= N48DF_MAX_SLOTS || !s->inflight[slot]) return 0;
+-    uint64_t *hi = n48df_surf_hi(s, sid);
+-    if (vkres != 0) { if (hi && *hi == seq) *hi = 0; return n48df_complete_seq(s, slot, vkres, seq); }
+-    if (s->state == N48DF_ACTIVE && seq > s->last_seq && hi && *hi > seq) { n48df_release_slot(s, slot); s->superseded++; return 0; }
++    if (vkres != 0) { n48df_unsupersede(s, slot); return n48df_complete_seq(s, slot, vkres, seq); }   // marks taken back BEFORE the slot is released
++    if (s->state == N48DF_ACTIVE && seq > s->last_seq && n48df_is_superseded(s, slot)) { n48df_release_slot(s, slot); s->superseded++; return 0; }
+     return n48df_complete_seq(s, slot, vkres, seq);
+ }
+ // native #12 P3 "present hold". Switch file /private/tmp/n48m-hold (absent = OFF, today's behaviour exactly). A display-surface present waits on the present queue until
+@@ -169,8 +185,7 @@ static inline int n48df_complete_held(n48df_t *s, int slot, int vkres, uint64_t
+                                       void (*wait)(void *, uint64_t), void *ctx, uint64_t *waited) {
+     uint64_t w = 0; if (waited) *waited = 0;
+     if (on && sid && vkres == 0 && slot >= 0 && slot < N48DF_MAX_SLOTS && s->inflight[slot] && s->state == N48DF_ACTIVE && seq > s->last_seq) {
+-        uint64_t *hi = n48df_surf_hi(s, sid);
+-        if (!(hi && *hi > seq)) w = n48df_hold_ns(on, hms, tcommit, now);
++        if (!n48df_is_superseded(s, slot)) w = n48df_hold_ns(on, hms, tcommit, now);
+     }
+     if (w && wait) { wait(ctx, w); if (waited) *waited = w; }
+     return n48df_complete_surf(s, slot, vkres, seq, sid);
+@@ -193,9 +208,10 @@ static inline int n48df_class(uint32_t m) {
+ // native #12 scanout rule (damage on or off): final-GPUPass, or a render-composite into a surface whose scanout flag is set (`scan`).
+ static inline int n48df_should_present(uint32_t m, int presentall, int scan) { return presentall || (m & N48DF_W_DRAW_FINAL) != 0 || (scan && (m & N48DF_W_DRAW_COMP) != 0); }
+ static inline int n48df_is_scan(const n48df_t *s, uint32_t sid) { if (!sid) return 0; for (int i = 0; i < s->nscan; i++) if (s->scan_id[i] == sid) return 1; return 0; }
+-// Sets the flag (returns 1 when newly set). Table full: not flagged (never presented as composite).
++// Sets the flag (returns 1 when newly set). Table full: not flagged (never presented as composite); scan_full_refused counts it (bundle 20, F4).
+ static inline int n48df_scan_set(n48df_t *s, uint32_t sid) {
+-    if (!sid || n48df_is_scan(s, sid) || s->nscan >= N48DF_MAX_SURF) return 0;
++    if (!sid || n48df_is_scan(s, sid)) return 0;
++    if (s->nscan >= N48DF_MAX_SURF) { s->scan_full_refused++; return 0; }
+     s->scan_id[s->nscan++] = sid; if (s->nflag_log < 10) s->flag_log[s->nflag_log++] = sid; return 1;
+ }
+ static inline int n48df_fn_is_fill(const char *fragment_name) { return fragment_name && strstr(fragment_name, "ColorFill") != 0; }
+@@ -206,10 +222,13 @@ static inline uint32_t n48df_draw_bits(const char *fragment_name) {
+     return N48DF_W_DRAW_OTHER | N48DF_W_DRAW_COMP;
+ }
+ // Counts the write (P1) and returns whether the caller may take a slot and copy (P2). A refused one is nonfinal[class]++.
+-static inline int n48df_account_sid(n48df_t *s, uint32_t m, uint32_t sid) {
++// Bundle 20 (F1): `known` = the routing latch is on and the surface was planned NON-TENTATIVELY to this instance, i.e. the kernel's table maps it to this display's pipe: it IS a scanout surface, so a composite write
++// into it presents without any table entry (the 8-entry scan_id[] filled after a display rearrangement and from then on every composite write was refused, so the unfinished GPUPass image was shown alone).
++// The GPUPass-proxy flag (a final-GPUPass draw targeted it) stays for tentative / latch-off frames (known = 0). Unknown / ambiguous surfaces never reach here with known = 1: they stay non-presentable.
++static inline int n48df_account_sid(n48df_t *s, uint32_t m, uint32_t sid, int known) {
+     int c = n48df_class(m); s->cls[c]++;
+-    if (m & N48DF_W_DRAW_FINAL) n48df_scan_set(s, sid);
+-    if (n48df_should_present(m, s->presentall, n48df_is_scan(s, sid))) return 1;
++    if ((m & N48DF_W_DRAW_FINAL) && !known) n48df_scan_set(s, sid);
++    if (n48df_should_present(m, s->presentall, (known && sid) || n48df_is_scan(s, sid))) return 1;
+     s->nonfinal[c]++;
+     if (c == N48DF_C_RENDER_COMP && !s->presentall) {      // a composite write into a surface that was never a scanout surface
+         s->nonscan_total++; int k = -1;
+@@ -219,7 +238,7 @@ static inline int n48df_account_sid(n48df_t *s, uint32_t m, uint32_t sid) {
+     }
+     return 0;
+ }
+-static inline int n48df_account(n48df_t *s, uint32_t m) { return n48df_account_sid(s, m, 0); }
++static inline int n48df_account(n48df_t *s, uint32_t m) { return n48df_account_sid(s, m, 0, 0); }
+ // Result of the present call that complete() asked for. Returns 1 when the caller must release (fail closed).
+ static inline int n48df_present_result(n48df_t *s, int rc) {
+     if (rc == 0) { s->presents++; return 0; }
+diff --git a/n48_m6x.h b/n48_m6x.h
+index 11b175f9..8faf794b 100644
+--- a/n48_m6x.h
++++ b/n48_m6x.h
+@@ -168,9 +168,9 @@ static inline uint32_t n48x_tick_plan(const n48x_tick_t *t, const n48m6_t *s) {
+ /* ---- the per-instance counters and the re-copy memory ------------------------------------------------------------------------------------------------------------------------------------------------ */
+ typedef struct {
+     uint64_t inst_geom_mismatch, inst_mismatch, recopy_noted, recopy_done, recopy_fail, stale_retry, stale_drop, killed, acquire_fail, alloc_fail, status_calls, keepalive_calls, tentative_frames;
+-    uint32_t recopy_sid; int recopy_pending;
++    uint32_t recopy_sid; int recopy_pending; uint64_t recopy_seq;   /* bundle 20 (F3): the sequence of the NOTED (dropped) frame: the re-copy presents with it, never with a fresh newest one */
+ } n48x_stats_t;
+-static inline void n48x_recopy_note(n48x_stats_t *x, uint32_t sid) { x->recopy_sid = sid; x->recopy_pending = 1; x->recopy_noted++; }
++static inline void n48x_recopy_note(n48x_stats_t *x, uint32_t sid, uint64_t seq) { x->recopy_sid = sid; x->recopy_seq = seq; x->recopy_pending = 1; x->recopy_noted++; }
+ /* the re-copy ran (ok) or could not (no slot / surface gone): either way it is done once (a failed one is counted, the next monitor B present repaints the whole surface anyway) */
+ static inline void n48x_recopy_done(n48x_stats_t *x, int ok) { x->recopy_pending = 0; if (ok) x->recopy_done++; else x->recopy_fail++; }
+ 

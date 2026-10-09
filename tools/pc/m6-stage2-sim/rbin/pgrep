@@ -1,0 +1,10 @@
+#!/bin/bash
+n=${@: -1}
+r=$(cat "$SIM_DIR/kv/restart_epoch" 2>/dev/null || echo -1)
+now=$(( 1791470000 + $(cat "$SIM_DIR/vclock_ms") / 1000 ))
+case "$n" in
+  WindowServer) if [ "$r" -lt 0 ]; then echo 100; else ts=$((now-r)); c=$(cat "$SIM_DIR/cfg/wspid_change_at" 2>/dev/null || echo 1000000000); if [ "$ts" -ge "${c%.*}" ]; then echo 300; else echo 200; fi; fi ;;
+  dtrace) [ -f "$SIM_DIR/kv/dtrace" ] && echo 4242 ;;
+  n48watch.sh) [ -f "$SIM_DIR/kv/watcher" ] && echo 4343 ;;
+esac
+exit 0

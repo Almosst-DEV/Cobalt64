@@ -20,14 +20,15 @@ typedef struct { int ok; int code; char why[192]; uint64_t off; size_t rowlen; }
 
 static inline int n48pl_fail(n48pl_out *o, int code, const char *why) { o->ok = 0; o->code = code; snprintf(o->why, sizeof o->why, "%s", why); return 0; }
 
-// Everything judged from the plane's own geometry and the descriptor (today's checks 74 / 75 / 76 / 77, plane-indexed). No allocation size, no base needed.
+// Everything judged from the plane's own geometry and the descriptor (checks 74 / 75 / 76 / 77, plane-indexed). No allocation size, no base needed.
 static inline int n48pl_geom(const n48pl_in *in, n48pl_out *o) {
     char b[192];
     o->ok = 1; o->code = 0; o->why[0] = 0; o->off = 0; o->rowlen = 0;
     if (in->pc <= 1) { if (in->plane != 0) { snprintf(b, sizeof b, "plane %lu of a single-plane surface", (unsigned long)in->plane); return n48pl_fail(o, 74, b); } }
     else if (in->plane >= in->pc) { snprintf(b, sizeof b, "plane %lu of a %zu-plane surface", (unsigned long)in->plane, in->pc); return n48pl_fail(o, 74, b); }
-    if (in->pw != in->dw || in->ph != in->dh) {
-        snprintf(b, sizeof b, "descriptor %lux%lu != IOSurface %zux%zu", (unsigned long)in->dw, (unsigned long)in->dh, in->pw, in->ph); return n48pl_fail(o, 75, b); }
+    // Build 7: a descriptor INSIDE the plane is accepted (Core Image asks for e.g. 308x514 on a 320x576 surface); a larger one is refused. The image extent stays the descriptor's, the row length comes from the surface.
+    if (in->dw > in->pw || in->dh > in->ph) {
+        snprintf(b, sizeof b, "descriptor %lux%lu exceeds IOSurface %zux%zu", (unsigned long)in->dw, (unsigned long)in->dh, in->pw, in->ph); return n48pl_fail(o, 75, b); }
     if (in->pbpe != in->dbpp) {
         snprintf(b, sizeof b, "IOSurface bytes per element %zu != %u bytes of pixel format", in->pbpe, (unsigned)in->dbpp); return n48pl_fail(o, 76, b); }
     if (in->pbpe == 0 || in->pbpr % in->pbpe || in->pbpr < in->pw * in->pbpe) {

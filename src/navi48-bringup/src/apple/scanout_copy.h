@@ -381,7 +381,7 @@ static inline uint32_t n48_tile_probe_pixel(uint32_t x, uint32_t y)
     return ((y & 0xffffu) << 16) | (x & 0xffffu);
 }
 
-// D7 (0.0.417, notes/design/SDMA-DCC-NOPTE.md) — THE UNIFORM LINEAR PROBE `accel scanout 8` writes, and the
+// D7 (0.0.417, an internal design note) — THE UNIFORM LINEAR PROBE `accel scanout 8` writes, and the
 // value every sampled position must then read back. A uniform (constant) 256-byte block is exactly what DCC
 // detects: with our SDMA's no-PTE write compression ON the block is STORED as a constant code and the raw MM
 // window reads that code, not this value; with `sdmadcc 1` the write is raw and this value comes back. The
@@ -400,7 +400,7 @@ static inline uint32_t n48_live_dim(uint32_t live, uint32_t fallback)
     return (live && live <= 16384u) ? live : fallback;
 }
 
-// --- S5 (notes/design/SCANOUT-SELFTEST-FULL.md, 0.0.414): THE BOUNDED SAMPLE SET ------------------------
+// --- S5 (an internal design note, 0.0.414): THE BOUNDED SAMPLE SET ------------------------
 //
 // The full-geometry self-test samples a surface at every pixel of a handful of named rows and columns plus a
 // 64x64 grid, so a wrong copy is named by position without reading every one of two million pixels. The set

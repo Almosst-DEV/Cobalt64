@@ -101,6 +101,21 @@ uint32_t dcn41_abs(const struct dcn41_dev *dev, uint32_t offset, uint32_t base_i
     return (uint32_t)a;
 }
 
+/* 0.0.628 (M4a): the READ-ONLY twin of dcn41_abs. It also resolves BASE_IDX 1 (DCCG, 0xc0) and 3 (0x9000), which the write layer never uses
+ * (DCN41_BASE_IDX_USED_MASK stays 0x4, so dcn41_abs and every write helper keep refusing them). Same checks otherwise: ready device, valid offset,
+ * the sum inside the BAR5 window. Only the census and ddcread's prescale READ may call it; there is no write path from this address. */
+uint32_t dcn41_abs_rd(const struct dcn41_dev *dev, uint32_t offset, uint32_t base_idx)
+{
+    uint64_t a;
+    if (!dcn41_ready(dev) || offset == DCN41_BAD_OFFSET || base_idx >= DCN41_NUM_SEGS ||
+        !(DCN41_BASE_IDX_READ_MASK & (1u << base_idx)) || dev->seg[base_idx] == 0)
+        return DCN41_BAD_OFFSET;
+    a = (uint64_t)dev->seg[base_idx] + offset;
+    if (a >= dev->mmio_dwords)
+        return DCN41_BAD_OFFSET;
+    return (uint32_t)a;
+}
+
 uint32_t dcn41_frame_delta(uint32_t count0, uint32_t count1)
 {
     return (count1 - count0) & DCN41_FRAME_COUNT_MASK;

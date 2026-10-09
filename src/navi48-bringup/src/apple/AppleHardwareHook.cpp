@@ -29,7 +29,7 @@
 #include "gfx_reloc.h"              //: the vertex-relocation arena in the ring region we own (host-tested)
 #include "gfx_commit.h"             // 0.0.352: X1 - the COMMIT gate over an in-place IB rewrite and its read-back (host-tested)
 #include "gfx_fillset.h"            // 0.0.404 (a items 1-7,b): the first-shot FILL-SET RESERVATION's pure state
-#include "gfx_fs85.h"               // build 0.0.530 (notes/design/SRCFILL85.md): switch 85 SOURCE FILLS (S1 twin, S2, S3)
+#include "gfx_fs85.h"               // build 0.0.530 (an internal design note): switch 85 SOURCE FILLS (S1 twin, S2, S3)
                                     // machine - the switch, the expiry, the one report format (host-tested,
                                     // tests/gfx_fillset_test.cpp). The kext half is below, behind `accel gfxneuter 33`,
                                     // OFF BY DEFAULT AND OFF AT BOOT
@@ -39,12 +39,12 @@
                                     // `accel gfxneuter 32 | M << 8`, OFF BY DEFAULT AND OFF AT BOOT
 #include "gfx_dep.h"                // 0.0.353: X9 - the frame-to-frame dependency the per-frame ladder cannot see (host-tested)
 #include "gfx_cp_build.h"           // 0.0.393: the consumer list's three loops, ONE copy the kext and its test share
-#include "gfx_memdst.h"             // R1 (notes/design/R1-MEMDST.md Q2): the memory-destination rung, over the final candidate
+#include "gfx_memdst.h"             // R1 (an internal design note Q2): the memory-destination rung, over the final candidate
 #include "gfx_e1.h"                 // 0.0.368: RULE E1 - the ONE arm-time ring history that may let EARLY go live (host-tested)
 #include "gfx_forgive.h"            // 0.0.372: X9-F - the ONE pre-baseline dropped-write forgiveness (host-tested, DEFAULT OFF)
 #include "gfx_keystone.h"           // 0.0.373: X10 - may the root keystone be armed for THIS committing frame, and
                                     // may the frame then run (host-tested; inert unless COMMIT is armed)
-#include "gfx_flightring.h"         // C5 part 1 (notes/design/C5-CONTINUOUS.md Q1): the flight ring replacing the single
+#include "gfx_flightring.h"         // C5 part 1 (an internal design note Q1): the flight ring replacing the single
                                     // kstone flight record (host-tested with planted defects; inert while nothing has
                                     // spent a shot this boot - a zero-initialised ring is 16 FREE entries)
 #include "gfx_fence828.h"           // 0.0.377: the ONE-DWORD un-NOP of Apple's own buried end-of-pipe
@@ -94,10 +94,10 @@
 #include "gfx_mibseg.h"             // 0.0.446: the `mibseg:` per-segment status counter for nib >= 2
                                     // frames - pure buckets + report formats, host-tested (gfx_mib_test.cpp, and
                                     // gfx_dep_test.cpp over F48's real segments). Read-only; changes no byte.
-#include "gfx_mmprio.h"             // 0.0.433 (notes/design/MM-PRIORITY.md): MM-window priority for the
+#include "gfx_mmprio.h"             // 0.0.433 (an internal design note): MM-window priority for the
                                     // policy pass - pure nesting/yield/bound decisions and the `mmprio:` report format,
                                     // host-tested (tests/gfx_mmprio_test.cpp). The live state is Navi48Bringup.cpp's.
-#include "gfx_pgmid.h"              // 0.0.434 (notes/design/PGMID-COPYGUARD.md Part 1): program-identity
+#include "gfx_pgmid.h"              // 0.0.434 (an internal design note Part 1): program-identity
                                     // cost - the head-first `n48_pgm_need` and the always-on `pgmid:` report format,
                                     // host-tested (tests/gfx_pgmid_test.cpp). The live state is declared beside
                                     // gfxsrc_pgm_profile, which is the only caller.
@@ -110,7 +110,7 @@
                                     // P did not commit (tests/gfx_present73_test.cpp over run10u's P sequence)
 #include "gfx_walknop75.h"          // build 0.0.519: switch 75, a flight NOPed at the ring walk retires at once
                                     // (tests/gfx_walknop75_test.cpp over run10w's token seq 3)
-#include "gfx_subst_pool.h"         // build 0.0.484 (notes/design/GLASS.md Q2 K1-K7): the program and image limits
+#include "gfx_subst_pool.h"         // build 0.0.484 (an internal design note Q2 K1-K7): the program and image limits
                                     // (gfx_subst_caps.h, with their static_asserts), the program read, the "is this
                                     // OURS" byte compare and the recognition pool's build - host-tested
                                     // (tests/gfx_pgmid_test.cpp, tests/sc_census_test.cpp)
@@ -118,8 +118,8 @@
 #include "gfx_spill.h"              // build 0.0.522: switch 76, the kext spill tier's slice table
 #include "gfx_rnforgive.h"          // build 0.0.523: switch 77, the ring-neuter forgiveness (pure half)
 #include "gfx_cgredo.h"             // build 0.0.523: switch 78, the copy-guard redo's undo (pure half)
-#include "gfx_t0src.h"             // build 0.0.524 (notes/design/T0SRC.md): switch 79, S's texture-0 source (read-only)
-#include "gfx_cycle80.h"            // build 0.0.525 (notes/design/CYCLE80.md): switch 80, cycle completeness
+#include "gfx_t0src.h"             // build 0.0.524 (an internal design note): switch 79, S's texture-0 source (read-only)
+#include "gfx_cycle80.h"            // build 0.0.525 (an internal design note): switch 80, cycle completeness
 #include "gfx_p86.h"               // build 0.0.531: switch 86, the present-time retirement re-check
 #include "gfx_p87.h"               // build 0.0.531 item 4b: switch 87, the text-element instrument
 #include "gfx_p94.h"               // build 0.0.538: switch 94, present-time promotion without gXdLock
@@ -851,7 +851,7 @@ static void *hook_newMMHub(void *self) {
 
 // ---------------------------------------------------------------------------
 // 0.0.247 — VMM slots 40/41 in OBSERVE-ONLY mode. MILESTONE 3 step 4: the
-// read-only boot notes/M3-ROOT-WRITE-REVIEW.md.1 requires BEFORE increment
+// read-only boot notes/an internal review note.1 requires BEFORE increment
 // (iii)'s single 8-byte root PDE write.
 //
 // *** THESE HOOKS WRITE NOTHING, ANYWHERE. *** Each calls Apple's function and
@@ -865,7 +865,7 @@ static void *hook_newMMHub(void *self) {
 // write lands in a page that has changed owner.
 //
 // *** ONE CORRECTION TO THE REVIEW, made from the binary rather than by
-// spending a boot on it. *** M3-ROOT-WRITE-REVIEW.md.2 says the slot-40 hook
+// spending a boot on it. *** an internal review note.2 says the slot-40 hook
 // should "call Apple's, get ctx, read *(uint64_t*)(ctx+0x98+0x20) = the
 // authoritative root address". It is the right field and the WRONG MOMENT: at
 // slot-40 return that field is always zero, because AMDHWVMContext::init
@@ -1393,7 +1393,7 @@ static volatile uint32_t gXdResProvKinds { 0u };
 // n48_rp_ok, so a residency-provenance entry recorded while DECIDE was the arm level may also answer at COMMIT.
 static volatile uint32_t gXdRpOkCarryOn { 0u };
 // build 0.0.486, switch 59, DEFAULT OFF (`accel gfxneuter 59 | M << 8`: M 1 on, M 2 off, `59` alone reads).
-// notes/design/STATIC-RETILE.md: ON (and only while gXdResProv is also on - hw_resprov_lin_on()), Navi48AccelPeer.cpp's
+// an internal design note: ON (and only while gXdResProv is also on - hw_resprov_lin_on()), Navi48AccelPeer.cpp's
 // residency copy writes mip 0 of a texture whose SYSTEM-MEMORY backing is LINEAR as gfx12 ADDR3_4KB_2D (ws_resprov.h
 // section 6), the descriptor path's ask sees the T# for such an entry (gfxsrc_desc_tiled_okt: the entry must match the T#,
 // and OUR placed T# is clamped to mip 0), and a committed colour target overlapping such an entry drops it. OFF, the copy,
@@ -1426,7 +1426,7 @@ static volatile uint32_t gKsDeferOn { 0u };
 // the run recipe could change by accident.
 static constexpr uint64_t kKsFlightUs = 2000000ull;
 
-// C5 part 1 (notes/design/C5-CONTINUOUS.md Q1, gfx_flightring.h) — THE FLIGHT RING, REPLACING THE SINGLE KSTONE
+// C5 part 1 (an internal design note Q1, gfx_flightring.h) — THE FLIGHT RING, REPLACING THE SINGLE KSTONE
 // FLIGHT RECORD (0.0.384-0.0.431's `gKsFlight`/`gKsFlightSaved`). Written ONLY by gfxsrc_commit_try, which PUSHES a
 // PENDING entry at the exact instant the COMMIT gate answers N48_CM_OK for a live rewrite (the same instant that
 // already stamps gXdShotSpentUs) — BEFORE the keystone runs, preserving KEYSTONE-A-PRIME's "stamp before the marker
@@ -1453,7 +1453,7 @@ static n48_sp_table gSpill {};
 // keystone), so a keystone-refused frame's seq was named "the newest flight" and's falsifier could fire falsely.
 static uint32_t gKsLastFlightSeq { 0u };
 
-// C5 part 2 (notes/design/C5-CONTINUOUS.md Q2) — "A FENCE READ CHANGED BUT NOT OURS" (corrupted), for the flight
+// C5 part 2 (an internal design note Q2) — "A FENCE READ CHANGED BUT NOT OURS" (corrupted), for the flight
 // ring's own per-entry poll (never the legacy single-record poll, which already has its own `ever`/`revert_poll`
 // latch). Counted at the ring poll loop below when a poll reads a NON-ZERO value that does not match the entry's
 // own `want` on an entry that has not yet retired - the ring's per-entry state does not keep a sticky "ever
@@ -1473,7 +1473,7 @@ static struct {
     uint64_t windows;         // withdrawal windows instrumented (a clear happened and we read the fault status)
     uint64_t latchedInWindow; // windows in which the fault status went from ZERO to non-zero
     uint32_t lines;           // log budget for the per-fire deferral lines
-    // C5 part 2 (notes/design/C5-CONTINUOUS.md Q2, build 0.0.460) — A WITHDRAWAL THAT HAPPENED WHILE THE FLIGHT
+    // C5 part 2 (an internal design note Q2, build 0.0.460) — A WITHDRAWAL THAT HAPPENED WHILE THE FLIGHT
     // RING STILL SHOWED A LIVE ENTRY: `kdArmed && !deferNow` (the withdrawal write below actually ran) with
     // `n48_fr_any_live(&gKsRing)` true at the SAME scan the verdict was computed from, and the verdict itself one
     // of NOW_TIMEOUT/NOW_TORN/NOW_OFF - i.e. we withdrew NOT because the ring was clean (NOW_EOP/NOW_NOT_IN_FLIGHT)
@@ -1487,7 +1487,7 @@ static constexpr uint32_t kKsDeferLogCap = 64u;
 // hook_unmapVA sits ~13400 and ~14900 lines above them respectively and this is the only way to reach them.
 static uint64_t drain_now_us();
 static uint32_t vm_fault_read(uint32_t *lo, uint32_t *hi, uint32_t *alo, uint32_t *ahi);
-// C5 part 1 (notes/design/C5-CONTINUOUS.md Q1) — hook_unmapVA's OWN "was the committed frame's end of pipe
+// C5 part 1 (an internal design note Q1) — hook_unmapVA's OWN "was the committed frame's end of pipe
 // observed" question is now the flight ring's (gKsRing, gfx_flightring.h): a RETIRED entry's own fence, not a
 // single sticky latch. The old accessor this comment used to declare (`ks_eop_seen`, gXdF828.committed && ever)
 // had no caller left once hook_unmapVA, gfxsrc_ts_after_slot and ks_defer_line all moved to the ring, and was
@@ -1508,7 +1508,7 @@ static volatile uint32_t gKsEopExpOn { 0u };   // switch 65; OFF at boot
 static void ks_eop_at_expiry(const void *self, uint32_t ctxSeq, uint32_t fire, uint32_t *kdv, uint32_t *anyLive,
                              uint64_t *nowUs, uint32_t *nowOk, uint32_t *blkSeq, uint64_t *blkAtUs);
 
-// 0.0.418 (notes/design/BUILD-0.0.418.md, E4) — THE WITHDRAWAL MARKER IS A COUNTER, AND THIS IS ITS DECREMENT.
+// 0.0.418 (an internal design note, E4) — THE WITHDRAWAL MARKER IS A COUNTER, AND THIS IS ITS DECREMENT.
 // hook_unmapVA holds no lock from its clear of root[511], through Apple's unmapVA, to its re-arm, so two overlapping
 // unmaps of one context are possible. As a flag (0.0.411), the second call's set was undone by the FIRST call's clear
 // and the keystone was let into the second call's window. The counter's increment is one atomic fetch_add at the set
@@ -1525,7 +1525,7 @@ static void ks_withdraw_leave_atomic(uint32_t *p)
 }
 
 // =====================================================================================================================
-// build 0.0.524 (notes/design/T0SRC.md items 2-3) — SWITCH 79 (`t0src`, default OFF): THE MAP AND UNMAP RINGS.
+// build 0.0.524 (an internal design note items 2-3) — SWITCH 79 (`t0src`, default OFF): THE MAP AND UNMAP RINGS.
 // hook_mapVA records one entry AFTER Apple's mapVA returned (C3); hook_unmapVA records one at its ENTRY. Only for contexts we
 // recorded (both hooks' scope checks run first, unchanged). READ-ONLY: the two note functions read their arguments, the uptime, the
 // judged-frame count and - through kernel-pointer checks on the object, its vtable, its metaclass and the name -
@@ -1638,7 +1638,7 @@ static uint64_t hook_unmapVA(void *self, uint64_t va, uint64_t size) {
     // build 0.0.541 (switch 98, gfx_wc98.h): FIRST, for ANY context: a remap is in flight from here to EVERY return (RAII).
     const Wc98Remap<N48_WC_B_UNMAP_IN, N48_WC_B_UNMAP_OUT> wcRemap;
 
-    // build 0.0.527 (notes/design/SKIP82.md item 4; gfx_sk82.h): every unmapVA, of ANY context, before the scope check - a
+    // build 0.0.527 (an internal design note item 4; gfx_sk82.h): every unmapVA, of ANY context, before the scope check - a
     // switch-82 entry whose VA overlaps [va, va + size) is no longer trusted (size 0 = all). ONE load while 82 was never ON.
     if (gN48Sk82Live) navi48_sk82_ev(N48_SK82_EV_UNMAP, va, size);
     if (gN48D84Live) navi48_d84_unmap(va, size);   // build 0.0.529 (CG84.md item 7): a switch-84 key whose VA overlaps (size 0 = all)
@@ -1701,7 +1701,7 @@ static uint64_t hook_unmapVA(void *self, uint64_t va, uint64_t size) {
     // MM-window reads and the TLB invalidate this path already pays. n48_fr_defer_verdict reads no entry when
     // `kdArmed` is 0, and answers OFF immediately when the switch is 0, so leaving the clock unread decides nothing.
     //
-    // C5 part 1 (notes/design/C5-CONTINUOUS.md Q1, gfx_flightring.h) — ITEM 4: "DEFERS while ANY entry is live and
+    // C5 part 1 (an internal design note Q1, gfx_flightring.h) — ITEM 4: "DEFERS while ANY entry is live and
     // within its bound; may WITHDRAW only when EVERY entry has retired by its own fence, or on the [per-entry]
     // timeout." n48_fr_defer_verdict asks that of the WHOLE ring and answers one of n48_ksd_eval's own N48_KSD_*
     // verdicts, so every existing reader of `kdv` below (n48_ksd_defer, n48_ksd_name) is unchanged. At exactly one
@@ -1711,7 +1711,7 @@ static uint64_t hook_unmapVA(void *self, uint64_t va, uint64_t size) {
     uint32_t kdNowOk = 0u, kdEop = 0u, kdBlockingSeq = 0u;
     uint64_t kdNowUs = 0ull, kdBlockingAtUs = 0ull;
     uint32_t kdv = N48_KSD_NOW_NOTHING;
-    // C5 part 2 (notes/design/C5-CONTINUOUS.md Q2) — CAPTURED for the continuous build's own "withdrawal inside a
+    // C5 part 2 (an internal design note Q2) — CAPTURED for the continuous build's own "withdrawal inside a
     // flight" stop below; read-only, exactly like every other use of this presence scan on this path (see the
     // comment on n48_fr_any_live's call just below: it is never depended on for the WITHDRAW/DEFER decision
     // itself, only here as a REPORTING signal, same footing as gKsD's other counters).
@@ -1726,7 +1726,7 @@ static uint64_t hook_unmapVA(void *self, uint64_t va, uint64_t size) {
         // THIS thread observes at least what the writer thread's own release fence (at the push, and at every later
         // transition) had published by the time this thread's most recent synchronising read happened.
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        // 0.0.444 (C5-RING-REVIEW.md (B) item 2, Q1 route 1) — THE RING SCAN RUNS BEFORE THE CLOCK IS READ, not
+        // 0.0.444 (an internal review note (B) item 2, Q1 route 1) — THE RING SCAN RUNS BEFORE THE CLOCK IS READ, not
         // after. 0.0.443 read `drain_now_us()` here FIRST and scanned the ring inside n48_fr_defer_verdict SECOND,
         // so a push landing in between (a commit's gate stamp, on the OTHER thread) could hand the verdict a
         // `now_us` OLDER than that brand-new entry's own `at_us` - a future stamp purely from the reading order.
@@ -1858,7 +1858,7 @@ static uint64_t hook_unmapVA(void *self, uint64_t va, uint64_t size) {
         // byte for byte, on the same guard (rootwrite_withdraw_check) - the only thing the deferral ever did was make
         // an EARLIER call skip it. So "applied" means "the first call after the window took the withdrawal it always
         // would have taken", and a reviewer reading this line is reading a LOG, not a second code path.
-        // 0.0.444 (C5-RING-REVIEW.md (B) item 8) — "THE FLIGHT" IS NAMED BY THE NEWEST PUSH (`gKsLastFlightSeq`),
+        // 0.0.444 (an internal review note (B) item 8) — "THE FLIGHT" IS NAMED BY THE NEWEST PUSH (`gKsLastFlightSeq`),
         // not the oldest. 0.0.443 named this line's flight by `kdBlockingSeq` (the ring's OLDEST still-live entry),
         // which breaks's own falsifier ("must read the LAST committed seq") the instant a second commit is in
         // flight. The oldest blocking entry is kept as a SECOND field (still useful: it is the one actually still
@@ -1918,7 +1918,7 @@ static uint64_t hook_unmapVA(void *self, uint64_t va, uint64_t size) {
     //
     // 0.0.384: `&& !deferNow` is the ONLY change to this condition, and with the switch off n48_ksd_eval cannot
     // return N48_KSD_DEFER, so `deferNow` is 0 on every path and this reads exactly as 0.0.383's did.
-    // C5 part 2 (notes/design/C5-CONTINUOUS.md Q2) — "A WITHDRAWAL INSIDE A FLIGHT". This IS the withdrawal (the
+    // C5 part 2 (an internal design note Q2) — "A WITHDRAWAL INSIDE A FLIGHT". This IS the withdrawal (the
     // block below runs); `deferNow` is false (nothing deferred it) yet the ring's own presence scan, taken at the
     // top of this call, still saw a live entry - so this withdrawal did not happen because the ring was clean
     // (NOW_EOP / NOW_NOT_IN_FLIGHT), it happened DESPITE a flight still showing, on one of the three verdicts that
@@ -9098,7 +9098,7 @@ uint32_t hw_hook_sched_state() {
                 // 283: BEFORE deciding whether forcing the 0x20548 gate is safe, resolve
                 // every slot AMDHardware::powerUp() calls, from LIVE memory minus slide -
                 // file-side scanning cannot answer it (initializeVmHardware has zero direct
-                // callers; it is vtable-dispatched). HANDOFF 609-614 records 0.0.74
+                // callers; it is vtable-dispatched). the project notes record 0.0.74
                 // page-faulting at CR2=0 inside GFX10Hardware::initializeVmHardware
                 // (0xbe31438) reached from powerUpHW, and 1463-1481 records 0.0.52 HARD
                 // HANGING the machine on Apple's GART/MMHUB path. If any slot below is
@@ -10788,7 +10788,7 @@ struct RingMapState {
 };
 static RingMapState gRingMap {};
 
-// 0.0.413 (notes/design/FENCE-OWNED-SLOT.md,) — THE FENCE828 OWNED-SLOT EPOCH. Stamp it once per boot when the ring
+// 0.0.413 (an internal design note,) — THE FENCE828 OWNED-SLOT EPOCH. Stamp it once per boot when the ring
 // map is built, so every fence this boot writes carries the SAME nonzero high 16 bits and a value left in the fence page
 // by a PREVIOUS boot (VRAM survives a warm reboot,) can never match. The fence page itself is zeroed on the same
 // build path, so this is belt-and-suspenders; `n48_f828_owned_gate` refuses (EPOCH) when it is zero.
@@ -11320,7 +11320,7 @@ uint32_t hw_hook_ring_map(uint64_t arg, uint64_t *out, unsigned count) {
     gRingMap.descOk = descOk ? 1u : 0u;
     gRingMap.descBad = descBad;
 
-    // --- (4c) 0.0.413 (notes/design/FENCE-OWNED-SLOT.md,) — ZERO THE FENCE828 OWNED SLOT PAGE, AND STAMP THE
+    // --- (4c) 0.0.413 (an internal design note,) — ZERO THE FENCE828 OWNED SLOT PAGE, AND STAMP THE
     // PER-BOOT EPOCH. The page is the LAST 4 KiB of the relocation arena, [ringBase + XLAT12_FENCE_PAGE_OFF,
     // +0x1000), immediately above the shortened arena and below the L1 block. VRAM IS NOT ZEROED AT BOOT and
     // it SURVIVES a warm reboot, so a stale value from a previous boot could otherwise sit in a slot: zeroing
@@ -11472,7 +11472,7 @@ uint32_t hw_hook_ring_map(uint64_t arg, uint64_t *out, unsigned count) {
 
 // ---------------------------------------------------------------------------
 // 0.0.247 — `vmctx` (54). MILESTONE 3 step 4, the OBSERVE BOOT of
-// notes/M3-ROOT-WRITE-REVIEW.md.1. READ-ONLY in the strongest sense: it
+// notes/an internal review note.1. READ-ONLY in the strongest sense: it
 // writes nothing into Apple's page tables, nothing into Apple's objects, no
 // register and no VRAM. Everything it reports it read.
 //
@@ -17101,7 +17101,7 @@ private:
 };
 
 // Read up to n dwords at VMID-2 VA `va` (page by page). Returns dwords read; stops at the first unmapped page.
-// 0.0.435 (notes/design/PGMID-COPYGUARD.md Part 2) — `rec`, if non-null, is fed every VRAM page this
+// 0.0.435 (an internal design note Part 2) — `rec`, if non-null, is fed every VRAM page this
 // call actually reads (n48_cg_pagerec_note, gfx_copyguard.h). `gfxc_read` itself always passes null (below), so
 // every existing caller is byte-identical to before this brief; `gfxc_read_rs` is the ONLY entry point that passes
 // a non-null recorder, and it is used ONLY by the descriptor-read and program-identity callbacks (gfxsrc_desc_gfxc,
@@ -17196,7 +17196,7 @@ static __attribute__((noinline)) bool vram_read_sub(uint32_t sub, uint64_t off, 
 static inline uint32_t gfxc_read_rs(const GfxcVm &vm, uint64_t va, uint32_t *dst, uint32_t n, uint32_t *sysPages, n48_cg_pagerec *rec) {
     return gfxc_read_core(vm, va, dst, n, sysPages, rec);
 }
-// build 0.0.529 (notes/design/CG84.md item 5, X2 - THE READER CENSUS): a VRAM read inside the policy pass that does NOT go through
+// build 0.0.529 (an internal design note item 5, X2 - THE READER CENSUS): a VRAM read inside the policy pass that does NOT go through
 // gfxc_read_rs, and whose bytes the granule model would otherwise stop protecting "by accident" (CG84.md R5: under the page model it
 // was covered whenever a recorded reader noted the same page), notes its WHOLE page(s) into the active recorder's CENSUS list. Only a
 // fine check (switch 84 ON's counted check, SHADOW's instrument) reads that list, so OFF - and SHADOW's counted check - is 0.0.528's.
@@ -18290,7 +18290,7 @@ extern const size_t  fw_shadercache_size;
 // navi48_shadercache_epoch() is declared in Navi48Ttl.hpp at global scope (as navi48_shadercache_control is) and defined in
 // Navi48AccelPeer.cpp: the residency-copy count the program memo uses as its epoch.
 static constexpr uint32_t kXdIbDwords    = 32768u;   // the largest IB gfxcap1 saw was 13920 dwords
-// build 0.0.484 (notes/design/GLASS.md Q2 K2/K3 and the substitution cap): the three numbers are gfx_subst_caps.h's,
+// build 0.0.484 (an internal design note Q2 K2/K3 and the substitution cap): the three numbers are gfx_subst_caps.h's,
 // where their static_asserts live. K3 1024 -> 1344 (glass's 5376-byte image must fit one read: our gfx1201 bytes carry no
 // gfx10 terminator, so recognition always reads the full window); K2 2048 -> 5376 (glass renders to 5376 B); the cap
 // 96 -> 128 (r17 holds 90 substitutable entries, r18 92-93). gXdPgm 4 -> 5.25 KiB and the gXdSubst pool 192 -> 672 KiB,
@@ -18309,7 +18309,7 @@ static_assert(N48_WSV_ARM_COMMIT == (uint32_t)N48_SD_ARM_COMMIT, "ws_valid.h's C
 static IOLock   *gXdLock  { nullptr };
 static uint32_t *gXdIb    { nullptr };
 static uint32_t *gXdPgm   { nullptr };
-// 0.0.434 (notes/design/PGMID-COPYGUARD.md Part 1): SHADOW mode's SECOND scratch, kXdIdDwords wide. Only
+// 0.0.434 (an internal design note Part 1): SHADOW mode's SECOND scratch, kXdIdDwords wide. Only
 // SHADOW (`gfxneuter 38 | 3 << 8`) ever writes it - it holds mode T's head-first read side by side with `gXdPgm`'s
 // full 512-dword read, which SHADOW leaves the downstream code reading exactly as HEAD does. Allocated with gXdPgm.
 // build 0.0.484: it has always been ALLOCATED N48_PGMID_CAP wide (the "kXdIdDwords wide" above was true only while
@@ -18391,7 +18391,7 @@ static uint32_t gfxsrc_xlat_open() {
 // it gets there, and who may claim a piece of it (gfx_reloc.h has the reasoning).
 // The room is the tail of the ring region `ringmap` carves and maps R/W/X through our OWN L1 block at root slot 511:
 // [vaBase + 0xA81000, + 0xA8F000), 56 KiB since 0.0.413 — the old 60 KiB less the last 4 KiB, which is now the fence828
-// owned slot page [+0xA8F000, +0xA90000) (notes/design/FENCE-OWNED-SLOT.md,) — reserved by XLAT12_RELOC_ARENA_OFF/BYTES.
+// owned slot page [+0xA8F000, +0xA90000) (an internal design note,) — reserved by XLAT12_RELOC_ARENA_OFF/BYTES.
 // This is INERT until `accel gfxneuter 6` asks for it, and it writes nothing but our own VRAM.
 static uint32_t gfxsrc_read_program(const GfxcVm &vm, uint64_t va, uint32_t &L);   // defined with the decision, below
 static n48_reloc_arena gReloc {};
@@ -18637,7 +18637,7 @@ static struct { uint32_t active; uint64_t cb0; } gFsPend {};
 // what commits it and closes the window. A plane frame the keystone withdraws never reaches that call, so the window stays
 // open (for the next plane frame or its own expiry), exactly as P1 specifies. OFF (switch 35 never thrown) nothing sets it.
 static uint32_t gFsPlanePend { 0u };
-// build 0.0.530 (notes/design/SRCFILL85.md): switch 85 "SOURCE FILLS" (gfx_fs85.h). All-zero at boot, so OFF, and every
+// build 0.0.530 (an internal design note): switch 85 "SOURCE FILLS" (gfx_fs85.h). All-zero at boot, so OFF, and every
 // fill-set call site dispatches to the 0.0.529 n48_fs_* function until `gfxneuter 85 | 1 << 8` AND 33 AND 35 are all ON.
 static n48_fs85 gFs85 {};
 // build 0.0.548: switch 106's MODE and THE LEARNER (gfx_fillset.h n48_fs_learn). All-zero at boot: mode TABLED, so
@@ -18835,7 +18835,7 @@ static volatile uint32_t gHgPendOn { 0u };
 static uint32_t gHgPendLatch { 0u };
 static n48_hg_pend gHgPend {};
 static uint32_t gHgPendLogN { 0u };
-// build 0.0.533 (; notes/design/HG88.md): SWITCH 88, THE RANGE-PRECISE HEAP-GENERATION JUDGE. `88 | M << 8`:
+// build 0.0.533 (; an internal design note): SWITCH 88, THE RANGE-PRECISE HEAP-GENERATION JUDGE. `88 | M << 8`:
 // M 1 ON (= 344: in the start-up window only), M 2 OFF (= 600, the default and the boot value), bare `88` reads. Latched per pass
 // into gHgFrame.r88 at the top of the pass (hg_frame_begin_pass, with 62's latch and the start-up window). gfx_heapgen.h holds the
 // judge; the copy records live in gHg under gHgLock. It never touches gHgPend (switch 72's PRE/LIVE): 88 changes only the
@@ -18854,7 +18854,7 @@ static void hg_wait_lock(void *c) { IOLockLock(static_cast<IOLock *>(c)); }
 static void hg_wait_unlock(void *c) { IOLockUnlock(static_cast<IOLock *>(c)); }
 static void hg_wait_delay(void *, uint32_t us) { if (us >= 1000u) IOSleep(us / 1000u); else IODelay(us); }
 static const n48_hg_wait_ops kHgWaitOps = { &hg_wait_now, &hg_wait_lock, &hg_wait_unlock, &hg_wait_delay };
-// build 0.0.532 (switch 72 M3, notes/design/HW72M3.md item 8): the same callbacks plus the LIVE flight's fence read, which
+// build 0.0.532 (switch 72 M3, an internal design note item 8): the same callbacks plus the LIVE flight's fence read, which
 // n48_hg_copy_wait3 calls ONLY with gHgLock released: navi48_vram_read_mm takes gVramMmLock alone (the existing gXdLock ->
 // gVramMmLock order is untouched: the copier holds no lock of ours here) and never gXdLock. One dword, the ring poll's own read.
 static uint32_t hg_wait_read_fence(void *, uint64_t off, uint32_t *val) { return navi48_vram_read_mm(off, val, 1) ? 1u : 0u; }
@@ -18902,7 +18902,7 @@ static IOLock *hg_lock_get()
 
 bool hw_hg_on() { return gHgOn && __atomic_load_n(&gHgLock, __ATOMIC_ACQUIRE); }
 
-// build 0.0.532 (switch 72 M3, notes/design/HW72M3.md item 8): hw_hg_copy_begin's wait under M3, with gHgLock (`l`) HELD on entry
+// build 0.0.532 (switch 72 M3, an internal design note item 8): hw_hg_copy_begin's wait under M3, with gHgLock (`l`) HELD on entry
 // and on return. Waits while PRE is set by another thread and this copy is fully patched (`mayWait`), or while LIVE is set (any
 // bumping copy), reading the LIVE flight's own fence with the lock released; at most N48_HG_WAIT_US. noinline: its frame stays out of
 // hw_hg_copy_begin's.
@@ -19234,7 +19234,7 @@ static void gfxsrc_identify_pgm(const GfxcVm &vm, uint64_t va, uint32_t stage, i
 // where our copy of that program currently lives. `accel gfxneuter 6` can place a program after frames have already
 // been judged, and a memo row written before that upload would otherwise say "not relocated" for the rest of the epoch.
 // The lookup is a linear scan of at most N48_RELOC_ROWS rows already in memory - no page mapping, nothing to cache.
-// build 0.0.533 (switch 88, notes/design/HG88.md "Frame side"): under gXdLock, BEFORE the program's VA is recorded and before
+// build 0.0.533 (switch 88, an internal design note "Frame side"): under gXdLock, BEFORE the program's VA is recorded and before
 // the memo: the pid, and - the first time this pass names the VA - every 4 KiB page of [va, va + kXdPgmDwords * 4) mapped through
 // the submitter's page table (gfxc_page: gXdLock -> gVramMmLock, the existing order; gHgLock is not taken) and converted to its
 // VRAM offset. A page that is host memory or cannot be mapped (or converted), or a FULL list, makes the frame UNRESOLVED (refused
@@ -19323,7 +19323,7 @@ static n48_cm_shot  gXdShot {};
 static uint64_t     gXdShotSpentUs { 0 };        // when the gate answered OK, for the disarm line's own arithmetic
 
 // =============================================================================================================================
-// build 0.0.532 (; notes/design/HW72M3.md) — SWITCH 72 M3's KEXT STEPS (gfx_heapgen.h holds every decision).
+// build 0.0.532 (; an internal design note) — SWITCH 72 M3's KEXT STEPS (gfx_heapgen.h holds every decision).
 // gHgLock stays a leaf: each helper below takes it alone or under gXdLock (the existing order), and calls nothing under it but
 // gfx_heapgen.h's arithmetic. Every call site is guarded by one load (M1/M2 and M3 with nothing LIVE: nothing else runs).
 // =============================================================================================================================
@@ -19390,7 +19390,7 @@ static __attribute__((noinline)) void fs_note_walk_nopped(uint32_t seq)
     if (n48_fs_note_nopped(&gFs, &gFsNop, seq)) fs_nop_line();
 }
 
-// C5 part 2 (notes/design/C5-CONTINUOUS.md Q2, build 0.0.460) — SWITCH 41's OWN PARAMETERS, "frozen into the shot
+// C5 part 2 (an internal design note Q2, build 0.0.460) — SWITCH 41's OWN PARAMETERS, "frozen into the shot
 // at the arm (`4 | 1 << 8`), like switch 20" (gXdShotBudget below). Both 0 is OFF (the default and the boot
 // value): the arm verb reads these and, ONLY if `gXdContN` is non-zero, arms a CONTINUOUS shot instead of a
 // one-shot. Neither is touched by anything but `gfxneuter 41`, so a boot that never throws it arms exactly as
@@ -19689,7 +19689,7 @@ static void xd_shot_finish(const char *where)
     // 0.0.404: the arm is over, so the fill-set reservation's window closes with it. The next arm re-opens
     // it with a fresh member set and count (n48_fs_open). A no-op when switch 33 is off.
     n48_fs_clear(&gFs);
-    // C5 part 1 (hygiene, notes/design/C5-CONTINUOUS.md Q3) — THE OLD LINE LIED ABOVE BUDGET 1. Through 0.0.442 it read
+    // C5 part 1 (hygiene, an internal design note Q3) — THE OLD LINE LIED ABOVE BUDGET 1. Through 0.0.442 it read
     // "Exactly one frame was ever handed COMMIT this boot", true only when gXdShot.budget was 1; at budget 2-4 this
     // disarm can follow the LAST of several spends, and the line still claimed "exactly one". It now reads the real
     // count this arm actually spent and the budget it was given, which is 1-and-1 at budget 1 (byte for byte the old
@@ -19701,7 +19701,7 @@ static void xd_shot_finish(const char *where)
           (unsigned long long)(gXdShotSpentUs ? drain_now_us() - gXdShotSpentUs : 0ull), gXdArm,
           gXdShot.spent, budgetAtFinish);
     fsl_arm_stop();   // build 0.0.548 (switch 106 LEARNED / SHADOW): the learned vs tabled STOP line; TABLED prints nothing
-    // C5 part 2 (notes/design/C5-CONTINUOUS.md Q2/Q3) — THE CONTINUOUS STOP LINE, naming stop_why, spent/N and
+    // C5 part 2 (an internal design note Q2/Q3) — THE CONTINUOUS STOP LINE, naming stop_why, spent/N and
     // last-commit-minus-start, UNCAPPED (a stop is never suppressed by the periodic-summary caps above). Printed
     // once per continuous arm, here and nowhere else - this is the ONE place every continuous stop site converges
     // on (n48_cm_shot_stop moves ARMED -> SPENT; this function is what then moves SPENT -> DONE and is called,
@@ -19772,7 +19772,7 @@ static struct {
     // unit formed, nsegPre == nseg and units == 0. Both cleared wherever `nseg` is.
     uint32_t nsegPre, units;
     n48_cm_seg seg[N48_XV_MAX_SEGS];
-    /* 0.0.426 (notes/design/MIB-COMMIT.md binding B2) — THE CONCATENATED FRAME'S PER-IB LAYOUT, written by the gather and
+    /* 0.0.426 (an internal design note binding B2) — THE CONCATENATED FRAME'S PER-IB LAYOUT, written by the gather and
      * read by the gate/rewrite/token/exemption. All zero unless switch 36 is on AND the frame carried more than one IB, so
      * a single-IB or OFF frame leaves them unread (B0's byte-identical property). `ib_off[k] = sum(ib_n[j], j < k)`. */
     uint32_t mib;                          /* 1: every field below describes THIS frame's concatenation */
@@ -19781,7 +19781,7 @@ static struct {
     uint32_t ib_got[N48_XV_MAX_IBS];       /* dwords gfxc_read returned for IB k */
     uint32_t ib_nseg[N48_XV_MAX_IBS];      /* segments the recogniser found in IB k */
     uint64_t ib_va[N48_XV_MAX_IBS];        /* IB k's VA */
-    // R1 (notes/design/R1-MEMDST.md Q2, item C) — THE MEMORY-DESTINATION RUNG'S OWN VERDICT FOR THIS FRAME, written
+    // R1 (an internal design note Q2, item C) — THE MEMORY-DESTINATION RUNG'S OWN VERDICT FOR THIS FRAME, written
     // at the tail of gfxsrc_policy (after the segment loop and the fence apply) and read by the gate/report. Cleared
     // at the TOP of the pass, exactly like every other gXdBuild field: a stale verdict must never describe a new
     // frame. `md_ok` is 1 only when n48_md_judge answered N48_MD_OK; `md_clause`/`md_detail` are its own answer,
@@ -20067,7 +20067,7 @@ static void p73_report_line(const char *how)
     }
 }
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════
-// build 0.0.525 (notes/design/CYCLE80.md C1-C7, X1-X4; gfx_cycle80.h) — SWITCH 80: CYCLE COMPLETENESS. `80 | M << 8`: M 1 ON
+// build 0.0.525 (an internal design note C1-C7, X1-X4; gfx_cycle80.h) — SWITCH 80: CYCLE COMPLETENESS. `80 | M << 8`: M 1 ON
 // (= 336), M 2 OFF (= 592, the default and the boot value), M 3 SHADOW (= 848), bare `80` reads. The mode lives in gP73.c80on (the
 // present reads it there: n48_p73_c80_hold, ONE load while OFF); the verb is its only writer. OFF, every hook below is one load of
 // that mode and a return (or not reached), and switch 73 decides, copies and logs exactly as 0.0.524.
@@ -20523,11 +20523,11 @@ static void gfxsrc_note_no_identity(uint32_t stage, uint64_t va, const uint32_t 
 }
 
 // =================================================================================================================
-// 0.0.434 (notes/design/PGMID-COPYGUARD.md Part 1) — SWITCH 38: PROGRAM-IDENTITY COST.
+// 0.0.434 (an internal design note Part 1) — SWITCH 38: PROGRAM-IDENTITY COST.
 // =================================================================================================================
 // `accel gfxneuter 38 | M << 8`: M 1 = T (read the 4-dword head first, then only the largest same-head row's own
 // `ndw` - gfx_pgmid.h's `n48_pgm_need`, provably sufficient, never a guess); M 2 = T+M, the per-pass memo, keyed by
-// (stage,VA) and cleared once per gfxsrc_policy pass (0.0.436, notes/design/PGMID-COPYGUARD.md design "2. M"); M 3 =
+// (stage,VA) and cleared once per gfxsrc_policy pass (0.0.436, an internal design note design "2. M"); M 3 =
 // SHADOW (run BOTH T and HEAD's full read, but USE HEAD'S ANSWER - T's is only compared, never returned); M 4 =
 // SHADOW-M (0.0.436: run T+M's own path as a side trial against a SEPARATE memo/scratch, use HEAD's answer, count
 // disagreements); M 0xFF = OFF, the default and the boot value, `38` alone reads. OFF is 0.0.433's
@@ -20680,7 +20680,7 @@ static uint32_t gfxsrc_pgm_profile_headfirst(uint32_t stage, uint64_t va, uint32
     }
     return got;
 }
-// 0.0.436 (notes/design/PGMID-COPYGUARD.md Part 1, design "2. M") — THE MEMO'S OWN LOOKUP. Returns true
+// 0.0.436 (an internal design note Part 1, design "2. M") — THE MEMO'S OWN LOOKUP. Returns true
 // only for a VALID hit: `m` has a row for (stage,va), the copy-guard ring mark has not moved since it was filled
 // (navi48_cg_ring_mark_now - "any Part-2 guard event invalidates it", the design's own words, not merely an
 // overlapping one), and none of its pages are currently poisoned (navi48_cg_poison_overlaps_page). On a valid hit
@@ -20988,7 +20988,7 @@ static uint32_t gfxsrc_pgm_profile_id_read(uint32_t stage, uint64_t va, uint32_t
 // Declared HERE (ahead of gXpOn/gXpD4 and friends, which sit far below) because this is its one and only reader.
 static volatile uint32_t gP43On { 0u };
 static struct { uint64_t asks, gated, admitted; } gP43 {};
-// build 0.0.470 (notes/design/NO-SAMPLER-CLASS10.md section 3) — SWITCH 51, the two NEW table shapes (no sampler:
+// build 0.0.470 (an internal design note section 3) — SWITCH 51, the two NEW table shapes (no sampler:
 // T/AP/AR/AV/AW/AX; class 10: AZ). `accel gfxneuter 51 | M<<8`: M 1 ON (= 307), M 0xFF OFF (= 65331, the default and boot
 // value; M 2 is accepted as OFF too, the 48-52 spelling), bare `51` reads and changes nothing. OFF, `gfxsrc_pgm_profile`
 // zeroes any `ps_table_abi1` that `xlat12_table_abi_new_shape` names (a property of the row's own fields, not a list),
@@ -21024,7 +21024,7 @@ static int gfxsrc_pgm_profile(void *ctx, uint32_t stage, uint64_t va, xlat12_dra
     gPgmId.asks++;
     uint64_t pgT0 = 0ull, pgT1 = 0ull;
     clock_get_uptime(&pgT0);                          // ALWAYS timed - the instrument's own promise, switch or no
-    // 0.0.436 (notes/design/PGMID-COPYGUARD.md Part 1, design "2. M") — MODE T+M: the per-pass memo,
+    // 0.0.436 (an internal design note Part 1, design "2. M") — MODE T+M: the per-pass memo,
     // tried BEFORE the head-first read. A VALID hit (gfxsrc_pgmid_memo_try) skips the read AND the match below
     // entirely - `id` comes from the memo directly - because everything from the match down is otherwise UNCHANGED
     // (the design's own words) and safe to skip on a hit: `xlat12_ib_profile_stage`/`xlat12_shader_id_desc_*` (both
@@ -21368,7 +21368,7 @@ static void gfxsrc_ring_open()
 // old records. Whether that is sufficient is a hardware question. The replay's --kext-desc mirrors this block line for line.
 struct GfxDescCtx { const GfxcVm *vm; uint64_t ctx; };
 static n48_dl gXdLed {};   // under gXdLock
-// build 0.0.448 item 3 (notes/design/MIB-A1-PROVENANCE.md Q4 step 2), switch 45, DEFAULT OFF —
+// build 0.0.448 item 3 (an internal design note Q4 step 2), switch 45, DEFAULT OFF —
 // FRAME-LOCAL PROVENANCE. A SECOND, throwaway n48_dl instance: cleared UNCONDITIONALLY at the top of every
 // gfxsrc_policy PASS (gfxsrc_policy's own per-pass-clear block, beside n48_pm_clear/navi48_cg_seg_begin), fed
 // INCREMENTALLY inside the per-segment loop right after each segment's OWN successful translate (never waiting
@@ -21391,7 +21391,7 @@ static n48_dl gXdLed {};   // under gXdLock
 static n48_dl gXdFrameLocal {};   // under gXdLock, exactly like gXdLed
 static volatile uint32_t gXdFrameLocalOn { 0u };
 static struct { uint64_t segsOn, vouched; } gXdFrameLocalS {};
-// 0.0.444 (C5-RING-REVIEW.md (B) item 9a) — hook_gfxCommitIB's three un-feed sites QUEUE here (no lock: one writer
+// 0.0.444 (an internal review note (B) item 9a) — hook_gfxCommitIB's three un-feed sites QUEUE here (no lock: one writer
 // thread, Apple's submit thread); gfxsrc_decide_frame DRAINS it under gXdLock at the next judged frame's top.
 static n48_dl_unfeed_q gXdLedUnfeedQ {};
 static struct {
@@ -21434,7 +21434,7 @@ static void xd_rb_detect(const GfxcVm &vm, uint64_t provVa, uint64_t frame, uint
 // entry and its exit, so the hot descriptor callback pays two uptime reads only inside the pass whose phases the
 // instrument is about.
 static n48_mib_pol gMibPol {};
-// 0.0.434 (notes/design/PGMID-COPYGUARD.md Part 1): the SAME shape, fed by nib >= 2 passes instead of
+// 0.0.434 (an internal design note Part 1): the SAME shape, fed by nib >= 2 passes instead of
 // nib == 1 (gfxsrc_policy picks which one `gPolDescTarget` points at, per pass). Declared here, beside `gMibPol`,
 // so both are in scope wherever either is; the report line lives beside gMibPol's own, further down this file.
 static n48_mib_pol gMibPol2 {};
@@ -21664,7 +21664,7 @@ static int gfxsrc_desc_tiled_ok(void *ctx, uint64_t va, uint32_t mode, uint32_t 
     gfxsrc_defer_ask_failed(va);   // build 0.0.511 (switch 70): every source said no - the attempt's failed ask
     return 0;
 }
-// build 0.0.488 (notes/design/DCC-DESC.md Q2 option (A) and Q4), switch 60, DEFAULT OFF AND OFF AT BOOT — THE DCC T#
+// build 0.0.488 (an internal design note Q2 option (A) and Q4), switch 60, DEFAULT OFF AND OFF AT BOOT — THE DCC T#
 // STRIP. ON, the descriptor path (10) also passes XLAT12_EXTRA_DCC_STRIP: a table T# with DCC metadata, of the design's
 // accept shape, is translated by meaning (xlat12_ib.h) instead of refused 0x106, and is then admitted ONLY through
 // ex->desc_dcc_ok = gfxsrc_desc_dcc_ok below: the producer ledger or (switch 45) the frame-local list, through
@@ -21750,7 +21750,7 @@ static void st103_wire(xlat12_draw_extra *e) {
     if (e->desc_dcc_ok == static_cast<TiledFn>(&gfxsrc_desc_dcc_ok)) e->desc_dcc_ok = &st103_dcc_ok;
 }
 // =============================================================================================================================
-// build 0.0.554 (; notes/design/ADMIT-STALE-112.md; gfx_admit112.h) - SWITCH 112 "admit112", ADMIT STALE. gAd112Mode is
+// build 0.0.554 (; an internal design note; gfx_admit112.h) - SWITCH 112 "admit112", ADMIT STALE. gAd112Mode is
 // written ONLY by `gfxneuter 112`. ON: a tiled, NOT-DCC, table-path texture read of an allow-listed program that EVERY proof ask refused
 // is admitted when its base page resolves through the asking frame's own VM and this arm's EVER ledger (gEver) holds (context, VA, mode,
 // page): the surface was demonstrably WRITTEN earlier this arm (a committed frame's colour target, or a recorded residency copy).
@@ -22173,7 +22173,7 @@ static void gfxsrc_rp_ws_gone() {
 //, Navi48AccelPeer's half (declared in AppleHardwareHook.hpp). 1 = both switches are on: the residency copy may re-tile a
 // proven-shape 4KB_D_X resource and should hand its facts to hw_resprov_note_copy.
 bool hw_resprov_on() { return gXdDescPort && gXdResProv; }
-// build 0.0.527 (notes/design/SKIP82.md; gfx_sk82.h): switch 82's reads (AppleHardwareHook.hpp). Read-only, no lock: a torn
+// build 0.0.527 (an internal design note; gfx_sk82.h): switch 82's reads (AppleHardwareHook.hpp). Read-only, no lock: a torn
 // or stale answer can only make a snapshot differ (no skip) or answer BUSY.
 uint32_t hw_sk82_arm_level() { return gXdArm; }
 uint32_t hw_sk82_neuter() { return gGfxNeuter; }
@@ -22267,7 +22267,7 @@ uint32_t hw_resprov_note_copy(n48_rp_copy *c, int32_t pid, uint64_t *ctxOut, uin
 // our bytes written into its IB; it is safe only because the frame is then NEUTERED at the source, so the CP never runs
 // the rewritten stream. (0.0.415, Q6b: the pre-0.0.415 wording claimed nothing was ever written, which is false.)
 static_assert(N48_F828_NOP1 == XLAT12_IB_NOP, "the one-dword NOP must be the translator's own");
-// 0.0.413 (notes/design/FENCE-OWNED-SLOT.md,): the owned slot page is the LAST 4 KiB of the relocation arena. The
+// 0.0.413 (an internal design note,): the owned slot page is the LAST 4 KiB of the relocation arena. The
 // pure header cannot include xlat12_ib.h, so the two definitions are tied here, and the non-overlap with the arena too.
 static_assert((uint32_t)N48_F828_FENCE_PAGE_OFF == (uint32_t)XLAT12_FENCE_PAGE_OFF,
               "the fence828 owned page must be the relocation arena's last 4 KiB");
@@ -22325,7 +22325,7 @@ static volatile uint32_t gTvScanOn { 0u };
 // declared separately from the `uint64_t` fields above so the base type is not silently applied to it too.
 static struct { uint64_t frames, refused, why[7]; uint32_t vramSeen; } gTvS {};
 static n48_gcap_cbt gTvCbt {};   // file scope (> 128 B): this runs deep in Apple's submit path, under gXdLock
-// build 0.0.485 (notes/design/LOGIN-SCREEN-PATH.md "The ledger wall (L1, L2)") — switch 58, DEFAULT OFF AND OFF AT BOOT.
+// build 0.0.485 (an internal design note "The ledger wall (L1, L2)") — switch 58, DEFAULT OFF AND OFF AT BOOT.
 // `58 | M << 8`: M 1 ON (= 314), M 2 OFF (= 570), bare `58` reads. Acts only while the descriptor path (10) is on. ON:
 //   L1 - every judged frame also runs the per-draw colour-target pass (gfx_capture_scan.h n48_gcap_cbt_ib, into gLedCbt,
 //        WHATEVER SWITCH 54 SAYS), and a frame the COMMIT gate answered yes for has each of those targets' base pages resolved
@@ -22338,7 +22338,7 @@ static n48_gcap_cbt gTvCbt {};   // file scope (> 128 B): this runs deep in Appl
 // gfxc_page, and changes only what the ledger records. Throwing it moves the ledger's epoch, so no entry crosses the change.
 // Joins the continuous mid-arm guard (n48_cm_cont_switch_refused) like 43-56. Both statics are > 128 B (off the stack).
 static volatile uint32_t gLedMidOn { 0u };
-// build 0.0.487 (notes/design/COMPUTE-N.md Q6/Q7, contract C3) — SWITCH 57, THE COMPUTE-N ELIDE. `57 | M << 8`: M 1 ON
+// build 0.0.487 (an internal design note Q6/Q7, contract C3) — SWITCH 57, THE COMPUTE-N ELIDE. `57 | M << 8`: M 1 ON
 // (= 313), M 2 OFF (= 569, the default and the boot value), bare `57` reads. ON, gfxsrc_policy hands every segment
 // XLAT12_EXTRA_CS_ELIDE and gfxsrc_cs_is_n (THIS frame's own gathered programs: compute stage, BufferClear_CS's key, bytes
 // ours), so xlat12 replaces a PROVEN compute clear N (P2-P5, xlat12_ib.h) by a same-length NOP; gXdBuild.csElided carries
@@ -22557,7 +22557,7 @@ static __attribute__((noinline)) void nclear_seg(const GfxcVm &vm, uint32_t k, u
               was ? "segment refused by the translator" : *st ? "REFUSED by the kext's check (packets or pages)" : "segment translated");
     }
 }
-// build 0.0.500 (notes/design/DRAW-ELIDE.md Q4; ) — SWITCH 66, THE DRAW ELIDE. `66 | M << 8`: M 1 (= 322)
+// build 0.0.500 (an internal design note Q4; ) — SWITCH 66, THE DRAW ELIDE. `66 | M << 8`: M 1 (= 322)
 // the U/Y rows (the clock composite), M 3 (= 834) the U/Y rows and the AO row (the login panel material), M 2 (= 578) OFF (the
 // default and the boot value), bare `66` reads. The value is xlat12's row-class mask (n48_cm_de_rows_of). Latched ONCE per pass
 // (gXdBuild.deRows at gfxsrc_policy's top); acts only inside the descriptor path's block and only while switch 60 (the DCC strip)
@@ -22613,7 +22613,7 @@ static struct { uint64_t frame; uint32_t why; } gTvFrame {};   // the judged fra
 // and kXdRhWouldLines WOULD-COMMIT answers past that cap, so a two-head frame judged late still gets a line).
 static struct { uint64_t asks, by[N48_CM_RH_REASONS]; uint32_t lines, mibLines, wouldLines; } gXdRh {};
 static constexpr uint32_t kXdRhLines = 16u, kXdRhMibLines = 16u, kXdRhWouldLines = 8u;
-// build 0.0.480 (notes/design/CONTINUATION-UNITS.md Q11 C1-C5): switch 55, DEFAULT OFF. ON, gfxsrc_policy merges each
+// build 0.0.480 (an internal design note Q11 C1-C5): switch 55, DEFAULT OFF. ON, gfxsrc_policy merges each
 // CONTINUATION segment into the unit it continues (gfx_mib.h n48_mib_units, same IB only) and translates every unit of two
 // or more constituents with XLAT12_EXTRA_UNIT (xlat12_ib.h: compaction, deferred records placed in the unit's own leftover
 // or the frame pool, the inline invalidate, un-redirect, every HS pair, the constituent table). A single segment is handed
@@ -22651,7 +22651,7 @@ static uint32_t gSpillBack[64];
 static struct { uint64_t passes, offered, flushes, flushDw, writeFail, mismatch, badUsed, outside, refused, released, notLive,
                 reserveFail, reserveOk, disarms, rowLost, frameMismatch; uint32_t lines; } gSpillS {};
 static uint64_t gSpillFrame { 0ull };   // the judged frame (gXdC.judged + 1) whose pass took the BUILDING slice
-// build 0.0.501 (notes/design/UNIT-ROOM.md Q3 C3): switch 67, PACK, DEFAULT OFF. `67 | M << 8`: M 1 ON
+// build 0.0.501 (an internal design note Q3 C3): switch 67, PACK, DEFAULT OFF. `67 | M << 8`: M 1 ON
 // (= 323), M 2 OFF (= 579, the default and the boot value), bare `67` reads and changes nothing. Latched ONCE per pass into
 // gUnitState.pack (the unit state's IN field) before the segment loop, so every unit AND switch 56's retry (the same
 // gUnitState) see one answer. ON, a unit's deferred descriptor records go one PACKET3(NOP) per free run (xlat12_ib.c
@@ -22682,7 +22682,7 @@ static uint32_t gUnitDeferLines { 0u };
 static uint32_t gUnitDeferAug { 0u };   // the current retry's entries from earlier retries (for its line)
 // The ask callbacks' note (gfxsrc_desc_tiled_ok / gfxsrc_desc_dcc_ok answered 0): kept only while 70 is latched ON, in pass 0.
 static void gfxsrc_defer_ask_failed(uint64_t va) { n48_mib_defer_ask_note(&gUnitDefer, va); }
-// build 0.0.505 (notes/design/CROSS-IB.md Q4): switch 69, THE CROSS-IB RULES, DEFAULT OFF, REQUIRES 36.
+// build 0.0.505 (an internal design note Q4): switch 69, THE CROSS-IB RULES, DEFAULT OFF, REQUIRES 36.
 // `69 | M << 8`: M 1 the IB-0 disguise (= 325), M 2 the lead (= 581), M 3 both (= 837), M 0xFF OFF (= 65349, the default and
 // the boot value), bare `69` reads and changes nothing. Latched ONCE per pass (gXdBuild.xib) at gfxsrc_policy's top and handed
 // to gfx_mib.h's n48_mib_segment, which is 0.0.504's stage byte for byte at 0. INERT without 36 (the rules live only in the
@@ -22744,7 +22744,7 @@ static uint64_t gXpInFrame { 0 };      // the judged frame gXpIn belongs to: a s
 // one-segment frame the union is field-for-field gXpIn, so 0.0.420's decision is unchanged (gfx_dep_test.cpp proves
 // it and plants the last-segment-only break). OFF, it is never written and never read.
 static n48_cp_consumer gXpAcc {};
-// D4' (notes/design/D4-PRIME.md, notes/design/R1-MEMDST.md Q5) — `accel gfxneuter 40 | M<<8` (M 1 ON = 296, M 0xFF
+// D4' (an internal design note, an internal design note Q5) — `accel gfxneuter 40 | M<<8` (M 1 ON = 296, M 0xFF
 // OFF = 65320, bare `40` reads). OFF BY DEFAULT AND OFF AT BOOT. ON is refused unless `gXpOn` (28) and `gR5On` (30)
 // are ALREADY on - see the verb site. Exactly the gXpIn/gXpInFrame/gXpAcc arrangement above, widened to the D4'
 // consumer: `gXpInD4` is ONE segment's read-set, `gXpAccD4` the frame's deduped union (gfx_cp_build.h's
@@ -22787,9 +22787,9 @@ static struct {
                           // which stay boot-cumulative and must never be touched by that per-frame reset.
 } gXpD4 {};
 
-// R1 (notes/design/R1-MEMDST.md Q2) — THE MEMORY-DESTINATION RUNG. `accel gfxneuter 42 | M<<8`: M 1
+// R1 (an internal design note Q2) — THE MEMORY-DESTINATION RUNG. `accel gfxneuter 42 | M<<8`: M 1
 // ENFORCE (= 298), M 3 SHADOW (= 810, count only, never refuses), M 0xFF OFF (= 65322, the default and boot value),
-// bare `42` reads. Switch 40 (D4') is 0.0.439's; 41 is RESERVED for C5 (notes/design/C5-CONTINUOUS.md) - not taken
+// bare `42` reads. Switch 40 (D4') is 0.0.439's; 41 is RESERVED for C5 (an internal design note) - not taken
 // here. Re-censused against this chain at HEAD: 1..40 taken, 41/42 free.
 //
 // THE ARM-VERB REFUSAL (owed since 0.0.440) IS BUILT IN 0.0.490, in the reviewer's corrected form rather
@@ -22837,7 +22837,7 @@ static uint32_t gXdFillHasTable { 0u };
 static uint32_t gXdFillNImg { 0u };
 
 // =====================================================================================================================
-// 0.0.421 (notes/design/MIB-COMMIT.md binding B10) — MIB-0: THE READ-ONLY, ALWAYS-ON CENSUS.
+// 0.0.421 (an internal design note binding B10) — MIB-0: THE READ-ONLY, ALWAYS-ON CENSUS.
 //
 // WHAT IT IS. Four counters, fed only from facts the decide path has ALREADY read, and ONE report line:
 //   (1) the START class of every IB k >= 1 the WindowServer gather reads (HEAD / NOP-HEAD / MID / UNREAD), which is
@@ -22862,7 +22862,7 @@ static void mib0_report_line(void) { HWLOG(N48_MIB0_FMT, N48_MIB0_ARGS(&gMib0));
 static void mib0_seg_report_line(void) { HWLOG(N48_MIB0_SEG_FMT, N48_MIB0_SEG_ARGS(&gMib0)); }
 // 0.0.430: the single-IB policy's phases. One read-only line, printed beside the census.
 static void mib0_pol_report_line(void) { HWLOG(N48_MIB0_POL_FMT, N48_MIB0_POL_ARGS(&gMibPol)); }
-// 0.0.434 (notes/design/PGMID-COPYGUARD.md Part 1) — THE SAME FIVE PHASES, ACCUMULATED SEPARATELY FOR
+// 0.0.434 (an internal design note Part 1) — THE SAME FIVE PHASES, ACCUMULATED SEPARATELY FOR
 // nib >= 2 PASSES. gMibPol (above) has only ever fed from nib == 1 (`polSingle`); gfxsrc_policy now also times a
 // multi-IB pass (`polMulti`) into this SECOND n48_mib_pol, printed on its OWN line so the single-IB figure this
 // report already carries is never mixed with a population it was never about. Read-only, prints on every read of
@@ -22948,7 +22948,7 @@ static void unkkeys_report_line(void)
 // (how many of those refusals got a `desc-prov:` line, N48_RP_PROV_FMT, at line ~kXdProvLines cap 256/boot - not
 // this build's own 64; see this build's own final report for that open doubt). No new counter line is added here:
 // adding a second one would duplicate an existing, tested boot total for the same population.
-// 0.0.433 (notes/design/MM-PRIORITY.md) — THE MM-WINDOW PRIORITY COUNTERS, beside the policy phases
+// 0.0.433 (an internal design note) — THE MM-WINDOW PRIORITY COUNTERS, beside the policy phases
 // line above: it explains where decide36b's 11.7 ms/run of `desc_ns` most likely went (waiting on gVramMmLock, not
 // reading). Read-only, printed on every read of the `gfxneuter` report whatever switch (37) was thrown — the
 // instrument is always on, only the yielding is gated. The live counters live in Navi48Bringup.cpp.
@@ -22957,7 +22957,7 @@ static void mmprio_pol_report_line(void) {
     navi48_mm_prio_snapshot(&s);
     HWLOG(N48_MMPRIO_FMT, N48_MMPRIO_ARGS(&s));
 }
-// 0.0.434 (notes/design/PGMID-COPYGUARD.md Part 1) — PROGRAM-IDENTITY COST, on every read of this
+// 0.0.434 (an internal design note Part 1) — PROGRAM-IDENTITY COST, on every read of this
 // report whatever switch (38) was thrown: the instrument is always on, only the read PATH is gated.
 static const char *gfxsrc_pgmid_mode_str(uint32_t mode)
 {
@@ -22968,7 +22968,7 @@ static const char *gfxsrc_pgmid_mode_str(uint32_t mode)
          : "OFF (default)";
 }
 static void pgmid_report_line(void) { HWLOG(N48_PGMID_FMT, N48_PGMID_ARGS(gfxsrc_pgmid_mode_str(gXdPgmIdMode), &gPgmId)); }
-// 0.0.435 (notes/design/PGMID-COPYGUARD.md Part 2) — THE COPY-OVERLAP REFUSAL, on every read of this
+// 0.0.435 (an internal design note Part 2) — THE COPY-OVERLAP REFUSAL, on every read of this
 // report, whatever switch (39, the phantom-scope control) was thrown: the check itself is always on and reads no
 // switch at all.
 static void cguard_report_line(void) {
@@ -23022,7 +23022,7 @@ static uint32_t gXdF828Pending, gXdF828GateOk, gXdF828GateSeq;
 static constexpr uint64_t kXdF828Lines = 96ull;   /* arm6 judged 737 frames; 96 lines covers an armed boot's policy passes */
 static constexpr uint32_t kXdF828Polls = 8u;      /* how many LATER judged frames re-read the slot */
 
-// C5 part 1 (notes/design/C5-CONTINUOUS.md Q1) — "WAS THE LAST-PROMOTED COMMIT'S END OF PIPE OBSERVED, AND FOR THE
+// C5 part 1 (an internal design note Q1) — "WAS THE LAST-PROMOTED COMMIT'S END OF PIPE OBSERVED, AND FOR THE
 // CURRENT FLIGHT?" This used to be a named accessor (`ks_eop_seen`, `n48_f828_eop_seen(gXdF828.committed,
 // &gXdF828.watch, gXdF828.frame.flight, ...)`) that hook_unmapVA, gfxsrc_ts_after_slot and ks_defer_line all called;
 // all three now ask the flight ring instead (gKsRing, gfx_flightring.h), so the accessor had no caller left and was
@@ -23031,7 +23031,7 @@ static constexpr uint32_t kXdF828Polls = 8u;      /* how many LATER judged frame
 // "the current flight" in the same sense `gKsFlight.seq` was - so a sticky latch that belongs to an earlier,
 // superseded flight is still distinguishable there, even with nothing left that reads it for the withdrawal decision).
 
-// C5 part 1 (notes/design/C5-CONTINUOUS.md Q1) — WHAT THE DEFERRAL IS AND WHAT IT DID, on three lines. Printed by
+// C5 part 1 (an internal design note Q1) — WHAT THE DEFERRAL IS AND WHAT IT DID, on three lines. Printed by
 // its own verb (`gfxneuter 22`) and by the `rootwrite` report, which is where the withdraw/re-arm counters already
 // live. Read-only. The first two lines are 0.0.384's own counters, unchanged; the third is gfx_flightring.h's own
 // N48_FR_REPORT_FMT, reused verbatim so the ring's report has exactly one format string in the tree (this call site
@@ -23512,7 +23512,7 @@ static void pairpre_report_line(const char *how)
           (unsigned long long)gXdPairPreS.unresolved);
 }
 
-// 0.0.426 (notes/design/MIB-COMMIT.md binding B0) — THE MULTI-IB COMMIT SWITCH. `accel gfxneuter 36 | M << 8`: M 1 turns it
+// 0.0.426 (an internal design note binding B0) — THE MULTI-IB COMMIT SWITCH. `accel gfxneuter 36 | M << 8`: M 1 turns it
 // ON, M 0xFF turns it OFF, `36` alone reads this line and changes nothing. OFF BY DEFAULT AND OFF AT BOOT; 1..35 were taken, so
 // 36 is the next free selector (re-checked against this chain at HEAD).
 //
@@ -23532,7 +23532,7 @@ static void mib_report_line(const char *how)
     HWLOG(N48_MIB_REPORT_FMT, gXdMib ? "ON" : "OFF (default)", how, (unsigned long long)gXdMibS.frames);
 }
 
-// R4 ( (B), notes/design/R1-MEMDST.md Q2) — EACH IB's OWN [va, va + 4*len) range for R1's OWN-IB clause,
+// R4 ( (B), an internal design note Q2) — EACH IB's OWN [va, va + 4*len) range for R1's OWN-IB clause,
 // not IB 0's VA stretched over the whole concatenated length (0.0.440's bug). A FREE-STANDING helper, not inlined
 // into gfxsrc_policy's own body: gfx_desc_port_test.cpp's own C4 check greps that ONE function's body for the
 // literal substring "ib_va" to prove nothing of the descriptor-port machinery leaks outside its `if (dp)` guard, and
@@ -23831,7 +23831,7 @@ static __attribute__((noinline)) void gfxsrc_spill_begin(uint32_t arm, uint32_t 
 }
 
 // =============================================================================================================================
-// build 0.0.523 (notes/design/RING-NEUTER-FORGIVE.md rev 2 items 9-11; gfx_copyguard.h n48_cg_redo_*, gfx_cgredo.h) —
+// build 0.0.523 (an internal design note rev 2 items 9-11; gfx_copyguard.h n48_cg_redo_*, gfx_cgredo.h) —
 // SWITCH 78, THE COPY-GUARD REDO. `78 | M << 8`: M 1 ON (= 334), M 2 OFF (= 590, the default and the boot value), bare `78` reads.
 // Latched ONCE per pass (gfxsrc_cg_redo_begin, beside navi48_cg_seg_begin). ON, a segment whose translate succeeded but whose
 // UNCOUNTED peek at the copy guard answers EVENT (or IN_FLIGHT with 37 OFF, a copy another thread owns, after a bounded wait)
@@ -24342,7 +24342,7 @@ static __attribute__((noinline)) uint32_t p87_dump(uint64_t arg) {
     return N48_P87_D_OK;
 }
 // =============================================================================================================================
-// build 0.0.524 item 4 (notes/design/T0SRC.md) — SWITCH 79's PER-FRAME PROBE of S's texture 0, READ-ONLY. Called
+// build 0.0.524 item 4 (an internal design note) — SWITCH 79's PER-FRAME PROBE of S's texture 0, READ-ONLY. Called
 // at the end of gfxsrc_c88_frame_end, so only on a B1 frame (the content gate and its per-target budget), and under its own cap of
 // N48_T0_LINES line pairs. (a) the first and last page through THIS frame's own page tables, with the sys bit (a system page is
 // never a VRAM key); (b) 16 MM-window reads of 64 dwords at P (C1: timed, only under 79, only on these capped frames); (c) the
@@ -24474,7 +24474,7 @@ static void t0src_report_line(const char *how) {
 __attribute__((always_inline))
 static void gfxsrc_policy(const GfxcVm &vm, n48_xv_frame *f, uint32_t n, uint64_t ibVa, uint32_t dp, uint64_t dctxKey,
                           uint32_t arm, uint64_t boundCtx, uint32_t wsBound) {
-    // 0.0.433 (notes/design/MM-PRIORITY.md) — THE MM-WINDOW PRIORITY SCOPE, FIRST STATEMENT. RAII so nesting/owner
+    // 0.0.433 (an internal design note) — THE MM-WINDOW PRIORITY SCOPE, FIRST STATEMENT. RAII so nesting/owner
     // (gfx_mmprio.h, Navi48Bringup.cpp) are exact across every return path this function has, including the single
     // early `if (!gXdOut) return;` below, without a manual exit call at every one.
     Navi48MmPrioScope mmPrioScope;
@@ -24489,14 +24489,14 @@ static void gfxsrc_policy(const GfxcVm &vm, n48_xv_frame *f, uint32_t n, uint64_
     // `gXpD4Frame.d4` and none reads the live switch again until the NEXT pass's own top.
     gXpD4Frame.judged = gXdC.judged + 1u; gXpD4Frame.d4 = (gXpOn && gD4On) ? 1u : 0u;
     gXpD4Frame.fold = (gXpD4Frame.d4 && gD4FoldOn) ? 1u : 0u;   // build 0.0.494: switch 61, latched here and only here
-    // R1 (notes/design/R1-MEMDST.md Q2, item C): this frame's own r4_waits/r4_memwrites sum, over every segment.
+    // R1 (an internal design note Q2, item C): this frame's own r4_waits/r4_memwrites sum, over every segment.
     uint32_t frameR4Waits = 0u, frameR4Memwrites = 0u;
     static xlat12_ib_segment segs[N48_XV_MAX_SEGS];
     static GfxDescCtx dctx;   // M4-DESC-KEXT-PORT: read only when dp; under gXdLock like the rest of this function
     // 0.0.430 — THE SINGLE-IB PHASE TIMERS. Read-only: a handful of uptime reads around work this pass
     // already does, accumulated in gMibPol and printed on the MIB-0 policy line. They run ONLY for a single-IB frame
     // (`f->nib == 1`), which is the population's 15.4 ms/run figure is about.
-    // 0.0.434 (notes/design/PGMID-COPYGUARD.md Part 1) — AND NOW ALSO FOR nib >= 2, into the SEPARATE
+    // 0.0.434 (an internal design note Part 1) — AND NOW ALSO FOR nib >= 2, into the SEPARATE
     // gMibPol2 (a multi-IB pass was, through 0.0.433, two loads and no clock read at every one of these sites; it
     // still is for nib == 0, a shape-refused frame). `polSingle`/`polMulti` are mutually exclusive per frame (nib is
     // exactly one value), so every site below shares ONE pair of clock reads and ONE set of local phase totals;
@@ -24639,7 +24639,7 @@ static void gfxsrc_policy(const GfxcVm &vm, n48_xv_frame *f, uint32_t n, uint64_
     f->nseg = ns;
     gXdBuild.nseg = (ns == total && ns <= N48_XV_MAX_SEGS) ? ns : 0u;   // more segments than rows: nothing is buildable
     gXdBuild.nsegPre = nsegPre; gXdBuild.units = unitMap;   // build 0.0.481: with no unit formed nsegPre == nseg
-    // R0 (; notes/design/R1-MEMDST.md Q2, item C) — `ok` MOVED HERE, from its 0.0.440 position after the
+    // R0 (; an internal design note Q2, item C) — `ok` MOVED HERE, from its 0.0.440 position after the
     // segment loop (and after the R1 block below). 0.0.440 reset `ok` to 0 at the pass top (above) and set it only
     // AFTER the R1 block tested it, so `if (gMdMode && build && gXdBuild.ok)` could never see anything but a
     // leftover 0 - the R1 scan was UNREACHABLE for every frame, in every mode, found by the decide40 operator before
@@ -24650,7 +24650,7 @@ static void gfxsrc_policy(const GfxcVm &vm, n48_xv_frame *f, uint32_t n, uint64_
     // way, since the R1 block's own `gMdMode &&` short-circuits before `ok` is ever read there.
     gXdBuild.ok = build && gXdBuild.nseg ? 1u : 0u;
     uint32_t segIb = 0u;   // B2: which IB owns segment k (only read when gXdBuild.mib)
-    // 0.0.436 (notes/design/PGMID-COPYGUARD.md Part 1, design "2. M") — THE PER-PASS MEMO CLEAR. Once
+    // 0.0.436 (an internal design note Part 1, design "2. M") — THE PER-PASS MEMO CLEAR. Once
     // per gfxsrc_policy pass, before the segment loop, unconditionally (cheap either way: just `n->0`) so a memo
     // row can never survive into a pass it was not filled by, whatever mode 38 is set to at the time. Both the
     // real T+M memo and SHADOW-M's separate side-trial memo are cleared here, on the same discipline.
@@ -25004,7 +25004,7 @@ static void gfxsrc_policy(const GfxcVm &vm, n48_xv_frame *f, uint32_t n, uint64_
         // 0.0.409: the pair pre-resolve's own counters, accumulated for the verb's report line. NOTHING is
         // logged here - there is no new per-frame line - and with the switch off this is one volatile load.
         if (gXdPairPre) { gXdPairPreS.resolved += ds.pair_pre_resolved; gXdPairPreS.unresolved += ds.pair_pre_unresolved; }
-        // R1 (notes/design/R1-MEMDST.md Q2, item C) — THE FRAME-WIDE R4 SUMS n48_md_judge's COUNT clause reads.
+        // R1 (an internal design note Q2, item C) — THE FRAME-WIDE R4 SUMS n48_md_judge's COUNT clause reads.
         // Summed UNCONDITIONALLY, the same D4-PRIME.md binding (independent of ds.in_abi): r4_waits/r4_memwrites are
         // never reset per draw or per segment inside xlat12_ib.c, so this is a straight per-segment accumulation,
         // never re-derived. One volatile add per segment when the switch is off; nothing else.
@@ -25078,7 +25078,7 @@ static void gfxsrc_policy(const GfxcVm &vm, n48_xv_frame *f, uint32_t n, uint64_
         // is >= 64. This prints BOTH so the next armed run confirms or refutes that on the live stream. LOG ONLY -
         // nothing reads these fields, nothing is appended, and no dword of the candidate changes.
         if (polTarget) clock_get_uptime(&polT0);
-        // C5 part 2 (notes/design/C5-CONTINUOUS.md Q3, build 0.0.460) — CAPPED AT 96 UNDER A CONTINUOUS ARM ONLY.
+        // C5 part 2 (an internal design note Q3, build 0.0.460) — CAPPED AT 96 UNDER A CONTINUOUS ARM ONLY.
         // Uncapped at HEAD (arm35 printed 203 of these in one boot, per the design's own measurement) and still
         // uncapped for a one-shot (`gXdShot.cont` 0): this line runs once per SEGMENT translated, not per commit,
         // so a one-shot's own small budget never approaches a cap worth adding. `!gXdShot.cont ||` is the OFF
@@ -25105,7 +25105,7 @@ static void gfxsrc_policy(const GfxcVm &vm, n48_xv_frame *f, uint32_t n, uint64_
             if (gXdBuild.fence71) fence71_tally(1u, whyC, mibfr.candidates);
             n48_mib0_note_f828(&gMib0, whyC);
         }
-        // 0.0.413 (notes/design/FENCE-OWNED-SLOT.md,) — THE OWNED SLOT. 0.0.377 changed two dwords of Apple's buried
+        // 0.0.413 (an internal design note,) — THE OWNED SLOT. 0.0.377 changed two dwords of Apple's buried
         // NOP+RELEASE_MEM so the packet wrote OUR value into APPLE'S per-submission slot. measured that slot
         // TRANSIENT (something zeroes it within a frame interval), so end-of-pipe was missed for every commit after the
         // first and the keystone deferral always ended by its 2 s timeout. This keeps the one-dword un-NOP but RE-POINTS
@@ -25270,7 +25270,7 @@ static void gfxsrc_policy(const GfxcVm &vm, n48_xv_frame *f, uint32_t n, uint64_
         // too (d_readset_from_table), so a segment that ALSO ran the table step contributes to BOTH unions, not
         // just one. A copy-guard-refused segment sets `over` on the D4' union, exactly as the fallback branch above
         // already sets it on the table-ABI one for a segment that branch does not reach.
-        // 0.0.444 (C5-RING-REVIEW.md (B) item K(ii), D1 hole) — A SEGMENT THE TRANSLATOR ITSELF REFUSED
+        // 0.0.444 (an internal review note (B) item K(ii), D1 hole) — A SEGMENT THE TRANSLATOR ITSELF REFUSED
         // (`st != 0`) MUST ALSO SET `over`, NOT MERGE. Through 0.0.443 this condition was `!cgRefused` alone:
         // `cgRefused` is set ONLY inside the `if (!st) { ... }` block above (the copy-guard reader-side check runs
         // only when the TRANSLATE itself did not already refuse), so a translator refusal left `cgRefused` false
@@ -25411,7 +25411,7 @@ static void gfxsrc_policy(const GfxcVm &vm, n48_xv_frame *f, uint32_t n, uint64_
             gXpInFrame = gXdC.judged + 1u;
         }
     }
-    // R1 (notes/design/R1-MEMDST.md Q2, item C) — THE MEMORY-DESTINATION RUNG, over the FINAL CANDIDATE, after the
+    // R1 (an internal design note Q2, item C) — THE MEMORY-DESTINATION RUNG, over the FINAL CANDIDATE, after the
     // segment loop (every per-segment fence apply has already run) and after the last navi48_cg_seg_check above.
     // OFF (gMdMode 0, the default and boot value) this whole block is one volatile load and nothing else runs -
     // byte-identical to 0.0.439. Nothing here ever walks root[511]: OWN-REGION is a VA-only bound.
@@ -25734,7 +25734,7 @@ static __attribute__((noinline)) void r3_hit_note(const uint64_t *ptr, const uin
               (unsigned long long)gR3Cap.suppressed);
     }
 }
-// build 0.0.523 (notes/design/RING-NEUTER-FORGIVE.md rev 2 items 2-6, gfx_rnforgive.h) — SWITCH 77, THE RING-NEUTER
+// build 0.0.523 (an internal design note rev 2 items 2-6, gfx_rnforgive.h) — SWITCH 77, THE RING-NEUTER
 // FORGIVENESS. `77 | M << 8`: M 1 ON (= 333), M 2 OFF (= 589, the default and the boot value), bare `77` reads. OFF nothing is
 // saved, queued, noted or granted, and gfx_dep.h's fill is 0.0.522's. ON: a COMMITTED frame's R5′ record is saved at decide
 // (gfxsrc_rn_save); a flight switch 75 PROVED NOPed and retired is queued at the retire site (hook_gfxCommitIB, no grant there);
@@ -26001,7 +26001,7 @@ static uint32_t gfxsrc_ts_before(const GfxcVm &vm, uint64_t tgtVa, uint32_t live
 // The take-rule is gfx_tgtsample.h's and it asks the SAME two questions of the SAME state the keystone withdrawal
 // deferral asks (gfx_keystone.h n48_ksd_eval, generalised per entry by gfx_flightring.h's n48_fr_defer_verdict): is
 // THIS slot's own committed flight still live, and has it ended by its own fence or its own bound?
-// C5 part 1 (notes/design/C5-CONTINUOUS.md Q1) — MOVED TO THE RING. `gTs[s].seq` is the token seq of the frame that
+// C5 part 1 (an internal design note Q1) — MOVED TO THE RING. `gTs[s].seq` is the token seq of the frame that
 // published this slot's BEFORE (set from gXdCmToken.seq at the same commit_try call that later pushes the ring
 // entry), so THIS slot's own flight is the ring entry with that same seq - never "whichever flight is most recent",
 // which is what the single gKsFlight answered and which was already only correct because at most one flight was
@@ -26131,7 +26131,7 @@ static void tblreuse_report_line(const char *how)
           (unsigned long long)gTblReuseS.reused, (unsigned long long)gTblReuseS.appended);
 }
 
-// build 0.0.470 (notes/design/NO-SAMPLER-CLASS10.md section 3) - switch 51.
+// build 0.0.470 (an internal design note section 3) - switch 51.
 static void t51_report_line(const char *how)
 {
     HWLOG("t51-470: the no-sampler and class-10 table rows (`gfxneuter 51 | M << 8`, NO-SAMPLER-CLASS10.md) are %s (%s). "
@@ -26859,7 +26859,7 @@ static void gfxsrc_cprov_eval(const GfxcVm &vm)
     } else if (cc.enumerated == 1u) {
         cc.over = 1u;       /* no usable page table: nothing below could be resolved, so the list is not provable */
     }
-    // R1 (notes/design/R1-MEMDST.md Q2, item C) — THE R4 DISCHARGE. ENFORCE has independently proven, over the SAME
+    // R1 (an internal design note Q2, item C) — THE R4 DISCHARGE. ENFORCE has independently proven, over the SAME
     // final candidate, that every live wait/write destination is safe (n48_md_judge answered CLEAN, which includes
     // its own COUNT clause that the scan's counts equal these same r4 sums) - so R4's own wait/write refusal is
     // redundant for THIS frame and is discharged. SHADOW and OFF never touch R4 (gMdMode != ENFORCE leaves this
@@ -27081,7 +27081,7 @@ static uint32_t gfxsrc_commit_try(const GfxcVm &vm, const uint8_t *info, uint64_
     gfxsrc_cprov_eval(vm);   // 0.0.390: THIS frame's own answer, before the gather that carries it
     gfxsrc_dep_world(dw, 1u, &gXdMono, ds);
     c.dep_ok = n48_dep_ok(&dw);
-    // R1 (notes/design/R1-MEMDST.md Q2) — the gate's OWN redundant second check (n48_cm_gate's md_switch/md_ok),
+    // R1 (an internal design note Q2) — the gate's OWN redundant second check (n48_cm_gate's md_switch/md_ok),
     // mirroring dep_ok exactly. gXdBuild.md_ok is THIS frame's own n48_md_judge answer, written by gfxsrc_policy;
     // md_switch is 1 only under ENFORCE, so SHADOW/OFF leave the rung unreachable.
     c.md_switch = (gMdMode == N48_MD_MODE_ENFORCE) ? 1u : 0u;
@@ -27125,7 +27125,7 @@ static uint32_t gfxsrc_commit_try(const GfxcVm &vm, const uint8_t *info, uint64_
     // window is open, is refused at the gate's appended rung. OFF it reads 0 and the switch-off path is unchanged.
     // build 0.0.481: the SEGMENT STAGE's count (gXdBuild.nsegPre), never switch 55's unit count - a
     // single-IB frame of several segments can become ONE unit, and `fill` is sticky over the frame (K2's own failure).
-    // build 0.0.530 (notes/design/SRCFILL85.md item 8) — THE FRAME'S FILL-SET ORDER IS n48_fs85_frame's: identify, the
+    // build 0.0.530 (an internal design note item 8) — THE FRAME'S FILL-SET ORDER IS n48_fs85_frame's: identify, the
     // FILL step, THEN the plane step. With switch 85 not in force (`fs85On` 0: 85, 33 or 35 OFF) it calls the three 0.0.529
     // functions verbatim (n48_fs_identify_fill, n48_fs_step, n48_fs_plane_step); in force, their S1/S3 versions. S3's `left`
     // is read HERE, before the rewrite and before n48_cm_shot_spend, under gXdLock (item 4); 0 when 85 is not in force.
@@ -27154,15 +27154,15 @@ static uint32_t gfxsrc_commit_try(const GfxcVm &vm, const uint8_t *info, uint64_
     c.fp_open    = fpActive ? (n48_fs_plane_win_open(&gFs) ? 1u : 0u) : 0u;
     c.fp_reserve = (fpStep == N48_FS_RESERVE) ? 1u : 0u;
 
-    // R1 (notes/design/R1-MEMDST.md Q2, item C) — `live &= (!md_switch || md_ok)`. Only ENFORCE (gMdMode 1) gates;
+    // R1 (an internal design note Q2, item C) — `live &= (!md_switch || md_ok)`. Only ENFORCE (gMdMode 1) gates;
     // SHADOW (2) and OFF (0) never touch `live` - gMdMode != N48_MD_MODE_ENFORCE is true for both, so the extra
     // clause is a tautology and `live` is exactly 0.0.439's for every mode but ENFORCE.
-    // C5 part 1 (notes/design/C5-CONTINUOUS.md Q1, gfx_flightring.h) — `live &= !n48_fr_full(&gKsRing)`. Unconditional
+    // C5 part 1 (an internal design note Q1, gfx_flightring.h) — `live &= !n48_fr_full(&gKsRing)`. Unconditional
     // (no switch): a commit whose OWN flight the ring has no room to track must refuse, exactly as a commit whose
     // rewrite did not read back clean does. At budget <= 4 with a 16-entry ring, and every entry freed by a keystone
     // refusal before the next candidate is ever built, this is never observed to fire in this build's own usage.
     c.ring_full = n48_fr_full(&gKsRing) ? 1u : 0u;
-    // C5 part 2 (notes/design/C5-CONTINUOUS.md Q2, "Require a fence in continuous mode") — `live &= (!cont_on ||
+    // C5 part 2 (an internal design note Q2, "Require a fence in continuous mode") — `live &= (!cont_on ||
     // cont_fence_ok)`, the SAME redundant-second-check shape ring_full/md_ok already have. `cont_on` is THIS
     // shot's own continuous flag (gXdShot.cont), read here rather than passed in, for the same reason `arm` itself
     // is a snapshot of `gXdArm` taken under the same lock earlier in the frame - both are read once, under
@@ -27447,7 +27447,7 @@ static uint32_t gfxsrc_commit_try(const GfxcVm &vm, const uint8_t *info, uint64_
             // The ring region must still be the one the fence was placed against: a rebuild/move between placement and
             // the gate would make the slot VA name different bytes, so the candidate is refused (REGION-MOVED).
             const uint32_t rmWhy = n48_f828_region_moved_reason(f828RegionMoved);
-            // 0.0.418 (E3, notes/design/BUILD-0.0.418.md): NEUTER THE FRAME — do not merely drop the candidate.
+            // 0.0.418 (E3, an internal design note): NEUTER THE FRAME — do not merely drop the candidate.
             // The rewrite (un-NOP + re-point) is ALREADY in the client's IB, so through 0.0.417 this branch left
             // the frame's verdict at COMMIT and the frame ran: its executed, un-promoted packet wrote `want` into
             // the slot the NEXT candidate recomputes (no promotion advanced the committed ordinal), which then read
@@ -27493,7 +27493,7 @@ static uint32_t gfxsrc_commit_try(const GfxcVm &vm, const uint8_t *info, uint64_
     // in xd_shot_finish, after Apple's original returns - because the ring walk's exemption reads `gXdArm` inside that
     // call, and writing DECIDE here would NOP the IB we have just written and read back (gfx_neuter.h condition (1)).
     // n48_cm_shot_spend answers 1 exactly once; the write and the read-back for this frame are already complete above.
-    // C5 part 1 (hardening, notes/design/C5-CONTINUOUS.md Q2) — `spent` IS CAPTURED HERE AND TIES THE RETURN BELOW.
+    // C5 part 1 (hardening, an internal design note Q2) — `spent` IS CAPTURED HERE AND TIES THE RETURN BELOW.
     // Through 0.0.442 the return was `reason == N48_CM_OK ? 1u : 0u`, independent of whether this call's OWN spend
     // actually succeeded - so a call that reached `reason == N48_CM_OK` while the shot was NOT actually charged (the
     // one-shot already exhausted, cancelled, or off between the arm being read and this line) would still report
@@ -27518,7 +27518,7 @@ static uint32_t gfxsrc_commit_try(const GfxcVm &vm, const uint8_t *info, uint64_
         contStartedThisFrame = n48_cm_shot_cont_start(&gXdShot, gXdShotSpentUs, gXdBuild.plane);
     }
     const bool spent = live && reason == N48_CM_OK && n48_cm_shot_spend(&gXdShot, gXdCmToken.seq);
-    // 0.0.444 (C5-RING-REVIEW.md (B) item 5(i)) — set false only by a ring-push failure inside the block below;
+    // 0.0.444 (an internal review note (B) item 5(i)) — set false only by a ring-push failure inside the block below;
     // ties the function's own return (and the RING-FULL accounting) to whether this commit's flight was actually
     // tracked, not merely to whether the shot's budget was charged.
     bool ringPushed = true;
@@ -27539,7 +27539,7 @@ static uint32_t gfxsrc_commit_try(const GfxcVm &vm, const uint8_t *info, uint64_
         // it is recorded apart (gFs85.s3_pend) and committed at the keystone's TRANSLATED point. 85 not in force: s3 is 0.
         if (c.fp_reserve && !fs85F.s3) { gFsPlanePend = 1u; }
         if (c.fp_reserve && fs85F.s3) { gFs85.s3_pend = 1u; gFs85.s3_pend_cb0 = tgtVa; }
-        // C5 part 1 (notes/design/C5-CONTINUOUS.md Q1, gfx_flightring.h) — THE START OF "IN FLIGHT", published for
+        // C5 part 1 (an internal design note Q1, gfx_flightring.h) — THE START OF "IN FLIGHT", published for
         // hook_unmapVA's deferral: a PENDING entry is PUSHED at this exact instant, replacing 0.0.384-0.0.431's
         // single-record stamp (`gKsFlight.at_us`/`.seq`/`.active`). This is the SAME instant KEYSTONE-A-PRIME's
         // ordering depends on ("stamp before the marker read"): the entry becomes visible to hook_unmapVA's ring
@@ -27547,7 +27547,7 @@ static uint32_t gfxsrc_commit_try(const GfxcVm &vm, const uint8_t *info, uint64_
         // than overwriting the first, so an earlier committed frame's OWN entry is never touched by a later commit's
         // stamp - this is what replaces 0.0.431's stash/restore: there is no longer a single record for a
         // later stamp to clobber.
-        // 0.0.444 (C5-RING-REVIEW.md (B) item 1) — THE FENCE FIELDS, VIA THE PURE HANDOFF. `gXdF828Pending` was
+        // 0.0.444 (an internal review note (B) item 1) — THE FENCE FIELDS, VIA THE PURE HANDOFF. `gXdF828Pending` was
         // ALREADY CLEARED above, in the gate block (this frame's own candidate is judged there, before this push
         // ever runs) — reading it here always answers 0, which is the review's HEADLINE defect. The durable proof
         // this frame owns a fence candidate that the gate answered OK for is `gXdF828GateOk && gXdF828GateSeq ==
@@ -27582,7 +27582,7 @@ static uint32_t gfxsrc_commit_try(const GfxcVm &vm, const uint8_t *info, uint64_
             // keystone has not run yet and may still refuse this frame, and a refused seq must never be named "the
             // newest flight". It is set at the COMMIT mark in hook_gfxCommitIB (n48_fr_commit_mark).
             if (!frPushed) {
-                // 0.0.444 (C5-RING-REVIEW.md (B) item 5(i)) — FAIL CLOSED. `live` already required
+                // 0.0.444 (an internal review note (B) item 5(i)) — FAIL CLOSED. `live` already required
                 // `!n48_fr_full(&gKsRing)` (c.ring_full, above), so the gate itself should have refused this frame
                 // at N48_CM_RING_FULL had the ring been full at that same instant. Reaching here means the ring
                 // filled in the narrow window between the gate's read and this write - nothing in this
@@ -27616,7 +27616,7 @@ static uint32_t gfxsrc_commit_try(const GfxcVm &vm, const uint8_t *info, uint64_
         // 0.0.444 (item 5(i)): NEVER printed when the ring push itself failed - this frame was not handed COMMIT,
         // whatever the (unrefunded) budget ledger says.
         if (ringPushed) { const uint32_t bud = n48_cm_shot_budget_of(&gXdShot), left = n48_cm_shot_left(&gXdShot);
-          // C5 part 2 (notes/design/C5-CONTINUOUS.md Q2/Q3, build 0.0.460) — THE FIRST PLANE COMMIT STARTS T, and
+          // C5 part 2 (an internal design note Q2/Q3, build 0.0.460) — THE FIRST PLANE COMMIT STARTS T, and
           // this arm's own commit/log bookkeeping runs here, at the SAME instant a real spend was actually charged
           // and tracked (ringPushed). `gXdBuild.plane` is the SAME in-force-PS-identity flag n48_fs_plane_step
           // already reads for the second window - "switch 35's window" the design names.
@@ -27749,7 +27749,7 @@ static uint32_t gfxsrc_commit_try(const GfxcVm &vm, const uint8_t *info, uint64_
               "reaches the CP.", n48_cm_reason_name(reason), detail, (unsigned long long)va, n, c.nseg, c.pages,
               c.sys_pages, c.wrote, c.got, c.mismatch, firstBad);
     }
-    // C5 part 1 (hardening, notes/design/C5-CONTINUOUS.md Q2) — TIED TO THE SPEND. `reason == N48_CM_OK` alone used to
+    // C5 part 1 (hardening, an internal design note Q2) — TIED TO THE SPEND. `reason == N48_CM_OK` alone used to
     // be reported as a commit; now it is one only when this call's OWN n48_cm_shot_spend also answered 1.
     // 0.0.444 (item 5(i)) — AND TO THE RING PUSH. A charged spend whose own flight could not be tracked is not a
     // commit either: the caller (gfxsrc_decide_frame's `commitOk`) must see 0, so the ledger feed refuses
@@ -28003,7 +28003,7 @@ static uint32_t gfxsrc_decide_frame(const uint8_t *info, uint32_t shapeOk, uint3
     // build 0.0.495 (a): switch 62 latched and the heap generation recorded for THIS frame, before any program is read.
     hg_frame_begin_pass();
     // =====================================================================================================================
-    // C5 part 2 (notes/design/C5-CONTINUOUS.md Q2, build 0.0.460; F3, 0.0.461 REVIEW) — THE JUDGED-FRAME-TOP
+    // C5 part 2 (an internal design note Q2, build 0.0.460; F3, 0.0.461 REVIEW) — THE JUDGED-FRAME-TOP
     // CONTINUOUS STOP SEQUENCE, MOVED BEFORE n48_cm_shot_level. Through 0.0.460 this ran AFTER `arm` was already
     // computed, so a stop detected on THIS frame still let it be judged at COMMIT: the rewrite was written, the
     // gate ran and logged GATE OK/BEFORE PUBLISHED, and gXdCm.commits++ - all AFTER the STOP line - with only
@@ -28137,7 +28137,7 @@ static uint32_t gfxsrc_decide_frame(const uint8_t *info, uint32_t shapeOk, uint3
     // It is absorbed HERE, under gXdLock and BEFORE the sync and before anything in this frame can ask the ledger - the same
     // position in the frame the epoch bump used to act from, with the scope narrowed from "every context" to the unmap's own.
     if (dp && gXdDlDrain) xd_led_drain_locked();
-    // 0.0.444 (C5-RING-REVIEW.md (B) item 9a) — THE UN-FEED QUEUE DRAINS HERE: under gXdLock, before the sync and
+    // 0.0.444 (an internal review note (B) item 9a) — THE UN-FEED QUEUE DRAINS HERE: under gXdLock, before the sync and
     // before anything in this frame can ask the ledger - the same position xd_led_drain_locked just took, and for
     // the same reason (hook_gfxCommitIB's three un-feed sites hold no lock and must never touch `gXdLed.e[]`
     // directly). Unconditional on `dp` exactly as the queue pushes themselves are gated on `gXdDescPort`.
@@ -28605,7 +28605,7 @@ static uint32_t gfxsrc_decide_frame(const uint8_t *info, uint32_t shapeOk, uint3
                 : val == gXdF828.frame.pre ? "unchanged - the frame did not reach end of pipe, or the packet never ran"
                                       : "CHANGED BUT NOT OURS - the slot is shared, or our write did not take");
         }
-        // C5 part 1 (item 3, notes/design/C5-CONTINUOUS.md Q1) — EVERY LIVE RING ENTRY, POLLED ON EVERY JUDGED FRAME,
+        // C5 part 1 (item 3, an internal design note Q1) — EVERY LIVE RING ENTRY, POLLED ON EVERY JUDGED FRAME,
         // AGAINST ITS OWN OWNED-SLOT FENCE. The block above is the LEGACY single-record poll (gXdF828), kept running
         // unchanged for its own "fence828:" report lines; this is the SEPARATE, ring-wide mechanism the withdrawal
         // decision actually depends on now. At budget 1 there is at most one COMMITTED entry and it is the SAME
@@ -28719,7 +28719,7 @@ static uint32_t gfxsrc_decide_frame(const uint8_t *info, uint32_t shapeOk, uint3
             for (uint32_t s2 = 0; s2 < nsl; s2++) if (gTs[s2].published && !gTs[s2].afterDone) tsPend = 1u;
             if (tsPend && vm.ok && f.reader_ok) gfxsrc_ts_after(vm);
         }
-        // 0.0.444 (C5-RING-REVIEW.md (B) item 6) — EXPIRE, THEN RECLAIM, ONCE PER JUDGED FRAME. A live entry past
+        // 0.0.444 (an internal review note (B) item 6) — EXPIRE, THEN RECLAIM, ONCE PER JUDGED FRAME. A live entry past
         // its OWN withdrawal bound (the same `kKsFlightUs` n48_fr_defer_verdict judges it against) is EXPIRED
         // rather than left live forever; every RETIRED or EXPIRED slot is then returned to FREE. Without this a
         // long-running arm (the continuous build, switch 41, NEXT) fills the ring's 16 slots and every later push
@@ -30064,7 +30064,7 @@ static uint64_t hook_gfxCommitIB(void *self, void *info) {
         // context's own root. A refusal falls through to the neuter below - the same fallback a token mismatch takes,
         // which works - so the worst case of this change is a boot that commits nothing.
         const bool tokMatch = n48_cm_token_match(&gXdCmToken, &here) != 0;
-        // 0.0.444 (C5-RING-REVIEW.md (B) item 5(ii)) — NO ENTRY, NO KEYSTONE, NO RUN. The push at the gate stamp
+        // 0.0.444 (an internal review note (B) item 5(ii)) — NO ENTRY, NO KEYSTONE, NO RUN. The push at the gate stamp
         // (gfxsrc_commit_try, above) is this frame's ONLY route to a ring entry; if it is not still PENDING here -
         // never pushed at all (unreachable when tokMatch holds, since the token and the push share one commit's
         // token seq), or already taken by a concurrent free (Q2's SUSPECTED gap: another thread's token-mismatch
@@ -30107,7 +30107,7 @@ static uint64_t hook_gfxCommitIB(void *self, void *info) {
             }
         }
         if (tokMatch && !ksOk) {
-            // C5 part 1 (notes/design/C5-CONTINUOUS.md Q1, gfx_flightring.h item 2) — A REFUSAL FREES ONLY ITS OWN
+            // C5 part 1 (an internal design note Q1, gfx_flightring.h item 2) — A REFUSAL FREES ONLY ITS OWN
             // ENTRY. This REPLACES 0.0.431's stash/restore of the single `gKsFlight` record: that fix existed
             // ONLY because ONE shared record could be stamped by commit B over commit A's still-executing flight, so
             // B's refusal had to RESTORE A's record rather than clear it. With the ring, B's push and A's push are
@@ -30121,7 +30121,7 @@ static uint64_t hook_gfxCommitIB(void *self, void *info) {
             // build 0.0.522 (switch 76): the keystone refused THIS frame (its own seq: tokMatch) - it is neutered at the source
             // and never runs, so its spill slice may be freed (applied under gXdLock at the next pass top).
             (void)n48_sp_request(&gSpill, here.seq, N48_SP_REQ_KS_REFUSED);
-            // C5 part 1 (hygiene, notes/design/C5-CONTINUOUS.md Q4) — THE LEDGER UN-FEED. This frame's gate answered
+            // C5 part 1 (hygiene, an internal design note Q4) — THE LEDGER UN-FEED. This frame's gate answered
             // OK (it reached this branch only because `tokMatch` held and the KEYSTONE then withdrew it), so
             // n48_dl_feed may already have recorded entries for it (gfxsrc_decide_frame feeds the ledger from the
             // gate's OWN answer, before the keystone ever runs). Those entries describe pixels this frame never
@@ -30189,7 +30189,7 @@ static uint64_t hook_gfxCommitIB(void *self, void *info) {
         if (tokMatch && ksOk) {
             gGs.translated++;
             const uint32_t seq = gXdCmToken.seq, gateSeq = gXdCmGateSeq;
-            // C5 part 1 (notes/design/C5-CONTINUOUS.md Q1, gfx_flightring.h) — PENDING -> COMMITTED. The keystone has
+            // C5 part 1 (an internal design note Q1, gfx_flightring.h) — PENDING -> COMMITTED. The keystone has
             // just proved this frame will run; its own ring entry (pushed at the gate stamp, above) now counts as an
             // in-flight commit for the withdrawal decision. A no-op (0) if the entry is not PENDING - unreachable
             // here in this build (this branch runs at most once per seq), kept fail-closed regardless.
@@ -30302,7 +30302,7 @@ static uint64_t hook_gfxCommitIB(void *self, void *info) {
             // build 0.0.525 (switch 80, C4): the walk did not spare it (NOPed: switch 75's retire-at-once and 77's forgiveness
             // are this same NOP) - its writes never ran.
             if (c80_mode() && exWhy != N48_GFXN_EX_SPARED) c80_writer_lost(seq);
-            // C5 part 1 (item 1, notes/design/C5-CONTINUOUS.md Q1) — COMMITTED -> NOT_RUN. The ring-walk exemption
+            // C5 part 1 (item 1, an internal design note Q1) — COMMITTED -> NOT_RUN. The ring-walk exemption
             // did NOT spare this IB, so it was NOPed and never reached the CP: this commit's own flight is still
             // deferred to its own bound (gfx_flightring.h's n48_fr_poll_entry never retires a NOT_RUN entry - nothing
             // will ever write its fence slot), but it is no longer reported as a running commit.
@@ -30356,7 +30356,7 @@ static uint64_t hook_gfxCommitIB(void *self, void *info) {
             gFsPlanePend = 0u;     // 0.0.420 (P1): the same for a plane reservation whose identity did not match
             gFs85.s3_pend = 0u;    // build 0.0.530 (S3): the same for an admitted source fill
             gXdF828GateOk = 0u;    // 0.0.415 (Q4): an identity mismatch is not a commit; the candidate is dropped, untouched latch
-            // 0.0.444 (C5-RING-REVIEW.md (B) item 4) — PENDING -> NOT_RUN, NOT FREE. A token mismatch never reaches
+            // 0.0.444 (an internal review note (B) item 4) — PENDING -> NOT_RUN, NOT FREE. A token mismatch never reaches
             // `commit_keystone_arm` (tokMatch gates it above), so this frame's own ring entry is still PENDING from
             // the gate stamp, pushed at the SAME instant KEYSTONE-A-PRIME's ordering depends on. 0.0.443 freed it
             // here - but n48_fr_free_by_seq frees BY THE SHARED `gXdCmToken.seq`, so under concurrent hook calls
@@ -30476,7 +30476,7 @@ static uint32_t gfxsrc_install() {
     return 2u;
 }
 
-// build 0.0.484 (notes/design/GLASS.md Q2 K7 and the substitution cap) — THE IDENTITY-CAP BOOT GUARD. Once per boot,
+// build 0.0.484 (an internal design note Q2 K7 and the substitution cap) — THE IDENTITY-CAP BOOT GUARD. Once per boot,
 // from gfx_protect_arm (the boot chain's [10], or the first `accel gfxneuter 1`), before any frame is judged. Read-only:
 // it asks xlat12's identity table and opens its own read-only view of the embedded shader cache; nothing is written,
 // allocated beyond this file's statics, or armed. Three facts a run log must carry, each of which was silent before:
@@ -30914,7 +30914,7 @@ static void gfxsrc_dep_gather(n48_dep_src &s, uint32_t inflight, bool mayWait) {
 // [9] render drain state, [10] GFX frames walked, [11] last IB VA, [12] last IB len | raced frames << 32.
 uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
     uint32_t st = 0;
-    // C5 part 2 (notes/design/C5-CONTINUOUS.md Q2) — a DEDICATED flag for switch 3's continuous-arm refusal,
+    // C5 part 2 (an internal design note Q2) — a DEDICATED flag for switch 3's continuous-arm refusal,
     // rather than reusing `st` (which every branch in this long chain sets independently, and st == 6 is ALREADY
     // used by switch 37's "unknown M" refusal - sharing it would make switch 37's own report line misprint the
     // switch-3-specific sentence below whenever it fired). Declared here, read only by switch 3's own final report
@@ -30929,7 +30929,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
         // step 3: arm the translate-or-neuter DECISION. Every frame is still neutered (n48_sd_action at DECIDE), so this
         // cannot regress the engine-liveness recipe of; it only measures. Refused unless the source hook is installed,
         // because the decision has no frames to judge otherwise.
-        // C5 part 2 (notes/design/C5-CONTINUOUS.md Q2) — "`gfxneuter 3` (which writes DECIDE) refuses while a
+        // C5 part 2 (an internal design note Q2) — "`gfxneuter 3` (which writes DECIDE) refuses while a
         // continuous arm stands". Through 0.0.451 this verb wrote `gXdArm = N48_SD_ARM_DECIDE` unconditionally on
         // success, bypassing n48_cm_shot_cancel/n48_cm_shot_stop entirely and silently dropping a standing COMMIT
         // arm to DECIDE - exactly the STEP10-PLAN Q5 risk the design names ("gfxneuter 3 ... would silently drop a
@@ -31005,12 +31005,12 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
         req.resprov_on        = gXdResProv ? 1u : 0u;
         req.headless_on       = gXdHeadless ? 1u : 0u;
         const uint32_t missing = n48_cm_arm_missing(&req);
-        // C5 part 2 (notes/design/C5-CONTINUOUS.md Q2, build 0.0.460) — THE CONTINUOUS ARM'S OWN REFUSALS, asked
+        // C5 part 2 (an internal design note Q2, build 0.0.460) — THE CONTINUOUS ARM'S OWN REFUSALS, asked
         // ONLY when switch 41 has a request pending (`gXdContN != 0`); named separately from `missing` (the
         // ORIGINAL pre-arm checklist, byte for byte unchanged) so neither can mask the other, and both are checked
         // before anything is armed. Bits, each named on its own line below if set:
         //   0x1  switch 22 (the in-flight deferral) is not ON
-        //   0x2  switch 16 (the fence un-NOP) is not ON - "Require a fence in continuous mode" (C5-RING-REVIEW.md)
+        //   0x2  switch 16 (the fence un-NOP) is not ON - "Require a fence in continuous mode" (an internal review note)
         //   0x4  switch 15 (X9-F pre-baseline forgiveness) is ON - must be OFF
         //   0x8  switch 19 (Exit C running budget) is ON (non-zero) - must be OFF
         //   0x10 the judged-frame cap does not have room for N more commits plus the margin below
@@ -31397,7 +31397,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
         // OFF, every line of this is unreachable: n48_ksd_eval's first clause answers N48_KSD_NOW_OFF and the
         // withdrawal block runs on exactly 0.0.383's condition.
         const uint32_t m = (uint32_t)(arg >> 8);
-        // C5 part 2 (notes/design/C5-CONTINUOUS.md Q2) — "switches 22 and 16 REFUSE being turned OFF while a
+        // C5 part 2 (an internal design note Q2) — "switches 22 and 16 REFUSE being turned OFF while a
         // continuous arm stands": a continuous arm's OWN arm-time checklist required this switch ON, and its
         // withdrawal-inside-a-flight stop depends on it staying on for as long as the arm does — turning it off
         // mid-arm would silently widen the safety envelope the arm was granted against. Turning it ON, or reading,
@@ -31565,7 +31565,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
               (unsigned long long)gXdLed.keptAcross, (unsigned long long)gXdLed.provenRemap,
               (unsigned long long)gXdLed.movedRemap);
     } else if ((arg & 0xffull) == 30ull) {
-        // 0.0.395 (notes/design/R5-REDESIGN.md v2 "Switch and identity") — R5′. `30 | M << 8`: M 1 ON, M 2 OFF, `30`
+        // 0.0.395 (an internal design note v2 "Switch and identity") — R5′. `30 | M << 8`: M 1 ON, M 2 OFF, `30`
         // alone reads it. OFF BY DEFAULT AND OFF AT BOOT; 17..29 were taken, so 30 is the next free selector (
         // said "30 free"; this chain is where it is checked).
         //
@@ -31761,7 +31761,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
         pairpre_report_line(m == 0u ? "`gfxneuter 34` read it only, unchanged"
                                     : (changed ? "`gfxneuter 34` CHANGED it" : "`gfxneuter 34` REFUSED it, unchanged"));
     } else if ((arg & 0xffull) == 35ull) {
-        // 0.0.420 (notes/design/STEP10-PLAN.md P1) — THE SECOND WINDOW: HOLD A SHOT FOR THE PLANE. `35 | M << 8`:
+        // 0.0.420 (an internal design note P1) — THE SECOND WINDOW: HOLD A SHOT FOR THE PLANE. `35 | M << 8`:
         // M 1 turns it ON, M 0xFF turns it OFF, `35` alone reads this line and changes nothing. OFF BY DEFAULT AND OFF AT
         // BOOT; 17..34 were taken, so 35 is the next free selector (checked against this chain).
         //
@@ -31802,7 +31802,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
                                     : (m == 0xFFu && contStanding35) ? "`gfxneuter 35` OFF REFUSED - a continuous arm stands"
                                     : (changed ? "`gfxneuter 35` CHANGED it" : "`gfxneuter 35` REFUSED it, unchanged"));
     } else if ((arg & 0xffull) == 36ull) {
-        // 0.0.426 (notes/design/MIB-COMMIT.md binding B0) — THE MULTI-IB COMMIT. `36 | M << 8`: M 1 turns it ON, M 0xFF turns
+        // 0.0.426 (an internal design note binding B0) — THE MULTI-IB COMMIT. `36 | M << 8`: M 1 turns it ON, M 0xFF turns
         // it OFF, `36` alone reads this line and changes nothing. OFF BY DEFAULT AND OFF AT BOOT; 1..35 were taken, so 36 is
         // the next free selector (re-checked against this chain at HEAD).
         //
@@ -31829,7 +31829,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
         mib_report_line(m == 0u ? "`gfxneuter 36` read it only, unchanged"
                                 : (changed ? "`gfxneuter 36` CHANGED it" : "`gfxneuter 36` REFUSED it, unchanged"));
     } else if ((arg & 0xffull) == 37ull) {
-        // 0.0.433 (notes/design/MM-PRIORITY.md) — MM-WINDOW PRIORITY FOR THE POLICY PASS. `37 | M << 8`:
+        // 0.0.433 (an internal design note) — MM-WINDOW PRIORITY FOR THE POLICY PASS. `37 | M << 8`:
         // M 1 turns it ON, M 0xFF turns it OFF, `37` alone reads this line and changes nothing. OFF BY DEFAULT AND OFF
         // AT BOOT; 1..36 were taken (re-checked against this chain at HEAD), so 37 is the next free selector.
         //
@@ -31870,7 +31870,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
                       : contStanding37 ? " *** REFUSED: a continuous arm stands ***"
                       : (changed ? " - CHANGED BY THIS VERB" : " - REFUSED (unknown M), unchanged"));
     } else if ((arg & 0xffull) == 38ull) {
-        // 0.0.436 (notes/design/PGMID-COPYGUARD.md Part 1, design "2. M") — PROGRAM-IDENTITY COST.
+        // 0.0.436 (an internal design note Part 1, design "2. M") — PROGRAM-IDENTITY COST.
         // `38 | M << 8`: M 1 = T (head-first read); M 2 = T+M (head-first read, memoised per pass, keyed by
         // (stage,VA) - NOW BUILT); M 3 = SHADOW (run T and HEAD's full read side by side, use HEAD's answer, count
         // disagreements); M 4 = SHADOW-M (run T+M's own path and HEAD's full read side by side, use HEAD's answer,
@@ -31907,7 +31907,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
               "disagreements; OFF is 0.0.433's single kXdIdDwords read, byte for byte.",
               modeStr, why);
     } else if ((arg & 0xffull) == 39ull) {
-        // 0.0.435 (notes/design/PGMID-COPYGUARD.md Part 2) — THE COPY-GUARD POSITIVE CONTROL. `39 | 1 << 8`
+        // 0.0.435 (an internal design note Part 2) — THE COPY-GUARD POSITIVE CONTROL. `39 | 1 << 8`
         // opens ONE phantom scope over the whole of measured VRAM, holds it 2 s writing nothing, then closes it
         // (navi48_cg_phantom_scope, Navi48Bringup.cpp) - "confirm free by census": every reader check whose recorded
         // pages fall inside VRAM must refuse IN_FLIGHT for the whole 2 s and return to baseline the instant it closes,
@@ -31925,7 +31925,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
             HWLOG("cguard-sw: phantom-scope control REFUSED (m=%u, only 1 is accepted) - nothing opened, nothing changed.", m);
         }
     } else if ((arg & 0xffull) == 40ull) {
-        // D4' (notes/design/D4-PRIME.md, notes/design/R1-MEMDST.md Q5) — THE PER-DRAW READ-SET. `40 | M << 8`: M 1
+        // D4' (an internal design note, an internal design note Q5) — THE PER-DRAW READ-SET. `40 | M << 8`: M 1
         // ON (= 296), M 0xFF OFF (= 65320), bare `40` reads and changes nothing. OFF BY DEFAULT AND OFF AT BOOT;
         // 1..39 were taken (re-checked against this chain at HEAD: the D4-PRIME.md census of 1, 2, 5, 6 and masked
         // 3, 4, 7..39 matches this file exactly), so 40 is the next free selector.
@@ -31967,7 +31967,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
         (void)changed;
         d4_report_line(why);
     } else if ((arg & 0xffull) == 41ull) {
-        // C5 part 2 (notes/design/C5-CONTINUOUS.md Q2, build 0.0.460) — THE CONTINUOUS ARM'S PARAMETERS.
+        // C5 part 2 (an internal design note Q2, build 0.0.460) — THE CONTINUOUS ARM'S PARAMETERS.
         // `41 | N << 8 | T10ms << 18`: N in bits [8:17] (1..1022, the frame budget; raised it from 600, 0x3FF clears), T in bits [18:27] (1..500,
         // 10-ms units, the deadline from the first plane commit). Bare `41` (both fields 0) reads. `N == 0x3FF`
         // (1023, past every legal N and the field's own maximum) is the explicit OFF sentinel — the same shape
@@ -32004,7 +32004,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
               N48_CM_CONT_N_MAX, N48_CM_CONT_T_MAX, (unsigned long long)(N48_CM_CONT_T_MAX_US / 100000ull),
               N48_CM_CONT_T_UNIT_BIT);
     } else if ((arg & 0xffull) == 42ull) {
-        // R1 (notes/design/R1-MEMDST.md Q2) — THE MEMORY-DESTINATION RUNG. `42 | M << 8`: M 1 ENFORCE
+        // R1 (an internal design note Q2) — THE MEMORY-DESTINATION RUNG. `42 | M << 8`: M 1 ENFORCE
         // (= 298), M 3 SHADOW (= 810, count only, never refuses), M 0xFF OFF (= 65322, the default and boot value),
         // bare `42` reads and changes nothing. 40 is D4-PRIME.md's (0.0.439); 41 is RESERVED for C5 - not taken.
         // 1..40 were taken (re-checked against this chain at HEAD), so 41/42 are free and this build takes 42 only.
@@ -32116,7 +32116,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
               gP43On ? "ON" : "OFF (default)", why,
               (unsigned long long)gP43.asks, (unsigned long long)gP43.gated, (unsigned long long)gP43.admitted);
     } else if ((arg & 0xffull) == 44ull) {
-        // build 0.0.448 item 1 (notes/design/MIB-A1-PATH.md Q1, "B2/B3 WITHIN ONE TRANSLATION, no
+        // build 0.0.448 item 1 (an internal design note Q1, "B2/B3 WITHIN ONE TRANSLATION, no
         // cross-segment carry"). `44 | M << 8`: M 1 ON, M 0xFF OFF (the default and the boot value), bare `44`
         // reads and changes nothing. Re-censused against this chain at HEAD: 1..40, 42 and 43 taken, 41 RESERVED
         // for C5 (not taken), so this build takes 44 - the next free selector after 43.
@@ -32146,7 +32146,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
               gXdUdReemitOn ? "ON" : "OFF (default)", why, (unsigned long long)gXdUdReemitS.segsOn,
               (unsigned long long)gXdUdReemitS.reemitN);
     } else if ((arg & 0xffull) == 45ull) {
-        // build 0.0.448 item 3 (notes/design/MIB-A1-PROVENANCE.md Q4 step 2). `45 | M << 8`: M 1 ON, M 0xFF
+        // build 0.0.448 item 3 (an internal design note Q4 step 2). `45 | M << 8`: M 1 ON, M 0xFF
         // OFF (the default and the boot value), bare `45` reads and changes nothing. Re-censused against this
         // chain at HEAD: 1..40 and 42..44 taken, 41 RESERVED for C5 (not taken), so this build takes 45 - the
         // next free selector after 44.
@@ -32176,7 +32176,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
               (unsigned long long)gXdFrameLocalS.vouched, (unsigned long long)gXdFrameLocal.asked,
               (unsigned long long)gXdFrameLocal.proven);
     } else if ((arg & 0xffull) == 46ull) {
-        // build 0.0.450 item 1 (T450, notes/design/MIB-A1-PROVENANCE.md Q3). `46 | M << 8`: M 1 ON, M 0xFF OFF
+        // build 0.0.450 item 1 (T450, an internal design note Q3). `46 | M << 8`: M 1 ON, M 0xFF OFF
         // (the default and the boot value), bare `46` reads and changes nothing. Re-censused against this chain at
         // HEAD (0.0.449 + T450's pure-header commit, which touched no switch): 1..40 and 42..45 taken, 41 RESERVED
         // for C5 (not taken), so this build takes 46 and 47 - the next two free selectors after 45.
@@ -32276,7 +32276,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
         descinvhead_report_line(contRefused49 ? "`gfxneuter 49` REFUSED - a continuous arm stands"
                                                : changed ? "`gfxneuter 49` changed it" : "`gfxneuter 49` read it only, unchanged");
     } else if ((arg & 0xffull) == 51ull) {
-        // build 0.0.470 (notes/design/NO-SAMPLER-CLASS10.md section 3). `51 | M << 8`: M 1 ON (= 307), M 0xFF OFF
+        // build 0.0.470 (an internal design note section 3). `51 | M << 8`: M 1 ON (= 307), M 0xFF OFF
         // (= 65331, the default and the boot value; M 2 is also OFF, the spelling switches 48-52 use), bare `51` reads and
         // changes nothing, any other M is refused unchanged. Re-censused at this build's base (7f075b2): no `== 51ull`
         // selector and no `gfxneuter 51` anywhere in src/ or tools/ (44-50 and 52 taken, 41 reserved for C5); the design
@@ -32343,7 +32343,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
         tvscan_report_line(contRefused54 ? "`gfxneuter 54` REFUSED - a continuous arm stands"
                                           : changed54 ? "`gfxneuter 54` changed it" : "`gfxneuter 54` read it only, unchanged");
     } else if ((arg & 0xffull) == 55ull) {
-        // build 0.0.480 (notes/design/CONTINUATION-UNITS.md Q11 C5). `55 | M << 8`: M 1 ON (= 311), M 2 OFF (= 567,
+        // build 0.0.480 (an internal design note Q11 C5). `55 | M << 8`: M 1 ON (= 311), M 2 OFF (= 567,
         // the default and the boot value), bare `55` reads and changes nothing. Re-censused at this build's base (c278d17)
         // and main (52ca774): no `== 55ull` selector and no `gfxneuter 55` anywhere in src/ or tools/ (43-54 taken), so
         // 55 is the next free selector. Joins the continuous mid-arm guard (n48_cm_cont_switch_refused) like 43-54. See
@@ -32374,7 +32374,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
         retry_report_line(contRefused56 ? "`gfxneuter 56` REFUSED - a continuous arm stands"
                                         : changed56 ? "`gfxneuter 56` changed it" : "`gfxneuter 56` read it only, unchanged");
     } else if ((arg & 0xffull) == 57ull) {
-        // build 0.0.487 (notes/design/COMPUTE-N.md Q7, contract C3). `57 | M << 8`: M 1 ON (= 313), M 2 OFF (= 569, the
+        // build 0.0.487 (an internal design note Q7, contract C3). `57 | M << 8`: M 1 ON (= 313), M 2 OFF (= 569, the
         // default and the boot value), bare `57` reads and changes nothing. Re-censused at this build's base (34019fb) and
         // main (70e5b11): no `== 57ull` selector and no `gfxneuter 57` anywhere in src/ or tools/ (43-56 and 58 taken, 57
         // reserved by COMPUTE-N.md). Joins the continuous mid-arm guard (n48_cm_cont_switch_refused) like 43-56 and 58. See
@@ -32388,10 +32388,10 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
         cselide_report_line(contRefused57 ? "`gfxneuter 57` REFUSED - a continuous arm stands"
                                           : changed57 ? "`gfxneuter 57` changed it" : "`gfxneuter 57` read it only, unchanged");
     } else if ((arg & 0xffull) == 58ull) {
-        // build 0.0.485 (notes/design/LOGIN-SCREEN-PATH.md "The ledger wall (L1, L2)"). `58 | M << 8`: M 1 ON (= 314),
+        // build 0.0.485 (an internal design note "The ledger wall (L1, L2)"). `58 | M << 8`: M 1 ON (= 314),
         // M 2 OFF (= 570, the default and the boot value), bare `58` reads and changes nothing. Censused at this build's base
         // (57d2c20): no `== 58ull` selector and no `gfxneuter 58` anywhere in src/ or tools/ (43-56 taken, 57 reserved by
-        // notes/design/COMPUTE-N.md), so 58 is the next free selector. Joins the continuous mid-arm guard
+        // an internal design note), so 58 is the next free selector. Joins the continuous mid-arm guard
         // (n48_cm_cont_switch_refused) like 43-56. A change moves the ledger's epoch (as 17/18/21/29 do), so the ledger starts
         // empty under the new rule. It writes no register, no page table and nothing of Apple's. See gLedMidOn.
         const uint32_t m = (uint32_t)(arg >> 8);
@@ -32406,10 +32406,10 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
         ledmid_report_line(contRefused58 ? "`gfxneuter 58` REFUSED - a continuous arm stands"
                                          : changed58 ? "`gfxneuter 58` changed it" : "`gfxneuter 58` read it only, unchanged");
     } else if ((arg & 0xffull) == 60ull) {
-        // build 0.0.488 (notes/design/DCC-DESC.md Q2 option (A), Q4). `60 | M << 8`: M 1 ON (= 316), M 2 OFF (= 572, the
+        // build 0.0.488 (an internal design note Q2 option (A), Q4). `60 | M << 8`: M 1 ON (= 316), M 2 OFF (= 572, the
         // default and the boot value), bare `60` reads and changes nothing. Censused at this build's base (34019fb), main
         // (70e5b11) and the two other build worktrees (wt436 34019fb, wtc5 fe2f769): no `== 60ull` selector and no
-        // `gfxneuter 60` anywhere in src/ (43-56 and 58 taken, 57 reserved by notes/design/COMPUTE-N.md, 59 claimed by
+        // `gfxneuter 60` anywhere in src/ (43-56 and 58 taken, 57 reserved by an internal design note, 59 claimed by
         // 0.0.486), so 60 is the design's own number. Joins the continuous mid-arm guard (n48_cm_cont_switch_refused) like
         // 43-58. No epoch move: it changes which records the table step translates, not what the ledger holds. It writes no
         // register, no page table and nothing of Apple's. See gDccStripOn.
@@ -32468,7 +32468,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
                        : changed62 ? " - `gfxneuter 62` CHANGED BY THIS VERB"
                        : m != 0u ? " - `gfxneuter 62` REFUSED (unknown M), unchanged" : " - `gfxneuter 62` read only, unchanged");
     } else if ((arg & 0xffull) == 63ull) {
-        // build 0.0.496 (notes/design/FAST-PAGEIN.md,). `63 | M << 8`: M 1 ON with a sampled MM verify (= 319), M 2 OFF (=
+        // build 0.0.496 (an internal design note,). `63 | M << 8`: M 1 ON with a sampled MM verify (= 319), M 2 OFF (=
         // 575, the default and the boot value), M 3 ON with every dword verified through the MM window (= 831); bare `63` reads and
         // changes nothing. Censused at this build's base (5064f01): no `63ull` selector and no `gfxneuter 63` anywhere in src/ or
         // tools/ (42-62 taken; gfx_commit_test.cpp listed 63 as unclaimed). ON: each chunk of a residency copy is produced into a
@@ -32527,7 +32527,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
                           : changed65 ? " - `gfxneuter 65` CHANGED BY THIS VERB"
                           : m != 0u ? " - `gfxneuter 65` REFUSED (unknown M), unchanged" : " - `gfxneuter 65` read only, unchanged");
     } else if ((arg & 0xffull) == 66ull) {
-        // build 0.0.500 (notes/design/DRAW-ELIDE.md Q4, the reviewer's switch number). `66 | M << 8`: M 1 ON for the U/Y rows
+        // build 0.0.500 (an internal design note Q4, the reviewer's switch number). `66 | M << 8`: M 1 ON for the U/Y rows
         // (= 322), M 3 ON for the U/Y rows and the AO row (= 834), build 0.0.512: M 7 ON for U/Y, AO AND the glass rows BD / BA
         // (= 1858, xlat12_ib.h XLAT12_DE_CLASS_GLASS), M 2 OFF (= 578, the default and the boot value), bare `66`
         // reads and changes nothing. Censused at this build's base (f935e52) in src/ and tools/: no `66ull` selector and no
@@ -32545,7 +32545,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
                               : changed66 ? " - `gfxneuter 66` CHANGED BY THIS VERB"
                               : m != 0u ? " - `gfxneuter 66` REFUSED (unknown M), unchanged" : " - `gfxneuter 66` read only, unchanged");
     } else if ((arg & 0xffull) == 67ull) {
-        // build 0.0.501 (notes/design/UNIT-ROOM.md Q3, the reviewer's switch number). `67 | M << 8`: M 1 ON (= 323), M 2 OFF
+        // build 0.0.501 (an internal design note Q3, the reviewer's switch number). `67 | M << 8`: M 1 ON (= 323), M 2 OFF
         // (= 579, the default and the boot value), bare `67` reads and changes nothing. Censused at this build's base (2a23275) in
         // src/ and tools/: no `67ull` selector and no `gfxneuter 67` anywhere (42-66 taken; gfx_commit_test.cpp listed 67 as
         // unclaimed). Joins the continuous mid-arm guard (n48_cm_cont_switch_refused) like 42-66: changed only before an arm.
@@ -32561,7 +32561,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
                              : changed67 ? " - `gfxneuter 67` CHANGED BY THIS VERB"
                              : m != 0u ? " - `gfxneuter 67` REFUSED (unknown M), unchanged" : " - `gfxneuter 67` read only, unchanged");
     } else if ((arg & 0xffull) == 68ull) {
-        // build 0.0.503 (notes/design/HYBRID.md; the reviewer's switch in place of the design's boot-arg). `68 | M
+        // build 0.0.503 (an internal design note; the reviewer's switch in place of the design's boot-arg). `68 | M
         // << 8`: M 1 ON (= 324), M 2 OFF (= 580, the default and the boot value), bare `68` reads and changes nothing. Censused at
         // this build's base (ee71d84) in src/ and tools/: no `68ull` selector and no `gfxneuter 68` anywhere (42-67 taken;
         // gfx_commit_test.cpp listed 68 as unclaimed). ON: the slot-239 newUserClient hook (Navi48AccelPeer.cpp, installed at the
@@ -32580,7 +32580,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
                              : changed68 ? " - `gfxneuter 68` CHANGED BY THIS VERB"
                              : m != 0u ? " - `gfxneuter 68` REFUSED (unknown M), unchanged" : " - `gfxneuter 68` read only, unchanged");
     } else if ((arg & 0xffull) == 69ull) {
-        // build 0.0.505 (notes/design/CROSS-IB.md Q4; the design's "69 if free", re-derived). `69 | M << 8`: M 1 the IB-0
+        // build 0.0.505 (an internal design note Q4; the design's "69 if free", re-derived). `69 | M << 8`: M 1 the IB-0
         // disguise (= 325), M 2 the lead (= 581), M 3 both (= 837), M 0xFF OFF (= 65349, the default and the boot value), bare
         // `69` reads and changes nothing, any other M is refused unchanged. Censused at this build's base (0299a0f9) in src/ and
         // tools/: no `69ull` selector and no `gfxneuter 69` anywhere (3-68 taken; gfx_commit_test.cpp listed 69 as unclaimed).
@@ -32639,7 +32639,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
         // changed only before an arm. Latched once per pass (gHgPendLatch, with 62's latch). ON: a shader-heap copy that would bump
         // the heap generation waits (at most 100 ms) while a committed frame's ring walk has not answered, then proceeds exactly as
         // before. It writes no register, no page table and nothing of Apple's. OFF clears any flag (a disarm).
-        // build 0.0.532 (; notes/design/HW72M3.md item 1): M 3 (= 840) - START-UP SCOPED, HELD TO RETIREMENT.
+        // build 0.0.532 (; an internal design note item 1): M 3 (= 840) - START-UP SCOPED, HELD TO RETIREMENT.
         // Only in the pre-plane window (a continuous arm before CONTINUOUS START) the judge's flag is set; the walk no longer ends it;
         // the commit hook's EXIT 3 promotes a SPARED fill with a fence to LIVE, and a bumping copy waits (at most 100 ms, reading the
         // flight's own fence itself) until that fence lands. After START it sets nothing (72 OFF's behaviour). n48_ra_set knows only
@@ -32740,7 +32740,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
                           : changed76 ? " - `gfxneuter 76` CHANGED BY THIS VERB"
                           : m != 0u ? " - `gfxneuter 76` REFUSED (unknown M), unchanged" : " - `gfxneuter 76` read only, unchanged");
     } else if ((arg & 0xffull) == 77ull) {
-        // build 0.0.523 (notes/design/RING-NEUTER-FORGIVE.md rev 2; gfx_rnforgive.h). Censused at this build's base (8103cabc)
+        // build 0.0.523 (an internal design note rev 2; gfx_rnforgive.h). Censused at this build's base (8103cabc)
         // in src/, tests/ and tools/: `(arg & 0xffull) == Nll` selectors 3-76 taken, no `77ull`/`78ull` selector and no `gfxneuter
         // 77`/`78` anywhere; gfx_commit_test.cpp listed 77 and 78 as unclaimed. `77 | M << 8`: M 1 ON (= 333), M 2 OFF (= 589, the
         // default and the boot value), bare `77` reads and changes nothing, any other M is refused unchanged (st 11). Joins the
@@ -32766,7 +32766,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
               (unsigned long long)gRn.bounded, (unsigned long long)gRn.lostDrains, (unsigned long long)gRn.retiredIbs,
               n48_rn_verdict(gRn.forgiven, gRn.grantedIbs, gRn.retiredIbs));
     } else if ((arg & 0xffull) == 78ull) {
-        // build 0.0.523 (notes/design/RING-NEUTER-FORGIVE.md rev 2 items 9-11; gfx_copyguard.h, gfx_cgredo.h). Censused with
+        // build 0.0.523 (an internal design note rev 2 items 9-11; gfx_copyguard.h, gfx_cgredo.h). Censused with
         // 77 above. `78 | M << 8`: M 1 ON (= 334), M 2 OFF (= 590, the default and the boot value), bare `78` reads and changes
         // nothing, any other M is refused unchanged (st 11). Joins the continuous mid-arm guard like 42-77 (latched per pass).
         // It writes no register, no page table and nothing of Apple's: a refused segment is translated once more, and the
@@ -32792,7 +32792,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
               (unsigned long long)gCgRedoS.waitUs[0], (unsigned long long)gCgRedoS.waitUs[1],
               (unsigned long long)gCgRedoS.waitUs[2], (unsigned long long)gCgRedoS.waitUs[3]);
     } else if ((arg & 0xffull) == 79ull) {
-        // build 0.0.524 (notes/design/T0SRC.md item 1, ; gfx_t0src.h). Censused at this build's base (d9622558) in
+        // build 0.0.524 (an internal design note item 1, ; gfx_t0src.h). Censused at this build's base (d9622558) in
         // src/, tests/ and tools/: `(arg & 0xffull) == Nll` selectors 3-78 taken, no `79ull` selector, no `gfxneuter 79` and no
         // SWITCH-GUARD:79 anywhere; gfx_commit_test.cpp listed 79 as unclaimed (`action == 79` in Navi48Bringup.cpp is the verb
         // number space). `79 | M << 8`: M 1 ON (= 335), M 2 OFF (= 591, the default and the boot value), bare `79` reads and
@@ -32810,7 +32810,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
                           : changed79 ? " - `gfxneuter 79` CHANGED BY THIS VERB"
                           : m != 0u ? " - `gfxneuter 79` REFUSED (unknown M), unchanged" : " - `gfxneuter 79` read only, unchanged");
     } else if ((arg & 0xffull) == 80ull) {
-        // build 0.0.525 (notes/design/CYCLE80.md, X1-X2; gfx_cycle80.h). Censused at this build's base (c4cbc423) in src/,
+        // build 0.0.525 (an internal design note, X1-X2; gfx_cycle80.h). Censused at this build's base (c4cbc423) in src/,
         // tests/ and tools/: `(arg & 0xffull) == Nll` selectors 3-79 taken, no `80ull` selector, no `gfxneuter 80` and no
         // SWITCH-GUARD:80 anywhere; gfx_commit_test.cpp listed 80 as unclaimed (`action == 80` in Navi48Bringup.cpp is the verb
         // number space). `80 | M << 8`: M 1 ON (= 336), M 2 OFF (= 592, the default and the boot value), M 3 SHADOW (= 848: every
@@ -32861,7 +32861,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
                          : changed81 ? " - `gfxneuter 81` CHANGED BY THIS VERB"
                          : m != 0u ? " - `gfxneuter 81` REFUSED (unknown M), unchanged" : " - `gfxneuter 81` read only, unchanged");
     } else if ((arg & 0xffull) == 82ull) {
-        // build 0.0.527 (notes/design/SKIP82.md, ; gfx_sk82.h). Censused at this build's base (8c22b79e) in src/,
+        // build 0.0.527 (an internal design note, ; gfx_sk82.h). Censused at this build's base (8c22b79e) in src/,
         // tests/ and tools/: no `(arg & 0xffull) == 82ull` selector, no `gfxneuter 82`, no SWITCH-GUARD:82 anywhere; gfx_commit_test.cpp
         // listed 82 as unclaimed (`action == 82` in Navi48Bringup.cpp and `in == 82` in navi48test.c are the verb number space).
         // `82 | M << 8`: M 1 (= 338) MEASURE: compare and count, never skip, never force a full verify; M 2 (= 594) OFF, the default
@@ -32883,7 +32883,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
         const bool contRefused83 = n48_cm_cont_switch_refused(83u, m == 0u ? 1u : 0u, gXdShot.cont, gXdShot.state) != 0u;
         (void)navi48_tlb83_switch(m, contRefused83 ? 1u : 0u, &st);
     } else if ((arg & 0xffull) == 84ull) {
-        // build 0.0.529 (notes/design/CG84.md item 1; gfx_cg84.h). Censused at this build's base (f824012f) in src/, tests/ and
+        // build 0.0.529 (an internal design note item 1; gfx_cg84.h). Censused at this build's base (f824012f) in src/, tests/ and
         // tools/: no `(arg & 0xffull) == 84ull` selector, no `gfxneuter 84`, no SWITCH-GUARD:84 anywhere; gfx_commit_test.cpp listed 84
         // as unclaimed (842 = 74 | 3 << 8 is switch 74's force verb, no clash). `84 | M << 8`: M 1 (= 340) SHADOW: the counted check
         // stays the page check and every copy 0.0.528's, keys are kept, the would-be deltas ride the slots and events, and an
@@ -32895,7 +32895,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
         const bool contRefused84 = n48_cm_cont_switch_refused(84u, m == 0u ? 1u : 0u, gXdShot.cont, gXdShot.state) != 0u;
         (void)navi48_cg84_switch(m, contRefused84 ? 1u : 0u, &st);
     } else if ((arg & 0xffull) == 85ull) {
-        // build 0.0.530 (notes/design/SRCFILL85.md, gfx_fs85.h): SOURCE FILLS. Censused at this build's base (ab336a80) in
+        // build 0.0.530 (an internal design note, gfx_fs85.h): SOURCE FILLS. Censused at this build's base (ab336a80) in
         // src/, tests/ and tools/: no `(arg & 0xffull) == 85ull` selector, no `gfxneuter 85`, no SWITCH-GUARD:85 anywhere;
         // gfx_commit_test.cpp listed 85 as unclaimed (N48_C88_PS_ID's `85ull << 32` is an ndw, not a selector). `85 | M << 8`,
         // switch 37's shape: M 1 (= 341) ON, M 0xFF (= 65365) OFF, the default and the boot value; bare `85` reads; any other
@@ -32981,7 +32981,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
                         : (m == N48_P87_M_GEOM || m == N48_P87_M_DUMP) ? " - `gfxneuter 87` readback (see the imgdump531 lines)"
                         : " - `gfxneuter 87` REFUSED it (unknown M), unchanged");
     } else if ((arg & 0xffull) == 88ull) {
-        // build 0.0.533 (; notes/design/HG88.md): SWITCH 88, THE RANGE-PRECISE HEAP-GENERATION JUDGE. Censused at
+        // build 0.0.533 (; an internal design note): SWITCH 88, THE RANGE-PRECISE HEAP-GENERATION JUDGE. Censused at
         // this build's base (b126ecd3) in src/, tests/ and tools/: no `(arg & 0xffull) == 88ull` selector, no `gfxneuter 88`, no
         // SWITCH-GUARD:88, no `gfxneuter 344`/`gfxneuter 600` (gfx_commit_test.cpp listed 88 as unclaimed; gfx_clock88.h's 88 is an
         // identity, not a switch). `88 | M << 8`: M 1 ON (= 344), M 2 OFF (= 600, the default and the boot value), bare `88` reads and
@@ -33504,7 +33504,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
               (unsigned long long)gAn110S.would, (unsigned long long)gAn110S.refWs, (unsigned long long)gAn110S.refCap,
               (unsigned long long)de515_an_committed());
     } else if ((arg & 0xffull) == 112ull) {
-        // build 0.0.554 (; gfx_admit112.h, notes/design/ADMIT-STALE-112.md): SWITCH 112, "admit112", ADMIT STALE. Censused at
+        // build 0.0.554 (; gfx_admit112.h, an internal design note): SWITCH 112, "admit112", ADMIT STALE. Censused at
         // this build's base (bb4360a2) in src/, tests/ and tools/ of the worktree and main by grep: no `(arg & 0xffull) == 112ull` selector, no
         // `case 112u`, no SWITCH-GUARD:112, no `gfxneuter 112`/`368`/`624`/`880` (gfx_commit_test.cpp listed 112 as unclaimed). `112 | M << 8`:
         // M 1 ON (= 368), M 2 OFF (= 624, the default and the boot value), M 3 SHADOW (= 880), bare `112` reads; any other M is refused
@@ -33603,7 +33603,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
                            : changed92 ? "`gfxneuter 92` CHANGED BY THIS VERB"
                            : m != 0u ? "`gfxneuter 92` REFUSED (unknown M), unchanged" : "`gfxneuter 92` read only, unchanged");
     } else if ((arg & 0xffull) == 59ull) {
-        // build 0.0.486 (notes/design/STATIC-RETILE.md Q6). `59 | M << 8`: M 1 ON (= 315), M 2 OFF (= 571, the default and
+        // build 0.0.486 (an internal design note Q6). `59 | M << 8`: M 1 ON (= 315), M 2 OFF (= 571, the default and
         // the boot value), bare `59` reads and changes nothing. Censused at this build's base (fe2f769) and against the two
         // concurrent candidates (0.0.484 at 822443d, 0.0.485 at c01c7a4): no `== 59ull` selector and no `gfxneuter 59` in src/
         // or tools/ of any of them (55, 56 taken; 57 claimed by COMPUTE-N's design; 58 taken by 0.0.485), so 59 is free.
@@ -33861,7 +33861,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
         // fence page (the last 4 KiB of the relocation arena, root[511]), where its DATA_LO carries epoch|ordinal.
         // Four dwords change, length unchanged, nothing appended, nothing synthesized, INT_SEL 0 so no EOP interrupt.
         const uint32_t m = (uint32_t)(arg >> 8);
-        // C5 part 2 (notes/design/C5-CONTINUOUS.md Q2) — REFUSED OFF WHILE A CONTINUOUS ARM STANDS, the same rule
+        // C5 part 2 (an internal design note Q2) — REFUSED OFF WHILE A CONTINUOUS ARM STANDS, the same rule
         // and the same reason as switch 22's: a continuous arm's own fence-required rung (N48_CM_CONT_NO_FENCE)
         // depends on this switch staying ON for the arm's whole duration, and this is the ONE switch that changes
         // Apple's own instruction stream, so turning it off under a standing continuous arm is refused rather than
@@ -34075,7 +34075,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
     mib0_seg_report_line();
     xib_report_line("");   // build 0.0.505: switch 69's census (C4), on every read, whatever switch was thrown
     mib0_pol_report_line();
-    // 0.0.434 (notes/design/PGMID-COPYGUARD.md Part 1): the same phases, accumulated separately for
+    // 0.0.434 (an internal design note Part 1): the same phases, accumulated separately for
     // nib >= 2 passes, on its own line beside the single-IB one above.
     mib0_pol2_report_line();
     // 0.0.446: the per-segment status counter for nib >= 2 frames (gfx_mibseg.h), report-read only.
@@ -34085,7 +34085,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
     nseg0_report_line();
     mibseg_detail_report_line();
     unkkeys_report_line();
-    // 0.0.433 (notes/design/MM-PRIORITY.md): the MM-window priority counters, beside the policy phases line,
+    // 0.0.433 (an internal design note): the MM-window priority counters, beside the policy phases line,
     // whatever switch (37) was thrown.
     mmprio_pol_report_line();
     // 0.0.434: program-identity cost, on every read, whatever switch (38) was thrown.

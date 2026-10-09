@@ -335,7 +335,7 @@ static void t7_glue(const char *path)
                                  "static void de515_report_line(void)",
                                  // build 0.0.552 (switch 110): a read-only accessor for 110's report line (log only).
                                  "static uint64_t de515_an_committed(void)",
-                                 // build 0.0.525 (switch 80, notes/design/CYCLE80.md): the ONLY decision readers, by name. Both read
+                                 // build 0.0.525 (switch 80, an internal design note): the ONLY decision readers, by name. Both read
                                  // the write set: c80_heldback to ADD held-back writes (C3's 0.0.525 finding: more holds, never fewer),
                                  // c80_judge (fix pass, the HIGH review's SHOULD) to credit committed writers from the union. Since the fix
                                  // pass (MF-3) the P's layer is switch 80's OWN count of plane-shaped pairs, not in_ok / in_layer.

@@ -502,7 +502,7 @@ static void rehearsal_line_bound()
              (std::strstr(N48_CM_SPENT_MORE, "MAY STILL BE HANDED COMMIT") != nullptr &&
               std::strstr(N48_CM_SPENT_DONE, "MAY STILL BE HANDED COMMIT") == nullptr) ? 1u : 0u, 1);
 
-    /* C5 part 2 (notes/design/C5-CONTINUOUS.md Q3, build 0.0.460) — THE THREE CONTINUOUS-MODE LINES, same rule. */
+    /* C5 part 2 (an internal design note Q3, build 0.0.460) — THE THREE CONTINUOUS-MODE LINES, same rule. */
     {
         const int n2 = std::snprintf(b, sizeof(b), N48_CM_CONT_START_FMT, 0xffffffffu, 0xffffffffffffffffull,
                                      0xffffffffffffffffull, 0xffffffffu, 0xffffffffu);
@@ -1064,8 +1064,8 @@ static void fillset_checks()
 {
     /* The reason is APPENDED: 0..18 are 0.0.403's and may never move. Pin the index and the neighbours. */
     expect_u("fillset: the reason is APPENDED at index 19", N48_CM_RESERVED_FOR_FILL, 19u);
-    expect_u("fillset: N48_CM_REASONS was 21 at 0.0.419, 22 after P1's append, 23 after R1's (notes/design/R1-MEMDST.md), "
-             "24 after C5 part 1's RING-FULL (notes/design/C5-CONTINUOUS.md), 25 after 0.0.456's MIB-REQUIRED, 26 after C5 part 2's CONTINUOUS-NO-FENCE (merged after 0.0.456), 27 after 0.0.487's COMPUTE-ELIDE-R1, 28 after 0.0.500's DRAW-ELIDE-R1",
+    expect_u("fillset: N48_CM_REASONS was 21 at 0.0.419, 22 after P1's append, 23 after R1's (an internal design note), "
+             "24 after C5 part 1's RING-FULL (an internal design note), 25 after 0.0.456's MIB-REQUIRED, 26 after C5 part 2's CONTINUOUS-NO-FENCE (merged after 0.0.456), 27 after 0.0.487's COMPUTE-ELIDE-R1, 28 after 0.0.500's DRAW-ELIDE-R1",
              N48_CM_REASONS, 28u);
     expect_u("fillset: LUT-NOT-READY did not move", N48_CM_LUT_NOT_READY, 18u);
     expect_u("fillset: DEPENDENCY-STALE did not move", N48_CM_DEP_STALE, 16u);
@@ -1075,12 +1075,12 @@ static void fillset_checks()
     expect_u("E3: FENCE-REGION-MOVED is APPENDED at index 20", N48_CM_FENCE_REGION_MOVED, 20u);
     expect_s("E3: it has its own name", n48_cm_reason_name(N48_CM_FENCE_REGION_MOVED), "FENCE-REGION-MOVED");
     expect_u("P1: RESERVED-FOR-PLANE is APPENDED at index 21", N48_CM_RESERVED_FOR_PLANE, 21u);
-    // R1 (notes/design/R1-MEMDST.md Q2) — MEMORY-DESTINATION is APPENDED after it, at index 22, and named.
+    // R1 (an internal design note Q2) — MEMORY-DESTINATION is APPENDED after it, at index 22, and named.
     expect_u("R1: MEMORY-DESTINATION is APPENDED at index 22", N48_CM_MEMDST, 22u);
     expect_s("R1: it has its own name", n48_cm_reason_name(N48_CM_MEMDST), "MEMORY-DESTINATION");
     // R1's own "N48_CM_REASONS is 23 after the append" is superseded by C5's own count check just below (24) - kept
     // as ONE check per append, on the CURRENT total, rather than a stale count that every future append must edit.
-    // C5 part 1 (notes/design/C5-CONTINUOUS.md Q1, gfx_flightring.h) — RING-FULL is APPENDED after it, at index 23.
+    // C5 part 1 (an internal design note Q1, gfx_flightring.h) — RING-FULL is APPENDED after it, at index 23.
     expect_u("C5: RING-FULL is APPENDED at index 23", N48_CM_RING_FULL, 23u);
     expect_s("C5: it has its own name", n48_cm_reason_name(N48_CM_RING_FULL), "RING-FULL");
     // C5's own "N48_CM_REASONS is 24 after the append" and 0.0.456's "25" are superseded by the merged count:
@@ -1145,7 +1145,7 @@ static void fillset_checks()
     expect_u("fillset:   and nine reasons follow it", N48_CM_REASONS - 9u, N48_CM_RESERVED_FOR_FILL);
 }
 
-/* C5 part 1 (notes/design/C5-CONTINUOUS.md Q1, gfx_flightring.h) — THE RING-FULL RUNG. Unconditional (no switch): the
+/* C5 part 1 (an internal design note Q1, gfx_flightring.h) — THE RING-FULL RUNG. Unconditional (no switch): the
  * ring exists whenever this gate does, so unlike LUT/fillset/plane there is no "switch off" byte-identity case to
  * prove here — the identity claim for THIS rung is the budget-1 identity proved in gfx_flightring_test.cpp instead
  * (a one-entry ring is never full). What this suite proves is the GATE's own wiring: the rung fires exactly on
@@ -1243,7 +1243,7 @@ static void mib_required_checks()
 }
 
 /* =====================================================================================================================
- * C5 part 1 (hardening, notes/design/C5-CONTINUOUS.md Q2) — gfxsrc_commit_try's RETURN MUST NEED THE SPEND.
+ * C5 part 1 (hardening, an internal design note Q2) — gfxsrc_commit_try's RETURN MUST NEED THE SPEND.
  *
  * This is a REACHABILITY test on the ORDERING (the brief's own words), not a literal-line source pin: it drives the
  * REAL gate (n48_cm_gate) and the REAL one-shot state machine (n48_cm_shot_spend) in the EXACT sequence the kext's
@@ -1363,7 +1363,7 @@ static void retire_checks()
     expect_u("N2   and the window stays OPEN", n48_fs_win_open(&g), 1u);
 }
 
-/* 0.0.420 (notes/design/STEP10-PLAN.md P1) — THE SECOND WINDOW'S (hold a shot for the plane) APPENDED RUNG.
+/* 0.0.420 (an internal design note P1) — THE SECOND WINDOW'S (hold a shot for the plane) APPENDED RUNG.
  * Present ONLY while switch 35 is on AND the second window is open (the fill window has closed, no plane frame has
  * committed, its own expiry has not fired); with it off the gate must be 0.0.419's exactly, the plane must pass, and once
  * the window closes a non-plane must pass too. Each check is the falsifier of one way to write the rung wrong. */
@@ -1470,7 +1470,7 @@ static void mib_gate_checks()
     }
 }
 
-/* C5 part 2 (notes/design/C5-CONTINUOUS.md Q2, build 0.0.460) — THE CONTINUOUS-NO-FENCE RUNG. Present ONLY while
+/* C5 part 2 (an internal design note Q2, build 0.0.460) — THE CONTINUOUS-NO-FENCE RUNG. Present ONLY while
  * `cont_on` is 1 (this shot is a continuous arm); a one-shot's fence-less commit is unaffected. */
 static void cont_no_fence_checks()
 {
@@ -1522,7 +1522,7 @@ static void cont_no_fence_checks()
 }
 
 /* =====================================================================================================================
- * C5 part 2 (notes/design/C5-CONTINUOUS.md Q2, build 0.0.460) — THE CONTINUOUS ARM'S OWN STATE MACHINE.
+ * C5 part 2 (an internal design note Q2, build 0.0.460) — THE CONTINUOUS ARM'S OWN STATE MACHINE.
  *
  * OFF IDENTITY FIRST: with switch 41 never thrown, n48_cm_shot_arm_cont is never called, so `cont` stays 0 for
  * every arm this boot makes and n48_cm_shot_budget_of/n48_cm_shot_level/n48_cm_shot_spend all read exactly as
@@ -2900,7 +2900,7 @@ static void cont_log_caps_checks()
 
 
 // =====================================================================================================================
-// build 0.0.487 (notes/design/COMPUTE-N.md Q6 item 5, Q7, Q8 T5/T6; contract C3) — SWITCH 57, THE COMPUTE-N ELIDE.
+// build 0.0.487 (an internal design note Q6 item 5, Q7, Q8 T5/T6; contract C3) — SWITCH 57, THE COMPUTE-N ELIDE.
 //   T5  COMPUTE-ELIDE-R1: a frame whose candidate carries an elision (cs_elided > 0) commits ONLY with 42 ENFORCE
 //       (md_switch) and R1 clean (md_ok); with cs_elided 0 the rung is absent (every md combination is the old gate).
 //   P4  n48_cm_cs_is_n (the kext's `ex->cs_is_n`): 1 only for THIS frame's own compute program at exactly that VA, with
@@ -2991,7 +2991,7 @@ static void cselide_line_bound()
 }
 
 // =====================================================================================================================
-// build 0.0.500 (notes/design/DRAW-ELIDE.md Q4 T5/T6) — SWITCH 66, THE DRAW ELIDE.
+// build 0.0.500 (an internal design note Q4 T5/T6) — SWITCH 66, THE DRAW ELIDE.
 //   T5  DRAW-ELIDE-R1: a frame whose candidate carries an elided draw (draw_elided > 0) commits ONLY with 42 ENFORCE and R1
 //       clean; with draw_elided 0 the rung is absent (every md combination is the old gate); n48_cm_live carries it.
 //   T6  the verb's values (n48_cm_de_set: 1 -> U/Y, 3 -> U/Y+AO, 2 -> OFF, others refused) and the mid-arm guard (66 is in

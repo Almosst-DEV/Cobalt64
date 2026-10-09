@@ -97,3 +97,11 @@ Mesa (MIT)  https://gitlab.freedesktop.org/mesa/mesa
 See mesa-patches/README.txt. The patches are changes to Mesa and are
 released under Mesa's own licence.
 ==========================================================================
+
+==========================================================================
+metal2vulkan (LGPL-3.0-or-later)  https://github.com/steelbrain/metal2vulkan
+third-party/metal2vulkan-n48/ holds our changes to it and the n48xlate crate. That
+directory is licensed under the LGPL-3.0-or-later, NOT the MIT licence; see
+third-party/metal2vulkan-n48/NOTICE and COPYING. The upstream translator itself is
+not included.
+==========================================================================

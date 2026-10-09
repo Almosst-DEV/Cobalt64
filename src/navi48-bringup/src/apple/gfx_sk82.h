@@ -1,4 +1,4 @@
-// gfx_sk82.h — build 0.0.527 (notes/design/SKIP82.md): SWITCH 82, SKIP A BYTE-IDENTICAL RESIDENCY
+// gfx_sk82.h — build 0.0.527 (an internal design note): SWITCH 82, SKIP A BYTE-IDENTICAL RESIDENCY
 // RE-COPY. THE PURE HALF: the write counters' arithmetic, the invalidation event ring, the entry table, the skip decision, the
 // establishment and the log/report formats. No register, no page table, nothing of Apple's; plain C that also compiles as C++,
 // __atomic builtins only, no libc beyond stdint (the gfx_copyguard.h convention). Compiled into the kext (Navi48Bringup.cpp owns

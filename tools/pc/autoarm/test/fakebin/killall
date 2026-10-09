@@ -1,0 +1,2 @@
+#!/bin/bash
+D=${FAKE_DIR:?}; S=$D/st; echo "FAKE killall $*" >>"$D/cmds.log"; if [ "$*" = "-9 WindowServer" ]; then [ -n "${FAKE_WS_NO_RETURN:-}" ] || echo 5002 >"$D/wspid"; touch "$S/restarted"; fi

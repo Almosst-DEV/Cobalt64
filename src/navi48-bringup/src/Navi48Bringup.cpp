@@ -13,6 +13,7 @@
 #include "amd/amdgpu_regs.h"
 #include "amd/amdgpu_sdma.h"
 #include "Navi48MetalNub.hpp"   // 0.0.610: terminate a published Metal nub at stop
+#include "Navi48DisplayNub.hpp"       // 0.0.652 (M5): fbpublish 2
 #include <libkern/c++/OSData.h>
 #include "amd/native_s1b.h"   // 0.0.600 (native S1b): navi48-native=1, default OFF
 #include "amd/native_s1c.h"   // 0.0.612: n1c_latch_pci_bars
@@ -23,13 +24,17 @@
 #include "amd/native_disp.h"            // 0.0.613 (#11 11h.2): the display pipe glue (boot-arg navi48-metal-disp=1)
 #include "amd/native_disp_pure.h"
 #include "amd/native_agdc_pure.h"      // 0.0.614 (#11 11h.3): the native AGDC service (verb 88)
+#include "amd/native_g1_pure.h"        // 0.0.623 (GPU-apps G1): hangtest / hangrecover / hangstat (verbs 100..102, boot-arg navi48-g1=1)
+#include "amd/native_g5_pure.h"        // 0.0.650 (GPU-apps G5 Stage 1): sessstat page 5 (boot-arg navi48-g5=1)
+#include "amd/native_g2_pure.h"        // 0.0.627 (GPU-apps G2): sessstat (verb 103, boot-arg navi48-multisession=1)
+#include "amd/native_g4_pure.h"        // 0.0.640 (GPU-apps G4): appallow (verb 104, boot-args navi48-apps=1 + navi48-multisession=1)
 #include "dcn/navi48_fbname.hpp"
 #include <IOKit/IOLib.h>
 #include <kern/thread.h>            // current_thread() - the MM-window priority owner identity (0.0.433)
 #include <sys/proc.h>               // build 0.0.512 Part B: proc_selfpid/proc_name on the clock88w watch lines
 #include "apple/gfx_clock88.h"      // build 0.0.512 Part B: the clock88 watch (pure)
 #include "apple/gfx_ks81.h"         // build 0.0.526: the marker-holder gate in switch 37's yield (pure)
-#include "apple/gfx_sk82.h"         // build 0.0.527 (notes/design/SKIP82.md): switch 82, the byte-identical re-copy skip (pure)
+#include "apple/gfx_sk82.h"         // build 0.0.527 (an internal design note): switch 82, the byte-identical re-copy skip (pure)
 #include <IOKit/IOMemoryDescriptor.h> // build 0.0.527: the source re-read under gSk82Lock (readBytes)
 #include <kern/clock.h>             // clock_get_uptime/absolutetime_to_nanoseconds - the owner's wait and non-owner
                                      // yields are both timed (mirrors AppleHardwareHook.cpp's n48_pol_ns)
@@ -48,7 +53,7 @@ namespace {
 constexpr uint64_t kBringupSpan   = 32ULL << 20;
 constexpr uint64_t kOneMiB        = 1ULL << 20;
 constexpr uint64_t kFallbackBase  = 64ULL << 20;   // if the console FB can't be located
-constexpr uint64_t kMaxBar0Map    = 256ULL << 20;  // never map more aperture than this
+constexpr uint64_t kMaxBar0Map    = n48rebar::kMaxBar0Map;   // 0.0.663 (ReBAR item 1): 1 GiB, what Tahoe's IOPCIFamily can size; never map more aperture than this (was 256 MiB)
 
 // Drain write-combining buffers so BAR0 writes are visible to the GPU before
 // we ring its doorbell registers.
@@ -72,19 +77,44 @@ struct HwBridge final : n48::HwAccess {
 // 0.0.612 (review item A): read every PCI BAR of this GPU ONCE, at start, from the IOPCIDevice: the six BAR registers and the expansion ROM, each through getDeviceMemoryWithRegister (the
 // FULL assigned range: BAR0 is 16 GiB on a ReBAR boot, not the 256 MiB window bar0Size maps; a 64-bit BAR is one range, its upper-half register yields none). Hands the list to
 // native_s1c.cpp, which keeps it (first writer wins) and refuses any BoImportHost page inside one. Read-only: config-space reads and registry data, no register write.
+// 0.0.663 (ReBAR item 5): the BAR0 range is the UNION of IOPCIFamily's and our own config-space one (base from the BAR0/BAR1 dwords, size from the ReBAR capability, read-only). A BAR0 that IOPCIFamily dropped
+// (it publishes length 0 for a BAR it cannot size) is therefore still guarded, and a disagreement refuses the native client open (n1c_latch_bar0_conflict).
+static n48rebar::Census readRebarCensus(IOPCIDevice *pci) {
+	return n48rebar::census_read([pci](uint32_t o) -> uint32_t { return pci->configRead32(o); });
+}
+static uint64_t readCfgBar0(IOPCIDevice *pci) {
+	const uint32_t lo = pci->configRead32(kIOPCIConfigBaseAddress0);
+	const uint32_t hi = ((lo & 0x6) == 0x4) ? pci->configRead32(kIOPCIConfigBaseAddress1) : 0;
+	return n48rebar::cfg_bar_addr(lo, hi);
+}
 static void latchPciBars(IOPCIDevice *pci) {
 	static const UInt8 kRegs[] = { kIOPCIConfigBaseAddress0, kIOPCIConfigBaseAddress1, kIOPCIConfigBaseAddress2, kIOPCIConfigBaseAddress3,
 	                                  kIOPCIConfigBaseAddress4, kIOPCIConfigBaseAddress5, kIOPCIConfigExpansionROMBase };
 	uint64_t base[7] = {}, size[7] = {};
 	uint32_t n = 0;
+	uint64_t io0Base = 0, io0Len = 0;
 	for (uint32_t i = 0; i < 7u; i++) {
 		IODeviceMemory *m = pci->getDeviceMemoryWithRegister(kRegs[i]);
 		if (!m) continue;
 		const uint64_t len = m->getLength();
 		if (len == 0) continue;
 		base[n] = (uint64_t)m->getPhysicalAddress(); size[n] = len; n++;
+		if (i == 0) { io0Base = base[n - 1]; io0Len = len; }
 		N48LOG("pci bars: register %#x -> [%#llx, +%#llx)", kRegs[i], (unsigned long long)base[n - 1], (unsigned long long)len);
 	}
+	// The config-space BAR0 and the ReBAR capability's current size, then the union.
+	const n48rebar::Census cen = readRebarCensus(pci);
+	const int e0 = n48rebar::census_entry(cen, 0u);
+	const uint64_t cfgLen = (cen.found && e0 >= 0) ? n48rebar::entry_bytes(cen.e[e0].ctrlReg) : 0ull;
+	const uint64_t cfgBase = readCfgBar0(pci);
+	const n48rebar::LatchOut u = n48rebar::bar0_latch(io0Base, io0Len, cfgBase, cfgLen);
+	if (u.have) {
+		if (io0Len != 0 && n > 0 && base[0] == io0Base) { base[0] = u.base; size[0] = u.len; }              // BAR0 is entry 0 when IOPCIFamily published it
+		else if (n < 7u) { for (uint32_t k = n; k > 0; k--) { base[k] = base[k - 1]; size[k] = size[k - 1]; } base[0] = u.base; size[0] = u.len; n++; }   // a dropped BAR0 is added
+		N48LOG("pci bars: BAR0 union [%#llx, +%#llx) (IOPCIFamily [%#llx, +%#llx), config space %#llx, ReBAR size %#llx)%s", (unsigned long long)u.base, (unsigned long long)u.len,
+		       (unsigned long long)io0Base, (unsigned long long)io0Len, (unsigned long long)cfgBase, (unsigned long long)cfgLen, u.conflict ? " - DISAGREE" : "");
+	}
+	amdgpu::n1c_latch_bar0_conflict(u.conflict);
 	amdgpu::n1c_latch_pci_bars(base, size, n);
 }
 
@@ -138,13 +168,52 @@ uint32_t Navi48Bringup::vramRead32(uint64_t pos) const {
 // BAR0 VRAM aperture
 // ---------------------------------------------------------------------------
 
+// 0.0.663 (ReBAR items 2, 3, 6): plan BEFORE mapping. The inputs: IOPCIFamily's BAR0 range, config space's BAR0 address, the ReBAR capability's current BAR0 size (READ-ONLY; the capability is never written),
+// the VRAM size and the hi-pool reserve. A refusal maps nothing: the ladder stops at "no-bar0" and the machine keeps its CPU desktop (RDNA4FB), exactly as with no BAR0. The census is published as registry
+// properties and logged either way. The console is added by finishVramPlan once it has been located.
 bool Navi48Bringup::mapVramAperture() {
 	IODeviceMemory *bar = pciDevice->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
 	if (!bar) { N48LOG("vram: BAR0 not present/assigned"); return false; }
-	// Map at most the first 256 MiB: that is all the bring-up layout needs,
-	// and a ReBAR-sized aperture (up to 16 GiB) would be a needless mapping.
 	const uint64_t fullLen = bar->getLength();
-	const uint64_t winLen  = fullLen < kMaxBar0Map ? fullLen : kMaxBar0Map;
+	const n48rebar::Census cen = readRebarCensus(pciDevice);
+	{
+		const int e0 = n48rebar::census_entry(cen, 0u), e2 = n48rebar::census_entry(cen, 2u);
+		N48LOG("rebar census: extended config %s; Resizable BAR capability %s at %#x, %u entr%s", cen.extReadable ? "readable" : "UNREADABLE (all ones)", cen.found ? "found" : "NOT found", cen.capOff, cen.n, cen.n == 1 ? "y" : "ies");
+		setProperty("ReBAR,Found", cen.found);
+		setProperty("ReBAR,ExtConfigReadable", cen.extReadable);
+		if (cen.found) setProperty("ReBAR,CapOffset", (uint64_t)cen.capOff, 32);
+		for (uint32_t k = 0; k < 2u; k++) {
+			const int e = k == 0 ? e0 : e2;
+			const char *nm = k == 0 ? "BAR0" : "BAR2";
+			if (e < 0) { N48LOG("rebar census: %s has no resizable entry", nm); continue; }
+			const uint32_t cap = cen.e[e].capReg, ctl = cen.e[e].ctrlReg;
+			N48LOG("rebar census: %s capability dword %#010x (supported sizes mask %#x, bit k = 1 MiB << k), control dword %#010x -> current size code %u = %llu MiB", nm, cap, n48rebar::entry_supported_mask(cap), ctl,
+			       n48rebar::entry_code(ctl), (unsigned long long)(n48rebar::entry_bytes(ctl) >> 20));
+			char key[40];
+			snprintf(key, sizeof(key), "ReBAR,%s,SupportedMask", nm); setProperty(key, (uint64_t)n48rebar::entry_supported_mask(cap), 32);
+			snprintf(key, sizeof(key), "ReBAR,%s,CurrentMB", nm);     setProperty(key, (uint64_t)(n48rebar::entry_bytes(ctl) >> 20), 64);
+		}
+	}
+	const uint64_t cfgAddr = readCfgBar0(pciDevice);
+	const int e0 = n48rebar::census_entry(cen, 0u);
+	rebarFound = cen.found && e0 >= 0;
+	rebarMask = rebarFound ? n48rebar::entry_supported_mask(cen.e[e0].capReg) : 0u;
+	rebarCurMB = rebarFound ? (n48rebar::entry_bytes(cen.e[e0].ctrlReg) >> 20) : 0ull;
+	if (rebarFound) N48LOG("rebar census: BAR0 offers sizes mask %#x, smallest %llu MiB, current %llu MiB (ResizeAppleGpuBars code for 'smallest' = the lowest set bit)", rebarMask, (unsigned long long)(n48rebar::entry_min_bytes(rebarMask) >> 20), (unsigned long long)rebarCurMB);
+	n48rebar::PlanIn pin {};
+	pin.ioLen = fullLen; pin.ioAddr = (uint64_t)bar->getPhysicalAddress(); pin.cfgAddr = cfgAddr;
+	pin.rebarPresent = cen.found && e0 >= 0; pin.rebarBytes = pin.rebarPresent ? n48rebar::entry_bytes(cen.e[e0].ctrlReg) : 0ull;
+	pin.vramBytes = static_cast<uint64_t>(vramMB) << 20; pin.hiReserve = amdgpu::kVramHiTotalReserve;
+	pin.consoleOff = n48rebar::kNoConsole; pin.consoleLen = 0; pin.mapCap = kMaxBar0Map;
+	const n48rebar::PlanOut pl = n48rebar::plan_bar0(pin);
+	N48LOG("vram: BAR0 plan: IOPCIFamily [%#llx, +%llu MiB), config space %#llx, ReBAR %s %llu MiB, VRAM %llu MiB -> %s%s (map %llu MiB, vramLimit %llu MiB)", (unsigned long long)pin.ioAddr, (unsigned long long)(pin.ioLen >> 20),
+	       (unsigned long long)pin.cfgAddr, pin.rebarPresent ? "current" : "absent", (unsigned long long)(pin.rebarBytes >> 20), (unsigned long long)(pin.vramBytes >> 20),
+	       pl.ok ? "OK" : "REFUSED: ", pl.ok ? "" : n48rebar::reason_name(pl.reason), (unsigned long long)(pl.mapLen >> 20), (unsigned long long)(pl.vramLimit >> 20));
+	setProperty("BAR0,PlanReason", n48rebar::reason_name(pl.reason));
+	if (!pl.ok) { N48LOG("vram: BAR0 refused (%s): nothing is mapped, the native ladder will not run", n48rebar::reason_name(pl.reason)); return false; }
+	bar0Plan = pin;
+	// Map the planned length: all of a BAR up to 1 GiB; anything larger is capped by kMaxBar0Map.
+	const uint64_t winLen  = pl.mapLen;
 	IODeviceMemory *win = IODeviceMemory::withSubRange(bar, 0, winLen);
 	if (!win) { N48LOG("vram: BAR0 sub-range failed"); return false; }
 	bar0Map = win->map(kIOMapWriteCombineCache);
@@ -152,12 +221,15 @@ bool Navi48Bringup::mapVramAperture() {
 	win->release();                              // the map holds its own reference
 	if (!bar0Map) { N48LOG("vram: failed to map BAR0"); return false; }
 	bar0     = reinterpret_cast<volatile uint8_t *>(bar0Map->getVirtualAddress());
-	bar0Size = bar0Map->getLength();
+	bar0Size = bar0Map->getLength();             // item 3: bar0Size is the bytes ACTUALLY mapped
+	if (bar0Size != winLen) {
+		N48LOG("vram: BAR0 mapped %zu MiB but %llu MiB was planned; refusing", bar0Size >> 20, (unsigned long long)(winLen >> 20));
+		unmapVramAperture();
+		return false;
+	}
 	if (fullLen != bar0Size) N48LOG("vram: BAR0 is %llu MiB; mapped the first %zu MiB", fullLen >> 20, bar0Size >> 20);
 
-	uint32_t lo = pciDevice->configRead32(kIOPCIConfigBaseAddress0);
-	uint32_t hi = ((lo & 0x6) == 0x4) ? pciDevice->configRead32(kIOPCIConfigBaseAddress1) : 0;
-	bar0Phys = (static_cast<uint64_t>(hi) << 32) | (lo & ~0xFULL);
+	bar0Phys = cfgAddr;                          // planned equal to IOPCIFamily's address (plan_bar0 refuses a difference)
 	N48LOG("vram: BAR0 aperture phys 0x%llx, %zu MiB, mapped %s", bar0Phys, bar0Size >> 20,
 	       (bar0Map->getMapOptions() & kIOMapWriteCombineCache) ? "write-combining" : "uncached");
 	setProperty("BAR0,Phys", bar0Phys, 64);
@@ -165,10 +237,33 @@ bool Navi48Bringup::mapVramAperture() {
 	return bar0 != nullptr && bar0Size >= 2 * kOneMiB;
 }
 
+// The plan again, now that the console is located: judges the console against vramLimit and fixes bar0Limit (what buildDeviceContext hands the allocator as dev.vramLimit).
+bool Navi48Bringup::finishVramPlan() {
+	n48rebar::PlanIn pin = bar0Plan;
+	if (bootFbOff != ~0ULL) { pin.consoleOff = bootFbOff; pin.consoleLen = bootFbLen; }
+	const n48rebar::PlanOut pl = n48rebar::plan_bar0(pin);
+	if (!pl.ok || pl.mapLen != bar0Size) {
+		N48LOG("vram: BAR0 plan with the console: REFUSED (%s; planned map %llu MiB, mapped %zu MiB)", n48rebar::reason_name(pl.reason), (unsigned long long)(pl.mapLen >> 20), bar0Size >> 20);
+		return false;
+	}
+	bar0Limit = pl.vramLimit;
+	N48LOG("vram: vramLimit %llu MiB (mapped %zu MiB, VRAM %u MiB, hi reserve %llu MiB)", (unsigned long long)(bar0Limit >> 20), bar0Size >> 20, vramMB, (unsigned long long)(amdgpu::kVramHiTotalReserve >> 20));
+	setProperty("BAR0,VramLimitMB", static_cast<uint64_t>(bar0Limit >> 20), 32);
+	return true;
+}
+
 bool Navi48Bringup::mapDoorbells() {
 	if (bar2Map) return true;
 	IODeviceMemory *bar = pciDevice->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
 	if (!bar) { N48LOG("doorbell: BAR2 not present/assigned"); return false; }
+	{   // 0.0.664 (F2): IOPCIFamily's BAR2 address must be config space's (the self-ring aperture is pointed at the config-space one): same equality rule as BAR0
+		const uint32_t clo = pciDevice->configRead32(kIOPCIConfigBaseAddress2);
+		const uint32_t chi = ((clo & 0x6) == 0x4) ? pciDevice->configRead32(kIOPCIConfigBaseAddress3) : 0;
+		if (!n48rebar::bar_addr_agree((uint64_t)bar->getPhysicalAddress(), n48rebar::cfg_bar_addr(clo, chi))) {
+			N48LOG("doorbell: BAR2 refused: IOPCIFamily address %#llx != config space %#llx", (unsigned long long)bar->getPhysicalAddress(), (unsigned long long)n48rebar::cfg_bar_addr(clo, chi));
+			return false;
+		}
+	}
 	bar2Map = bar->map();                     // uncached: doorbells are MMIO
 	if (!bar2Map) { N48LOG("doorbell: failed to map BAR2"); return false; }
 	dev.bar2     = reinterpret_cast<volatile uint8_t *>(bar2Map->getVirtualAddress());
@@ -181,6 +276,12 @@ bool Navi48Bringup::mapDoorbells() {
 	N48LOG("doorbell: BAR2 mapped, %zu KiB at phys 0x%llx", dev.bar2Size >> 10, dev.bar2Phys);
 	setProperty("BAR2,SizeKB", static_cast<uint64_t>(dev.bar2Size >> 10), 32);
 	return dev.bar2 != nullptr;
+}
+
+// 0.0.664 (F4): after a refusal past the map the machine must be exactly the 'no BAR0' state: the map released, bar0 / bar0Size / bar0Phys / bar0Limit / vramBase all zero (nothing later may use a window the checks refused).
+void Navi48Bringup::dropBar0() {
+	unmapVramAperture();
+	bar0Phys = 0; bar0Limit = 0; vramBase = 0;
 }
 
 void Navi48Bringup::unmapVramAperture() {
@@ -332,9 +433,34 @@ bool Navi48Bringup::apertureCheck(uint64_t off) {
 	       "BAR0 read %08x %08x %08x %08x -> %s (was %08x %08x %08x %08x)",
 	       off, pat[0], pat[1], pat[2], pat[3], mm[0], mm[1], mm[2], mm[3], bar[0], bar[1], bar[2], bar[3],
 	       ok ? "MATCH" : "MISMATCH", before[0], before[1], before[2], before[3]);
-	vramMemset(off, 0, sizeof(pat));
-	setProperty("Navi48,ApertureCheck", ok ? "match" : "mismatch");
+	// 0.0.663 (ReBAR item 4): put back the bytes that were there (0.0.662 zeroed them). The restore is read back through the MM window; a byte that does not come back refuses like a mismatch.
+	if (!vramWrite(off, before, sizeof(before))) ok = false;
+	for (uint64_t i = 0; i < 4; i++) {
+		const uint32_t back = vramRead32(off + 4 * i);
+		if (back != before[i]) { N48LOG("vram: aperture check at vram+0x%llx: RESTORE FAILED at dword %llu (wanted %08x, read %08x)", off, i, before[i], back); ok = false; }
+	}
 	return ok;
+}
+
+// 0.0.663 (ReBAR item 4): three points across the window (n48rebar::aperture_points): proves BAR0 offset == VRAM offset at the bottom, the middle and the top of the planned window, BEFORE the allocator exists
+// (stagePSP calls this ahead of buildDeviceContext; the visible pool never starts until all three MATCH). Any mismatch, or a degenerate window, refuses.
+bool Navi48Bringup::apertureCheckWindow() {
+	uint64_t pt[3] = {};
+	if (bar0Limit == 0 || !n48rebar::aperture_points(vramBase, bar0Limit, bar0Size, pt)) {
+		N48LOG("vram: aperture check: no valid check points for vramBase %#llx vramLimit %#llx mapped %zu; refusing", (unsigned long long)vramBase, (unsigned long long)bar0Limit, bar0Size);
+		setProperty("Navi48,ApertureCheck", "mismatch");
+		return false;
+	}
+	if (!n48rebar::layout_ok(bootFbOff == ~0ULL ? n48rebar::kNoConsole : bootFbOff, bootFbLen, vramBase, pt, vramBase + n48rebar::kVisAllocOffset, bar0Limit)) {
+		N48LOG("vram: aperture check: vramBase %#llx, a check point or the visible pool overlaps the console [%#llx, +%#llx) or its 64 KiB cursor; refusing before any write", (unsigned long long)vramBase, (unsigned long long)bootFbOff, (unsigned long long)bootFbLen);
+		setProperty("Navi48,ApertureCheck", "mismatch");
+		return false;
+	}
+	bool all = true;
+	for (int i = 0; i < 3; i++) all = apertureCheck(pt[i]) && all;     // every point is tried and logged even after a mismatch
+	N48LOG("vram: aperture checks at vram+[%#llx, %#llx, %#llx] -> %s", (unsigned long long)pt[0], (unsigned long long)pt[1], (unsigned long long)pt[2], all ? "ALL MATCH" : "MISMATCH");
+	setProperty("Navi48,ApertureCheck", all ? "match" : "mismatch");
+	return all;
 }
 
 // ---------------------------------------------------------------------------
@@ -451,8 +577,9 @@ void Navi48Bringup::stagePSP() {
 
 	if (!mapVramAperture())        { N48LOG("psp-stage: no usable BAR0 aperture; aborting"); setProperty("PSP,Stage", "no-bar0"); return; }
 	captureBootFramebuffer();      // best effort; chooseVramBase() copes if unknown
-	if (!chooseVramBase())         { setProperty("PSP,Stage", "no-vram-region"); return; }
-	if (!apertureCheck(vramBase))  { N48LOG("psp-stage: aperture check failed — BAR0 offsets are not VRAM offsets here; refusing"); setProperty("PSP,Stage", "aperture-mismatch"); return; }
+	if (!chooseVramBase())         { dropBar0(); setProperty("PSP,Stage", "no-vram-region"); return; }
+	if (!finishVramPlan())         { dropBar0(); N48LOG("psp-stage: BAR0 plan refused with the console located; aborting (BAR0 unmapped: the no-BAR0 state)"); setProperty("PSP,Stage", "no-bar0"); return; }
+	if (!apertureCheckWindow())    { dropBar0(); N48LOG("psp-stage: aperture check failed — BAR0 offsets are not VRAM offsets here; refusing (BAR0 unmapped: the no-BAR0 state)"); setProperty("PSP,Stage", "aperture-mismatch"); return; }
 
 	HwBridge hw(this);
 	n48::PspLoader psp(hw);
@@ -491,7 +618,7 @@ bool Navi48Bringup::buildDeviceContext() {
 	dev.bar0 = bar0; dev.bar0Size = bar0Size; dev.bar0Phys = bar0Phys;
 	dev.vramSizeBytes = static_cast<uint64_t>(vramMB) << 20;
 	dev.vramBase  = vramBase;
-	dev.vramLimit = bar0Size;
+	dev.vramLimit = bar0Limit;   // 0.0.663 (ReBAR item 3): n48rebar::plan_bar0's clamp (== bar0Size at a 256 MiB BAR0); finishVramPlan has run (stagePSP)
 	uint32_t fbBase = regReadIp(IpDiscovery::HwMmhub, 0, 0, 0x0554);
 	if (fbBase == 0xFFFFFFFF) { N48LOG("dev: cannot read FB_LOCATION_BASE"); return false; }
 	dev.vramMcBase = static_cast<uint64_t>(fbBase & 0x00FFFFFF) << 24;
@@ -514,7 +641,7 @@ static amdgpu::BringupContext gBringup;   // one ladder per boot; constructed at
 // navi48_vram_write_mm hold this mutex per <=64-dword batch. Thread context only.
 static IOLock *gVramMmLock { nullptr };
 
-// 0.0.433 (notes/design/MM-PRIORITY.md) — MM-WINDOW PRIORITY FOR THE POLICY PASS, DEFAULT OFF.
+// 0.0.433 (an internal design note) — MM-WINDOW PRIORITY FOR THE POLICY PASS, DEFAULT OFF.
 // decide36b measured the single-IB policy's descriptor reads at 11.7 ms of its 19.25 ms/run, ~99% of it WAITING for
 // gVramMmLock rather than reading (uncontended, the same reads cost ~0.1 ms) — most likely behind our OWN residency
 // copier, which released and re-took this same lock every 64 dwords while pushing 492 MiB that boot
@@ -661,7 +788,7 @@ static __attribute__((noinline)) void mm_hold_note(uint64_t h0, uint32_t tag, ui
 	n48_mmhold_note_dw(&gMmHold, tag, ns, dwords);
 }
 
-// 0.0.435 (notes/design/PGMID-COPYGUARD.md Part 2) — THE COPY-OVERLAP REFUSAL'S STORAGE. All-zero at
+// 0.0.435 (an internal design note Part 2) — THE COPY-OVERLAP REFUSAL'S STORAGE. All-zero at
 // kext load is already each structure's own valid empty state (n48_cg_slot_init/ring_init/poison_init would write
 // exactly these bytes), so no explicit init call is needed at boot. No lock: every field is either touched only
 // under the __atomic ops gfx_copyguard.h's own functions use (the slot table, the ring, the poison table) or, like
@@ -681,7 +808,7 @@ static n48_cg_pagerec gCgSegRec {};
 static uint64_t gCgSegSince { 0ull };
 
 // =============================================================================================================================
-// build 0.0.529 (notes/design/CG84.md, ; apple/gfx_cg84.h) — SWITCH 84's STORAGE, LOCK AND GLUE. The pure
+// build 0.0.529 (an internal design note, ; apple/gfx_cg84.h) — SWITCH 84's STORAGE, LOCK AND GLUE. The pure
 // halves are gfx_copyguard.h (granules, n48_cg_rec_hit, n48_cg_check_fx) and gfx_cg84.h (the keys, the plan, the update, the
 // invalidations). Here: the mode (OFF at boot, written only by navi48_cg84_switch), the four keys' shadows and the scratch (5 x 32
 // KiB, allocated on the FIRST transition to SHADOW or ON, on the verb thread, never freed), the LEAF lock gD84Lock (nothing of ours
@@ -698,7 +825,7 @@ static n48_cg84_stats gCg84S {};                       // the reader's counters 
 uint32_t navi48_cg84_mode(void) { return gCg84Mode; }
 
 // =============================================================================================================================
-// build 0.0.527 (notes/design/SKIP82.md, ; apple/gfx_sk82.h) — SWITCH 82's STORAGE, LOCK AND GLUE. The pure
+// build 0.0.527 (an internal design note, ; apple/gfx_sk82.h) — SWITCH 82's STORAGE, LOCK AND GLUE. The pure
 // half (the decision, the establishment, the counters' arithmetic, the event ring) is gfx_sk82.h. Here: the memory (allocated on
 // the first transition to MEASURE or SKIP, from the verb thread, never in the copy path: X4), the leaf lock gSk82Lock (nothing of
 // ours is taken while it is held; the backing's readBytes runs under it, as SKIP82.md item 7 specifies), and the calls the copier
@@ -896,7 +1023,7 @@ uint32_t navi48_tlb83_switch(uint32_t m, uint32_t contRefused, uint32_t *st) {
 }
 
 // =============================================================================================================================
-// build 0.0.529 (notes/design/CG84.md; apple/gfx_cg84.h) — SWITCH 84's WRITER GLUE. Every function below takes gD84Lock (a
+// build 0.0.529 (an internal design note; apple/gfx_cg84.h) — SWITCH 84's WRITER GLUE. Every function below takes gD84Lock (a
 // LEAF: only the backing's readBytes runs under it) and returns at once while the memory does not exist.
 // =============================================================================================================================
 static void d84_world(n48_d84_world *w) {
@@ -1210,7 +1337,7 @@ void navi48_cg_seg_begin(void) {
 
 n48_cg_pagerec *navi48_cg_active_recorder(void) { return &gCgSegRec; }
 
-// 0.0.436 (notes/design/PGMID-COPYGUARD.md Part 1, design "2. M") — the per-pass program-identity
+// 0.0.436 (an internal design note Part 1, design "2. M") — the per-pass program-identity
 // memo's own validity reads (AppleHardwareHook.cpp's gfx_pgmid.h n48_pm_lookup/n48_pm_store callers): the ring's
 // live position, and a poison-overlap answer for one page, both thin wraps of this file's own gCgRing/gCgPoison.
 uint64_t navi48_cg_ring_mark_now(void) { return n48_cg_ring_mark(&gCgRing); }
@@ -1819,7 +1946,7 @@ bool navi48_vram_read_mm(uint64_t vramOffset, uint32_t *dst, uint32_t dwords) {
 	const uint64_t size = gBringup.dev->vramSizeBytes;
 	if (vramOffset > size || bytes > size - vramOffset) return false;
 	Pf540MmCall pfCall(dwords);   // build 0.0.540 (switch 96, T5): the whole call's time by taker, noted at its return
-	// 0.0.433 (notes/design/MM-PRIORITY.md) — MM-WINDOW PRIORITY, BEFORE IOLockLock. See gVramMmLock's comment.
+	// 0.0.433 (an internal design note) — MM-WINDOW PRIORITY, BEFORE IOLockLock. See gVramMmLock's comment.
 	if (gVramMmLock) {
 		const uint32_t nesting = gMmPrioNesting;
 		const uintptr_t caller = (uintptr_t)current_thread();
@@ -2048,11 +2175,11 @@ uint32_t navi48_vram_apple_dest_check(uint64_t off, uint64_t len) {
 #include "apple/gfx_flipmode.h"         // build 0.0.518: flip mode, switch 74 (pure)
 #include "apple/scanout_full.h"         // build 0.0.542: `accel scanout full`, the full-res scanout readback (pure)
 #include "apple/display_pipe_guard.h"   // 0.0.412: the pure 16x16 verify cell map / bound (S2)
-#include "apple/sdma_gcr.h"             // 0.0.416 (notes/design/SDMA-GCR.md): the SDMA GCR_REQ cache rinse (G1-G3)
-#include "apple/sdma_dcc.h"             // 0.0.417 (notes/design/SDMA-DCC-NOPTE.md): SDMA0_DCC_CNTL no-PTE compression (D1)
+#include "apple/sdma_gcr.h"             // 0.0.416 (an internal design note): the SDMA GCR_REQ cache rinse (G1-G3)
+#include "apple/sdma_dcc.h"             // 0.0.417 (an internal design note): SDMA0_DCC_CNTL no-PTE compression (D1)
 
 // =====================================================================================================
-// 0.0.417 (notes/design/SDMA-DCC-NOPTE.md, D1) — action 82 `sdmadcc [0|1|2]`.
+// 0.0.417 (an internal design note, D1) — action 82 `sdmadcc [0|1|2]`.
 //
 // SDMA0_DCC_CNTL (GC BASE_IDX 0, offset 0x0034) turns on no-PTE read DECOMPRESSION and write COMPRESSION for
 // our SDMA0 QUEUE0 (VMID 0, FB aperture passed through —), which is why a uniform block reads back as a
@@ -2132,18 +2259,19 @@ done:
 }
 
 // =====================================================================================================
-// E1 (0.0.418, notes/design/BUILD-0.0.418.md) — THE SDMA0_DCC_CNTL CLEAR IS THE DEFAULT.
+// E1 (0.0.418, an internal design note) — THE SDMA0_DCC_CNTL CLEAR IS THE DEFAULT.
 //
 // THE SITE, cited: SDMA0's QUEUE0 ring is up when `sdma_init_full` returns in the ladder's SDMAInit stage
-// (src/amd/amdgpu_init.cpp, the BringupStage::SDMAInit case). That case now calls this function IMMEDIATELY after
-// `sdma_init_full` succeeds and BEFORE the ladder's own SDMA copy test and copy_sweep (GitHub issue #1: those two
-// used to run first, on the boot default `0x0000aabe` with no-PTE compression ON, and their results then disagreed
-// from run to run). So from the first SDMA packet of the boot onward, `fire`, the copy test, the sweep, the boot
-// chain, `scanout` and the pipe guard all run with no-PTE compression OFF.
+// (src/amd/amdgpu_init.cpp, the BringupStage::SDMAInit case). 0.0.657 (GitHub issue #1, fixed on the public repo in
+// 1a04d8e): that case now calls this function IMMEDIATELY after `sdma_init_full` succeeds and BEFORE the ladder's own
+// SDMA copy test and copy_sweep (through 0.0.656 those two ran first, on the boot default `0x0000aabe` with no-PTE
+// compression ON, and their results disagreed from run to run). So from the first SDMA packet of the boot onward,
+// `fire`, the copy test, the sweep, the boot chain, `scanout` and the pipe guard all run with no-PTE compression OFF.
 //
 // The write happens ONCE per boot. `Navi48Bringup::runStages` still calls this function at the first kext-layer
 // point after the stage (`ctx.reached >= BringupStage::SDMAInit`); by then it has run, so that call logs that it
-// already ran and writes nothing (gSdmaDccDefaultDone).
+// already ran and writes nothing (gSdmaDccDefaultDone, set on the opt-out path and right after the write, NOT on the
+// 'no DeviceContext' / 'GC base did not resolve' skips, so a skipped early call is retried by the later one).
 //
 // It captures the boot value into the SAME RESTORE pair the `sdmadcc` verb uses, writes
 // `n48_sdma_dcc_cleared` of it, reads back, and logs ONE line. `navi48-sdmadcc=0` skips it; absent or nonzero
@@ -2215,7 +2343,7 @@ enum : uint32_t {
 	kScanStQueue = 5, kScanStQueueBusy = 6, kScanStAlloc = 7, kScanStSourceCtl = 8, kScanStPreflight = 9,
 	kScanStFence = 10, kScanStReadback = 11, kScanStPlan = 12, kScanStInterlock = 13, kScanStRing = 14,
 	kScanStNoSave = 15,
-	// 0.0.416 (notes/design/SDMA-GCR.md, G2): the named refusals of `accel scanout 7`'s source window.
+	// 0.0.416 (an internal design note, G2): the named refusals of `accel scanout 7`'s source window.
 	kScanStGcrAlign = 18, kScanStGcrRange = 19, kScanStGcrOverlap = 20,
 	// build 0.0.518: a writer into the console refused because flip mode is ON (the display may be
 	// scanning B, and A is flip mode's to write: only the flip path and its restore write A or B while the switch is ON).
@@ -2365,7 +2493,7 @@ static uint32_t scanout_sdma_copies(amdgpu::DeviceContext &dev, amdgpu::SDMAInst
 }
 
 // =====================================================================================================
-// build 0.0.496 (notes/design/FAST-PAGEIN.md) — SWITCH 63, THE RESIDENCY COPY THROUGH SDMA.
+// build 0.0.496 (an internal design note) — SWITCH 63, THE RESIDENCY COPY THROUGH SDMA.
 //
 // apple/fastcopy.h holds the argument and every decision; this is its kernel half, beside the SDMA code it reuses:
 //   - the staging buffer: ONE physically contiguous 1 MiB system-memory buffer (amdgpu::sysmem_alloc, snooped), bound into the
@@ -3366,7 +3494,7 @@ void navi48_mmhold_snapshot(const char *where) {
 // n48_scanout_tiled_dst_ok over EVERY byte the packet may write). tiledMc/linearMc are MC addresses the caller has
 // already range-checked. CPV IS NEVER SET: found COPY_LINEAR grows a trailing dword only when CPV is set,
 // and a 15-dword packet in a 14-dword slot desynchronises the ring for ever.
-// 0.0.416 (notes/design/SDMA-GCR.md, G3): `gcr` prepends the five-dword GCR_REQ to the SAME submission as the
+// 0.0.416 (an internal design note, G3): `gcr` prepends the five-dword GCR_REQ to the SAME submission as the
 // copy — one ring write, one doorbell, one fence — so the cache rinse is ordered before the copy the engine then
 // reads the tiled source with. Default false: every pre-0.0.416 caller is byte-identical (18 dwords, no GCR).
 static uint32_t scanout_sdma_tiled_copy(amdgpu::DeviceContext &dev, amdgpu::SDMAInstance &inst,
@@ -3421,7 +3549,7 @@ static uint32_t scanout_sdma_tiled_copy(amdgpu::DeviceContext &dev, amdgpu::SDMA
 	return v == fenceValue ? kScanStOk : kScanStFence;
 }
 
-// 0.0.416 (notes/design/SDMA-GCR.md, G2) — ONE COPY_LINEAR window plus, if asked, the GCR_REQ immediately before
+// 0.0.416 (an internal design note, G2) — ONE COPY_LINEAR window plus, if asked, the GCR_REQ immediately before
 // it in the SAME submission (one ring write, one doorbell, one fence). The COPY_LINEAR shape is scanout_sdma_copies'
 // (header with CPV 1, bytes-1, src, dst), so mode 7's copy is the same packet the scanout path already proved.
 static uint32_t scanout_sdma_copy_linear_gcr(amdgpu::DeviceContext &dev, amdgpu::SDMAInstance &inst,
@@ -3493,7 +3621,7 @@ static void scanout_free_vram(amdgpu::VRAMAllocation &a) {
 }
 
 // =====================================================================================================
-// 0.0.414 (notes/design/SCANOUT-SELFTEST-FULL.md,) — THE FULL-GEOMETRY SDMA SELF-TEST.
+// 0.0.414 (an internal design note,) — THE FULL-GEOMETRY SDMA SELF-TEST.
 //
 // Mode 5 proves the 14-dword COPY_TILED_SUB_WINDOW packet on a 256x256 surface.'s live
 // plane is 1920x1080, ADDR3 64KB_2D, pitch 1920, 15 blocks across and a partial 9th block row, and the
@@ -3546,7 +3674,7 @@ static void scanout_full_decode(const N48FullCase *r, char *out, unsigned cap) {
 	}
 }
 
-// D7 (0.0.417, notes/design/SDMA-DCC-NOPTE.md): `uniform` selects the probe pattern. Mode 6 passes false and is
+// D7 (0.0.417, an internal design note): `uniform` selects the probe pattern. Mode 6 passes false and is
 // byte-identical; mode 8 passes true for its 1920x1080 case only, so the CPU writes N48_TILE_UNIFORM_PIXEL at
 // every position and every expected value is that same value. Everything else - buffers, packet fields, sample
 // set, report lines, POISON detection - is the same code the two modes share.
@@ -3678,7 +3806,7 @@ done:
 }
 
 // =====================================================================================================
-// 0.0.416 (notes/design/SDMA-GCR.md, G2;) — MODE 7: THE SDMA CACHE-RINSE INSTRUMENT.
+// 0.0.416 (an internal design note, G2;) — MODE 7: THE SDMA CACHE-RINSE INSTRUMENT.
 //
 // READ-ONLY on the source. ONE SDMA COPY_LINEAR moves a 256 KiB window from VRAM offset `vramOff` into a low
 // scratch buffer of ours; if `gcr` is asked for, the SDMA GCR_REQ (GL2 write-back + invalidate) goes
@@ -3817,7 +3945,7 @@ static uint32_t scanout_gcr_case(amdgpu::DeviceContext &dev, amdgpu::SDMAInstanc
 static uint32_t navi48_scanout_full(uint32_t mode, uint64_t *v);   // build 0.0.542: modes 9 and 10 (below, beside flip mode)
 uint32_t navi48_scanout_control(uint64_t arg, uint64_t *out, unsigned count) {
 	uint64_t v[13] = { 0 };
-	// 0.0.416 (notes/design/SDMA-GCR.md, G2): mode 7 packs the mode, the GCR flag and the source VRAM offset
+	// 0.0.416 (an internal design note, G2): mode 7 packs the mode, the GCR flag and the source VRAM offset
 	// into the one ABI scalar (n48_scanout7_scalar). Modes 0..6 keep scalar == mode, byte-identical; any other
 	// scalar with high bits set is refused exactly as it was before (kScanStPlan).
 	const uint32_t mode = (uint32_t)(arg & N48_SCANOUT_MODE_MASK);
@@ -4259,7 +4387,7 @@ uint32_t navi48_scanout_control(uint64_t arg, uint64_t *out, unsigned count) {
 			if (detileBad || tileBad || subBad || discBad || v[10]) st = kScanStReadback;
 			goto done;
 		}
-		// 0.0.414 (notes/design/SCANOUT-SELFTEST-FULL.md) — MODE 6: THE FULL-GEOMETRY SDMA SELF-TEST.
+		// 0.0.414 (an internal design note) — MODE 6: THE FULL-GEOMETRY SDMA SELF-TEST.
 		// ONE call, two cases IN ORDER (S1): (a) 256x256, the control, and (b) 1920x1080, the live plane's
 		// exact packet fields (swizzle 3, pitch 1920, 15 blocks wide, a partial 9th block row). Both run S3/S4's
 		// method on OUR OWN three scratch buffers and never touch the scanout or Apple's surfaces. Mode 5's
@@ -4292,7 +4420,7 @@ uint32_t navi48_scanout_control(uint64_t arg, uint64_t *out, unsigned count) {
 			       c0.tileStatus, c0.detStatus, c1.tileStatus, c1.detStatus, st);
 			goto done;
 		}
-		// D7 (0.0.417, notes/design/SDMA-DCC-NOPTE.md) — MODE 8: THE UNIFORM PROBE. Mode 6's live 1920x1080 case
+		// D7 (0.0.417, an internal design note) — MODE 8: THE UNIFORM PROBE. Mode 6's live 1920x1080 case
 		// EXACTLY - same buffers, same packet fields, same bounded sample set, same `scanout-full:` report lines and
 		// the same POISON detection - except the CPU writes N48_TILE_UNIFORM_PIXEL (0xff00ff00) everywhere and every
 		// expected value is that value. It is the write-compression half of the DCC fault: with our no-PTE write
@@ -4313,7 +4441,7 @@ uint32_t navi48_scanout_control(uint64_t arg, uint64_t *out, unsigned count) {
 			       c1.poison, c1.tileStatus, c1.detStatus, st);
 			goto done;
 		}
-		// 0.0.416 (notes/design/SDMA-GCR.md, G2) — MODE 7: the SDMA cache-rinse instrument. READ-ONLY on the
+		// 0.0.416 (an internal design note, G2) — MODE 7: the SDMA cache-rinse instrument. READ-ONLY on the
 		// source; our own low scratch only; the same interlock-free proof discipline as modes 5/6 (three/four
 		// scratch buffers, no WindowServer, no Apple accelerator, no reboot). out: 1 gcr|control<<1, 2 source
 		// VRAM offset, 3 scratch VRAM offset, 4 fence us | copy dwords<<32, 5 lines full|part<<16|diff<<32,
@@ -4744,7 +4872,7 @@ fin:
 // the shim read them out of the resource - both come from the caller, neither is guessed here.
 // out[0] status, [1] plan reason, [2] srcOff, [3] rect, [4] fence us, [5] readback mismatches, [6] pixels compared,
 // [7] swizzle | surfW<<16 | surfH<<32, [8..10] samples dst<<32|src at (0,0), (w/2,h/2), (w-1,h-1).
-// 0.0.416 (notes/design/SDMA-GCR.md, G3): `gcr` prepends the five-dword GCR_REQ to the SAME submission as the
+// 0.0.416 (an internal design note, G3): `gcr` prepends the five-dword GCR_REQ to the SAME submission as the
 // tiled copy (and so grows the ring traffic from 18 to 23 dwords). false is the 0.0.415 behaviour, byte for byte.
 uint32_t navi48_scanout_copy_tiled(uint64_t srcOff, uint64_t srcLen, uint32_t surfW, uint32_t surfH, uint32_t swizzle,
                                    uint32_t dstX, uint32_t dstY, uint32_t w, uint32_t h, uint64_t *out, unsigned count,
@@ -6481,7 +6609,7 @@ bool navi48_vram_hi_pool(uint64_t &base, uint64_t &size, uint64_t &used) {
 
 // 0.0.244 — the per-VMID TLB / walker-cache invalidate, reachable from src/apple/.
 //
-// CORRECTION to  and to M3-ROOT-WRITE-REVIEW.md.3, which both say the
+// CORRECTION to  and to an internal review note.3, which both say the
 // apple/ layer needs a NEW accessor for the HDP flush. It does not, and this file is
 // where that is checkable: navi48_hdp_flush_now() is defined above, is declared in
 // apple/Navi48Ttl.hpp, and AppleHardwareHook.cpp already calls it. It also does the
@@ -6731,7 +6859,7 @@ static void publishVMFragOn(IOService *svc, const amdgpu::BringupContext &ctx) {
 	}
 }
 
-// NATIVE S1b (0.0.600, notes/design/NATIVE-S1.md step S1b + review MUST-FIX 4): navi48-native=1 asks for the reserved-VMID VM
+// NATIVE S1b (0.0.600, an internal design note step S1b + review MUST-FIX 4): navi48-native=1 asks for the reserved-VMID VM
 // self-test at the END of the ladder. It is REFUSED (logged, nothing native runs) when the Apple accelerator experiment, the boot
 // chain, any of the four self-tests (they rewrite CONTEXT1 with RETRY = 1) or the two Apple-only hooks are also armed. Absent (every
 // current config) it reads one boot-arg, finds it 0 and does nothing else: no log line, no property, no register. noinline and
@@ -6967,9 +7095,9 @@ void Navi48Bringup::runStages(uint32_t target) {
 	if (ctx.reached >= amdgpu::BringupStage::SDMAInit) {
 		setProperty("Navi48,SDMACopyTest", ctx.sdmaCopyPassed ? "passed" : "failed");
 		setProperty("Navi48,SDMACopyMismatched", static_cast<uint64_t>(ctx.sdmaCopy.mismatched), 32);
-		// E1 (0.0.418, notes/design/BUILD-0.0.418.md): the SDMA0_DCC_CNTL no-PTE compression clear is the DEFAULT.
-		// The SDMAInit stage already applied it right after `sdma_init_full` (before its own copy test and sweep);
-		// this call is then a logged no-op. `navi48-sdmadcc=0` skips it.
+		// E1 (0.0.418, an internal design note): the SDMA0_DCC_CNTL no-PTE compression clear is the DEFAULT.
+		// 0.0.657: the SDMAInit stage already applied it right after `sdma_init_full` (before its own copy test and
+		// sweep), so this call is then a logged no-op (gSdmaDccDefaultDone). `navi48-sdmadcc=0` skips it.
 		navi48_sdmadcc_default();
 	}
 	publishPDB0On(this, ctx);
@@ -7009,7 +7137,7 @@ IOReturn Navi48Bringup::newUserClient(task_t owningTask, void *securityID, UInt3
                                       OSDictionary *properties, IOUserClient **handler) {
 	if (!handler) return kIOReturnBadArgument;
 	// NATIVE S1c (0.0.601): type 'N48N' is the native user client; every other type is the legacy Navi48UserClient, exactly as before.
-	if (type == N48N_UC_TYPE) return IOAccelNavi48NativeClient::create(this, owningTask, securityID, type, properties, handler);
+	if (type == N48N_UC_TYPE) return IOAccelNavi48NativeClient::create(this, this, n48native::policy::kRouteBringup, owningTask, securityID, type, properties, handler);   // 0.0.656 (G6): the Navi48Bringup route (WindowServer, root tools); the accelerator route is Navi48MetalNub's native_open
 	auto *uc = OSTypeAlloc(Navi48UserClient);
 	if (!uc) return kIOReturnNoMemory;
 	if (!uc->initWithTask(owningTask, securityID, type, properties)) {
@@ -7382,6 +7510,47 @@ IOReturn Navi48Bringup::accelExperiment(uint32_t action, uint64_t *outInstalled,
 	// the refusal protects. The table is n48scan::accel_exempt (host-tested, incl. that dcnflip 1002 and dcnmode 1 stay refused).
 	// 0.0.613 (#11 11h.2, B5): with boot-arg navi48-metal-disp=1 latched, fbname 0|1 and the five display verbs (83..87, each with its legal argument) are ALSO exempt: they touch no GFX/VM
 	// state and no register (n48disp::native_exempt, host-tested: with the latch OFF it is false for everything, so this line is 0.0.612's).
+	// action 100..102 (0.0.623, GPU-apps G1, an internal design note section 4; boot-arg navi48-g1=1 only): `hangtest 1` / `hangrecover <0..4>` / `hangstat [0..8]`.
+	// Dispatched BEFORE the native-boot refusal below, as its own exemption: with the latch ON exactly n48native::g1::native_exempt's (action, argument) pairs run,
+	// and they act only on the native kernel GFX queue and a kernel-owned native test context (amdgpu::n1c_g1_verb, amd/native_s1c.cpp), never on Apple's driver
+	// state. With the latch OFF (the default) 100..102 are BadArgument here and in the user client, as before 0.0.623. o[0] is the verdict code.
+	if (n48native::g1::is_g1_action(action)) {
+		if (!n48native::g1::native_exempt(amdgpu::n1c_g1_latched_on(), action, argScalar)) return kIOReturnBadArgument;
+		uint64_t v[n48native::g1::kOutN] = { 0 };
+		const IOReturn kr = amdgpu::n1c_g1_verb(action, argScalar, gBringup, v);
+		N48LOG("accel-experiment: %s %llu -> kr %#x code %llu", action == n48native::g1::kActHangTest ? "hangtest" : action == n48native::g1::kActHangRecover ? "hangrecover" : "hangstat",
+		       (unsigned long long)argScalar, kr, (unsigned long long)v[0]);
+		if (outExtra)
+			for (unsigned i = 0; i < n48native::g1::kOutN && i < kAccelExtraScalars; i++) outExtra[i] = v[i];
+		return kr;
+	}
+	// action 103 (0.0.627, GPU-apps G2; boot-arg navi48-multisession=1 only): `sessstat <0..4>`, READ-ONLY: page 0..3 one native session slot (VMID 8..11), page 4 the
+	// global page (open sessions, DEAD slots, seqnos, the shared VRAM budget, automatic recoveries). Like G1, dispatched before the native-boot refusal as its own
+	// exemption (n48native::g2::native_exempt); with the latch OFF (the default) 103 is BadArgument here and in the user client, as before 0.0.627.
+	// 0.0.650 (G5 Stage 1): page 5 is the application-credit page; it exists only with boot-arg navi48-g5=1 (and multisession) latched, else BadArgument as before.
+	if (n48native::g2::is_g2_action(action)) {
+		const bool g5page = n48native::g5::args_ok(amdgpu::n1c_g5_latched_on(), action, argScalar);
+		if (!g5page && !n48native::g2::native_exempt(amdgpu::n1c_multi_latched_on(), action, argScalar)) return kIOReturnBadArgument;
+		uint64_t v[n48native::g2::kOutN] = { 0 };
+		const IOReturn kr = g5page ? amdgpu::n1c_g5_stat(v) : amdgpu::n1c_g2_stat(argScalar, v);
+		N48LOG("accel-experiment: sessstat %llu -> kr %#x code %llu", (unsigned long long)argScalar, kr, (unsigned long long)v[0]);
+		if (outExtra)
+			for (unsigned i = 0; i < n48native::g2::kOutN && i < kAccelExtraScalars; i++) outExtra[i] = v[i];
+		return kr;
+	}
+	// action 104 (0.0.640, GPU-apps G4; boot-args navi48-apps=1 AND navi48-multisession=1 only): `appallow add|remove <name>` / `appallow list [page]`, the kernel's APP allow-list
+	// (max 32 entries, empty at every boot). Reachable only through the admin-only legacy user client. It touches no hardware and no register: a 32-slot table in the kext's
+	// data. Like G1 / G2, dispatched before the native-boot refusal as its own exemption (n48native::g4::native_exempt); with the role disabled (the default) 104 is BadArgument here
+	// and in the user client, as before 0.0.640. o[0] is the code (n48native::g4::AllowCode).
+	if (n48native::g4::is_g4_action(action)) {
+		if (!n48native::g4::native_exempt(amdgpu::n1c_apps_enabled(), action, argScalar)) return kIOReturnBadArgument;
+		uint64_t v[n48native::g4::kOutN] = { 0 };
+		const IOReturn kr = amdgpu::n1c_app_verb(argScalar, v);
+		N48LOG("accel-experiment: appallow op %llu -> kr %#x code %llu entries %llu", (unsigned long long)v[2], kr, (unsigned long long)v[0], (unsigned long long)v[1]);
+		if (outExtra)
+			for (unsigned i = 0; i < n48native::g4::kOutN && i < kAccelExtraScalars; i++) outExtra[i] = v[i];
+		return kr;
+	}
 	if (!n48scan::accel_exempt(action, argScalar) && !n48disp::native_exempt(n48disp_latched_on(), action, argScalar)) {
 	if (action != 0 && amdgpu::native_s1b_refuse(0)) return kIOReturnNotPermitted;
 	}
@@ -7477,7 +7646,7 @@ IOReturn Navi48Bringup::accelExperiment(uint32_t action, uint64_t *outInstalled,
 	//   0 reads, 1 log-only, 3 log + copy into the scanout, 2 pass-through. Defined in Navi48AccelPeer.cpp.
 	// action 60 — `scanout [0|1|2]` (0.0.272): 0 geometry read, 1 the positive-control copy with BAR0 readback,
 	//   2 restore the rectangle it overwrote. Defined above.
-	// action 82 — `sdmadcc [0|1|2]` (0.0.417, notes/design/SDMA-DCC-NOPTE.md): SDMA0_DCC_CNTL's no-PTE read
+	// action 82 — `sdmadcc [0|1|2]` (0.0.417, an internal design note): SDMA0_DCC_CNTL's no-PTE read
 	//   decompression / write compression. 0 reads SDMA0+SDMA1 raw and decoded, 1 captures-then-clears only the
 	//   eight *_COMP_EN_n bits on SDMA0, 2 restores the captured value; other arguments (and 2 before a capture)
 	//   are REFUSED. SDMA1 is never written. Defined above.
@@ -7557,7 +7726,32 @@ IOReturn Navi48Bringup::accelExperiment(uint32_t action, uint64_t *outInstalled,
 	//   87 pipeshortcut [0|1]   : the slot-62 'already prepared' shortcut switch (default ON; guarded by the SysMemory flag bit 4 either way).
 	//   89 pipevbl [0|1]        : (0.0.618) the vblank-timestamp switch: 1 (the default with the latch ON) writes the transaction's +0x178 / +0x188 (next vblank time, next + one period; mach_absolute_time units) in the perform hook, 0 = 0.0.617 behaviour. `pipestat 4` shows the counts.
 	//   90 pipereload [0|1]     : (0.0.619) the operator restart window: 0 (the default) opens a one-shot 15 s window in which the next uid-88 WindowServer client close while armed does not auto-disarm and slot-267 calls are not counted by the restart guard; 1 only reads it. Then `killall -9 WindowServer`.
-	if (action == 83 || action == 84 || action == 85 || action == 86 || action == 87 || action == 89 || action == 90) {
+	// action 106 (0.0.659, M6 Stage 1a; the same latch as 83..90): `m6stat [0|1|2|3]` - READ-ONLY report of the multi-display routing: per pipe instance the submits, the surface IDs (3 expected per display), the ambiguous ones, the refused presents and
+	// their reasons, the performs completed without a copy, the vblank stamps per OTG and the AGDC answers. Writes nothing, reads no register. Served by n48disp_verb.
+	// action 108 (0.0.663, ReBAR + Stage 2 review S3; the same latch as 83..90): `vramstat` - READ-ONLY report of the kernel allocator's visible-VRAM state: the pools' totals and free bytes, vramLimit, the mapped BAR0 bytes and BAR0's physical
+	// address. Writes nothing and reads no register; the pool figures are plain loads of the allocator's counters (a diagnostic, like QueryInfo's). v[0] status (0 ok, 1 the ladder / allocator is not up: the BAR0 fields are still filled),
+	// v[1] visible total, v[2] visible free, v[3] hi total, v[4] hi free, v[5] vramLimit, v[6] mapped BAR0 bytes, v[7] BAR0 phys, v[8] VRAM bytes, v[9] vramBase, v[10] gmc visible size, v[11] bit0 = hi pool exists, v[12] hi pool base.
+	if (action == n48disp::kActVramStat) {
+		uint64_t v[13] = { 0 };
+		const uint32_t st = n48disp::verb_args_ok(action, argScalar) ? 0u : n48disp::kBadArg;
+		if (st == 0u) {
+			v[5] = bar0Limit; v[6] = bar0Size; v[7] = bar0Phys; v[8] = static_cast<uint64_t>(vramMB) << 20; v[9] = vramBase;
+			if (gBringup.dev && gBringup.gmc.vram_alloc.is_inited()) {
+				const amdgpu::GMCContext &g = gBringup.gmc;
+				v[1] = g.vram_alloc.size(); v[2] = g.vram_alloc.bytes_free();
+				if (g.vram_alloc_hi.is_inited()) { v[3] = g.vram_alloc_hi.size(); v[4] = g.vram_alloc_hi.bytes_free(); v[11] = 1ull; v[12] = g.vram_hi_base; }
+				v[10] = g.visible_vram_size;
+			} else v[0] = 1ull;
+			// 0.0.664: the census for the step-B3 choice of ResizeAppleGpuBars: bit1 = the capability was found for BAR0, bits 8..31 = its current size in MiB, bits 32..63 = its supported-sizes mask (bit k = 1 MiB << k)
+			v[11] |= (rebarFound ? 2ull : 0ull) | ((rebarCurMB & 0xFFFFFFull) << 8) | ((uint64_t)rebarMask << 32);
+		}
+		N48LOG("accel-experiment: vramstat -> status %u: visible %llu / %llu KiB free, hi %llu / %llu KiB free, vramLimit %#llx, BAR0 mapped %#llx at %#llx", st == n48disp::kBadArg ? 2u : (uint32_t)v[0],
+		       (unsigned long long)(v[2] >> 10), (unsigned long long)(v[1] >> 10), (unsigned long long)(v[4] >> 10), (unsigned long long)(v[3] >> 10), (unsigned long long)v[5], (unsigned long long)v[6], (unsigned long long)v[7]);
+		if (outExtra)
+			for (unsigned i = 0; i < 13 && i < kAccelExtraScalars; i++) outExtra[i] = v[i];
+		return st == n48disp::kBadArg ? kIOReturnBadArgument : kIOReturnSuccess;
+	}
+	if (action == 83 || action == 84 || action == 85 || action == 86 || action == 87 || action == 89 || action == 90 || action == n48disp::kActM6Stat) {
 		uint64_t v[13] = { 0 };
 		const uint32_t st = n48disp_verb(action, argScalar, v, 13);
 		N48LOG("accel-experiment: pipe verb %u arg %llu -> status %u", action, (unsigned long long)argScalar, st);
@@ -7568,6 +7762,55 @@ IOReturn Navi48Bringup::accelExperiment(uint32_t action, uint64_t *outInstalled,
 	// action 88 (0.0.614, #11 11h.3; boot-arg navi48-metal-disp=1 only): `pipeagdc [0|1]` - the NATIVE AGDC service (amd/native_agdc_pure.h). 1 builds Apple's AppleGraphicsDeviceControl object on a vtable copy
 	// whose slots 0 / 1 / 266 are ours (IOPresentment's "Unable to get AGDC information" goes away); 0 only reads the state. Refused with the boot-arg OFF, while a row-120 hold is up, and on any failed check.
 	// Served by DisplayPipeGuard.cpp (the AGDC state and the reply fillers live there); the admission and the exemption above are the generic n48disp ones.
+	// actions 91..93 (0.0.622, multi-monitor stage M1; boot-arg navi48-metal-disp=1 only, like 83..90): the display instruments `ddcread <line> <block>`, `dmubring [page]`, `dispcensus [page]` (dcn/navi48_dispread.h).
+	// dmubring and dispcensus only READ registers (through the read-only device attach() built); ddcread writes ONLY the DC_I2C engine's registers, through the DCN write allowlist, after the arbitration read says the engine is
+	// free (dcn/navi48_dispread_flow.h). No command is ever sent to the DMUB and 91..93 read no VRAM through MM_INDEX (94, below, does: READ-ONLY). Served by n48dcn (dcn/navi48_dcn.cpp).
+	// action 94 (0.0.624, stage M1.5; same latch): `region4read <off> [n]` - READ-ONLY dump of the DMUB REGION4 window in VRAM (the first 64 KiB, 64 dwords a call), the window base computed live from the DMCUB registers, the
+	// memory read through navi48_vram_read_mm (the existing MM_INDEX reader). No register and no VRAM byte is written. Served by n48dcn::region4Read (dcn/navi48_dcn.cpp).
+	// action 107 (0.0.661, M6 Stage 1b; the same latch as 83..90): `m6xstat [0|1|2]` - READ-ONLY report of instance 2's scanout (the monitor B: acquired, slots, EARLIEST2, FLIP_PENDING, the counters, the watchdog restores, the live HUBP2 health registers).
+	// Writes nothing; with navi48-m6 / navi48-m6flip OFF it reads nothing either (v[0] bits 0..1 name the latches). Served by n48dcn::scanXReport (dcn/navi48_dcn.cpp).
+	if (action == n48disp::kActM6XStat) {
+		uint64_t v[13] = { 0 };
+		if (n48m6_latched_on() && n48m6flip_latched_on()) (void)n48dcn::bind(this);
+		const uint32_t st = n48disp::verb_args_ok(action, argScalar) ? n48dcn::scanXReport(argScalar, v, 13) : n48disp::kBadArg;
+		N48LOG("accel-experiment: m6xstat page %llu -> status %u (latch words %#llx)", (unsigned long long)argScalar, st, (unsigned long long)v[0]);
+		if (outExtra)
+			for (unsigned i = 0; i < 13 && i < kAccelExtraScalars; i++) outExtra[i] = v[i];
+		return st == n48disp::kBadArg ? kIOReturnBadArgument : kIOReturnSuccess;
+	}
+	if (action == N48DR_ACT_DDCREAD || action == N48DR_ACT_DMUBRING || action == N48DR_ACT_DISPCENSUS || action == N48DR_ACT_REGION4READ) {
+		uint64_t v[13] = { 0 };
+		uint32_t st;
+		if (!n48disp::verb_args_ok(action, argScalar)) {
+			st = N48DR_BAD_ARG;
+			v[0] = st;
+		} else if (action == N48DR_ACT_DDCREAD) {
+			(void)n48dcn::bind(this);
+			st = n48dcn::ddcRead(argScalar, v, 13);
+		} else if (action == N48DR_ACT_DMUBRING) {
+			st = n48dcn::dmubRing(argScalar, v, 13);
+		} else if (action == N48DR_ACT_REGION4READ) {
+			st = n48dcn::region4Read(argScalar, v, 13);
+		} else {
+			st = n48dcn::dispCensus(argScalar, v, 13);
+		}
+		N48LOG("accel-experiment: %s %llu -> status %u (%s)", action == N48DR_ACT_DDCREAD ? "ddcread" : action == N48DR_ACT_DMUBRING ? "dmubring" : action == N48DR_ACT_REGION4READ ? "region4read" : "dispcensus",
+		       (unsigned long long)argScalar, st, n48dr_status_name(st));
+		if (outExtra)
+			for (unsigned i = 0; i < 13 && i < kAccelExtraScalars; i++) outExtra[i] = v[i];
+		return kIOReturnSuccess;
+	}
+	// actions 95..97 (0.0.625, stages M2 / M3; boot-arg navi48-metal-disp=1 for the admission AND boot-arg navi48-dmubcmd=1 inside the verb): `dmubsend <slotspec>`, `dmubmode <op>`, `dmubctx <ctx> status <v>` (dcn/navi48_dmubcmd.h) - the FIRST
+	// verbs that send to the display firmware. With navi48-dmubcmd absent each returns N48DR_CMD_OFF and touches nothing. dmubsend needs bind() (only with the latch ON; its one register write, DMCUB_INBOX1_WPTR, goes through the DCN write allowlist).
+	if (action == N48DM_ACT_SEND || action == N48DM_ACT_MODE || action == N48DM_ACT_CTX) {
+		uint64_t v[13] = { 0 };
+		if (action == N48DM_ACT_SEND && n48dcn::dmubCmdLatchedOn()) (void)n48dcn::bind(this);   // 0.0.626 (F4): the latch FIRST - OFF must touch nothing (bind() allocates a lock, reads registers, sets gDcn.armed)
+		const uint32_t st = action == N48DM_ACT_SEND ? n48dcn::dmubSend(argScalar, v, 13) : action == N48DM_ACT_MODE ? n48dcn::dmubMode(argScalar, v, 13) : n48dcn::dmubCtx(argScalar, v, 13);
+		N48LOG("accel-experiment: %s %#llx -> status %u (%s)", action == N48DM_ACT_SEND ? "dmubsend" : action == N48DM_ACT_MODE ? "dmubmode" : "dmubctx", (unsigned long long)argScalar, st, n48dr_status_name(st));
+		if (outExtra)
+			for (unsigned i = 0; i < 13 && i < kAccelExtraScalars; i++) outExtra[i] = v[i];
+		return kIOReturnSuccess;
+	}
 	if (action == 88) {
 		uint64_t v[13] = { 0 };
 		const uint32_t st = n48disp::verb_args_ok(action, argScalar) ? navi48_agdc_native_control(argScalar, v, 13) : (uint32_t)n48agdc::kBadArg;
@@ -7575,6 +7818,46 @@ IOReturn Navi48Bringup::accelExperiment(uint32_t action, uint64_t *outInstalled,
 		if (outExtra)
 			for (unsigned i = 0; i < 13 && i < kAccelExtraScalars; i++) outExtra[i] = v[i];
 		return st == n48agdc::kBadArg ? kIOReturnBadArgument : kIOReturnSuccess;
+	}
+	// action 99 (0.0.633; boot-arg navi48-metal-disp=1 only, like 91): `scdcread <line> <off> [len]` - READ-ONLY SCDC status read from the HDMI sink over the DC_I2C engine, the same engine sequence and containment as ddcread
+	// (dcn/navi48_dispread_flow.h i2c_xfer; the only bus write is the 1-byte register offset). Served by n48dcn::scdcRead (dcn/navi48_dcn.cpp).
+	if (action == N48DR_ACT_SCDCREAD) {
+		uint64_t v[13] = { 0 };
+		uint32_t st;
+		if (!n48disp::verb_args_ok(action, argScalar)) {
+			st = N48DR_BAD_ARG;
+			v[0] = st;
+		} else {
+			(void)n48dcn::bind(this);
+			st = n48dcn::scdcRead(argScalar, v, 13);
+		}
+		N48LOG("accel-experiment: scdcread %#llx -> status %u (%s)", (unsigned long long)argScalar, st, n48dr_status_name(st));
+		if (outExtra)
+			for (unsigned i = 0; i < 13 && i < kAccelExtraScalars; i++) outExtra[i] = v[i];
+		return kIOReturnSuccess;
+	}
+	// action 98 (0.0.631, stage M4d; boot-arg navi48-metal-disp=1 for the admission AND boot-arg navi48-disp2=1 inside the verb): `disp2 timing|connect|off|status` (dcn/navi48_disp2.h) - OTG1 / ODM1 / OPP1 / DPG1 and DIG2's
+	// front end for a test pattern on the HDMI display PHY C drives (the DMUB's `pclk otg1-on` / `phyc enable` first). With navi48-disp2 absent it returns N48D2_OFF and touches nothing (no bind, no read).
+	if (action == N48D2_ACT) {
+		uint64_t v[13] = { 0 };
+		if (n48dcn::disp2LatchedOn()) (void)n48dcn::bind(this);   // the latch FIRST - OFF must touch nothing (bind() allocates a lock, reads registers, sets gDcn.armed)
+		const uint32_t st = n48dcn::disp2(argScalar, v, 13, &gBringup);   // 0.0.635: &gBringup = the VRAM allocator the monitor B plane's two buffers come from (amdgpu::n1c_d2_alloc)
+		N48LOG("accel-experiment: disp2 %#llx -> status %u (%s)", (unsigned long long)argScalar, st, n48d2_status_name(st));
+		if (outExtra)
+			for (unsigned i = 0; i < 13 && i < kAccelExtraScalars; i++) outExtra[i] = v[i];
+		return kIOReturnSuccess;
+	}
+	// action 105 (0.0.652, multi-monitor stage M5; boot-arg navi48-metal-disp=1 for the admission AND boot-arg navi48-fb2=1 inside the verb): `fbpublish 2` (the monitor B) / `fbpublish 1` (the monitor A, 0.0.658) - after `disp2 plane N` / `show N` / `fbhold N` (the plane HELD, the pair pinned), build the
+	// IMMUTABLE snapshot (the live gates re-read, the monitor B's EDID over DDC line 3, the aperture) and publish Navi48DisplayNub (Navi48DisplayIndex 1) under the GPU's PCI device: the aux kext's Navi48Framebuffer matches it. Refuses with a named status
+	// (n48fb::Status) and no register read when the plane is not held, a pipe is adopted, a WindowServer native session is open, or a nub already exists; WRITES NO REGISTER but the DC_I2C engine's (the EDID read, as `accel ddcread`).
+	// There is NO withdraw in M5: a reboot is the only way back. Served by Navi48DisplayNub.cpp (decisions: amd/native_fb_pure.h).
+	if (action == n48disp::kActFbPublish) {
+		uint64_t v[13] = { 0 };
+		const uint32_t st = Navi48DisplayNub::publishVerb(this, argScalar, v, 13);
+		N48LOG("accel-experiment: fbpublish %llu -> status %u (%s)", (unsigned long long)argScalar, st, n48fb::status_name(st));
+		if (outExtra)
+			for (unsigned i = 0; i < 13 && i < kAccelExtraScalars; i++) outExtra[i] = v[i];
+		return kIOReturnSuccess;
 	}
 	if (action == 78) {
 		uint64_t v[13] = { 0 };
@@ -7725,7 +8008,7 @@ IOReturn Navi48Bringup::accelExperiment(uint32_t action, uint64_t *outInstalled,
 			for (unsigned i = 0; i < 13 && i < kAccelExtraScalars; i++) outExtra[i] = v[i];
 		return kIOReturnSuccess;
 	}
-	// action 82 — `sdmadcc [0|1|2]` (0.0.417, notes/design/SDMA-DCC-NOPTE.md, D1): the SDMA0_DCC_CNTL
+	// action 82 — `sdmadcc [0|1|2]` (0.0.417, an internal design note, D1): the SDMA0_DCC_CNTL
 	// no-PTE read-decompression / write-compression set and restore. 0 reads SDMA0 and SDMA1 raw and decoded,
 	// 1 captures-then-clears the eight *_COMP_EN_n bits on SDMA0 only, 2 restores the captured value; any other
 	// argument, and 2 before a capture, is REFUSED. SDMA1 is never written. Defined above.
@@ -8144,7 +8427,7 @@ IOReturn Navi48Bringup::accelExperiment(uint32_t action, uint64_t *outInstalled,
 		return kIOReturnSuccess;
 	}
 	// action 54 — `vmctx` (0.0.247, milestone 3 step 4, the OBSERVE BOOT that
-	//   notes/M3-ROOT-WRITE-REVIEW.md section 7.1 requires before increment (iii)).
+	//   notes/an internal review note section 7.1 requires before increment (iii)).
 	//   READ-ONLY: neither this verb nor the VMM slot-40/41 hooks it reports on write
 	//   anything - not Apple's page tables, not Apple's objects, not a register, not
 	//   VRAM. Run it while a Metal client is alive: it reports the root page-table
@@ -8669,6 +8952,7 @@ void Navi48Bringup::stop(IOService *provider) {
 	// 0.0.603 (native S2a): the console plane back and every scanout watchdog thread finished BEFORE anything is unmapped (both need the registers).
 	n48dcn::scanShutdown();
 	// 0.0.610 (milestone #9): a published Metal nub (and the aux accelerator under it) goes before the GPU state does. No-op unless the nub was published.
+	Navi48DisplayNub::shutdown();      // 0.0.652 (M5): the framebuffer's nub first (no-op when never published)
 	Navi48MetalNub::shutdown();
 	// Quiesce the GPU before any of its memory goes away: a mapped MES queue
 	// or a running CP would keep fetching from buffers IOFree is about to

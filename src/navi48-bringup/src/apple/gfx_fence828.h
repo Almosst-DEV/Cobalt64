@@ -61,7 +61,7 @@
 //   N48_F828_NOT_DEAD   the destination is not inside the measured dead page, or is not 4-byte aligned
 //   N48_F828_NOT_MATCHED  between the decision and the write, a dword we matched changed. Nothing is written.
 //
-// 0.0.413 (notes/design/FENCE-OWNED-SLOT.md,) ADDS THE OWNED-SLOT REFUSALS, each its own named, counted reason:
+// 0.0.413 (an internal design note,) ADDS THE OWNED-SLOT REFUSALS, each its own named, counted reason:
 //   N48_F828_NO_RING        the ring map is not built, or its VA base is 0 — there is no arena to point the packet at
 //   N48_F828_NO_ROOT        root[511] is not armed for the committing context at the instant of the decision (B4)
 //   N48_F828_SLOT_VA        the computed slot VA is not inside our own fence page (the last 4 KiB of the arena)
@@ -79,7 +79,7 @@
 //                           later segments ran (Q1, the step-10 flag). The fence site CAN know (the translator's own
 //                           segment count is in scope), so it refuses instead of guessing.
 //
-// 0.0.418 (notes/design/BUILD-0.0.418.md, E2/E3):
+// 0.0.418 (an internal design note, E2/E3):
 //   E2  `n48_f828_eop_seen` — the committed record carries the `flight` it was promoted on, and `ks_eop_seen()` answers
 //       end-of-pipe only when that flight is the CURRENT one. A later flight whose own fence was refused keeps the old
 //       latch (0.0.415 Q4) but can no longer be read as its own end-of-pipe.
@@ -132,7 +132,7 @@ extern "C" {
 #define N48_F828_VALUE     0x4E480828u   /* "N48" + the notes section that found the packet */
 
 /* =====================================================================================================================
- * 0.0.413 (notes/design/FENCE-OWNED-SLOT.md,) — THE OWNED SLOT.
+ * 0.0.413 (an internal design note,) — THE OWNED SLOT.
  * Apple's per-submission slot is TRANSIENT: something zeroes it within a frame interval, so end-of-pipe is missed for
  * every commit after the first and the keystone deferral always ends by its 2 s timeout. This build re-points
  * the SAME buried Apple RELEASE_MEM at a slot in the LAST 4 KiB of the relocation arena — memory WE own, mapped through
@@ -235,7 +235,7 @@ static inline uint32_t n48_f828_pkt_len(uint32_t h)
     return 0u;
 }
 
-/* 0.0.426 (notes/design/MIB-COMMIT.md binding B3) — WHETHER THE FENCE MAY BE OFFERED AT THIS SEGMENT.
+/* 0.0.426 (an internal design note binding B3) — WHETHER THE FENCE MAY BE OFFERED AT THIS SEGMENT.
  *
  * The packet fires at the END of the segment it sits in. For a single-IB frame that is the frame's end. For a multi-IB
  * frame read into one buffer and segmented on its own, the frame's end is the FINAL segment (the last segment of the LAST
@@ -468,7 +468,7 @@ typedef struct {
     uint64_t vram_off;    /* the same slot's VRAM offset — how every poll reads it */
     uint64_t arm_va_base; /* the ring region identity at placement (REGION-MOVED is asked against THIS) */
     uint64_t arm_carve;
-    /* 0.0.418 (notes/design/BUILD-0.0.418.md, E2): THE FLIGHT THIS COMMITTED FENCE BELONGS TO, recorded at promotion
+    /* 0.0.418 (an internal design note, E2): THE FLIGHT THIS COMMITTED FENCE BELONGS TO, recorded at promotion
      * from the then-current `gKsFlight.seq`. `ks_eop_seen()` requires it to equal the CURRENT flight's, so a committed
      * frame's sticky `ever` latch can never answer end-of-pipe for a LATER flight whose own fence was refused (the
      * candidate gate dropped it, the keystone withdrew it, or REGION-MOVED neutered it) and therefore never reset the
@@ -479,7 +479,7 @@ typedef struct {
 /* Fill a candidate record from the translate-time site. This is the ONLY write the candidate site makes: it takes no
  * committed record and no watch, so it cannot clear `committed` or overwrite the committed frame's target. */
 /* =====================================================================================================================
- * 0.0.444 (notes/design/C5-RING-REVIEW.md (B) item 1) — THE FLIGHT-RING FENCE HANDOFF, PURE.
+ * 0.0.444 (an internal design note (B) item 1) — THE FLIGHT-RING FENCE HANDOFF, PURE.
  *
  * gfxsrc_commit_try's gate block clears `gXdF828Pending` (its own per-frame "have I got a fence candidate to judge"
  * flag) several lines BEFORE the flight-ring push runs, later in the SAME call (gfx_flightring.h's n48_fr_push).
@@ -546,7 +546,7 @@ static inline uint32_t n48_f828_owned_gate(uint32_t ring_built, uint64_t ring_va
 }
 
 /* =====================================================================================================================
- * 0.0.418 (notes/design/BUILD-0.0.418.md, E3) — REGION-MOVED MUST NEUTER THE FRAME, NOT MERELY DROP THE CANDIDATE.
+ * 0.0.418 (an internal design note, E3) — REGION-MOVED MUST NEUTER THE FRAME, NOT MERELY DROP THE CANDIDATE.
  *
  * The gate at translate time RE-POINTS Apple's buried RELEASE_MEM at a slot in our fence page and arms a candidate.
  * If the ring region is rebuilt or moved before the COMMIT gate runs, the slot VA names different bytes, so the
@@ -706,7 +706,7 @@ static inline uint32_t n48_f828_state(uint64_t enabled, uint32_t committed, cons
 }
 
 /* =====================================================================================================================
- * 0.0.418 (notes/design/BUILD-0.0.418.md, E2) — END-OF-PIPE IS ANSWERED ONLY FOR THE FLIGHT IT BELONGS TO.
+ * 0.0.418 (an internal design note, E2) — END-OF-PIPE IS ANSWERED ONLY FOR THE FLIGHT IT BELONGS TO.
  *
  * `ks_eop_seen()` through 0.0.417 was `committed && watch.ever`. `ever` is STICKY (M11) and belongs to the last
  * PROMOTED commit, while `gKsFlight.seq` advances the instant a new commit spends its shot. When that new flight's

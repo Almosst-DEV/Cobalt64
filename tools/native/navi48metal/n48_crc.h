@@ -1,4 +1,4 @@
-// n48_crc.h: the pure helpers of the opt-in per-frame CRC diagnostic for the D-copy path (notes/design/NATIVE-S5-FLIP.md "Tearing diagnostic (CRC)").
+// n48_crc.h: the pure helpers of the opt-in per-frame CRC diagnostic for the D-copy path (an internal design note "Tearing diagnostic (CRC)").
 // Row sampling + CRC-32 (IEEE, reflected, the zlib one) + the accounting of the three checks. No Vulkan, no ObjC, no locking (the bundle holds a mutex).
 //   A1 = sampled CRC of the display surface's import memory right after the GPU finished the command buffer; B = same rows of the scanout slot (the GPU copy's
 //   result); A2 = the surface again right after B (A1 != A2: someone is writing it WHILE we check = written outside our command buffers, H1); C = the surface once

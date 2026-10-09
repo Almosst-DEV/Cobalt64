@@ -1,0 +1,9 @@
+#!/bin/bash
+D=${FAKE_DIR:?}; S=$D/st; mkdir -p "$S"; echo "NUB $*" >>"$D/cmds.log"
+if [ -n "${FAKE_FAIL_VERB:-}" ] && [ "nub $*" = "$FAKE_FAIL_VERB" ]; then
+  case "${FAKE_FAIL_MODE:-rc}" in rc) echo "publish: 5 (Failed)"; exit 1 ;; empty) exit 0 ;; badout) echo "publish: 5 (Failed)"; exit 0 ;; esac
+fi
+case "$1" in
+ status) if [ -f "$S/nub" ] || [ -n "${FAKE_NUB_PRESENT:-}" ]; then echo "Navi48MetalNub present, registry ID 0x100000abc"; else echo "NO Navi48MetalNub in the registry"; exit 1; fi ;;
+ publish) touch "$S/nub"; echo "publish: 0 (Success)" ;;
+esac

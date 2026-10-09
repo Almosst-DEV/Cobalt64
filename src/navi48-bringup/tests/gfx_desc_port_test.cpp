@@ -232,7 +232,7 @@ static void checks_ledger(const LedgerOps &op)
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------
-// D-FL. build 0.0.448 item 3 (notes/design/MIB-A1-PROVENANCE.md Q4 step 2, switch 45) — FRAME-LOCAL PROVENANCE.
+// D-FL. build 0.0.448 item 3 (an internal design note Q4 step 2, switch 45) — FRAME-LOCAL PROVENANCE.
 //
 // The kext's own wiring (AppleHardwareHook.cpp: gfxsrc_policy, gfxsrc_desc_tiled_ok) is a second n48_dl instance, cleared
 // unconditionally at the top of every pass and fed PER SEGMENT, IN SUBMISSION ORDER, right after that segment's own
@@ -1524,7 +1524,7 @@ static void checks_source(const std::string &raw, const std::string &hdrRaw)
       const std::string verb = vb == std::string::npos ? "" : block_at(s, vb);
       expect("C1 only the `gfxneuter 10` verb assigns it", count(s, "gXdDescPort =") == 1u && count(verb, "gXdDescPort =") == 1u); }
     // C2 the reader
-    // 0.0.435 (notes/design/PGMID-COPYGUARD.md Part 2): the adapter is now routed through gfxc_read_rs
+    // 0.0.435 (an internal design note Part 2): the adapter is now routed through gfxc_read_rs
     // (gfxc_read's byte-identical recording twin - see gfxc_read_core in AppleHardwareHook.cpp), not gfxc_read
     // directly, so the copy-overlap reader check sees every VRAM page a descriptor read touches. Re-baselined
     // deliberately, the same way 0.0.433 re-baselined gfx_mmprio_test.cpp's T6: the review diffs old against new.
@@ -2152,10 +2152,10 @@ static void checks_source(const std::string &raw, const std::string &hdrRaw)
       expect("C31 and it never touches the `gfxneuter 15` (forgiveness) or `19` (running budget) switches",
              !has(v34, "gXdForgive") && !has(v34, "gXdRunBudget"));
     }
-    // C5 part 1 (hygiene, notes/design/C5-CONTINUOUS.md Q4) — THE LEDGER UN-FEED IS WIRED AT ALL THREE SITES the
+    // C5 part 1 (hygiene, an internal design note Q4) — THE LEDGER UN-FEED IS WIRED AT ALL THREE SITES the
     // brief names: keystone-withdrawn, token-mismatched, never-run (the ring-walk exemption's NOT_RUN). Each site
     // is also gated on `gXdDescPort`, exactly as every other ledger touch in this file already is.
-    // 0.0.444 (C5-RING-REVIEW.md (B) item 9a, Q7a) — THE THREE SITES NOW QUEUE (n48_dl_unfeed_queue), not apply
+    // 0.0.444 (an internal review note (B) item 9a, Q7a) — THE THREE SITES NOW QUEUE (n48_dl_unfeed_queue), not apply
     // directly: none of the three runs under gXdLock (they are all inside hook_gfxCommitIB, on Apple's submit
     // thread), so calling n48_dl_unfeed_tok from there could race gfxsrc_desc_unmap's LOCKED compaction. The queue
     // is drained (n48_dl_unfeed_drain) under gXdLock at the top of the NEXT judged frame instead - pinned below.
@@ -2345,7 +2345,7 @@ static void checks_line()
 
 static int run_quiet(void (*fn)());
 // ---------------------------------------------------------------------------------------------------------------------------
-// L485. build 0.0.485 (switch 58, notes/design/LOGIN-SCREEN-PATH.md "The ledger wall (L1, L2)") — THE LEDGER FIX.
+// L485. build 0.0.485 (switch 58, an internal design note "The ledger wall (L1, L2)") — THE LEDGER FIX.
 //
 //   L1  every colour target a COMMITTED frame wrote is fed with ITS OWN base page (n48_dl_pgx_extend over the per-draw pass
 //       gfx_capture_scan.h n48_gcap_cbt_ib), not only each IB's final target. Fixture: run10c F48 (token seq 9, 15520|7616, 40
@@ -2811,7 +2811,7 @@ static std::string gL485Src;
 static void l485_wiring_mut() { checks_l485_wiring(gL485Src); }
 
 // ---------------------------------------------------------------------------------------------------------------------------
-// DCC60. build 0.0.488 (switch 60, notes/design/DCC-DESC.md Q2 option (A)) — THE ONLY PROOF A STRIPPED DCC T# MAY HAVE.
+// DCC60. build 0.0.488 (switch 60, an internal design note Q2 option (A)) — THE ONLY PROOF A STRIPPED DCC T# MAY HAVE.
 // gfx_desc_port.h n48_dl_dcc_ok, driven directly: the ledger (keyed as the caller keys it), then the frame-local list only
 // while switch 45 is on, and nothing else - it takes no residency table at all. Then the report line's bound, then the
 // kext's own wiring in source order (every block the design names, in the order the policy pass runs them).
@@ -3002,7 +3002,7 @@ int main(int argc, char **argv)
     checks_keep(&keep_real);
     { gKeep = &keep_mut_ignores; const int d = run_quiet(&keep_mut); planted++; if (d) caught++;
       std::printf("  planted: %-58s %s (%d check(s) fail)\n", "the keep switch is read and then IGNORED", d ? "CAUGHT" : "MISSED", d); }
-    std::printf("== L: the ledger UN-FEED (C5 part 1, notes/design/C5-CONTINUOUS.md Q4)\n");
+    std::printf("== L: the ledger UN-FEED (C5 part 1, an internal design note Q4)\n");
     {
         n48_dl l {};
         n48_dl_ent &e0 = l.e[0]; e0.ctx = 1ull; e0.va = 0x1000ull; e0.page = 0x2000ull; e0.mode = 1u; e0.tok = 10u;
@@ -3034,7 +3034,7 @@ int main(int argc, char **argv)
                     "above, removes them)" : "MISSED");
         planted++; if (thisCaught) caught++;
     }
-    // 0.0.444 (C5-RING-REVIEW.md (B) item 9b, Q7b, CONFIRMED) — n48_dl_unmap_rng's COMPACTION MUST CARRY tok/arm_ep
+    // 0.0.444 (an internal review note (B) item 9b, Q7b, CONFIRMED) — n48_dl_unmap_rng's COMPACTION MUST CARRY tok/arm_ep
     // WITH THE SURVIVING ENTRY. Two entries, ctx 1 (unmapped, dropped) and ctx 2 (survives, tok 11) - the survivor
     // compacts DOWN from slot 1 to slot 0, so this exercises the exact copy the review found missing.
     {
@@ -3448,7 +3448,7 @@ int main(int argc, char **argv)
         expect("J a surface nothing produced answers NO", n48_dl_producer_of(&l, 5ull, 0x404800000ull, &tok, &ep) == 0);
         expect("J   and hands back no identity", tok == 0u && ep == 0u);
         expect("J a null ledger answers NO", n48_dl_producer_of(nullptr, 5ull, 0x400800000ull, &tok, &ep) == 0);
-        // 0.0.444 (C5-RING-REVIEW.md (B) item 9c, Q7c) — A SECOND producer of the SAME surface does NOT replace the
+        // 0.0.444 (an internal review note (B) item 9c, Q7c) — A SECOND producer of the SAME surface does NOT replace the
         // identity any more: the PREVIOUS producer's proof is kept. Through 0.0.443 the last writer replaced it,
         // which meant un-feeding a LATER, withdrawn frame (by its own tok) could delete an EARLIER, genuinely
         // committed fill's only proof from the ledger.

@@ -1,5 +1,5 @@
 // Navi48Device.m - Metal driver bundle for the Navi48 native stack (milestone #9, step 9c/9d).
-// Spec: notes/design/NATIVE-S3.md section 4 and 5 (rows 9c/9d/9e); RE: NATIVE-S3-RE-KERNEL.md sections 1, 3.
+// Spec: an internal design note section 4 and 5 (rows 9c/9d/9e); RE: NATIVE-S3-RE-KERNEL.md sections 1, 3.
 //
 // Superclass binding: MTLIOAccelDevice is an exported ObjC class of Metal.framework (the SDK's Metal.tbd lists
 // it under objc-classes for x86_64-macos, and pvm.x86 - AppleParavirtGPUMetal - links _OBJC_CLASS_$_MTLIOAccelDevice
@@ -22,6 +22,8 @@
 #include <string.h>
 #include <dlfcn.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <crt_externs.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <dispatch/dispatch.h>
 #include <pthread.h>
@@ -38,12 +40,25 @@
 #include "n48_plane.h"
 #include "n48_fallback_spv.h"
 #include "n48_hotswap.h"
+#include "n48_dumpacl.h"
 #include "n48_scanabi.h"    // S5.2a: scanout ABI structs (verbatim copy of the Mesa header)
 #include "n48_dispflip.h"   // S5.2a: the pure D-copy state machine
+#include "n48_m6x.h"        // bundle 13 (M6 Stage 1b): the monitor B's scanout decisions (instance 2: routing, enable, pool budget, keep-alive tick, re-copy)
+#include "n48_m6route.h"    // bundle 11 (M6 Stage 1a): which display an IOSurface belongs to (the kernel's IOSurface ID -> instance table; host test: test-m6route.c)
+#include "n48_texdesc.h"    // bundle 9 (app crash study item 2): descriptor -> Vulkan image mapping incl. cube and 2D array (host tests: test-texdesc.c, test-vkimage.c)
+#include "n48_depth.h"      // bundle 10: depth/stencil formats and pipeline state, MSAA, multisample resolve (host tests: test-depth.c, test-vkimage.c)
+#include "n48_cienv.h"      // bundle 9 (app crash study item 1): CI_USE_MTL_DAG_FOR_CIKL_SRC=0 unless the process already set it (host test: test-cienv.c)
+#include "n48_xlate.h"      // bundle 14: in-process shader translation for admitted applications (NATIVE-S8-INPROC.md; host tests: test-xlate.c, test-xlate-corpus.sh)
+#include "n48_gate.h"       // GPU-apps G4 (kext 0.0.640): the pure load policy outside WindowServer - fail-closed gates, the kernel probe, the per-process cache path (host test: test-gate.c)
 #include "n48_crc.h"        // native #12: opt-in per-frame CRC diagnostic (row sampling, accounting; host test: test-crc.c)
 #include "n48_cblog.h"      // native #12 Stage 0b: pure cross-queue RAW-inversion bookkeeping (host test: test-cblog.c)
 #include "n48_t1.h"        // native #12: T1 timing histograms + T2 pipeline-cache file format (host test: test-t1.c)
-#include "n48_impcache.h"  // P4 import cache + classify cache decisions (host test: test-impcache.c)
+#include "n48_impcache.h"  // P4 import cache + classify cache decisions; build 16: F2 default-on, F1 fallback decision, failure-injection hook (host test: test-impcache.c)
+#include "n48_ledger.h"    // build 16 (P5): live-import ledger (Step 0) + the F3 use-count policy (host test: test-ledger.c)
+#include "n48_ioalias.h"   // build 16 (P1): per-command-buffer aliasing of IOSurface wrappers (host test: test-ioalias.c)
+#include "n48_census.h"    // build 18: the unimplemented-selector census (+load compares our classes with the running system's Metal protocols; logged once for a process that gets a device)
+#include "n48_occ.h"       // build 18 (P2): occlusion queries - setVisibilityResultMode:offset: over Vulkan occlusion queries, the measured Metal semantics, the fail-safe (host test: test-occ.c)
+#include "n48_intfmt.h"    // bundle 19 (missing menus): integer colour-format rules - the integer clear conversion measured on Apple's Metal, the fallback write mask (host test: test-intfmt.c, test-intclear-semantics.m)
 #include "n48_pool.h"      // P1 memory pooling decisions (fence-gated deferred frees, 4 MiB slabs, recycle cache; host test: test-pool.c)
 #include "n48_drawcache.h" // P5b per-draw redundancy: descriptor-set signatures, last-pipeline caches, render-pass cache (host test: test-drawcache.c)
 
@@ -100,12 +115,14 @@ static void n48_log(const char *fmt, ...) {
 #define N48LOGR(fmt, ...) do { static _Atomic uint64_t n_; uint64_t k_ = atomic_fetch_add(&n_, 1); if (k_ < 8 || (k_ & 1023) == 0) n48_log(fmt, ##__VA_ARGS__); } while (0)
 
 // ---------------------------------------------------------------------------------------------------------------
-// Load policy (NATIVE-S4-M11 11b, L1-L3). Every Metal-enumerating process loads this bundle; only WindowServer (or a root
-// tool that opts in with N48M_ALLOW=1) may get a device. All test hooks are honoured only with N48M_ALLOW=1 as root.
-//   /private/tmp/n48m-off              exists -> decline (L1 kill file)
+// Load policy (NATIVE-S4-M11 11b, L1-L3). Every Metal-enumerating process loads this bundle; only WindowServer, a root
+// tool that opts in with N48M_ALLOW=1, or (GPU-apps G4, kext 0.0.640) a process the KERNEL admits as an allow-listed application (decided by a
+// successful N48N open + QueryInfo, never by name; n48_gate.h) may get a device. All test hooks are honoured only with N48M_ALLOW=1 as root.
+// Outside WindowServer the safety gates below FAIL CLOSED (a gate that cannot be read declines): see n48_gate.h.
+//   /private/tmp/n48m-off              exists -> decline (L1 kill file); outside WindowServer also when the stat is denied (anything but ENOENT / ENOTDIR)
 //   /private/tmp/n48m-starts           one epoch-seconds line per WindowServer init; >= 3 within 300 s -> decline (L2)
-//   nub property "Navi48,Ready" = 0    -> decline (L3); absent (old kexts) -> proceed
-//   nub property "Navi48,AutoDisarmed" = 1 -> decline (#12); absent -> ignored
+//   nub property "Navi48,Ready" = 0    -> decline (L3); WindowServer: absent (old kexts) -> proceed; elsewhere it must be present and 1
+//   nub property "Navi48,AutoDisarmed" = 1 -> decline (#12); absent -> ignored (the kext does not publish it today)
 //   /private/tmp/n48m-headless-no      exists -> isHeadless NO (default YES); read once per process
 //   /private/tmp/n48m-noplanes         exists -> P2: multi-plane IOSurfaces refused as before (default: plane p of a 2/3-plane surface is accepted); read once per process
 //   /private/tmp/n48m-noflip           exists -> S5.2a D-copy present OFF for the process (the kernel v1 copy continues); read once per process
@@ -139,7 +156,9 @@ static BOOL n48_test_fb_as_ws(void) {
     const char *e = getenv("N48M_TEST_FALLBACK_AS_WS");
     return n48_allow() && e && !strcmp(e, "1");
 }
-static BOOL n48_fallback_ok(void) { return n48_is_ws() || n48_force_fallback() || n48_test_fb_as_ws(); }
+// GPU-apps G4: 1 once the kernel admitted this (non-WindowServer, non-N48M_ALLOW) process as an allow-listed application (n48_admit's probe succeeded).
+static _Atomic int n48_app_admitted;
+static BOOL n48_fallback_ok(void) { return n48g_fallback_ok(n48_is_ws(), n48_force_fallback(), n48_test_fb_as_ws(), atomic_load(&n48_app_admitted)) ? YES : NO; }
 
 // Crash counter (#12 R3): counts only ABNORMAL ends. One line per instance start: "<epoch> <pid>". An instance that committed a
 // first successful command buffer appends "<pid> <start epoch> <now>" to N48_OK_FILE (n48_mark_clean) and no longer counts: normal
@@ -182,14 +201,15 @@ static void n48_mark_clean(void) {
     N48LOG("clean marker written to %s (first completed command buffer)", n48_ok_path);
 }
 
-// -1 = property absent, 0 = false/zero, 1 = true. Reads a numeric/boolean property from the accelerator's parent (the nub).
+// N48G_FLAG_ABSENT (-1) = property absent (or filtered by a sandbox: the registry cannot tell), N48G_FLAG_NONUB (-2) = the nub could not be reached, 0 = false/zero, 1 = true.
+// Reads a numeric/boolean property from the accelerator's parent (the nub). WindowServer treats -1 and -2 alike (proceed); everything else declines on them (n48_gate.h).
 static int n48_nub_flag(uint32_t port, CFStringRef name) {
     io_registry_entry_t parent = 0;
-    if (IORegistryEntryGetParentEntry((io_registry_entry_t)port, kIOServicePlane, &parent) != KERN_SUCCESS || !parent) return -1;
+    if (IORegistryEntryGetParentEntry((io_registry_entry_t)port, kIOServicePlane, &parent) != KERN_SUCCESS || !parent) return N48G_FLAG_NONUB;
     CFTypeRef v = IORegistryEntryCreateCFProperty(parent, name, kCFAllocatorDefault, 0);
     IOObjectRelease(parent);
-    if (!v) return -1;
-    int r = -1;
+    if (!v) return N48G_FLAG_ABSENT;
+    int r = N48G_FLAG_ABSENT;
     if (CFGetTypeID(v) == CFNumberGetTypeID()) { int x = 0; CFNumberGetValue((CFNumberRef)v, kCFNumberIntType, &x); r = x ? 1 : 0; }
     else if (CFGetTypeID(v) == CFBooleanGetTypeID()) r = CFBooleanGetValue((CFBooleanRef)v) ? 1 : 0;
     CFRelease(v);
@@ -208,19 +228,69 @@ static int n48_nub_autodisarmed(uint32_t port) {
     return n48_nub_flag(port, CFSTR("Navi48,AutoDisarmed"));
 }
 
+// The kernel probe (GPU-apps G4): for a process that is neither WindowServer nor an N48M_ALLOW root tool the ONLY way in is the kernel's own decision. Open an N48N connection exactly
+// as Mesa's winsys does (IOServiceOpen type 'N48N'), say Hello, read QueryInfo (HUNG), and close it again at once; the real, lazy RADV connection is opened later by the same process.
+// G6 (bundle 8): the connection is opened on the ACCELERATOR PORT this bundle holds (the Navi48Accelerator the aux kext published), not on a Navi48Bringup looked up by name: a sandboxed application's profile
+// admits user clients only on an IOAccelerator service, and the accelerator's newUserClient hands out the same native client. The port is the caller's (Metal's) object: it is NOT released here.
+// A successful open IS the allow-list verdict (uid >= 501, navi48-apps=1, navi48-multisession=1, the process on the kernel's list); any failure - including a sandbox that denies the service
+// lookup or the open - declines. Returns NULL = admitted.
+static const char *n48_app_probe(uint32_t port) {
+    io_service_t svc = (io_service_t)port;   // G6: the accelerator port (0 = none); never released here
+    io_connect_t conn = 0; kern_return_t kr = KERN_FAILURE, hk = KERN_FAILURE, ik = KERN_FAILURE; uint32_t infoFlags = 0, budgetFlags = 0;
+    if (svc) {
+        for (int tries = 0;; tries++) {
+            kr = IOServiceOpen(svc, mach_task_self(), N48G_UC_TYPE, &conn);
+            if (!n48g_probe_retry((uint32_t)kr, tries)) break;
+            usleep(10000);
+        }
+        if (kr == KERN_SUCCESS) {
+            uint64_t in[2] = { 1ull, N48G_HELLO_F_MINOR }, out[4] = { 0 }; uint32_t outCnt = 4;
+            hk = IOConnectCallScalarMethod(conn, N48G_SEL_HELLO, in, 2, out, &outCnt);
+            if (hk == KERN_SUCCESS) {
+                uint8_t info[N48G_INFO_SIZE]; size_t isz = sizeof info; memset(info, 0, sizeof info);
+                ik = IOConnectCallStructMethod(conn, N48G_SEL_QUERYINFO, NULL, 0, info, &isz);
+                if (ik == KERN_SUCCESS && isz == sizeof info) { memcpy(&infoFlags, info + N48G_INFO_FLAGS_OFF, sizeof infoFlags); memcpy(&budgetFlags, info + N48G_INFO_BUDGET_OFF, sizeof budgetFlags); } else if (ik == KERN_SUCCESS) ik = KERN_FAILURE;
+            }
+            IOServiceClose(conn);   // the session is released at once; Mesa opens its own later
+        }
+    }
+    const int v = n48g_probe_verdict(svc != 0, (uint32_t)kr, (uint32_t)hk, (uint32_t)ik, infoFlags, budgetFlags);
+    if (v != N48G_PROBE_OK) N48LOG("APP probe: declined (%s): open 0x%x hello 0x%x info 0x%x flags 0x%x budget 0x%x", n48g_probe_text(v), (unsigned)kr, (unsigned)hk, (unsigned)ik, infoFlags, budgetFlags);
+    else N48LOG("APP probe: the kernel admitted this process (allow-listed application): GPU path enabled for %s", getprogname());
+    return v == N48G_PROBE_OK ? NULL : n48g_probe_text(v);
+}
+
 // NULL = admit, else the reason for declining (static string).
 static const char *n48_admit(uint32_t port) {
-    if (!n48_is_ws() && !n48_allow()) return "process is not WindowServer and N48M_ALLOW=1 (as root) is not set";
+    const int cls = n48g_class(n48_is_ws(), n48_allow());
+    const int isWs = cls == N48G_CLASS_WS;
+    // 0.0.641 (G4 review HIGH 2): root and daemons (euid < 501) that are neither WindowServer nor an N48M_ALLOW tool are declined BY CLASS, first of all, exactly as in 0.0.632: no kernel open for them.
+    if (n48g_declined_by_class(cls, (uint32_t)geteuid())) return N48G_DECLINE_BY_CLASS_TEXT;
+    // The kill file. Outside WindowServer a stat that fails for any reason but "no such file" (a sandbox answers EPERM) declines: fail CLOSED (n48_gate.h).
     struct stat st;
-    if (stat(N48_KILL_FILE, &st) == 0) {
+    const int srcRc = stat(N48_KILL_FILE, &st), srcErr = errno;
+    const int ks = n48g_kill_state(srcRc, srcErr);
+    int killIgnored = 0;
+    if (ks == N48G_KILL_PRESENT) {
         // S5.2b root test path: ignored ONLY by a non-WindowServer root process with N48M_ALLOW=1 and N48M_TEST_IGNORE_KILL=1 (WindowServer never is).
-        if (!n48df_off_file_ignored((int)geteuid(), getenv("N48M_ALLOW"), getenv("N48M_TEST_IGNORE_KILL"), n48_is_ws())) return "kill file " N48_KILL_FILE " exists";
+        killIgnored = n48df_off_file_ignored((int)geteuid(), getenv("N48M_ALLOW"), getenv("N48M_TEST_IGNORE_KILL"), n48_is_ws());
+        if (!killIgnored) return "kill file " N48_KILL_FILE " exists";
         N48LOG("admit: kill file " N48_KILL_FILE " exists but is IGNORED (root test bypass N48M_ALLOW=1 + N48M_TEST_IGNORE_KILL=1, not WindowServer)");
     }
-    if (n48_nub_ready(port) == 0) return "nub property Navi48,Ready is 0";
-    if (n48_nub_autodisarmed(port) == 1) return "nub property Navi48,AutoDisarmed is 1";
+    if (n48g_kill_declines(isWs, ks, killIgnored)) {
+        N48LOG("admit: kill file " N48_KILL_FILE " could not be checked (stat errno %d): declining outside WindowServer (fail closed)", srcErr);
+        return "kill file " N48_KILL_FILE " could not be read (fail closed outside WindowServer)";
+    }
+    const int rdy = n48_nub_ready(port);
+    if (n48g_ready_declines(isWs, rdy)) return rdy == 0 ? "nub property Navi48,Ready is 0" : "nub property Navi48,Ready is absent or unreadable (fail closed outside WindowServer)";
+    if (n48g_autodisarm_declines(isWs, n48_nub_autodisarmed(port))) return "nub property Navi48,AutoDisarmed is 1";
     int count = 0;
     if (n48_counter_tripped(&count)) return "crash counter: >= 3 starts within 300 s";
+    if (cls == N48G_CLASS_OTHER) {   // not WindowServer, not an N48M_ALLOW root tool: only the kernel can admit it
+        const char *why = n48_app_probe(port);
+        if (why) return why;
+        atomic_store(&n48_app_admitted, 1);
+    }
     return NULL;
 }
 static BOOL n48_headless(void) {
@@ -253,7 +323,9 @@ static BOOL n48_headless(void) {
     X(vkEnumerateDeviceExtensionProperties) X(vkGetPhysicalDeviceFeatures2) \
     X(vkGetImageSubresourceLayout) X(vkGetPhysicalDeviceProperties2) X(vkGetDeviceProcAddr) \
     X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceImageFormatProperties) \
-    X(vkCreatePipelineCache) X(vkGetPipelineCacheData)
+    X(vkCreatePipelineCache) X(vkGetPipelineCacheData) \
+    X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkGetQueryPoolResults) X(vkGetFenceStatus) /* build 18 (P2) */ \
+    X(vkCmdResolveImage) X(vkCmdSetStencilReference) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetDepthBias)
 #define X(n) static PFN_##n n;
 N48_VK_FUNCS(X)
 #undef X
@@ -265,6 +337,8 @@ static struct {
     BOOL tried; BOOL ok; NSError *err;
     void *lib; VkInstance inst; VkPhysicalDevice pd; VkDevice dev; VkQueue q; uint32_t qfi;
     VkPhysicalDeviceMemoryProperties mp; pthread_mutex_t qlock; VkPhysicalDeviceLimits lim; VkCommandPool opool; VkPipelineCache pc;   // pc: T2 persisted pipeline cache (VK_NULL_HANDLE = none)
+    BOOL occPrecise, occOK;   // build 18 (P2): occlusionQueryPrecise enabled on the device; every query entry point resolved
+    BOOL dbClamp;   // bundle 10: depthBiasClamp enabled on the device (a non-zero clamp in setDepthBias is passed on only then)
     BOOL hostExt; uint64_t hostAlign; uint64_t impTotal;   // 11h.6: external_memory_host enabled, minImportedHostPointerAlignment, bytes currently imported
 } N48R;
 
@@ -306,9 +380,15 @@ static void n48_pc_open(const VkPhysicalDeviceProperties *pp) {
     if (!vkCreatePipelineCache || !vkGetPipelineCacheData) { N48LOG("T2 pipeline cache: entry points not exposed by RADV, running without"); return; }
     if (access("/private/tmp/n48m-nopcache", F_OK) == 0 || (n48_allow() && getenv("N48M_NOPCACHE"))) { N48LOG("T2 pipeline cache: disabled (kill file /private/tmp/n48m-nopcache or N48M_NOPCACHE)"); return; }
     memcpy(N48PC.uuid, pp->pipelineCacheUUID, 16); N48PC.vendor = pp->vendorID; N48PC.device = pp->deviceID; n48_pc_derive_key();
-    const char *dir = (n48_allow() && getenv("N48M_PCACHE_DIR")) ? getenv("N48M_PCACHE_DIR") : (access("/private/var/tmp", W_OK) == 0 ? "/private/var/tmp" : "/private/tmp");
-    snprintf(N48PC.path, sizeof N48PC.path, "%s/n48m-pipecache.bin", dir);
-    N48PC.save = n48_is_ws() || (n48_allow() && getenv("N48M_PCACHE_SAVE"));   // only WindowServer writes: a root tool's file would block WindowServer's rename in the sticky dir
+    // GPU-apps G4: WindowServer and N48M_ALLOW root tools use /private/var/tmp/n48m-pipecache.bin as before; any other (admitted application) process uses a file of its OWN under the
+    // user's cache directory (confstr _CS_DARWIN_USER_CACHE_DIR, the one cache directory a sandboxed GPU process may write) and has NO cache if that directory is unavailable (n48_gate.h).
+    const int pcls = n48g_class(n48_is_ws(), n48_allow());
+    char ucd[1024]; ucd[0] = 0;
+    if (pcls == N48G_CLASS_OTHER) { const size_t cn = confstr(_CS_DARWIN_USER_CACHE_DIR, ucd, sizeof ucd); if (cn == 0 || cn > sizeof ucd) ucd[0] = 0; }
+    const char *envdir = (n48_allow() && getenv("N48M_PCACHE_DIR")) ? getenv("N48M_PCACHE_DIR") : NULL;
+    const int vtw = (pcls != N48G_CLASS_OTHER) ? (access("/private/var/tmp", W_OK) == 0) : 0;
+    if (!n48g_pcache_path(N48PC.path, sizeof N48PC.path, pcls, envdir, vtw, ucd, getprogname())) { N48LOG("T2 pipeline cache: no cache directory for this process (user cache dir unavailable), running without"); return; }
+    N48PC.save = n48g_pcache_save(pcls, (n48_allow() && getenv("N48M_PCACHE_SAVE")) ? 1 : 0) ? YES : NO;   // WindowServer and an application write (its own file); a root tool only with N48M_PCACHE_SAVE: its file would block WindowServer's rename in the sticky dir
     char marker[sizeof N48PC.path + 16]; snprintf(marker, sizeof marker, "%s.loading", N48PC.path);
     if (access(marker, F_OK) == 0) { unlink(N48PC.path); unlink(marker); N48LOG("T2 pipeline cache: a previous load never finished (%s present): cache file discarded", marker); }
     void *buf = NULL; size_t flen = 0; const void *payload = NULL; size_t plen = 0; int c = -1;
@@ -371,9 +451,11 @@ static void n48_pc_save(const char *why) {
 static void n48_pc_atexit(void) { n48_pc_save("exit"); }
 
 static void n48_pool_latch(void);
+static void n48_m6_report(void);
 static void n48_imp_latch(void);
 static void n48_imp_tick(void);
 static void n48_imp_report(unsigned tick);
+static void n48_led_report(unsigned tick);
 static void n48_pool_tick(void);
 static void n48_pool_report(unsigned tick);
 static void n48_drawopt_latch(void);
@@ -393,8 +475,10 @@ static void n48_t1_report(void) {
     else if (tick % 6 == 5) N48LOG("T1 idle: no pipeline/import/command buffer in the last 60 s [%s pid %d]", getprogname(), (int)getpid());
     n48_pool_report(tick);   // P1: one line when the pool is ON and something happened (nothing when OFF)
     n48_drawopt_report(tick);   // P5b: one line when the drawopt switch is ON and something happened (nothing when OFF)
+    n48_m6_report();   // bundle 11: one line when the kernel latch navi48-m6 is ON (nothing when OFF)
     n48_pool_tick();
     n48_imp_report(tick); n48_imp_tick();   // P4
+    n48_led_report(tick);   // build 16 (P5 Step 0): the live-import ledger, one line per tick while any surface texture is alive
     if (++tick % 3 == 0) n48_pc_save("periodic");
 }
 static void n48_t1_start(void) {
@@ -426,6 +510,17 @@ static BOOL n48_radv_open_once(NSError **err) {
         N48R.lib = h;
         n48_gipa = (PFN_vkGetInstanceProcAddr)dlsym(h, "vk_icdGetInstanceProcAddr");
         if (!n48_gipa) { N48R.err = n48_err(2, @"no vk_icdGetInstanceProcAddr in RADV"); goto fail; }
+        {   // G6: an admitted APPLICATION opens its native connection on the accelerator (a sandboxed app may open user clients only on an IOAccelerator service); WindowServer and root tools keep Mesa's default and no
+            // setter is called. Before vkCreateInstance: the connection is opened when the physical devices are enumerated. Fail closed: a RADV without the setter cannot be used for an application.
+            const char *svcCls = n48g_mesa_service_for_class(n48g_class(n48_is_ws(), n48_allow()));
+            if (svcCls) {
+                int (*setSvc)(const char *) = (int (*)(const char *))dlsym(h, N48G_MESA_SETTER);
+                if (!setSvc) { N48R.err = n48_err(7, @"no " N48G_MESA_SETTER " in RADV (an application needs the accelerator route)"); goto fail; }
+                const int src = setSvc(svcCls);
+                if (src != 0) { N48R.err = n48_err(7, [NSString stringWithFormat:@N48G_MESA_SETTER "(%s) = %d", svcCls, src]); goto fail; }
+                N48LOG("radv open: application class: N48N is opened on %s", svcCls);
+            }
+        }
         n48_vkCreateInstance = (PFN_vkCreateInstance)n48_gipa(NULL, "vkCreateInstance");
         if (!n48_vkCreateInstance) { N48R.err = n48_err(3, @"no vkCreateInstance"); goto fail; }
         VkApplicationInfo ai = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "navi48metal", .apiVersion = VK_API_VERSION_1_2 };
@@ -465,10 +560,21 @@ static BOOL n48_radv_open_once(NSError **err) {
         VkPhysicalDeviceFeatures pf; vkGetPhysicalDeviceFeatures(N48R.pd, &pf);
         // translated AIR uses Int64 (10a); 11e: storage images are translated with format Unknown + Read/WriteWithoutFormat (add-air.py)
         VkPhysicalDeviceFeatures ef = { .shaderInt64 = pf.shaderInt64, .fragmentStoresAndAtomics = pf.fragmentStoresAndAtomics, .shaderStorageImageReadWithoutFormat = pf.shaderStorageImageReadWithoutFormat,
-                                        .shaderStorageImageWriteWithoutFormat = pf.shaderStorageImageWriteWithoutFormat };
+                                        .shaderStorageImageWriteWithoutFormat = pf.shaderStorageImageWriteWithoutFormat,
+                                        .depthBiasClamp = pf.depthBiasClamp,   // bundle 10: setDepthBias:slopeScale:clamp:
+                                        .occlusionQueryPrecise = pf.occlusionQueryPrecise };   // build 18 (P2): Counting visibility mode
         N48LOG("radv: apiVersion %u.%u shaderInt64 supported %u, storage image read/write without format %u/%u", VK_API_VERSION_MAJOR(pp.apiVersion), VK_API_VERSION_MINOR(pp.apiVersion), pf.shaderInt64,
                pf.shaderStorageImageReadWithoutFormat, pf.shaderStorageImageWriteWithoutFormat);
-        N48R.lim = pp.limits;
+        N48R.lim = pp.limits; N48R.dbClamp = pf.depthBiasClamp ? YES : NO;
+        N48R.occPrecise = pf.occlusionQueryPrecise ? YES : NO;
+        N48R.occOK = (vkCreateQueryPool && vkDestroyQueryPool && vkCmdResetQueryPool && vkCmdBeginQuery && vkCmdEndQuery && vkGetQueryPoolResults && vkGetFenceStatus) ? YES : NO;   // build 18 (P2)
+        {   // bundle 10: what the device offers for depth/stencil and MSAA (each depth texture / pipeline checks these again before it uses a format)
+            static const VkFormat dsf[4] = { VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT, VK_FORMAT_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT };
+            for (int i = 0; i < 4 && vkGetPhysicalDeviceFormatProperties; i++) { VkFormatProperties fp0 = {0}; vkGetPhysicalDeviceFormatProperties(N48R.pd, dsf[i], &fp0);
+                N48LOG("radv: depth/stencil format %d optimal features 0x%x (sampled %d, depth/stencil attachment %d)%s", (int)dsf[i], fp0.optimalTilingFeatures, (fp0.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0,
+                       (fp0.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0, (fp0.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) ? "" : ": depth textures / pipelines of this format are refused"); }
+            N48LOG("radv: framebuffer sample counts color 0x%x depth 0x%x stencil 0x%x; depthBiasClamp %d", pp.limits.framebufferColorSampleCounts, pp.limits.framebufferDepthSampleCounts, pp.limits.framebufferStencilSampleCounts, pf.depthBiasClamp);
+        }
         // 11e-2: measure what RADV offers for framebuffer fetch (logged once per process; the design choice is recorded in NATIVE-S4-M11.md).
         {
             uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(N48R.pd, NULL, &ne, NULL);
@@ -515,7 +621,7 @@ static BOOL n48_radv_open_once(NSError **err) {
         if (r != VK_SUCCESS) { N48R.err = n48_err(8, [NSString stringWithFormat:@"vkCreateCommandPool(one-shot) = %d", r]); goto fail; }
         n48_pc_open(&pp);
         n48_pool_latch();   // P1: reads /private/tmp/n48m-pool ONCE
-        n48_imp_latch();    // P4: reads /private/tmp/n48m-impcache ONCE
+        n48_imp_latch();    // P4: reads the kill file /private/tmp/n48m-noimpcache ONCE (build 16: the cache is ON by default)
         n48_drawopt_latch();   // P5b: reads /private/tmp/n48m-drawopt ONCE
         N48R.ok = YES;
         n48_t1_start();
@@ -736,21 +842,21 @@ static void n48_drawopt_report(unsigned tick) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// P4 import cache (n48_impcache.h decides, this block does the Vulkan / CF calls). ON only when /private/tmp/n48m-impcache exists, latched ONCE at device creation;
+// P4 import cache (n48_impcache.h decides, this block does the Vulkan / CF calls). ON by default since build 16 (F2); the kill file /private/tmp/n48m-noimpcache switches it OFF, latched ONCE at device creation;
 // OFF = -initWithDevice:descriptor:iosurface:plane: and -dealloc run the per-texture import exactly as before (`_impShared` stays NO).
 //  * One VkDeviceMemory import per live IOSurface (key id + base + import size), shared by all its textures; kept 2 s after the last texture died, <= 128 MiB unused.
 //  * The cache holds its own CFRetain on the IOSurface for as long as it keeps the import (NOT IOSurfaceIncrementUseCount: that stays per texture).
 //  * An import given up is vkFreeMemory'd only once the P1 fence has cleared the serial taken when it was given up (stamp 0 / completed 0 when the pool is OFF = as today).
 // ---------------------------------------------------------------------------------------------------------------
-#define N48_IMPCACHE_FILE "/private/tmp/n48m-impcache"
+#define N48_IMPCACHE_KILL_FILE "/private/tmp/n48m-noimpcache"   // build 16 (F2): the cache is ON by default; this file switches it OFF (latched once per process). The old presence file n48m-impcache is no longer read.
 static struct { BOOL on; pthread_mutex_t mu; n48ic_cache c; _Atomic uint64_t baseless; uint64_t lastSig; } N48IC = { .mu = PTHREAD_MUTEX_INITIALIZER };
 static void n48_imp_latch(void) {
     static int done; if (done) return; done = 1;
-    N48IC.on = access(N48_IMPCACHE_FILE, F_OK) == 0;
+    N48IC.on = n48ic_default_on(access(N48_IMPCACHE_KILL_FILE, F_OK) == 0) ? YES : NO;   // build 16 (F2): default ON
     n48ic_init(&N48IC.c, N48IC.on);
-    if (N48IC.on) N48LOG("P4 impcache: ON (%s present at device creation; latched for the life of this process): one shared import per IOSurface, kept %llu ms after its last texture, <= %llu MiB unused, frees fence-gated (%s)",
-        N48_IMPCACHE_FILE, (unsigned long long)(N48IC_IDLE_NS / 1000000ULL), (unsigned long long)(N48IC_CAP >> 20), N48P.on ? "P1 fence" : "pool OFF: kernel idle wait as today");
-    else N48LOG("P4 impcache: OFF (no %s at device creation; latched for the life of this process)", N48_IMPCACHE_FILE);
+    if (N48IC.on) N48LOG("P4 impcache: ON (default since build 16; kill file %s absent at device creation; latched for the life of this process): one shared import per IOSurface, kept %llu ms after its last texture, <= %llu MiB unused, frees fence-gated (%s)",
+        N48_IMPCACHE_KILL_FILE, (unsigned long long)(N48IC_IDLE_NS / 1000000ULL), (unsigned long long)(N48IC_CAP >> 20), N48P.on ? "P1 fence" : "pool OFF: kernel idle wait as today");
+    else N48LOG("P4 impcache: OFF (kill file %s present at device creation; latched for the life of this process)", N48_IMPCACHE_KILL_FILE);
 }
 static void n48_imp_fence(uint64_t *stamp, uint64_t *completed) {
     *stamp = 0; *completed = 0;
@@ -775,16 +881,23 @@ static void n48_imp_tick(void) {
     pthread_mutex_lock(&N48IC.mu); n48ic_trim(&N48IC.c, n48_now(), st); pthread_mutex_unlock(&N48IC.mu);
     n48_imp_drain();
 }
+// Every import allocation goes through here so the F1 test hook can refuse it: N48M_TEST_IMPORT_FAIL_EVERY=<n> (root + N48M_ALLOW=1) fails every n-th attempt like a kernel that is out of import budget.
+static unsigned long n48f1_ctr; static unsigned n48f1_every = (unsigned)-1;
+static VkResult n48_import_alloc(const VkMemoryAllocateInfo *ma, VkDeviceMemory *out) {
+    if (n48f1_every == (unsigned)-1) { const char *e = getenv("N48M_TEST_IMPORT_FAIL_EVERY"); n48f1_every = (n48_allow() && e) ? (unsigned)atoi(e) : 0; }
+    if (n48f1_inject(n48f1_every, &n48f1_ctr)) { *out = VK_NULL_HANDLE; return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
+    return vkAllocateMemory(N48R.dev, ma, NULL, out);
+}
 // The shared import of `s` (ma = the import allocate info). *hit YES = an existing import was reused.
 static VkResult n48_imp_get(IOSurfaceRef s, void *base, size_t ialloc, const VkMemoryAllocateInfo *ma, VkDeviceMemory *out, BOOL *hit) {
     uint64_t st, comp; n48_imp_fence(&st, &comp); *hit = NO;
     uint32_t id = IOSurfaceGetID(s); void *m = NULL;
     pthread_mutex_lock(&N48IC.mu); int h = n48ic_acquire(&N48IC.c, id, (uint64_t)(uintptr_t)base, ialloc, n48_now(), st, &m); pthread_mutex_unlock(&N48IC.mu);
     if (h) { *out = (VkDeviceMemory)m; *hit = YES; return VK_SUCCESS; }
-    VkDeviceMemory mem = VK_NULL_HANDLE; VkResult r = vkAllocateMemory(N48R.dev, ma, NULL, &mem);
-    if (r != VK_SUCCESS) {   // out of kernel imports (256 MiB per client): give back the unused cached ones the fence has cleared, once
+    VkDeviceMemory mem = VK_NULL_HANDLE; VkResult r = n48_import_alloc(ma, &mem);
+    if (r != VK_SUCCESS) {   // out of kernel imports (256 MiB per client): give back the unused cached ones the fence has cleared, once (F1: the caller then falls back to a GPU-only texture, never nil)
         pthread_mutex_lock(&N48IC.mu); size_t k = n48ic_flush(&N48IC.c, st); pthread_mutex_unlock(&N48IC.mu);
-        if (k) { n48_imp_drain(); r = vkAllocateMemory(N48R.dev, ma, NULL, &mem); }
+        if (k) { n48_imp_drain(); r = n48_import_alloc(ma, &mem); }
     }
     if (r != VK_SUCCESS) { *out = VK_NULL_HANDLE; return r; }
     pthread_mutex_lock(&N48IC.mu); n48ic_add(&N48IC.c, id, (uint64_t)(uintptr_t)base, ialloc, (void *)mem, (void *)CFRetain(s)); pthread_mutex_unlock(&N48IC.mu);
@@ -822,6 +935,61 @@ static void n48_imp_report(unsigned tick) {
     pthread_mutex_unlock(&N48IC.mu);
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Build 16 (app-fix round 1; an internal design note P5 + P1). n48_ledger.h / n48_ioalias.h decide, this block holds the process-wide state and the IOSurface calls.
+//  * Step 0, the LIVE-IMPORT LEDGER: every IOSurface texture is entered when it comes alive and removed in -dealloc; the T1 tick logs "T1 ledger: ..." (live textures, distinct surface ids, bytes, textures with no
+//    command buffer in flight, the top 5 by size / format / planes with the age of the oldest). Logging only.
+//  * F3, the USE-COUNT POLICY: a texture NO LONGER holds IOSurfaceIncrementUseCount for its life (Apple's Metal does not: measured on the host Mac). A command buffer use-counts a surface from the first touch of a texture of it
+//    until the command buffer is finished with the GPU (n48PoolDone / dealloc). Kill file /private/tmp/n48m-nousecount = never (Apple-identical), latched once per process.
+//  * P1, the ALIAS GATE: applications act on the per-command-buffer aliasing decisions; WindowServer only counts them (it keeps build 14's behaviour exactly). Kill file /private/tmp/n48m-noioalias.
+// ---------------------------------------------------------------------------------------------------------------
+#define N48_NOUSECOUNT_FILE "/private/tmp/n48m-nousecount"
+#define N48_NOIOALIAS_FILE  "/private/tmp/n48m-noioalias"
+static struct { pthread_mutex_t mu; n48l L; int ucMode, iaActs; _Atomic uint64_t iaFlush, iaReup, iaWsFlush, iaWsReup, f1Fallbacks, ucTake, ucRelease; uint64_t lastSig; } N48LED = { .mu = PTHREAD_MUTEX_INITIALIZER };
+static void n48_led_latch(void) {
+    static dispatch_once_t o;
+    dispatch_once(&o, ^{
+        n48l_init(&N48LED.L);
+        N48LED.ucMode = n48uc_mode(access(N48_NOUSECOUNT_FILE, F_OK) == 0);
+        N48LED.iaActs = n48ia_enabled(n48_is_ws() ? 1 : 0, access(N48_NOIOALIAS_FILE, F_OK) == 0);
+        N48LOG("build 16: use-count policy %s (kill file " N48_NOUSECOUNT_FILE " %s); IOSurface wrapper aliasing (P1) %s (%s%s)", N48LED.ucMode == N48UC_INFLIGHT ? "IN-FLIGHT ONLY (a surface is use-counted while a command buffer that touched a texture of it is in flight)" : "NONE (Apple-identical)",
+               N48LED.ucMode == N48UC_INFLIGHT ? "absent" : "PRESENT", N48LED.iaActs ? "ACTS" : "OFF", n48_is_ws() ? "WindowServer: counted only" : "application", n48_is_ws() ? "" : N48LED.iaActs ? "" : ", kill file " N48_NOIOALIAS_FILE " present");
+    });
+}
+static void n48_led_add(id t, IOSurfaceRef s, uint64_t bytes, uint32_t pf, uint32_t planes, BOOL nobase) {
+    n48_led_latch();
+    pthread_mutex_lock(&N48LED.mu); n48l_add(&N48LED.L, (uintptr_t)(__bridge void *)t, (uint32_t)IOSurfaceGetID(s), bytes, pf, planes, nobase ? 1 : 0, n48_now()); pthread_mutex_unlock(&N48LED.mu);
+}
+static void n48_led_del(id t) { pthread_mutex_lock(&N48LED.mu); n48l_del(&N48LED.L, (uintptr_t)(__bridge void *)t); pthread_mutex_unlock(&N48LED.mu); }
+static void n48_led_touch(id t, int delta) {   // +1: a command buffer touched it for the first time; -1: that command buffer is finished
+    pthread_mutex_lock(&N48LED.mu);
+    if (delta > 0) n48l_touch(&N48LED.L, (uintptr_t)(__bridge void *)t); else n48l_untouch(&N48LED.L, (uintptr_t)(__bridge void *)t);
+    pthread_mutex_unlock(&N48LED.mu);
+}
+static void n48_uc_inc(void *s, void *c) { (void)c; CFRetain(s); IOSurfaceIncrementUseCount((IOSurfaceRef)s); atomic_fetch_add(&N48LED.ucTake, 1); }
+static void n48_uc_dec(void *s, void *c) { (void)c; IOSurfaceDecrementUseCount((IOSurfaceRef)s); CFRelease(s); atomic_fetch_add(&N48LED.ucRelease, 1); }
+static BOOL n48_ioalias_acts(void) { n48_led_latch(); return N48LED.iaActs ? YES : NO; }
+static void n48_led_report(unsigned tick) {
+    n48_led_latch();
+    n48l_snap sn; char line[1400]; uint64_t imp; unsigned long long tk = atomic_load(&N48LED.ucTake), rl = atomic_load(&N48LED.ucRelease);
+    @synchronized ([Navi48Device class]) { imp = N48R.impTotal; }
+    pthread_mutex_lock(&N48LED.mu);
+    n48l_snapshot(&N48LED.L, n48_now(), &sn);
+    const uint64_t sig = sn.live * 1000003ULL + N48LED.L.added + N48LED.L.removed * 31 + sn.texBytes + tk + rl + atomic_load(&N48LED.f1Fallbacks);
+    const BOOL emit = sn.live > 0 || sig != N48LED.lastSig || tick % 6 == 5;
+    if (emit && (sn.live > 0 || N48LED.L.added > 0)) {
+        N48LED.lastSig = sig;
+        int n = n48l_fmt(&sn, imp, &N48LED.L, line, sizeof line);
+        if (n > 0 && (size_t)n < sizeof line) snprintf(line + n, sizeof line - (size_t)n, " | usecount %s takes=%llu releases=%llu held_now=%lld | ioalias %s acted flush/reupload=%llu/%llu ws_would flush/reupload=%llu/%llu | f1_fallbacks=%llu [%s pid %d, 10 s tick]",
+            N48LED.ucMode == N48UC_INFLIGHT ? "IN-FLIGHT" : "NONE", tk, rl, (long long)(tk - rl), N48LED.iaActs ? "ON" : "OFF", (unsigned long long)atomic_load(&N48LED.iaFlush), (unsigned long long)atomic_load(&N48LED.iaReup),
+            (unsigned long long)atomic_load(&N48LED.iaWsFlush), (unsigned long long)atomic_load(&N48LED.iaWsReup), (unsigned long long)atomic_load(&N48LED.f1Fallbacks), getprogname(), (int)getpid());
+        pthread_mutex_unlock(&N48LED.mu);
+        N48LOG("%s", line);
+        return;
+    }
+    pthread_mutex_unlock(&N48LED.mu);
+}
+
 // One-shot command buffer on the device queue, waited to completion (11e: replaceRegion:, getBytes:). The pool and the queue are
 // externally synchronised by N48R.qlock. Returns NO with *err set on failure (a wait that times out leaks the command buffer).
 static BOOL n48_oneshot(NSError **err, void (^rec)(VkCommandBuffer cmd)) {
@@ -855,7 +1023,7 @@ static BOOL n48_oneshot(NSError **err, void (^rec)(VkCommandBuffer cmd)) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// S5.2a D-copy present (notes/design/NATIVE-S5-FLIP.md section 3, native #12). CoreDisplay's GPUPass renders into 3 IOSurfaces; at the end of each command buffer
+// S5.2a D-copy present (an internal design note section 3, native #12). CoreDisplay's GPUPass renders into 3 IOSurfaces; at the end of each command buffer
 // that wrote one, n48Finish appends a GPU copy (import -> a visible-VRAM scanout slot) and the completion block presents that slot (VUPDATE-latched flip) through
 // the six radv_darwin_scanout_* exports of the loaded RADV (same per-process N48N connection). The state machine is the pure n48_dispflip.h (host test:
 // test-dispflip.c). Default OFF where anything is missing; kill switch /private/tmp/n48m-noflip (read once per process); one mutex around every scanout call.
@@ -884,7 +1052,134 @@ static struct {
     struct n48n_scan_status st;
     void *map[N48DF_MAX_SLOTS];   // CRC diagnostic: persistent CPU mapping of each (host-visible) slot, made on first use
     dispatch_queue_t pq; _Atomic uint64_t seq, multi, cbno;   // ONE serial present queue; the frame sequence counter (taken under the submit lock)
+    n48m6_t m6;   // bundle 11 (M6 Stage 1a): the kernel latch and its IOSurface ID -> display table; written under mu
+    struct { uint32_t sid, w, h, bpr; } sg[64]; unsigned sgi;   // bundle 15: the geometry of every classified display surface (written by the classifier, read by the size gate); under mu
 } N48S = { .mu = PTHREAD_MUTEX_INITIALIZER };
+// ---- bundle 13 (M6 Stage 1b) + bundle 15 (M6 Stage 2): the HDMI instances (1 = the monitor A, 2 = the monitor B) beside the DP's N48S, as an ARRAY indexed by the kernel instance number ([0] is never used: the DP is N48S). Same locking (N48S.mu protects everything
+// below), same state machine type (n48_dispflip.h, a FULL-COPY machine: damage mode is the DP's alone), each with its own 3 slots in visible VRAM, registered and presented through Mesa's radv_darwin_n48n_call (selectors 22..26). The decisions
+// are n48_m6x.h (host-tested). An instance is enabled only when n48x_enabled(); acquired lazily; ANY failure leaves THAT instance OFF with the DP (and the other display) untouched. Slot size, copy rectangle and geometry come from the
+// instance's DESCRIPTOR (n48x_desc), never from the DP's plane.
+typedef int (*n48x_call_t)(VkDevice, uint32_t, const uint64_t *, uint32_t, const void *, size_t, uint64_t *, uint32_t *, void *, size_t *);
+typedef int (*n48x_bohandle_t)(VkDevice, VkDeviceMemory, uint32_t *);
+typedef struct {
+    n48df_t sm;
+    int enabled;                                     // decided at bind (n48x_enabled)
+    VkDeviceMemory mem[N48DF_MAX_SLOTS]; VkBuffer buf[N48DF_MAX_SLOTS]; uint32_t sid[N48DF_MAX_SLOTS];   // sid = the TAGGED kernel slot id (tag | k)
+    struct n48n_scan_status st; uint32_t gen; int gen_known;      // the last Status and its table generation
+    n48x_stats_t xs;
+    uint64_t plan_count, presents_seen;
+} n48xi_t;
+static struct { n48x_call_t call; n48x_bohandle_t bohandle; n48xi_t i[3]; } N48X;   // N48X.i[inst]
+#define N48XI(inst) (N48X.i[(inst)])
+static const char *n48s_reason_name(int r);
+static BOOL n48x_status_locked(int inst, struct n48n_scan_status *st);
+// the enable MASK the routing decisions take: bit i = instance i is enabled and not OFF. N48S.mu held.
+static uint32_t n48x_onmask_locked(void) { uint32_t m = 0; for (int i = 1; i <= 2; i++) if (N48XI(i).enabled && N48XI(i).sm.state != N48DF_OFF) m |= 1u << i; return m; }
+// the raw selector calls (N48S.mu held by the caller; every one returns 0 or -errno)
+static int n48x_k_acquire(int inst, uint64_t o[5], uint32_t *nout) {
+    const uint64_t in[2] = { (uint64_t)inst, 0 }; uint32_t no = 5; *nout = 0;
+    int rc = N48X.call(N48R.dev, N48N_SEL_SCANX_ACQUIRE, in, 2, NULL, 0, o, &no, NULL, NULL);
+    if (n48x_acquire_retry4(inst, rc)) { no = 4; rc = N48X.call(N48R.dev, N48N_SEL_SCANX_ACQUIRE, in, 2, NULL, 0, o, &no, NULL, NULL); }   // a 0.0.661 kernel answers four words only (the monitor B may fall back, and ONLY after the five-word shape was refused (-EINVAL), R-S2; the monitor A never)
+    if (rc) return rc;
+    if (no != 4 && no != 5) return -EIO;
+    *nout = no; return 0;
+}
+static int n48x_k_register(int inst, VkDeviceMemory mem, uint32_t pitch, uint32_t w, uint32_t h, uint32_t *slot, uint64_t *mc) {
+    uint32_t handle = 0; int rc = N48X.bohandle(N48R.dev, mem, &handle); if (rc) return rc;
+    const struct n48n_scan_reg reg = { .handle = handle, .offset = 0, .pitch_bytes = pitch, .height = h, .width = w, .format = N48N_SCAN_FMT_ARGB8888 };
+    const uint64_t in[1] = { (uint64_t)inst }; uint64_t o[2] = { 0, 0 }; uint32_t no = 2;
+    rc = N48X.call(N48R.dev, N48N_SEL_SCANX_REGISTER, in, 1, &reg, sizeof reg, o, &no, NULL, NULL);
+    if (rc) return rc;
+    if (no != 2) return -EIO;
+    *slot = (uint32_t)o[0]; *mc = o[1]; return 0;
+}
+static int n48x_k_present(int inst, uint32_t slot, uint64_t o[3]) { const uint64_t in[3] = { (uint64_t)inst, slot, 0 }; uint32_t no = 3; return N48X.call(N48R.dev, N48N_SEL_SCANX_PRESENT, in, 3, NULL, 0, o, &no, NULL, NULL) ?: (no == 3 ? 0 : -EIO); }
+static int n48x_k_status(int inst, struct n48n_scan_status *st, uint64_t o[4]) {
+    const uint64_t in[1] = { (uint64_t)inst }; uint32_t no = 4; size_t sz = sizeof *st; memset(st, 0, sizeof *st);
+    const int rc = N48X.call(N48R.dev, N48N_SEL_SCANX_STATUS, in, 1, NULL, 0, o, &no, st, &sz);
+    return rc ?: (sz == sizeof *st && no == 4 ? 0 : -EIO);
+}
+static int n48x_k_release(int inst, uint64_t o[2]) { const uint64_t in[1] = { (uint64_t)inst }; uint32_t no = 2; return N48X.call(N48R.dev, N48N_SEL_SCANX_RELEASE, in, 1, NULL, 0, o, &no, NULL, NULL) ?: (no == 2 ? 0 : -EIO); }
+// Release instance `inst` (the kernel puts A back, polled and verified) and stop presenting to it. Idempotent. N48S.mu held.
+static void n48x_do_release_locked(int inst) {
+    n48xi_t *const x = &N48XI(inst); const n48x_desc_t *const d = n48x_desc((uint32_t)inst);
+    if (N48X.call && x->sm.acquired && !x->sm.released) {
+        x->sm.released = 1; uint64_t o[2] = { 0, 0 }; const int rc = n48x_k_release(inst, o);
+        N48LOG("scanout (instance %d, %s): release rc %d, restore of A verified %llu, plane MC after 0x%llx", inst, d ? d->name : "?", rc, (unsigned long long)o[0], (unsigned long long)o[1]);
+    }
+    if (x->sm.state == N48DF_ACTIVE) x->sm.state = N48DF_OFF;   // a released instance presents nothing more (the DP failing closed takes the HDMI displays with it)
+}
+static void n48x_release_all_locked(void) { for (int i = 1; i <= 2; i++) n48x_do_release_locked(i); }
+// Fail closed: THAT instance only. The DP and the other display are never touched.
+static void n48x_off_locked(int inst, int reason, const char *why) {
+    n48xi_t *const x = &N48XI(inst); const n48x_desc_t *const d = n48x_desc((uint32_t)inst);
+    const int rel = n48df_fail(&x->sm, reason);
+    N48LOG("scanout (instance %d, %s): FAIL CLOSED / OFF (%s): %s", inst, d ? d->name : "?", n48s_reason_name(reason), why);
+    if (rel) { x->sm.released = 0; n48x_do_release_locked(inst); }
+}
+
+static uint32_t n48_acc_port;   // bundle 11: the accelerator port WindowServer's admitted device was created with (the table is a property of its parent, the Metal nub); set once, never released here
+
+// ---- bundle 11 (M6 Stage 1a): the kernel's IOSurface ID -> display table (decisions: n48_m6route.h) --------------------------------------------------------------------------------------------------
+// The table is the registry property "Navi48,M6Surf" of the Metal nub (the accelerator's parent: the channel Navi48,Ready already uses in WindowServer). Read OUTSIDE N48S.mu (a registry read is an IPC), stored under it.
+static int n48s_m6_read(n48m6_t *tmp) {
+    const uint32_t port = n48_acc_port;
+    if (!port) return -1;
+    io_registry_entry_t parent = 0;
+    if (IORegistryEntryGetParentEntry((io_registry_entry_t)port, kIOServicePlane, &parent) != KERN_SUCCESS || !parent) return -1;
+    CFTypeRef v = IORegistryEntryCreateCFProperty(parent, CFSTR(N48M6_PROP_SURF), kCFAllocatorDefault, 0);
+    IOObjectRelease(parent);
+    if (!v) return -2;
+    int rc = -2;
+    if (CFGetTypeID(v) == CFDataGetTypeID()) rc = n48m6_parse(tmp, CFDataGetBytePtr((CFDataRef)v), (size_t)CFDataGetLength((CFDataRef)v));
+    CFRelease(v);
+    return rc;
+}
+// Caller holds N48S.mu; it is dropped around the registry read and held again on return.
+static void n48s_m6_refresh_locked(void) {
+    pthread_mutex_unlock(&N48S.mu);
+    n48m6_t tmp; memset(&tmp, 0, sizeof tmp);
+    const int rc = n48s_m6_read(&tmp);
+    pthread_mutex_lock(&N48S.mu);
+    N48S.m6.refreshes++;
+    if (rc == 0) { if (n48m6_store(&N48S.m6, &tmp) != 0 && N48S.m6.store_refused <= 3) N48LOG("m6: an OLDER table read (generation %u < cached %u) was not stored (out-of-order refresh)", tmp.gen, N48S.m6.gen); }   // bundle 13 (R2): never store an older generation over a newer one
+    else { N48S.m6.refresh_fail++; if (N48S.m6.refresh_fail <= 3) N48LOG("m6: the kernel's surface table could not be read (rc %d, accelerator port 0x%x)", rc, n48_acc_port); }
+}
+// bundle 12 (queue 290 S3): an unknown ID is refreshed ASYNCHRONOUSLY - the registry read is an IPC, and it must never run (or sleep) on the serial present queue. At most one read is in flight; the result is stored
+// under N48S.mu like every refresh. The completion that asked is not blocked: it is queued again N48M6_RETRY_NS later (n48s_complete_run).
+static _Atomic int n48s_m6_refreshing;
+static void n48s_m6_refresh_async(void) {
+    if (atomic_exchange(&n48s_m6_refreshing, 1)) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        n48m6_t tmp; memset(&tmp, 0, sizeof tmp);
+        const int rc = n48s_m6_read(&tmp);
+        pthread_mutex_lock(&N48S.mu);
+        N48S.m6.refreshes++;
+        if (rc == 0) { if (n48m6_store(&N48S.m6, &tmp) != 0 && N48S.m6.store_refused <= 3) N48LOG("m6: an OLDER table read (generation %u < cached %u) was not stored (out-of-order refresh)", tmp.gen, N48S.m6.gen); }   // bundle 13 (R2)
+        else { N48S.m6.refresh_fail++; if (N48S.m6.refresh_fail <= 3) N48LOG("m6: the kernel's surface table could not be read (rc %d, accelerator port 0x%x)", rc, n48_acc_port); }
+        pthread_mutex_unlock(&N48S.mu);
+        atomic_store(&n48s_m6_refreshing, 0);
+    });
+}
+// N48S.mu held: a frame that will not be presented because of the table (SKIP / DROP): counted once, logged (the first 12), the slot released without touching last_seq (n48df_skip_content).
+static void n48s_m6_skip_locked(int slot, uint32_t sid, int plan, n48df_t *sm) {   // bundle 13: the machine of the frame's instance
+    const int v = n48m6_final_peek(&N48S.m6, sid);
+    (void)n48m6_final_count(&N48S.m6, sid, (plan == N48M6_C_DROP || plan == N48X_C_DROP) ? N48M6_SKIP_UNKNOWN : v);
+    n48df_skip_content(sm, slot);
+    static int lg; if (lg < 12) { lg++; N48LOG("m6: frame for IOSurface %u NOT presented (%s)", sid, plan == N48M6_C_DROP ? "the kernel has not seen it on any pipe (or the table stayed stale)" : v == N48M6_SKIP_OTHER ? "the kernel maps it to another display" : "the kernel saw it on two pipes: AMBIGUOUS"); }
+}
+static void n48_m6_report(void) {
+    pthread_mutex_lock(&N48S.mu);
+    const int on = N48S.m6.latch;
+    if (on) n48s_m6_refresh_locked();
+    n48m6_t c = N48S.m6;
+    pthread_mutex_unlock(&N48S.mu);
+    if (!on) return;
+    N48LOG("m6: surfaces for instance 1/2: %u/%u (kernel table %u IDs: instance 0 %u, ambiguous %u; refreshes %llu failed %llu); frames completed without a present: at the gate instance 1 %llu instance 2 %llu ambiguous %llu, at the present instance 1 %llu instance 2 %llu ambiguous %llu unknown %llu; tentative at the gate %llu; presented to instance 0 %llu",
+           n48m6_count_inst(&c, N48M6_INST_MONA), n48m6_count_inst(&c, N48M6_INST_MONB), c.n, n48m6_count_inst(&c, N48M6_INST_DP), n48m6_count_ambig(&c), (unsigned long long)c.refreshes, (unsigned long long)c.refresh_fail,
+           (unsigned long long)c.gate_skip[N48M6_INST_MONA], (unsigned long long)c.gate_skip[N48M6_INST_MONB], (unsigned long long)c.gate_ambig, (unsigned long long)c.fin_skip[N48M6_INST_MONA], (unsigned long long)c.fin_skip[N48M6_INST_MONB],
+           (unsigned long long)c.fin_ambig, (unsigned long long)c.fin_unknown, (unsigned long long)c.gate_tentative, (unsigned long long)c.fin_ok);
+}
 
 static const char *n48s_reason_name(int r) {
     static const char *n[] = { "none/released-on-request", "kill-file", "missing-export", "ENOSYS", "plane-geometry", "scanout-error", "plane-lost", "slot-alloc" };
@@ -894,6 +1189,7 @@ static BOOL n48s_testmode(void) { const char *e = getenv("N48M_TEST_DISPFLIP"); 
 
 // Release the plane (idempotent in the kernel) and stop the keep-alive. Called with the mutex held, at most once per process by the state machine's rule.
 static void n48s_do_release_locked(void) {
+    n48x_release_all_locked();   // bundle 13/15: the HDMI instances' A go back with the DP's console (the keep-alive ends with the timer below: a monitor B left acquired would be restored by the kernel's 5 s watchdog anyway)
     if (N48S.fr) { uint64_t o[2] = { 0, 0 }; int rc = N48S.fr(N48R.dev, o);
         N48LOG("scanout: release rc %d, console restore verified %llu, plane MC after 0x%llx", rc, (unsigned long long)o[0], (unsigned long long)o[1]); }
     if (N48S.timer) { dispatch_source_cancel(N48S.timer); N48S.timer = nil; }
@@ -923,12 +1219,27 @@ static void n48s_bind_locked(void) {
     struct n48n_scan_query q; memset(&q, 0, sizeof q);
     int rc = N48S.fq(N48R.dev, &q);
     if (rc) { char m[96]; snprintf(m, sizeof m, "scanout_query rc %d (-ENOSYS %d = not a native kext / ABI minor < 1)", rc, -ENOSYS); n48s_off_locked(rc == -ENOSYS ? N48DF_R_NOSYS : N48DF_R_ERROR, m); return; }
+    N48S.m6.latch = (q.flags & N48N_SCANQ_M6) != 0;
+    if (N48S.m6.latch) N48LOG("scanout: the kernel latch navi48-m6 is ON (scan_query flag N48N_SCANQ_M6): only surfaces the kernel maps to instance 0 are presented; the table is the Metal nub's property %s (accelerator port 0x%x)", N48M6_PROP_SURF, n48_acc_port);
     N48LOG("scanout: query: %ux%u plane, pitch %u px, hubp_format %u sw_mode %u, refresh %u mHz, flags 0x%x (LIT %d NATIVE %d ACQUIRED %d GEOM_OK %d), console MC 0x%llx",
            q.plane_w, q.plane_h, q.pitch_px, q.hubp_format, q.sw_mode, q.refresh_mhz, q.flags, !!(q.flags & N48N_SCANQ_LIT), !!(q.flags & N48N_SCANQ_NATIVE), !!(q.flags & N48N_SCANQ_ACQUIRED),
            !!(q.flags & N48N_SCANQ_GEOM_OK), (unsigned long long)q.console_mc);
     if (!(q.flags & N48N_SCANQ_GEOM_OK) || !q.plane_w || !q.plane_h || q.pitch_px < q.plane_w) { n48s_off_locked(N48DF_R_GEOM, "the live plane is not linear ARGB8888 with a plausible pitch (GEOM_OK clear)"); return; }
     N48S.pw = q.plane_w; N48S.ph = q.plane_h; N48S.pitch = q.pitch_px * 4;
     N48S.slotBytes = ((uint64_t)N48S.pitch * N48S.ph + 65535) & ~(uint64_t)65535;
+    {   // bundle 13/15 (M6 Stage 1b/2): is HDMI instance 1 (the monitor A) / 2 (the monitor B) enabled? ALL of: the kernel latches (both Stage-1b ones; the monitor A also navi48-m6flip1), both Mesa exports, THAT instance's kill file absent. The plane geometry is the
+        // descriptor's (cross-checked by the Acquire), NOT the DP's scan query. Anything missing = that instance OFF, the DP and the other display are unaffected.
+        N48X.call = (n48x_call_t)dlsym(N48R.lib, "radv_darwin_n48n_call"); N48X.bohandle = (n48x_bohandle_t)dlsym(N48R.lib, "radv_darwin_n48n_bo_handle");
+        for (int xi = 1; xi <= 2; xi++) {
+            const n48x_desc_t *const d = n48x_desc((uint32_t)xi); struct stat xs_;
+            const n48x_enable_t xe = { .inst = (uint32_t)xi, .kernel_m6 = (q.flags & N48N_SCANQ_M6) != 0, .kernel_m6flip = (q.flags & N48X_SCANQ_M6FLIP) != 0, .kernel_m6flip1 = (q.flags & N48X_SCANQ_M6FLIP1) != 0,
+                                       .have_call = N48X.call != NULL, .have_handle = N48X.bohandle != NULL, .killfile = stat(d->killfile, &xs_) == 0 };
+            N48XI(xi).enabled = n48x_enabled(&xe);
+            n48df_init(&N48XI(xi).sm, 0);
+            if (xe.kernel_m6flip) N48LOG("scanout: instance %d (the %s): %s (kernel latches m6 %d m6flip %d m6flip1 %d, exports call %d bo_handle %d, kill file %s; geometry %ux%u pitch %u B from the descriptor, slot %llu B)", xi, d->name, N48XI(xi).enabled ? "ENABLED (acquired lazily at the first frame the table maps to it)" : "OFF",
+                   xe.kernel_m6, xe.kernel_m6flip, xe.kernel_m6flip1, xe.have_call, xe.have_handle, xe.killfile ? "PRESENT" : "absent", d->w, d->h, d->pitch_bytes, (unsigned long long)d->slot_bytes);
+        }
+    }
     N48S.vtype = n48_find_mem(0xFFFFFFFFu, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     for (uint32_t i = 0; i < N48R.mp.memoryTypeCount; i++)
         N48LOG("scanout: RADV memory type %u: flags 0x%x heap %u (%llu MiB)%s", i, N48R.mp.memoryTypes[i].propertyFlags, N48R.mp.memoryTypes[i].heapIndex,
@@ -967,7 +1278,9 @@ static BOOL n48s_classify(size_t w, size_t h, uint32_t spf, NSUInteger usage, si
         int cv = 0;
         if (n48cc_lookup(&N48S.cc, sid, (uint64_t)(uintptr_t)base, w, h, bpr, alloc, &cv)) ok = cv != 0;
         else {
-            BOOL size = w == N48S.pw && h == N48S.ph, pitch = bpr == N48S.pitch && alloc >= (size_t)N48S.pitch * N48S.ph;
+            // bundle 15: the surface is a candidate when its size is the DP's plane OR an ENABLED HDMI instance's own geometry (the monitor A's 1920x1080 never matches the DP's plane)
+            const uint32_t cmask = n48x_classify_mask(N48S.pw, N48S.ph, N48S.pitch, n48x_onmask_locked(), (uint32_t)w, (uint32_t)h, (uint32_t)bpr);
+            BOOL size = cmask != 0u, pitch = size && alloc >= (size_t)bpr * h;
             // Reviewer: the backtrace only when the geometry can match, and only POSITIVE verdicts are cached: a display surface whose first texture came from
             // another caller must still be found when CoreDisplay's GetMTLTexture asks for it later (a cached NO would freeze the screen on that surface).
             BOOL bt = (size && pitch) ? n48s_bt_signal(N48S.ncand++ < 3) : NO, test = n48s_testmode();
@@ -977,6 +1290,11 @@ static BOOL n48s_classify(size_t w, size_t h, uint32_t spf, NSUInteger usage, si
             if (ok) n48cc_put(&N48S.cc, sid, (uint64_t)(uintptr_t)base, w, h, bpr, alloc, 1);
             if (ok) { N48S.ndisp++; N48LOG("scanout: display surface #%d identified: IOSurface id %u (expect 3 per WindowServer; counted once per surface id, later textures of the same surface hit the classify cache)", N48S.ndisp, sid); }
         }
+    }
+    if (ok) {   // bundle 15: remember the surface's geometry for the size gate (a cache hit records it too)
+        unsigned k = 0; for (; k < 64u; k++) if (N48S.sg[k].sid == sid) break;
+        if (k == 64u) { k = N48S.sgi++ % 64u; }
+        N48S.sg[k].sid = sid; N48S.sg[k].w = (uint32_t)w; N48S.sg[k].h = (uint32_t)h; N48S.sg[k].bpr = (uint32_t)bpr;
     }
     pthread_mutex_unlock(&N48S.mu);
     return ok;
@@ -1009,12 +1327,33 @@ static void n48s_class_summary_locked(void) {
 }
 // native #12 P1/P2 + D1: called from -n48Finish for the command buffer's chosen display write. Counts its class and its extents, logs the first 20 with the pipeline names and the
 // first 30 extent samples, and returns whether it may take a slot.
-static BOOL n48s_disp_account(uint32_t mask, uint32_t sid, const char *fns, uint64_t cbno, const n48df_wr_t *wr) {
+static BOOL n48s_disp_account(uint32_t mask, uint32_t sid, const char *fns, uint64_t cbno, const n48df_wr_t *wr, int *pinst, int *ptent) {
     pthread_mutex_lock(&N48S.mu);
-    int nf0 = N48S.sm.nflag_log, ok = n48df_account_sid(&N48S.sm, mask, sid), c = n48df_class(mask);
-    if (N48S.sm.nflag_log > nf0) N48LOG("scanout: scanout-surface flag set #%d: surface %u (a final-GPUPass draw targeted it)", N48S.sm.nflag_log, sid);
+    int pi = N48X_PLAN_DP, tent = 0;
+    if (N48S.m6.latch) {   // bundle 11: a surface the kernel maps to another display (or saw on two pipes) takes no slot and is never copied; an unknown one is let through TENTATIVELY (the completion path decides)
+        // bundle 13: a surface the table maps to the monitor B plans INSTANCE 2 (when enabled and not OFF); an UNKNOWN one only ever goes tentatively to instance 0, NEVER to instance 2
+        const uint32_t xon = n48x_onmask_locked();
+        pi = n48x_plan_inst(&N48S.m6, sid, xon, &tent);
+        if (pi == N48X_PLAN_DP || pi == N48X_PLAN_MONA || pi == N48X_PLAN_MONB) {
+            // bundle 15 / 17 (R-B1): THE SIZE GATE. A surface planned for an instance (a TENTATIVE DP plan included) whose size is not that instance's geometry takes no slot (the copy rectangle and the slot are the descriptor's).
+            uint32_t gw = 0, gh = 0, gb = 0; int have = 0;
+            for (unsigned k = 0; k < 64u; k++) if (N48S.sg[k].sid == sid && sid != 0u) { gw = N48S.sg[k].w; gh = N48S.sg[k].h; gb = N48S.sg[k].bpr; have = 1; break; }
+            if (!have || !n48x_plan_geom_ok(pi, gw, gh, gb, N48S.pw, N48S.ph, N48S.pitch)) { N48XI(pi).xs.inst_geom_mismatch++; pthread_mutex_unlock(&N48S.mu); return NO; }
+            if (pi != N48X_PLAN_DP) N48XI(pi).plan_count++;
+        } else { const int gv = n48m6_gate(&N48S.m6, sid);   // counts (gate_ok / gate_tentative / gate_skip / gate_ambig); the verdict is pi's
+               (void)gv; }
+        if (pi == N48X_PLAN_SKIP) { pthread_mutex_unlock(&N48S.mu); return NO; }
+        if (tent) N48XI(0).xs.tentative_frames++;
+    }
+    if (pinst) *pinst = pi;
+    if (ptent) *ptent = tent;
+    const int apx = n48x_desc((uint32_t)pi) != NULL;
+    n48df_t *const am = apx ? &N48XI(pi).sm : &N48S.sm;   // the machine of the planned instance accounts the frame (an HDMI machine is a full-copy machine)
+    if (apx) am->presentall = N48S.sm.presentall;
+    int nf0 = am->nflag_log, ok = n48df_account_sid(am, mask, sid, N48S.m6.latch && !tent), c = n48df_class(mask);   // bundle 20 (F1): latch on + planned NON-tentatively = the kernel's table maps the surface to this pipe: a scanout surface (no table entry needed)
+    if (am->nflag_log > nf0) N48LOG("scanout: scanout-surface flag set #%d: surface %u (a final-GPUPass draw targeted it)", am->nflag_log, sid);
     uint32_t W = N48S.pw, H = N48S.ph;
-    if (wr) n48df_dmg_account(&N48S.sm, c, wr, W, H);
+    if (wr && !apx) n48df_dmg_account(&N48S.sm, c, wr, W, H);
     static int logged; 
     if (logged < 20) { logged++; N48LOG("scanout: display write #%d: cb %llu surface %u class %s mask 0x%x -> %s; pipelines (vertex/fragment): %s", logged, (unsigned long long)cbno, sid, n48df_cls_name[c], mask, ok ? (c == N48DF_C_FINAL ? "FINAL: copy+present" : "scanout composite/presentall: copy+present") : "NON-FINAL: no copy, no present", fns && fns[0] ? fns : "(none)"); atomic_store(&n48_dw_logged, logged); }
     static int dlog;
@@ -1049,6 +1388,51 @@ static void n48s_dirty_summary_locked(void) {
             N48S.sm.damage ? "ON" : "off", (unsigned long long)N48S.sm.dm_part, (unsigned long long)N48S.sm.dm_empty, (unsigned long long)N48S.sm.dm_full, (unsigned long long)N48S.sm.dm_restart, (unsigned long long)N48S.sm.dm_carry,
             (unsigned long long)N48S.sm.chain_invalid, (unsigned long long)N48S.sm.dm_regions, (unsigned long long)N48S.sm.dm_copy_px, N48S.sm.head);
 }
+// bundle 20 (F4): per HDMI instance, every 10 s: the write classes (interval) with the non-final skips, the table occupancy (scan flags of 8, nonscan entries of 8, slots carrying a supersede mark of 3) and the cumulative
+// scan_full_refused / surf_untracked. A refused composite write is "skipped" under render-composite; occupancy 8/8 with scan_full_refused rising is the pre-bundle-20 saturation. Mutex held.
+static void n48x_rubber_summary_locked(int xi) {
+    static uint64_t pc[3][N48DF_NCLS], pn[3][N48DF_NCLS];
+    n48xi_t *const X = &N48XI(xi); char l[512]; size_t o = 0;
+    for (int i = 0; i < N48DF_NCLS; i++) {
+        uint64_t c = X->sm.cls[i] - pc[xi][i], n = X->sm.nonfinal[i] - pn[xi][i]; pc[xi][i] = X->sm.cls[i]; pn[xi][i] = X->sm.nonfinal[i];
+        if (c || n) o += (size_t)snprintf(l + o, sizeof l - o, " %s %llu(skipped %llu)", n48df_cls_name[i], (unsigned long long)c, (unsigned long long)n);
+    }
+    N48LOG("scanout (instance %d, %s): display writes by class (10 s):%s; tables: scan flags %d/%d nonscan %d/%d superseded-marked slots %d/%d; scan_full_refused %llu surf_untracked %llu",
+           xi, n48x_desc((uint32_t)xi)->name, o ? l : " (none)", X->sm.nscan, N48DF_MAX_SURF, n48df_nonscan_used(&X->sm), N48DF_MAX_SURF, n48df_marked_count(&X->sm), N48DF_MAX_SLOTS,
+           (unsigned long long)X->sm.scan_full_refused, (unsigned long long)X->sm.surf_untracked);
+}
+// bundle 13 (review R3, bundle half): a TENTATIVE frame (unknown surface, planned to instance 0) whose completion says the surface is the MONB's was dropped; its damage must not be lost. The surface was noted
+// (n48x_recopy_note); here, at the next 1 s keep-alive tick, the surface's CURRENT content (the IOSurface memory: the bundle writes every GPU frame back into it before the completion) is copied to a free slot of THAT instance and presented
+// through its own machine. N48S.mu is held on entry and on return, DROPPED around the copy. A present of the instance that completes first repaints the whole surface and cancels it (complete_run). Counted; never blocks.
+static void n48x_recopy_locked(int inst) {
+    n48xi_t *const X = &N48XI(inst); const n48x_desc_t *const d = n48x_desc((uint32_t)inst);
+    n48x_stats_t *const x = &X->xs;
+    const uint32_t sid = x->recopy_sid;
+    if (X->sm.state != N48DF_ACTIVE || !n48x_status_locked(inst, &X->st)) { n48x_recopy_done(x, 0); return; }
+    uint32_t fl[N48DF_MAX_SLOTS];
+    for (int i = 0; i < N48DF_MAX_SLOTS; i++) fl[i] = X->st.slot[X->sid[i] - d->tag].flags;
+    const int slot = n48df_pick(&X->sm, fl);
+    if (slot < 0) return;                                  // no free slot this tick: still pending, the next tick tries again
+    const uint64_t seq = x->recopy_seq;                    // bundle 20 (F3): the NOTED frame's own sequence, not a fresh (newest) one: if any later frame of this display was presented since, this one is stale and is not shown (no backward jump)
+    pthread_mutex_unlock(&N48S.mu);
+    int ok = 0, shown = 0;
+    IOSurfaceRef ios = sid ? IOSurfaceLookup(sid) : NULL;
+    if (ios && IOSurfaceGetWidth(ios) == d->w && IOSurfaceGetHeight(ios) == d->h && IOSurfaceGetBytesPerRow(ios) == d->pitch_bytes && IOSurfaceLock(ios, kIOSurfaceLockReadOnly, NULL) == kIOReturnSuccess) {   // the INSTANCE'S geometry
+        void *dst = NULL;
+        if (vkMapMemory(N48R.dev, X->mem[slot], 0, VK_WHOLE_SIZE, 0, &dst) == VK_SUCCESS && dst) { memcpy(dst, IOSurfaceGetBaseAddress(ios), (size_t)n48x_frame_bytes(d)); vkUnmapMemory(N48R.dev, X->mem[slot]); ok = 1; }
+        IOSurfaceUnlock(ios, kIOSurfaceLockReadOnly, NULL);
+    }
+    if (ios) CFRelease(ios);
+    pthread_mutex_lock(&N48S.mu);
+    if (ok && n48df_complete_seq(&X->sm, slot, 0, seq)) {
+        uint64_t o[3] = { 0, 0, 0 };
+        const int rc = n48x_k_present(inst, X->sid[slot], o);
+        if (rc == 0) { X->presents_seen++; shown = 1; }
+        if (n48df_present_result(&X->sm, rc)) { N48LOG("scanout (instance %d): FAIL CLOSED / OFF (scanout-error): re-copy present rc %d", inst, rc); n48x_do_release_locked(inst); }
+    } else (void)n48df_complete_seq(&X->sm, slot, 1, seq);      // not copied (or stale): the slot is released without a present
+    n48x_recopy_done(x, ok);
+    N48LOG("scanout (instance %d, %s): re-copy of IOSurface %u (a tentative DP-planned frame turned out to be this display's): %s", inst, d->name, sid, shown ? "presented" : ok ? "copied but NOT shown (stale: a newer frame of this display was presented since)" : "FAILED (the next present of this display repaints the whole surface)");
+}
 static void n48s_tick(void) {   // 1 s keep-alive (a status call counts as activity: no 5 s idle restore); counters every 10 s
     (void)n48s_crc_on();   // keeps the 2 s file poll alive on an idle screen
     {   // P3 present hold switch (1 s tick): absent = off; present = on, H from the content (decimal 1..8 ms, else 3); a log line on every change
@@ -1066,7 +1450,30 @@ static void n48s_tick(void) {   // 1 s keep-alive (a status call counts as activ
     { struct stat sb; int dm = stat(N48_DAMAGE_FILE, &sb) == 0; if (dm != N48S.sm.damage) { N48S.sm.damage = dm; N48S.sm.head = -1; N48LOG("scanout: partial-update emulation %s (" N48_DAMAGE_FILE " %s)", dm ? "ENABLED: SkyLight composite passes count as frames; each frame = previous frame + its dirty rectangle" : "DISABLED: full-surface copies", dm ? "exists" : "removed"); } }
     if (N48S.sm.state == N48DF_ACTIVE && n48s_status_locked(&N48S.st)) {
         uint64_t now = n48_now();
-        if (now - N48S.tLog >= 10ull * 1000000000ull) { N48S.tLog = now; n48s_log_counters_locked(&N48S.st); n48s_class_summary_locked(); n48s_dirty_summary_locked(); n48s_crc_summary(); }
+        if (now - N48S.tLog >= 10ull * 1000000000ull) { N48S.tLog = now; n48s_log_counters_locked(&N48S.st); n48s_class_summary_locked(); n48s_dirty_summary_locked(); n48s_crc_summary();
+            for (int xi = 1; xi <= 2; xi++) { n48xi_t *const X = &N48XI(xi); if (X->sm.state != N48DF_ACTIVE) continue;
+                N48LOG("scanout (instance %d, %s): counters: presents %llu (kernel presents %llu latched %llu replaced %llu refused %llu watchdog_restores %llu) drops %llu gpu_fail %llu stale_skipped %llu superseded %llu; planned %llu inst_mismatch %llu inst_geom_mismatch %llu stale_retry %llu stale_drop %llu tentative %llu re-copy noted %llu done %llu failed %llu; status calls %llu (keep-alive %llu); table gen %u (cached %u, refused out-of-order %llu)", xi, n48x_descs[xi].name,
+                (unsigned long long)X->sm.presents, (unsigned long long)X->st.presents, (unsigned long long)X->st.latched, (unsigned long long)X->st.replaced, (unsigned long long)X->st.refused, (unsigned long long)X->st.watchdog_restores,
+                (unsigned long long)X->sm.drops, (unsigned long long)X->sm.gpu_fail, (unsigned long long)X->sm.stale, (unsigned long long)X->sm.superseded, (unsigned long long)X->plan_count, (unsigned long long)X->xs.inst_mismatch, (unsigned long long)X->xs.inst_geom_mismatch, (unsigned long long)X->xs.stale_retry, (unsigned long long)X->xs.stale_drop,
+                (unsigned long long)X->xs.tentative_frames, (unsigned long long)X->xs.recopy_noted, (unsigned long long)X->xs.recopy_done, (unsigned long long)X->xs.recopy_fail, (unsigned long long)X->xs.status_calls, (unsigned long long)X->xs.keepalive_calls, X->gen, N48S.m6.gen, (unsigned long long)N48S.m6.store_refused);
+                n48x_rubber_summary_locked(xi); } }
+    }
+    for (int xi = 1; xi <= 2; xi++) {   // bundle 13/15: each HDMI instance's 1 s duties (n48x_tick_plan, host-tested). The KEEP-ALIVE comes first: a display pipe idles when nothing changes (queue 292), so a STATIC display is a static plane, and the kernel's 5 s
+        // idle watchdog would put it back on the bars unless a call counts as activity - Status is that call, once per ACTIVE instance. Then the kill file (this instance's own), a table refresh when the kernel has published a newer table than the cache, and a pending re-copy.
+        n48xi_t *const X = &N48XI(xi); const n48x_desc_t *const d = n48x_desc((uint32_t)xi);
+        struct stat kb; const int kill = stat(d->killfile, &kb) == 0;
+        if (kill && X->enabled) { X->enabled = 0; X->xs.killed++; N48LOG("scanout (instance %d, %s): kill switch %s exists: this instance %s and stays OFF for this process", xi, d->name, d->killfile, X->sm.state == N48DF_ACTIVE ? "is being released (the kernel puts A back)" : "is disabled");
+            if (X->sm.state == N48DF_ACTIVE) n48x_off_locked(xi, N48DF_R_KILL, "kill switch file present"); }
+        n48x_tick_t tk = { .x_active = X->sm.state == N48DF_ACTIVE, .killfile = 0, .status_gen_known = X->gen_known, .status_gen = X->gen, .recopy_pending = X->xs.recopy_pending };
+        uint32_t act = n48x_tick_plan(&tk, &N48S.m6);
+        if (act & N48X_T_STATUS) {
+            X->xs.keepalive_calls++;
+            (void)n48x_status_locked(xi, &X->st);
+            tk.x_active = X->sm.state == N48DF_ACTIVE; tk.status_gen = X->gen; tk.status_gen_known = X->gen_known;
+            act = n48x_tick_plan(&tk, &N48S.m6);
+            if (act & N48X_T_REFRESH) n48s_m6_refresh_async();
+            if (act & N48X_T_RECOPY) n48x_recopy_locked(xi);
+        }
     }
     pthread_mutex_unlock(&N48S.mu);
 }
@@ -1121,27 +1528,128 @@ static BOOL n48s_acquire_locked(void) {
     N48LOG("scanout ACQUIRED, %d slots (console MC 0x%llx, frame count %llu, %ux%u pitch %u)", N48DF_MAX_SLOTS, (unsigned long long)cmc, (unsigned long long)fc, N48S.pw, N48S.ph, N48S.pitch);
     return YES;
 }
+// bundle 13/15: Status of HDMI instance `inst` (the keep-alive: a call counts as activity for the kernel's 5 s idle watchdog). N48S.mu held. Stores the table generation (what the cached table is compared with).
+static BOOL n48x_status_locked(int inst, struct n48n_scan_status *st) {
+    n48xi_t *const X = &N48XI(inst);
+    uint64_t so[4] = { 0, 0, 0, 0 };
+    const int rc = n48x_k_status(inst, st, so);
+    X->xs.status_calls++;
+    if (rc) { char m[64]; snprintf(m, sizeof m, "scanout status (instance %d) rc %d", inst, rc); n48x_off_locked(inst, N48DF_R_ERROR, m); return NO; }
+    X->gen = (uint32_t)so[0]; X->gen_known = 1;
+    if (!st->acquired || (st->flags & (N48N_SCANST_RESTORING | N48N_SCANST_STORM))) {
+        char m[120]; snprintf(m, sizeof m, "the kernel ended instance %d's acquisition (acquired %u flags 0x%x watchdog_restores %llu)", inst, st->acquired, st->flags, (unsigned long long)st->watchdog_restores);
+        n48x_off_locked(inst, N48DF_R_PLANELOST, m); return NO; }
+    return YES;
+}
+static void n48x_free_slots(int inst) {
+    n48xi_t *const X = &N48XI(inst);
+    for (int i = 0; i < N48DF_MAX_SLOTS; i++) {
+        if (X->buf[i]) { vkDestroyBuffer(N48R.dev, X->buf[i], NULL); X->buf[i] = VK_NULL_HANDLE; }
+        if (X->mem[i]) { vkFreeMemory(N48R.dev, X->mem[i], NULL); X->mem[i] = VK_NULL_HANDLE; }
+    }
+}
+// Lazy acquire of an HDMI instance at the first frame the table maps to it: n48x_acquire_run (n48_m6x.h, host-tested with failure injection at every step) over the real operations below: SCANX_ACQUIRE (+ the geometry cross-check),
+// the pool budget (the kernel's FREE visible-VRAM figure), 3 slots of THE INSTANCE'S slot size in visible VRAM, SCANX_REGISTER each. Mutex held. Instance 0 must be ACTIVE (the kernel requires the session to hold it). ANY failure leaves
+// THAT instance OFF and releases what it took; NO operation here touches the DP (instance 0 is only ever ACQUIRED first, through its own n48s_acquire_locked) or the other display. The slots are freed only while nothing was submitted.
+typedef struct { int inst; uint64_t ao[5]; uint32_t nout; char why[160]; } n48x_acq_t;
+static int n48x_op_pool(void *c) {
+    const n48x_acq_t *a = c; n48xi_t *const X = &N48XI(a->inst); const n48x_desc_t *const d = n48x_desc((uint32_t)a->inst);
+    const n48x_pool_t pool = { .free_bytes = a->ao[3], .slot_bytes = d->slot_bytes, .slots = N48DF_MAX_SLOTS, .margin_bytes = N48X_MARGIN_BYTES };   // the kernel's FREE visible-VRAM figure (out[3]) - NOT RADV's heap size (review S4)
+    const int pv = n48x_pool_verdict(&pool);
+    if (pv != N48X_POOL_OK) { N48LOG("scanout (instance %d, %s): the free visible VRAM (%llu MiB, the kernel's figure) does not cover this display's %u slots + the %llu MiB margin (need %llu MiB: verdict %d)", a->inst, d->name, (unsigned long long)(pool.free_bytes >> 20), N48DF_MAX_SLOTS, (unsigned long long)(N48X_MARGIN_BYTES >> 20), (unsigned long long)(n48x_pool_need(&pool) >> 20), pv); X->xs.alloc_fail++; }
+    else N48LOG("scanout (instance %d, %s): free visible VRAM %llu MiB covers this display's %u slots + margin (need %llu MiB)", a->inst, d->name, (unsigned long long)(pool.free_bytes >> 20), N48DF_MAX_SLOTS, (unsigned long long)(n48x_pool_need(&pool) >> 20));
+    return pv;
+}
+static int n48x_op_acquire(void *c) { n48x_acq_t *a = c; n48xi_t *const X = &N48XI(a->inst); const int rc = n48x_k_acquire(a->inst, a->ao, &a->nout); if (rc) { N48LOG("scanout (instance %d): SCANX_ACQUIRE rc %d", a->inst, rc); X->xs.acquire_fail++; } else { X->gen = (uint32_t)a->ao[2]; X->gen_known = 1; } return rc; }
+static int n48x_op_geom(void *c) {
+    const n48x_acq_t *a = c; const n48x_desc_t *const d = n48x_desc((uint32_t)a->inst);
+    const int ok = n48x_acq_geom_ok(d, a->nout, a->ao[4]);
+    if (!ok) N48LOG("scanout (instance %d, %s): the kernel's plane geometry word 0x%llx (%u output words) is NOT %ux%u pitch %u B: instance OFF", a->inst, d->name, (unsigned long long)a->ao[4], a->nout, d->w, d->h, d->pitch_bytes);
+    return ok ? 0 : -1;
+}
+static void n48x_op_mark(void *c) { const n48x_acq_t *a = c; n48df_mark_acquired(&N48XI(a->inst).sm); }
+static int n48x_op_alloc(void *c, int i) {
+    n48x_acq_t *a = c; n48xi_t *const X = &N48XI(a->inst); const n48x_desc_t *const d = n48x_desc((uint32_t)a->inst);
+    VkBufferCreateInfo bc = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = d->slot_bytes, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    VkResult r = vkCreateBuffer(N48R.dev, &bc, NULL, &X->buf[i]);
+    if (r != VK_SUCCESS) { X->buf[i] = VK_NULL_HANDLE; snprintf(a->why, sizeof a->why, "%s slot %d vkCreateBuffer = %d", d->name, i, r); X->xs.alloc_fail++; return -1; }
+    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(N48R.dev, X->buf[i], &mr);
+    int mt = n48_find_mem(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mt < 0) { snprintf(a->why, sizeof a->why, "%s slot %d: no visible-VRAM type in the buffer's bits 0x%x", d->name, i, mr.memoryTypeBits); X->xs.alloc_fail++; return -1; }
+    VkMemoryAllocateInfo ma = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = (mr.size + 65535) & ~(VkDeviceSize)65535, .memoryTypeIndex = (uint32_t)mt };
+    r = vkAllocateMemory(N48R.dev, &ma, NULL, &X->mem[i]);
+    if (r != VK_SUCCESS) { X->mem[i] = VK_NULL_HANDLE; snprintf(a->why, sizeof a->why, "%s slot %d vkAllocateMemory(%llu B, type %d) = %d (visible pool full?)", d->name, i, (unsigned long long)ma.allocationSize, mt, r); X->xs.alloc_fail++; return -1; }
+    r = vkBindBufferMemory(N48R.dev, X->buf[i], X->mem[i], 0);
+    if (r != VK_SUCCESS) { snprintf(a->why, sizeof a->why, "%s slot %d vkBindBufferMemory = %d", d->name, i, r); X->xs.alloc_fail++; return -1; }
+    return 0;
+}
+static int n48x_op_register(void *c, int i) {
+    n48x_acq_t *a = c; n48xi_t *const X = &N48XI(a->inst); const n48x_desc_t *const d = n48x_desc((uint32_t)a->inst); uint64_t mc = 0; uint32_t sl = 0;
+    const int rc = n48x_k_register(a->inst, X->mem[i], d->pitch_bytes, d->w, d->h, &sl, &mc);   // the registered rectangle is the INSTANCE'S
+    if (rc) { snprintf(a->why, sizeof a->why, "%s slot %d SCANX_REGISTER rc %d", d->name, i, rc); X->xs.alloc_fail++; return -1; }
+    if (!n48x_id_ok((uint32_t)a->inst, sl)) { snprintf(a->why, sizeof a->why, "%s slot %d: kernel slot id %#x is not a tagged instance-%d id", d->name, i, sl, a->inst); X->xs.alloc_fail++; return -1; }
+    X->sid[i] = sl;
+    N48LOG("scanout (instance %d, %s): slot %d: %llu B, kernel slot id %#x, MC 0x%llx (64 KiB aligned: %d)", a->inst, d->name, i, (unsigned long long)d->slot_bytes, sl, (unsigned long long)mc, (mc & 0xFFFF) == 0);
+    return 0;
+}
+static void n48x_op_off(void *c, int reason, const char *why) { n48x_acq_t *a = c; n48x_off_locked(a->inst, reason, a->why[0] ? a->why : why); }
+static void n48x_op_free(void *c) { const n48x_acq_t *a = c; n48x_free_slots(a->inst); }
+static void n48x_op_activate(void *c) {
+    n48x_acq_t *a = c; n48xi_t *const X = &N48XI(a->inst);
+    n48df_activate(&X->sm, N48DF_MAX_SLOTS);
+    X->sm.presentall = N48S.sm.presentall;
+    N48LOG("scanout (instance %d, %s) ACQUIRED, %d slots (console A 0x%llx, frame count %llu, M6 table generation %u)", a->inst, n48x_desc((uint32_t)a->inst)->name, N48DF_MAX_SLOTS, (unsigned long long)a->ao[0], (unsigned long long)a->ao[1], X->gen);
+}
+static BOOL n48x_acquire_locked(int inst) {
+    n48xi_t *const X = &N48XI(inst);
+    if (X->sm.state != N48DF_UNBOUND) return X->sm.state == N48DF_ACTIVE;
+    if (!X->enabled) { n48df_fail(&X->sm, N48DF_R_NOSYS); return NO; }
+    if (N48S.sm.state == N48DF_UNBOUND) n48s_acquire_locked();
+    if (N48S.sm.state != N48DF_ACTIVE) { n48x_off_locked(inst, N48DF_R_ERROR, "instance 0 (the DP) is not active: the kernel requires the session to hold it first"); return NO; }
+    n48x_acq_t acq; memset(&acq, 0, sizeof acq); acq.inst = inst;
+    const n48x_ops_t ops = { .ctx = &acq, .pool_verdict = n48x_op_pool, .k_acquire = n48x_op_acquire, .mark_acquired = n48x_op_mark, .geom_verdict = n48x_op_geom, .alloc_slot = n48x_op_alloc, .register_slot = n48x_op_register, .off = n48x_op_off, .free_slots = n48x_op_free, .activate = n48x_op_activate };
+    return n48x_acquire_run(&ops) == 0;
+}
 static int n48s_damage_on(void) { pthread_mutex_lock(&N48S.mu); int d = N48S.sm.damage; pthread_mutex_unlock(&N48S.mu); return d; }
 // At command-buffer encode: a free slot (fresh kernel status says REUSABLE, none in flight, not pinned, not the chain head while damage is on) or -1 (drop counted, or D-copy off).
 // `wr` = what this cb wrote to the display surface (for the D2 rectangle). The plan says full copy or base slot + region.
-static int n48s_plan(const n48df_wr_t *wr, n48df_plan_t *pl) {
-    int slot = -1; pl->slot = -1; pl->base = -1; pl->id = pl->baseid = 0; pl->kind = N48DF_K_FULL;
+static int n48s_plan(const n48df_wr_t *wr, int inst, int tent, n48df_plan_t *pl) {
+    int slot = -1; pl->slot = -1; pl->base = -1; pl->id = pl->baseid = 0; pl->kind = N48DF_K_FULL; pl->inst = (inst == N48X_PLAN_MONA || inst == N48X_PLAN_MONB) ? inst : 0; pl->tent = tent ? 1 : 0;
     pthread_mutex_lock(&N48S.mu);
+    if (inst == N48X_PLAN_MONA || inst == N48X_PLAN_MONB) {   // bundle 13/15: an HDMI display: its own machine, its own slots, always a FULL copy of the whole surface, in THE INSTANCE'S geometry
+        n48xi_t *const X = &N48XI(inst); const n48x_desc_t *const d = n48x_desc((uint32_t)inst);
+        if (X->sm.state == N48DF_UNBOUND) n48x_acquire_locked(inst);
+        if (X->sm.state == N48DF_ACTIVE && n48x_status_locked(inst, &X->st)) {
+            uint32_t fl[N48DF_MAX_SLOTS];
+            for (int i = 0; i < N48DF_MAX_SLOTS; i++) fl[i] = X->st.slot[X->sid[i] - d->tag].flags;
+            if (N48S.m6.latch && n48m6_table_stale(&N48S.m6, X->gen)) n48s_m6_refresh_async();   // the kernel published a newer table than the cache holds: re-read it now (the completion also checks)
+            const n48df_rect_t r = { 0, 0, (int32_t)d->w, (int32_t)d->h };
+            slot = n48df_plan_ex(&X->sm, fl, N48DF_K_FULL, r, 0, pl);
+            pl->inst = inst;
+        }
+        pthread_mutex_unlock(&N48S.mu);
+        return slot;
+    }
     if (N48S.sm.state == N48DF_UNBOUND) n48s_acquire_locked();
     if (N48S.sm.state == N48DF_ACTIVE && n48s_status_locked(&N48S.st)) {
         uint32_t fl[N48DF_MAX_SLOTS];
         for (int i = 0; i < N48DF_MAX_SLOTS; i++) fl[i] = N48S.st.slot[N48S.sid[i]].flags;
         n48df_rect_t r = { 0, 0, (int32_t)N48S.pw, (int32_t)N48S.ph }; int k = wr ? n48df_dmg_resolve(&wr->pres, N48S.pw, N48S.ph, &r) : N48DF_K_FULL;
         if (k == N48DF_K_NONE) k = N48DF_K_FULL;   // a presentable cb with no recorded draw rectangle: unknown, copy it all
-        slot = n48df_plan(&N48S.sm, fl, k, r, pl);
+        k = n48x_kind_for(tent, N48DF_K_FULL, k);   // bundle 13 (R6): a TENTATIVE frame is a full copy
+        slot = n48df_plan_ex(&N48S.sm, fl, k, r, tent, pl);   // ... and never becomes the chain head
+        pl->inst = 0;
         if (slot >= 0 && pl->base >= 0) { N48S.sm.dm_copy_px += (uint64_t)n48df_rect_area(pl->rect); }
     }
     pthread_mutex_unlock(&N48S.mu);
     return slot;
 }
 static void n48s_record_copy(VkCommandBuffer cmd, VkBuffer src, const n48df_plan_t *pl) {
-    int slot = pl->slot; VkDeviceSize all = (VkDeviceSize)N48S.pitch * N48S.ph;
-    if (pl->base < 0) { VkBufferCopy bc = { .srcOffset = 0, .dstOffset = 0, .size = all }; vkCmdCopyBuffer(cmd, src, N48S.buf[slot], 1, &bc); return; }
+    int slot = pl->slot;
+    const n48x_desc_t *const xd = n48x_desc((uint32_t)pl->inst);   // bundle 15: an HDMI plan copies the INSTANCE'S rectangle (its pitch x height), never the DP's
+    VkDeviceSize all = xd ? (VkDeviceSize)n48x_frame_bytes(xd) : (VkDeviceSize)N48S.pitch * N48S.ph;
+    VkBuffer *const dstv = xd ? N48XI(pl->inst).buf : N48S.buf;   // the planned instance's slot buffers
+    if (pl->base < 0) { VkBufferCopy bc = { .srcOffset = 0, .dstOffset = 0, .size = all }; vkCmdCopyBuffer(cmd, src, dstv[slot], 1, &bc); return; }
     // D2: the slot first gets the previous frame (VRAM -> VRAM), then the dirty rows of the surface on top of it.
     VkBufferCopy bc = { .srcOffset = 0, .dstOffset = 0, .size = all }; vkCmdCopyBuffer(cmd, N48S.buf[pl->base], N48S.buf[slot], 1, &bc);
     static n48df_region_t rg[2048]; static VkBufferCopy vc[2048]; static pthread_mutex_t rmu = PTHREAD_MUTEX_INITIALIZER;   // recording is concurrent across command buffers: one scratch under a lock
@@ -1209,7 +1717,7 @@ static void n48s_crc_free(n48crc_rec_t *r) { if (!r) return; if (r->ios) CFRelea
 // The command buffer that carried the copy into `slot` ended (fence result r) or never ran: present on VK_SUCCESS only. `rec` (nil unless the CRC diagnostic runs) is consumed.
 
 // ---------------------------------------------------------------------------------------------------------------
-// native #12 Stage 0b (notes/design/NATIVE-S5-TXN.md): per-process command-buffer / present log and the cross-queue RAW-inversion counter.
+// native #12 Stage 0b (an internal design note): per-process command-buffer / present log and the cross-queue RAW-inversion counter.
 // OFF unless /private/tmp/n48m-cblog exists (polled every 1 s by its own timer; removed -> the file is closed). Output goes to
 // /private/var/tmp/n48m-cblog.<pid>.txt (a plain file, written with write(2) line by line: no os_log, so nothing is lost to log throttling), capped at 50 MB.
 // Observation only: nothing it logs changes what is submitted or presented. All times are CLOCK_UPTIME_RAW ns (n48_now); "K" lines pair it with CLOCK_REALTIME every second.
@@ -1303,34 +1811,73 @@ static void n48h_wait(void *c, uint64_t ns) {   // runs on the present queue wit
     pthread_mutex_lock(&N48S.mu);
     ((n48h_ctx *)c)->slept = n48_now() - t0;
 }
-static void n48s_complete(int slot, VkResult r, uint64_t seq, uint32_t sid, n48crc_rec_t *rec, int cls, uint64_t tcommit) {
+static void n48s_complete_run(int inst, int slot, VkResult r, uint64_t seq, uint32_t sid, n48crc_rec_t *rec, int cls, uint64_t tcommit, int tries);
+static void n48s_complete(int inst, int slot, VkResult r, uint64_t seq, uint32_t sid, n48crc_rec_t *rec, int cls, uint64_t tcommit) {
     // All presents go through ONE serial queue (completions arrive from one serial queue PER Metal command queue, so across queues their order is arbitrary);
     // the sequence check under the mutex then makes the present order equal the submission order: an older frame is skipped, never shown after a newer one.
     static dispatch_once_t once; dispatch_once(&once, ^{ N48S.pq = dispatch_queue_create("navi48.present", DISPATCH_QUEUE_SERIAL); });
-    dispatch_async(N48S.pq, ^{
+    dispatch_async(N48S.pq, ^{ n48s_complete_run(inst, slot, r, seq, sid, rec, cls, tcommit, 0); });
+}
+// Runs ON the present queue. `tries` = how many times this frame was already queued again because the kernel had not yet seen its surface (bundle 12).
+static void n48s_complete_run(int inst, int slot, VkResult r, uint64_t seq, uint32_t sid, n48crc_rec_t *rec, int cls, uint64_t tcommit, int tries) {
+    {
         pthread_mutex_lock(&N48S.mu);
-        uint64_t stale0 = N48S.sm.stale, sup0 = N48S.sm.superseded, inv0 = N48S.sm.chain_invalid;
+        const int xinst = n48x_desc((uint32_t)inst) != NULL;                      // bundle 13/15: an HDMI frame (instance 1 = the monitor A, 2 = the monitor B); 0 = the DP
+        n48df_t *const sm = xinst ? &N48XI(inst).sm : &N48S.sm;                     // the frame's own instance machine
+        const uint32_t *const sids = xinst ? N48XI(inst).sid : N48S.sid;
+        // bundle 12 (queue 290 S3): THE M6 VERDICT IS DECIDED FIRST, before n48df_complete_held releases the slot and moves last_seq. Bundle 11 asked after the release and, for an unknown ID, dropped the lock and slept
+        // up to 8 x 3 ms with the slot already free (another thread could pick it) on the one present queue. Now: no sleep, no registry read here. A frame whose surface is another display's (or still unknown after the
+        // last try) is skipped with its slot released as a failed chain frame would be (n48df_skip_content); an unknown one is queued again after N48M6_RETRY_NS while the table is refreshed in the background.
+        if (N48S.m6.latch && r == VK_SUCCESS && slot >= 0 && slot < N48DF_MAX_SLOTS && sm->inflight[slot]) {
+            // bundle 13: PRESENT ONLY IF THE FINAL INSTANCE EQUALS THE SLOT'S INSTANCE. A table older than the kernel's last published generation (Status2) is refreshed first (async) and the frame retried, then dropped: a stale
+            // cache can never send a DP frame to the monitor B. A mismatch is dropped and counted (inst_mismatch); a tentative instance-0 frame whose surface is the monitor B's also notes the surface for a re-copy (R3).
+            const uint32_t xon = n48x_onmask_locked();
+            int stale = 0; for (int xi = 1; xi <= 2; xi++) if (N48XI(xi).sm.state == N48DF_ACTIVE && n48m6_table_stale(&N48S.m6, N48XI(xi).gen_known ? N48XI(xi).gen : 0u)) stale = 1;   // any ACTIVE HDMI instance has seen a newer table than the cache
+            const int plan = n48x_complete_plan(&N48S.m6, sid, inst, tries, stale, xon);
+            const n48m6_ent_t *const fe = n48m6_find(&N48S.m6, sid);                  // the final entry (if any): which HDMI instance a mismatch / re-copy concerns
+            n48xi_t *const cx = xinst ? &N48XI(inst) : (fe && n48x_desc(fe->inst) ? &N48XI(fe->inst) : &N48XI(2));   // the counters go to the frame's instance, else to the display the surface turned out to belong to
+            if (plan == N48X_C_RETRY) {
+                if (stale) cx->xs.stale_retry++;
+                n48s_m6_refresh_async();
+                pthread_mutex_unlock(&N48S.mu);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)N48M6_RETRY_NS), N48S.pq, ^{ n48s_complete_run(inst, slot, r, seq, sid, rec, cls, tcommit, tries + 1); });
+                return;                                    // the slot stays in flight, `rec` is carried by the queued completion
+            }
+            if (plan != N48X_C_PRESENT) {
+                if (plan == N48X_C_MISMATCH || plan == N48X_C_RECOPY) cx->xs.inst_mismatch++;
+                if (plan == N48X_C_RECOPY) n48x_recopy_note(&cx->xs, sid, seq);
+                if (plan == N48X_C_DROP && stale) cx->xs.stale_drop++;
+                n48s_m6_skip_locked(slot, sid, plan, sm);
+                n48cbl_skip(sid, seq, slot, plan == N48X_C_MISMATCH || plan == N48X_C_RECOPY ? "inst-mismatch" : "m6", (int)r);
+                pthread_mutex_unlock(&N48S.mu);
+                n48s_crc_free(rec);
+                return;
+            }
+        }
+        uint64_t stale0 = sm->stale, sup0 = sm->superseded, inv0 = sm->chain_invalid;
         n48h_ctx hc = { 0 }; uint64_t hw = 0;
-        int hok = n48df_complete_held(&N48S.sm, slot, r == VK_SUCCESS ? 0 : 1, seq, sid, atomic_load_explicit(&N48H.on, memory_order_relaxed), atomic_load_explicit(&N48H.ms, memory_order_relaxed), tcommit, n48_now(), n48h_wait, &hc, &hw);   // P3: switch OFF = exactly n48df_complete_surf
-        if (hw) { N48H.held++; N48H.hold_ns += hc.slept; if (N48S.sm.superseded != sup0) N48H.held_sup++; else if (hok) N48H.held_pres++; }
+        int hok = n48df_complete_held(sm, slot, r == VK_SUCCESS ? 0 : 1, seq, sid, atomic_load_explicit(&N48H.on, memory_order_relaxed), atomic_load_explicit(&N48H.ms, memory_order_relaxed), tcommit, n48_now(), n48h_wait, &hc, &hw);   // P3: switch OFF = exactly n48df_complete_surf
+        if (hw) { N48H.held++; N48H.hold_ns += hc.slept; if (sm->superseded != sup0) N48H.held_sup++; else if (hok) N48H.held_pres++; }
+        if (hok && N48S.m6.latch) (void)n48m6_final_count(&N48S.m6, sid, N48M6_PRESENT);   // bundle 12: the verdict was decided above (a presented frame is counted once, at its present)
         if (hok) {
             uint64_t o[3] = { 0, 0, 0 };
             if (rec) n48s_crc_present(rec);
             uint64_t tp0_ = n48_now();
-            int rc = N48S.fp(N48R.dev, N48S.sid[slot], o);
+            int rc = xinst ? n48x_k_present(inst, sids[slot], o) : N48S.fp(N48R.dev, sids[slot], o);   // bundle 13/15: the instance's own present
             n48cbl_present(tp0_, n48_now(), sid, seq, slot, rc);   // Stage 0b (no-op unless /private/tmp/n48m-cblog exists)
-            if (rc == 0) n48df_count_present_cls(&N48S.sm, cls);
-            if (n48df_present_result(&N48S.sm, rc)) {
+            if (rc == 0) n48df_count_present_cls(sm, cls);
+            if (xinst && rc == 0) { N48XI(inst).presents_seen++; N48XI(inst).xs.recopy_pending = 0; }   // a present of an HDMI display repaints the whole surface: a pending re-copy is moot
+            if (n48df_present_result(sm, rc)) {
                 N48LOG("scanout: FAIL CLOSED / OFF (scanout-error): scanout_present(slot %d) rc %d", slot, rc);
-                n48s_do_release_locked();
+                if (xinst) n48x_do_release_locked(inst); else n48s_do_release_locked();   // a failed HDMI present fails THAT instance closed only
             } else N48LOGR("scanout: present slot %d seq %llu id %llu target frame %llu vupdates %llu", slot, (unsigned long long)seq, (unsigned long long)o[0], (unsigned long long)o[1], (unsigned long long)o[2]);
-        } else if (n48cbl_skip(sid, seq, slot, N48S.sm.superseded != sup0 ? "superseded" : N48S.sm.chain_invalid != inv0 ? "chain-order" : N48S.sm.stale != stale0 ? "stale" : r != VK_SUCCESS ? "gpu-error" : "other", (int)r), N48S.sm.superseded != sup0) N48LOGR("scanout: superseded frame skipped (slot %d seq %llu: a later command buffer for the same surface was submitted)", slot, (unsigned long long)seq);
-        else if (N48S.sm.chain_invalid != inv0) N48LOGR("scanout: frame NOT presented (slot %d seq %llu): submitted out of chain order, its base slot was not written yet", slot, (unsigned long long)seq);
-        else if (N48S.sm.stale != stale0) N48LOGR("scanout: stale frame skipped (slot %d seq %llu, last presented %llu)", slot, (unsigned long long)seq, (unsigned long long)N48S.sm.last_seq);
+        } else if (n48cbl_skip(sid, seq, slot, sm->superseded != sup0 ? "superseded" : sm->chain_invalid != inv0 ? "chain-order" : sm->stale != stale0 ? "stale" : r != VK_SUCCESS ? "gpu-error" : "other", (int)r), sm->superseded != sup0) N48LOGR("scanout: superseded frame skipped (slot %d seq %llu: a later command buffer for the same surface was submitted)", slot, (unsigned long long)seq);
+        else if (sm->chain_invalid != inv0) N48LOGR("scanout: frame NOT presented (slot %d seq %llu): submitted out of chain order, its base slot was not written yet", slot, (unsigned long long)seq);
+        else if (sm->stale != stale0) N48LOGR("scanout: stale frame skipped (slot %d seq %llu, last presented %llu)", slot, (unsigned long long)seq, (unsigned long long)sm->last_seq);
         else if (r != VK_SUCCESS) N48LOGR("scanout: command buffer for slot %d ended with %d: not presented", slot, r);
         pthread_mutex_unlock(&N48S.mu);
         n48s_crc_free(rec);
-    });
+    }
 }
 // Device selectors for mtlprobe dispflip (root test path; the stats read is one status call).
 static NSDictionary *n48s_stats(void) {
@@ -1341,12 +1888,23 @@ static NSDictionary *n48s_stats(void) {
         @"reason": @(n48s_reason_name(N48S.sm.reason)), @"fresh": @(fresh), @"presents": @(N48S.sm.presents), @"drops": @(N48S.sm.drops), @"gpu_fail": @(N48S.sm.gpu_fail), @"stale": @(N48S.sm.stale), @"superseded": @(N48S.sm.superseded), @"multi_disp": @(atomic_load(&N48S.multi)),
         @"present_fail": @(N48S.sm.present_fail), @"latched": @(st.latched), @"replaced": @(st.replaced), @"repeats": @(st.repeats), @"refused": @(st.refused),
         @"watchdog_restores": @(st.watchdog_restores), @"frame_count": @(st.frame_count), @"vupdates": @(st.vupdates), @"disp_surfaces": @(N48S.ndisp), @"nonfinal_skipped": @(N48S.sm.nonfinal[1] + N48S.sm.nonfinal[2] + N48S.sm.nonfinal[3] + N48S.sm.nonfinal[4] + N48S.sm.nonfinal[5] + N48S.sm.nonfinal[6]), @"final_writes": @(N48S.sm.cls[0]) };
+    NSMutableDictionary *md = [d mutableCopy];   // bundle 13/15: the HDMI instances' counters (x_* = the monitor B as in bundle 13; a_* = the monitor A)
+    for (int xi = 1; xi <= 2; xi++) {
+        n48xi_t *const X = &N48XI(xi); const char *pre = xi == 2 ? "x_" : "a_";
+        #define XK(n) [NSString stringWithFormat:@"%s%s", pre, n]
+        md[XK("enabled")] = @(X->enabled); md[XK("state")] = X->sm.state == N48DF_ACTIVE ? @"active" : X->sm.state == N48DF_OFF ? @"off" : @"unbound"; md[XK("reason")] = @(n48s_reason_name(X->sm.reason));
+        md[XK("presents")] = @(X->sm.presents); md[XK("plan")] = @(X->plan_count); md[XK("inst_mismatch")] = @(X->xs.inst_mismatch); md[XK("inst_geom_mismatch")] = @(X->xs.inst_geom_mismatch); md[XK("recopy_noted")] = @(X->xs.recopy_noted); md[XK("recopy_done")] = @(X->xs.recopy_done);
+        md[XK("keepalive_calls")] = @(X->xs.keepalive_calls); md[XK("stale_retry")] = @(X->xs.stale_retry); md[XK("gen")] = @(X->gen);
+        #undef XK
+    }
+    md[@"x_plan_monb"] = @(N48XI(2).plan_count); md[@"m6_gen"] = @(N48S.m6.gen); md[@"m6_store_refused"] = @(N48S.m6.store_refused);
     pthread_mutex_unlock(&N48S.mu);
-    return d;
+    return md;
 }
 static NSDictionary *n48s_release_request(void) {
     pthread_mutex_lock(&N48S.mu);
     uint64_t o[2] = { 0, 0 }; int rc = -1;
+    for (int xi = 1; xi <= 2; xi++) if (N48XI(xi).sm.acquired) { N48XI(xi).sm.state = N48DF_OFF; n48x_do_release_locked(xi); }   // bundle 13/15: the HDMI instances' A go back first
     if (N48S.sm.acquired && N48S.fr) { if (!N48S.sm.released) { N48S.sm.released = 1; N48S.sm.state = N48DF_OFF; }
         if (N48S.timer) { dispatch_source_cancel(N48S.timer); N48S.timer = nil; }
         rc = N48S.fr(N48R.dev, o); N48LOG("scanout: release (requested) rc %d, verified %llu, plane MC after 0x%llx", rc, (unsigned long long)o[0], (unsigned long long)o[1]); }
@@ -1365,6 +1923,74 @@ static NSString *n48_sha256hex(NSData *d) {
     return s;
 }
 
+// N48_ONCE: one log line per call site per process (no-op stubs are called thousands of times a second by the compositor; moved up in build 6 for the dump helpers)
+#define N48_ONCE(fmt, ...) do { static _Atomic int once_; if (!atomic_exchange(&once_, 1)) N48LOG(fmt, ##__VA_ARGS__); } while (0)
+// Bundle 9 (app crash study item 1): runs when Metal loads this bundle.  Core Image reflects a CIKL string kernel through [device newLibraryWithSource:] and asks the stitchable function
+// for its arguments; that goes to -[_MTLDevice compiler] (nil here), the argument list stays empty and CIKernelReflection::consolidate faults (Preview, Adjust Color).  With the variable
+// at 0 Core Image uses its own kernel-language parser instead.  An existing value (even "1") is never overwritten.  A process that calls kernelWithString before any Metal device exists
+// has already read the flag: the arm script's `launchctl setenv` is the backstop for that.
+__attribute__((constructor)) static void n48_cienv_ctor(void) {
+    int r = n48ce_apply((n48ce_getenv_fn)getenv, setenv);
+    if (r == N48CE_SET) N48_ONCE("cienv: set " N48CE_VAR "=" N48CE_VALUE " (Core Image takes its kernel-language parser, not the nil [device compiler])");
+    else if (r == N48CE_ALREADY_SET) N48_ONCE("cienv: " N48CE_VAR " is already set in this process (=%s); left alone", getenv(N48CE_VAR));
+    else N48_ONCE("cienv: setenv " N48CE_VAR " failed (errno %d)", errno);
+}
+// 0.0.641 (G4 review LOW) kept, bundle build 6 (C1 finding A): the dump area is /tmp/n48m (sticky 01777 parent, n48g_dumproot_ok) and every uid dumps into ITS OWN subdirectory /tmp/n48m/<euid> (0700, a
+// real directory owned by the caller, n48g_dumpdir_ok). No chmod ever follows a symlink; any failed check skips the dump (and says so once per reason in the log). The translate daemon's
+// account is granted list+search on the subdirectory by an ACL entry on the open directory descriptor (n48_dumpacl.h); a failed grant is logged and the dump still happens.
+static int n48_dump_dir_ready(char *sub, size_t subn) {
+    (void)mkdir(N48G_DUMP_DIR, N48G_DUMP_ROOT_MODE);
+    struct stat rs; memset(&rs, 0, sizeof rs);
+    int rrc = lstat(N48G_DUMP_DIR, &rs);
+    if (rrc == 0 && n48g_dumproot_needs_fix((uint32_t)rs.st_uid, (uint32_t)geteuid(), (uint32_t)rs.st_mode) && S_ISDIR(rs.st_mode) && !S_ISLNK(rs.st_mode)) {
+        (void)fchmodat(AT_FDCWD, N48G_DUMP_DIR, N48G_DUMP_ROOT_MODE, AT_SYMLINK_NOFOLLOW);   // ours but not sticky-1777 (the parent a pre-build-6 WindowServer made 0700): repaired, never through a link
+        rrc = lstat(N48G_DUMP_DIR, &rs);
+    }
+    if (!n48g_dumproot_ok(rrc, S_ISDIR(rs.st_mode), S_ISLNK(rs.st_mode), (uint32_t)rs.st_uid, (uint32_t)rs.st_mode, (uint32_t)geteuid())) {
+        N48_ONCE("dump: " N48G_DUMP_DIR " is not usable as the dump parent (lstat rc %d, owner %u, mode %o, caller %u): skipped", rrc, (unsigned)rs.st_uid, (unsigned)(rs.st_mode & 07777), (unsigned)geteuid());
+        return 0;
+    }
+    if (!n48g_dumpsub_path(sub, subn, (uint32_t)geteuid())) return 0;
+    (void)mkdir(sub, 0700);
+    struct stat st; memset(&st, 0, sizeof st);
+    const int rc = lstat(sub, &st);
+    if (!n48g_dumpdir_ok(rc, S_ISDIR(st.st_mode), S_ISLNK(st.st_mode), (uint32_t)st.st_uid, (uint32_t)geteuid())) {
+        N48_ONCE("dump: %s is not usable (lstat rc %d, owner %u, caller %u): skipped", sub, rc, (unsigned)st.st_uid, (unsigned)geteuid());
+        return 0;
+    }
+    static _Atomic int aclDone;   // once per process: narrow + grant on a descriptor that is the directory lstat just described
+    if (!atomic_load(&aclDone)) {
+        const int fd = open(sub, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+        struct stat fs; memset(&fs, 0, sizeof fs);
+        if (fd < 0 || fstat(fd, &fs) != 0 || fs.st_ino != st.st_ino || fs.st_dev != st.st_dev || (uint32_t)fs.st_uid != (uint32_t)geteuid()) {
+            N48LOG("dump: %s changed between the check and the open: skipped", sub);
+            if (fd >= 0) close(fd);
+            return 0;
+        }
+        if (n48g_dumpdir_needs_narrow((uint32_t)fs.st_mode)) (void)fchmod(fd, 0700);
+        const int g = n48da_grant_list(fd, (uid_t)N48G_DAEMON_UID);
+        N48LOG("dump: per-user directory %s ready (daemon list grant: %s)", sub, g == 1 ? "added" : g == 0 ? "already present" : "FAILED, the translate daemon may not see this directory");
+        close(fd);
+        atomic_store(&aclDone, 1);
+    }
+    return 1;
+}
+
+// A dump file appears under its final name only when complete and world-readable: written to a ".tmp" name (the daemon only looks at *.air), fchmod'ed 0644, renamed. 1 = written (or already there with this size).
+static int n48_dump_write(const char *path, NSData *data) {
+    struct stat ex;
+    if (lstat(path, &ex) == 0 && S_ISREG(ex.st_mode) && (uint64_t)ex.st_size == (uint64_t)data.length) return 1;
+    char tmp[1100]; snprintf(tmp, sizeof tmp, "%s.tmp%d", path, (int)getpid());
+    const int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd < 0) return 0;
+    const char *p = data.bytes; size_t left = data.length; int ok = 1;
+    while (left) { const ssize_t w = write(fd, p, left); if (w <= 0) { ok = 0; break; } p += w; left -= (size_t)w; }
+    if (ok && fchmod(fd, 0644) != 0) ok = 0;
+    if (close(fd) != 0) ok = 0;
+    if (!ok || rename(tmp, path) != 0) { (void)unlink(tmp); return 0; }
+    return 1;
+}
+
 // Dumps one function's bitcodeData; appends the .air path to paths, or a problem note to notes.
 static void n48_dump_function(id fn, const char *role, NSMutableArray *paths, NSMutableArray *notes) {
     if (!fn) { [notes addObject:[NSString stringWithFormat:@"%s function is nil", role]]; return; }
@@ -1377,16 +2003,15 @@ static void n48_dump_function(id fn, const char *role, NSMutableArray *paths, NS
            name.UTF8String, class_getName(object_getClass(fn)), (long)stage, (unsigned long)bc.length);
     if (!bc.length) { [notes addObject:[NSString stringWithFormat:@"%s '%@': no bitcodeData", role, name]]; return; }
     NSString *sha = n48_sha256hex(bc);
-    mkdir("/tmp/n48m", 0777); chmod("/tmp/n48m", 0777);
-    NSString *air = [NSString stringWithFormat:@"/tmp/n48m/%@.air", sha];
-    NSString *side = [NSString stringWithFormat:@"/tmp/n48m/%@.%s.json", sha, role];
-    BOOL ok = [bc writeToFile:air atomically:YES];
+    char sub[64];
+    if (!n48_dump_dir_ready(sub, sizeof sub)) { [notes addObject:[NSString stringWithFormat:@"%s function: " N48G_DUMP_DIR " or its per-user subdirectory is not usable (a symlink, or owned by someone else): not dumped", role]]; return; }
+    NSString *air = [NSString stringWithFormat:@"%s/%@.air", sub, sha];
+    NSString *side = [NSString stringWithFormat:@"%s/%@.%s.json", sub, sha, role];
     NSDictionary *meta = @{ @"sha256": sha, @"function": name, @"role": @(role), @"stage": @(stage),
                             @"stageName": stage == 1 ? @"vertex" : stage == 2 ? @"fragment" : stage == 3 ? @"kernel" : @"other",
                             @"bytes": @(bc.length), @"air": air };
     NSData *js = [NSJSONSerialization dataWithJSONObject:meta options:NSJSONWritingPrettyPrinted error:NULL];
-    ok = ok && [js writeToFile:side atomically:YES];
-    chmod(air.UTF8String, 0644); chmod(side.UTF8String, 0644);
+    BOOL ok = n48_dump_write(side.UTF8String, js) && n48_dump_write(air.UTF8String, bc);   // the sidecar FIRST: the daemon starts on the .air, so it always finds the sidecar
     if (!ok) { [notes addObject:[NSString stringWithFormat:@"%s '%@': write to %@ failed", role, name, air]]; return; }
     [paths addObject:[NSString stringWithFormat:@"%@ (%s '%@' stage %ld, sidecar %@)", air, role, name, (long)stage, side]];
 }
@@ -1404,12 +2029,11 @@ static NSError *n48_dump_pipeline(MTLRenderPipelineDescriptor *d) {
 
 
 // ---------------------------------------------------------------------------------------------------------------
-// Metal API gap census fixes (notes/design/NATIVE-S4-METAL-GAPS.md). Shared pieces:
+// Metal API gap census fixes (an internal design note). Shared pieces:
 //   N48_ONCE          one log line per call site per process (no-op stubs are called thousands of times a second by the compositor)
 //   N48_RES_IVARS /   state + the public/SPI MTLResource surface that QuartzCore / SkyLight send to every texture and buffer
 //   N48_RESOURCE_SPI  (census: -setResponsibleProcess: 7450, -protectionOptions 6741, -heap 1397, -virtualAddress 1092 in 45 s)
 // ---------------------------------------------------------------------------------------------------------------
-#define N48_ONCE(fmt, ...) do { static _Atomic int once_; if (!atomic_exchange(&once_, 1)) N48LOG(fmt, ##__VA_ARGS__); } while (0)
 static _Atomic uint64_t n48_uid_ctr;
 static _Atomic uint64_t n48_alloc_total;   // bytes of VkDeviceMemory held by live buffers and textures (-[MTLDevice currentAllocatedSize])
 // Heap membership (m11 H1): a resource made by -[N48Heap newBuffer.../newTexture...] is a normal VkBuffer/VkImage that carries its heap, the offset the heap
@@ -1590,6 +2214,7 @@ static uint64_t n48_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); 
 // flags: N48F_A8 = Metal A8Unorm stored as VK R8_UNORM; sampling goes through a view with components (0,0,0,R) (Metal returns (0,0,0,a)); a render target of this
 // format is refused (a Vulkan attachment view must be identity, so a fragment's alpha cannot be steered into the R8 image).
 #define N48F_A8 1u
+#define N48F_UINT 4u   // bundle 19: an unsigned-integer colour format (RG16Uint): clears fill .uint32, the magenta fallback is masked off, /private/tmp/n48m-nouint restores the old refusal. (2u is N48F_DS below.)
 typedef struct { MTLPixelFormat mtl; VkFormat vk; uint32_t bpp; uint32_t flags; } N48Fmt;
 static const N48Fmt n48_fmts[] = {
     { MTLPixelFormatBGRA8Unorm,      VK_FORMAT_B8G8R8A8_UNORM, 4, 0 },
@@ -1615,7 +2240,16 @@ static const N48Fmt n48_fmts[] = {
     { MTLPixelFormatRG11B10Float,    VK_FORMAT_B10G11R11_UFLOAT_PACK32,  4, 0 },
     // m11h9: A8Unorm (178 NIL lines in the first Metal-compositor run: glyph / mask textures, also buffer-backed)
     { MTLPixelFormatA8Unorm,         VK_FORMAT_R8_UNORM,                 1, N48F_A8 },
+    // bundle 19 (NATIVE-S8-MENUS.md): pixel format 63. Core Animation's large-shadow distance-field pass (brim_init / brim_jump / brim_outline) ping-pongs two of these; the refusal made
+    // emit_large_brim return without drawing, so the whole menu / Spotlight layer vanished. The RADV feature check at texture / pipeline creation stays the fail-closed gate.
+    { MTLPixelFormatRG16Uint,        VK_FORMAT_R16G16_UINT,              4, N48F_UINT },
 };
+#define N48_NOUINT_FILE "/private/tmp/n48m-nouint"   // bundle 19: exists -> the integer formats are refused as before (nil), read ONCE per process
+static BOOL n48_nouint(void) {
+    static BOOL v; static dispatch_once_t once;
+    dispatch_once(&once, ^{ struct stat st; v = stat(N48_NOUINT_FILE, &st) == 0; if (v) N48LOG("integer colour formats (RG16Uint) OFF: kill file " N48_NOUINT_FILE " exists (read once per process)"); });
+    return v;
+}
 // The component mapping of a view of format f whose client swizzle is swz: client channel -> (format's own mapping of that channel). Identity for every format but A8.
 static VkComponentMapping n48_view_map(const N48Fmt *f, MTLTextureSwizzleChannels swz) {
     static const VkComponentSwizzle base[6] = { VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A };
@@ -1630,8 +2264,55 @@ static BOOL n48_is_identity_map(const VkComponentMapping *m) {
            (m->b == VK_COMPONENT_SWIZZLE_B || m->b == VK_COMPONENT_SWIZZLE_IDENTITY) && (m->a == VK_COMPONENT_SWIZZLE_A || m->a == VK_COMPONENT_SWIZZLE_IDENTITY);
 }
 static const N48Fmt *n48_fmt(MTLPixelFormat f) {
-    for (size_t i = 0; i < sizeof n48_fmts / sizeof *n48_fmts; i++) if (n48_fmts[i].mtl == f) return &n48_fmts[i];
+    for (size_t i = 0; i < sizeof n48_fmts / sizeof *n48_fmts; i++) if (n48_fmts[i].mtl == f) return ((n48_fmts[i].flags & N48F_UINT) && n48_nouint()) ? NULL : &n48_fmts[i];
     return NULL;
+}
+// bundle 10: the depth / stencil formats live in their OWN table, so n48_fmt (colour targets, IOSurface- and buffer-backed textures, views, heaps' colour sizing) answers for them exactly as before: NULL.
+// Depth24Unorm_Stencil8 is not in it (AMD has no D24S8 on this path).  The numbers are tied to n48_depth.h by the asserts below.
+#define N48F_DS 2u
+static const N48Fmt n48_dsfmts[] = {
+    { MTLPixelFormatDepth16Unorm,          VK_FORMAT_D16_UNORM,          2, N48F_DS },
+    { MTLPixelFormatDepth32Float,          VK_FORMAT_D32_SFLOAT,         4, N48F_DS },
+    { MTLPixelFormatStencil8,              VK_FORMAT_S8_UINT,            1, N48F_DS },
+    { MTLPixelFormatDepth32Float_Stencil8, VK_FORMAT_D32_SFLOAT_S8_UINT, 8, N48F_DS },
+};
+static const N48Fmt *n48_fmt_ds(MTLPixelFormat f) {
+    for (size_t i = 0; i < sizeof n48_dsfmts / sizeof *n48_dsfmts; i++) if (n48_dsfmts[i].mtl == f) return &n48_dsfmts[i];
+    return NULL;
+}
+static const N48Fmt *n48_fmt_any(MTLPixelFormat f) { const N48Fmt *c = n48_fmt(f); return c ? c : n48_fmt_ds(f); }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"   // the macOS 27 SDK deprecates Depth24Unorm_Stencil8, X24_Stencil8 and Managed: the asserts still name them (this bundle refuses the first two and never creates Managed depth textures)
+_Static_assert((int)MTLPixelFormatDepth16Unorm == N48DP_MTL_DEPTH16 && (int)MTLPixelFormatDepth32Float == N48DP_MTL_DEPTH32 && (int)MTLPixelFormatStencil8 == N48DP_MTL_STENCIL8 &&
+               (int)MTLPixelFormatDepth24Unorm_Stencil8 == N48DP_MTL_D24S8 && (int)MTLPixelFormatDepth32Float_Stencil8 == N48DP_MTL_D32S8 && (int)MTLPixelFormatX32_Stencil8 == N48DP_MTL_X32S8 &&
+               (int)MTLPixelFormatX24_Stencil8 == N48DP_MTL_X24S8, "MTLPixelFormat depth/stencil values");
+_Static_assert((int)VK_FORMAT_D16_UNORM == N48DP_VK_D16 && (int)VK_FORMAT_D32_SFLOAT == N48DP_VK_D32 && (int)VK_FORMAT_S8_UINT == N48DP_VK_S8 && (int)VK_FORMAT_D32_SFLOAT_S8_UINT == N48DP_VK_D32S8, "VkFormat depth/stencil values");
+_Static_assert((int)VK_IMAGE_ASPECT_COLOR_BIT == N48DP_ASP_COLOR && (int)VK_IMAGE_ASPECT_DEPTH_BIT == N48DP_ASP_DEPTH && (int)VK_IMAGE_ASPECT_STENCIL_BIT == N48DP_ASP_STENCIL, "VkImageAspectFlagBits");
+_Static_assert((int)VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT == N48DP_FEAT_SAMPLED && (int)VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT == N48DP_FEAT_DS_ATT, "VkFormatFeatureFlagBits");
+_Static_assert((int)MTLTextureUsageShaderRead == N48DP_USE_READ && (int)MTLTextureUsageShaderWrite == N48DP_USE_WRITE && (int)MTLTextureUsageRenderTarget == N48DP_USE_RT && (int)MTLTextureUsagePixelFormatView == N48DP_USE_PFV, "MTLTextureUsage values (depth)");
+_Static_assert((int)MTLStorageModeShared == N48DP_ST_SHARED && (int)MTLStorageModeManaged == N48DP_ST_MANAGED && (int)MTLStorageModePrivate == N48DP_ST_PRIVATE && (int)MTLStorageModeMemoryless == N48DP_ST_MEMORYLESS, "MTLStorageMode values");
+#pragma clang diagnostic pop
+_Static_assert((int)MTLTextureType2D == N48DP_T_2D && (int)MTLTextureType2DMultisample == N48DP_T_2DMS, "MTLTextureType values (depth)");
+_Static_assert((int)MTLStoreActionDontCare == N48SA_DONTCARE && (int)MTLStoreActionStore == N48SA_STORE && (int)MTLStoreActionMultisampleResolve == N48SA_RESOLVE &&
+               (int)MTLStoreActionStoreAndMultisampleResolve == N48SA_STORE_RESOLVE && (int)MTLStoreActionUnknown == N48SA_UNKNOWN && (int)MTLStoreActionCustomSampleDepthStore == N48SA_CUSTOM, "MTLStoreAction values");
+_Static_assert((int)MTLLoadActionDontCare == N48LA_DONTCARE && (int)MTLLoadActionLoad == N48LA_LOAD && (int)MTLLoadActionClear == N48LA_CLEAR, "MTLLoadAction values");
+_Static_assert((int)VK_ATTACHMENT_LOAD_OP_LOAD == N48VK_LOAD && (int)VK_ATTACHMENT_LOAD_OP_CLEAR == N48VK_CLEAR && (int)VK_ATTACHMENT_LOAD_OP_DONT_CARE == N48VK_LOAD_DONT_CARE &&
+               (int)VK_ATTACHMENT_STORE_OP_STORE == N48VK_STORE && (int)VK_ATTACHMENT_STORE_OP_DONT_CARE == N48VK_STORE_DONT_CARE, "VkAttachmentLoadOp / StoreOp values");
+_Static_assert((int)MTLCompareFunctionNever == N48DS_CMP_NEVER && (int)MTLCompareFunctionLess == N48DS_CMP_LESS && (int)MTLCompareFunctionEqual == N48DS_CMP_EQUAL && (int)MTLCompareFunctionLessEqual == N48DS_CMP_LE &&
+               (int)MTLCompareFunctionGreater == N48DS_CMP_GREATER && (int)MTLCompareFunctionNotEqual == N48DS_CMP_NE && (int)MTLCompareFunctionGreaterEqual == N48DS_CMP_GE && (int)MTLCompareFunctionAlways == N48DS_CMP_ALWAYS, "MTLCompareFunction values");
+_Static_assert((int)VK_COMPARE_OP_NEVER == N48DS_CMP_NEVER && (int)VK_COMPARE_OP_LESS == N48DS_CMP_LESS && (int)VK_COMPARE_OP_EQUAL == N48DS_CMP_EQUAL && (int)VK_COMPARE_OP_LESS_OR_EQUAL == N48DS_CMP_LE &&
+               (int)VK_COMPARE_OP_GREATER == N48DS_CMP_GREATER && (int)VK_COMPARE_OP_NOT_EQUAL == N48DS_CMP_NE && (int)VK_COMPARE_OP_GREATER_OR_EQUAL == N48DS_CMP_GE && (int)VK_COMPARE_OP_ALWAYS == N48DS_CMP_ALWAYS, "VkCompareOp values");
+_Static_assert((int)MTLStencilOperationKeep == N48DS_OP_KEEP && (int)MTLStencilOperationZero == N48DS_OP_ZERO && (int)MTLStencilOperationReplace == N48DS_OP_REPLACE && (int)MTLStencilOperationIncrementClamp == N48DS_OP_INC_CLAMP &&
+               (int)MTLStencilOperationDecrementClamp == N48DS_OP_DEC_CLAMP && (int)MTLStencilOperationInvert == N48DS_OP_INVERT && (int)MTLStencilOperationIncrementWrap == N48DS_OP_INC_WRAP && (int)MTLStencilOperationDecrementWrap == N48DS_OP_DEC_WRAP, "MTLStencilOperation values");
+_Static_assert((int)VK_STENCIL_OP_KEEP == N48DS_OP_KEEP && (int)VK_STENCIL_OP_ZERO == N48DS_OP_ZERO && (int)VK_STENCIL_OP_REPLACE == N48DS_OP_REPLACE && (int)VK_STENCIL_OP_INCREMENT_AND_CLAMP == N48DS_OP_INC_CLAMP &&
+               (int)VK_STENCIL_OP_DECREMENT_AND_CLAMP == N48DS_OP_DEC_CLAMP && (int)VK_STENCIL_OP_INVERT == N48DS_OP_INVERT && (int)VK_STENCIL_OP_INCREMENT_AND_WRAP == N48DS_OP_INC_WRAP && (int)VK_STENCIL_OP_DECREMENT_AND_WRAP == N48DS_OP_DEC_WRAP, "VkStencilOp values");
+_Static_assert((int)VK_DYNAMIC_STATE_VIEWPORT == N48VK_DYN_VIEWPORT && (int)VK_DYNAMIC_STATE_SCISSOR == N48VK_DYN_SCISSOR && (int)VK_DYNAMIC_STATE_DEPTH_BIAS == N48VK_DYN_DEPTH_BIAS && (int)VK_DYNAMIC_STATE_BLEND_CONSTANTS == N48VK_DYN_BLEND_CONSTANTS &&
+               (int)VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK == N48VK_DYN_STENCIL_COMPARE_MASK && (int)VK_DYNAMIC_STATE_STENCIL_WRITE_MASK == N48VK_DYN_STENCIL_WRITE_MASK && (int)VK_DYNAMIC_STATE_STENCIL_REFERENCE == N48VK_DYN_STENCIL_REFERENCE, "VkDynamicState values");
+_Static_assert((int)VK_SAMPLE_COUNT_2_BIT == 2 && (int)VK_SAMPLE_COUNT_4_BIT == 4 && (int)VK_SAMPLE_COUNT_8_BIT == 8, "VkSampleCountFlagBits are the counts");
+// The device's sample counts that are usable for BOTH colour and depth/stencil framebuffer attachments.  0 until RADV is open.
+static unsigned n48_ms_mask(void) {
+    if (!N48R.ok) return 0;
+    return N48R.lim.framebufferColorSampleCounts & N48R.lim.framebufferDepthSampleCounts & N48R.lim.framebufferStencilSampleCounts;
 }
 // RADV's optimal-tiling features of a format (RADV must be open). 0 when the entry point is missing.
 static VkFormatFeatureFlags n48_fmt_feats(const N48Fmt *f) {
@@ -1652,6 +2333,14 @@ static void n48_add_protocols(Class c, const char **names, unsigned n, const cha
 @class N48Texture;
 
 // ---------------------------------------------------------------------------------------------------------------
+// bundle 9: n48_texdesc.h carries the numeric Metal / Vulkan values (it includes neither header); these asserts tie them to the real enums.
+_Static_assert((int)MTLTextureType1D == N48TD_MTL_1D && (int)MTLTextureType1DArray == N48TD_MTL_1DARRAY && (int)MTLTextureType2D == N48TD_MTL_2D && (int)MTLTextureType2DArray == N48TD_MTL_2DARRAY &&
+               (int)MTLTextureType2DMultisample == N48TD_MTL_2DMS && (int)MTLTextureTypeCube == N48TD_MTL_CUBE && (int)MTLTextureTypeCubeArray == N48TD_MTL_CUBEARRAY && (int)MTLTextureType3D == N48TD_MTL_3D, "MTLTextureType values");
+_Static_assert((int)MTLTextureUsageShaderWrite == N48TD_USE_SHADERWRITE && (int)MTLTextureUsageRenderTarget == N48TD_USE_RENDERTARGET, "MTLTextureUsage values");
+_Static_assert((int)VK_IMAGE_TYPE_1D == N48TD_VK_IMAGE_1D && (int)VK_IMAGE_TYPE_2D == N48TD_VK_IMAGE_2D && (int)VK_IMAGE_TYPE_3D == N48TD_VK_IMAGE_3D, "VkImageType values");
+_Static_assert((int)VK_IMAGE_VIEW_TYPE_1D == N48TD_VK_VIEW_1D && (int)VK_IMAGE_VIEW_TYPE_2D == N48TD_VK_VIEW_2D && (int)VK_IMAGE_VIEW_TYPE_3D == N48TD_VK_VIEW_3D && (int)VK_IMAGE_VIEW_TYPE_CUBE == N48TD_VK_VIEW_CUBE &&
+               (int)VK_IMAGE_VIEW_TYPE_1D_ARRAY == N48TD_VK_VIEW_1D_ARRAY && (int)VK_IMAGE_VIEW_TYPE_2D_ARRAY == N48TD_VK_VIEW_2D_ARRAY, "VkImageViewType values");
+_Static_assert((unsigned)VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT == N48TD_VK_CREATE_CUBE_COMPATIBLE, "VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT");
 // N48Texture: VkImage (optimal, DEVICE_LOCAL), always TRANSFER_SRC|DST (10c).
 // ---------------------------------------------------------------------------------------------------------------
 @interface N48Texture : _MTLResource {
@@ -1662,6 +2351,8 @@ static void n48_add_protocols(Class c, const char **names, unsigned n, const cha
     IOSurfaceRef _ios; NSUInteger _iosPlane; BOOL _iosLinear; VkDeviceMemory _imem; VkBuffer _ibuf; uint8_t *_ibase; size_t _ialloc, _ibpr; NSUInteger _ioff;   // P2: _ioff = the plane's byte offset inside the imported allocation (0 for plane 0 / single-plane)
     // gap census: texture views (newTextureViewWithPixelFormat:...) share the ROOT texture's VkImage; _root is the image owner (nil for a root texture).
     N48Texture *_root; MTLTextureSwizzleChannels _swz;
+    unsigned _aspects, _samples;   // bundle 10: _aspects = every VkImageAspect of a depth/stencil format (0 = colour: colour, view, IOSurface- and buffer-backed textures); _samples = the sample count (0 = 1)
+    unsigned _tdk;   // bundle 9: N48TD_K_* (0 = 2D, so IOSurface-, buffer-backed and view textures stay 2D); _layers is also set for cube (6) and 2DArray (arrayLength)
     BOOL _is1D, _arr1D; NSUInteger _layers;   // m11h3: MTLTextureType1D / 1DArray (VkImageType 1D, arrayLayers = _layers); 2D textures keep _is1D NO, _layers 0
     // m11h9: mip levels (2D and 3D), 3D textures (VkImageType 3D, _depth slices) and A8 (the view carries a swizzle, so an identity view per level is made on demand for attachments / storage)
     NSUInteger _levels, _depth; BOOL _is3D, _viewSwz; NSMutableDictionary<NSNumber *, NSNumber *> *_lvViews;
@@ -1671,6 +2362,7 @@ static void n48_add_protocols(Class c, const char **names, unsigned n, const cha
     N48Mem _pm; BOOL _pooled;   // P1: _mem's role is played by _pm (slab range / recycled / own allocation through n48_mem_alloc); _mem is then NULL
     BOOL _impShared, _iosNoBase;   // P4: _imem is a shared import-cache entry (give it back with n48_imp_put, never vkFreeMemory); _iosNoBase = a protected IOSurface with no CPU mapping: a GPU-only texture (no _imem/_ibuf/_ibase, n48IsIOS is NO)
     BOOL _disp; VkBuffer _dbuf;   // S5.2a: CoreDisplay display surface (D-copy source); _dbuf = a VkBuffer over _imem when path (a) has no _ibuf
+    BOOL _led;   // build 16 (P5 Step 0): entered in the live-import ledger (removed in -dealloc)
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d error:(NSError **)err;
 - (void)n48AdoptHeap:(N48Heap *)h offset:(NSUInteger)o size:(NSUInteger)sz bid:(uint64_t)bid;
@@ -1678,6 +2370,8 @@ static void n48_add_protocols(Class c, const char **names, unsigned n, const cha
 - (instancetype)initViewOf:(N48Texture *)root pixelFormat:(MTLPixelFormat)pf swizzle:(MTLTextureSwizzleChannels)swz error:(NSError **)err;
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d buffer:(N48Buffer *)b offset:(NSUInteger)off bytesPerRow:(NSUInteger)bpr error:(NSError **)err;
 - (NSUInteger)n48IOSOffset;
+- (IOSurfaceRef)n48UCSurface;   // build 16 (F3): the retained surface (also for a GPU-only texture), NULL for a buffer-backed one
+- (void)n48AliasKey:(uint32_t *)sid off:(uint64_t *)off;   // build 16 (P1): the range this texture covers: (IOSurface id, plane offset), or (0, host address) for a buffer-backed texture
 - (BOOL)n48IsIOS;
 - (BOOL)n48IsDisp;
 - (VkBuffer)n48DispBuf;
@@ -1692,7 +2386,14 @@ static void n48_add_protocols(Class c, const char **names, unsigned n, const cha
 - (VkImageView)vkView;
 - (uint32_t)n48Layers;
 - (uint32_t)n48Levels;
+- (unsigned)n48Aspects;   // bundle 10: VkImageAspectFlags of every barrier / attachment view of this texture (colour for the colour world)
+- (BOOL)n48IsDS;
+- (BOOL)n48IsUInt;   // bundle 19: an unsigned-integer colour format (RG16Uint)
+- (BOOL)n48IsView;
+- (NSUInteger)n48Samples;
+- (unsigned)n48CopyAspect;   // the aspect of a buffer<->image copy (0 = refuse: a combined depth/stencil format)
 - (VkImageView)n48AttViewLevel:(uint32_t)lv;
+- (VkImageView)n48AttViewLevel:(uint32_t)lv layer:(uint32_t)ly;   // bundle 9: cube / 2D array render targets and attachments are per-layer 2D views
 - (VkFormat)vkFormat;
 - (uint32_t)bytesPerPixel;
 - (VkImageLayout)layout;
@@ -1723,7 +2424,7 @@ static void n48_tex_to(VkCommandBuffer cmd, N48Texture *t, VkImageLayout nl) {
     VkImageMemoryBarrier ib = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
         .oldLayout = [t layout], .newLayout = nl, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = [t vkImage], .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, [t n48Levels], 0, [t n48Layers] } };
+        .image = [t vkImage], .subresourceRange = { n48dp_barrier_aspect([t n48Aspects]), 0, [t n48Levels], 0, [t n48Layers] } };   // bundle 10: a depth/stencil image's barrier names its own aspects
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
     [t setLayout:nl];
 }
@@ -1744,24 +2445,31 @@ static BOOL n48_region_ok(N48Texture *t, MTLRegion r, NSUInteger level, NSUInteg
     _swz = (MTLTextureSwizzleChannels){ MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha };
     _opts = ((NSUInteger)d.storageMode << 4) | ((NSUInteger)d.cpuCacheMode) | ((NSUInteger)d.hazardTrackingMode << 8);
     _fmt = n48_fmt(_pf);
+    BOOL isDS = NO;
+    if (!_fmt && n48dp_is_dsformat((unsigned long)_pf)) {   // bundle 10: depth / stencil formats (own table; D24S8 is refused with its own message)
+        n48dp_fmt_t df;
+        if (!n48dp_fmt((unsigned long)_pf, &df)) { if (err) *err = n48_err(30, [NSString stringWithFormat:@"pixel format %lu: %s", (unsigned long)_pf, df.why]); return nil; }
+        _fmt = n48_fmt_ds(_pf); isDS = _fmt != NULL; _aspects = df.aspects;
+    }
     if (!_fmt) { if (err) *err = n48_err(30, [NSString stringWithFormat:@"pixel format %lu not supported", (unsigned long)_pf]); return nil; }
     // m11h3: 2D, 1D and 1DArray. Mapping chosen: VkImageType 1D + VK_IMAGE_VIEW_TYPE_1D / 1D_ARRAY (not 2D with height 1), because the translated
     // AIR declares a Dim1D arrayed OpTypeImage (Sampled1D) and a descriptor view must have the matching view type; RADV supports 1D images up to 16384.
     // m11h9: mip levels (2D, 3D) and MTLTextureType3D (VkImageType 3D, view type 3D, depth slices in the extent).
     MTLTextureType tt = d.textureType;
-    BOOL is1D = tt == MTLTextureType1D || tt == MTLTextureType1DArray, is3D = tt == MTLTextureType3D;
-    NSUInteger levels = d.mipmapLevelCount ? d.mipmapLevelCount : 1, depth = d.depth ? d.depth : 1;
-    if (!(tt == MTLTextureType2D || is1D || is3D) || (is3D ? d.arrayLength != 1 : depth != 1) || d.sampleCount != 1 ||
-        (tt != MTLTextureType1DArray && d.arrayLength != 1) || d.arrayLength < 1 || (is1D && levels != 1)) {
-        if (err) { *err = n48_err(31, [NSString stringWithFormat:@"only single-sample 2D (mips), 3D (mips) and single-level 1D / 1DArray textures (type %lu depth %lu mips %lu array %lu samples %lu)", (unsigned long)tt,
-            (unsigned long)d.depth, (unsigned long)d.mipmapLevelCount, (unsigned long)d.arrayLength, (unsigned long)d.sampleCount]); } return nil; }
+    n48td_t ti;   // bundle 9: the descriptor check and the Vulkan mapping live in n48_texdesc.h (cube and 2DArray added; everything accepted before maps as before)
+    if (!n48td_map((unsigned long)tt, _w, _h, d.depth, d.arrayLength, d.sampleCount, d.mipmapLevelCount, (unsigned long)d.usage, &ti)) {
+        if (err) { *err = n48_err(31, [NSString stringWithFormat:@"%s (type %lu %lux%lu depth %lu mips %lu array %lu samples %lu usage 0x%lx)", ti.why, (unsigned long)tt, (unsigned long)_w, (unsigned long)_h,
+            (unsigned long)d.depth, (unsigned long)d.mipmapLevelCount, (unsigned long)d.arrayLength, (unsigned long)d.sampleCount, (unsigned long)d.usage]); } return nil; }
+    BOOL is1D = ti.is1D, is3D = ti.is3D;
+    NSUInteger levels = ti.levels, depth = ti.depth;
     { NSUInteger md = MAX(MAX(_w, _h), is3D ? depth : (NSUInteger)1), maxLevels = 1; while (md > 1) { md >>= 1; maxLevels++; }
       if (levels > maxLevels) { if (err) *err = n48_err(42, [NSString stringWithFormat:@"%lu mip levels for a %lux%lux%lu texture (at most %lu)", (unsigned long)levels, (unsigned long)_w, (unsigned long)_h, (unsigned long)depth, (unsigned long)maxLevels]); return nil; } }
     if ((_fmt->flags & N48F_A8) && (d.usage & MTLTextureUsageRenderTarget)) {
         if (err) *err = n48_err(44, @"A8Unorm render targets are not supported (an R8 attachment cannot take the fragment's alpha)"); return nil; }
     if (is3D && (d.usage & MTLTextureUsageRenderTarget)) { if (err) *err = n48_err(45, @"3D render targets are not supported"); return nil; }
     if (!n48_radv_open(err)) return nil;
-    _is1D = is1D; _arr1D = tt == MTLTextureType1DArray; _layers = is1D ? d.arrayLength : 0; _is3D = is3D; _levels = levels; _depth = depth;
+    _is1D = is1D; _arr1D = tt == MTLTextureType1DArray; _layers = ti.layersIvar; _tdk = ti.kind; _is3D = is3D; _levels = levels; _depth = depth; _samples = ti.samples > 1 ? ti.samples : 0;
+    if (ti.samples > 1 && d.storageMode != MTLStorageModePrivate) { if (err) *err = n48_err(31, [NSString stringWithFormat:@"multisample textures are Private storage only (storage mode %lu)", (unsigned long)d.storageMode]); return nil; }
     if (is1D && (d.height != 1 || _w > N48R.lim.maxImageDimension1D || _layers > N48R.lim.maxImageArrayLayers)) {
         if (err) { *err = n48_err(37, [NSString stringWithFormat:@"1D texture %lux%lu array %lu outside RADV limits (width <= %u, layers <= %u, height 1)", (unsigned long)_w, (unsigned long)_h,
             (unsigned long)_layers, N48R.lim.maxImageDimension1D, N48R.lim.maxImageArrayLayers]); } return nil; }
@@ -1769,9 +2477,14 @@ static BOOL n48_region_ok(N48Texture *t, MTLRegion r, NSUInteger level, NSUInteg
         if (err) *err = n48_err(46, [NSString stringWithFormat:@"3D texture %lux%lux%lu outside the RADV limit %u", (unsigned long)_w, (unsigned long)_h, (unsigned long)_depth, N48R.lim.maxImageDimension3D]); return nil; }
     // RADV format features decide the usage bits (before this, every format had colour-attachment and input-attachment usage).
     VkFormatFeatureFlags ff = n48_fmt_feats(_fmt);
-    const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    const VkFormatFeatureFlags need = isDS ? 0 : (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT);   // bundle 10: a depth format needs what its USAGE needs (n48dp_check)
+    if (isDS) {
+        const char *why = NULL;
+        if (!n48dp_check((unsigned long)tt, (unsigned long)d.usage, (unsigned long)d.storageMode, (unsigned)ff, &why)) {
+            if (err) *err = n48_err(48, [NSString stringWithFormat:@"%s (pixel format %lu vk %d features 0x%x type %lu storage %lu usage 0x%lx)", why, (unsigned long)_pf, _fmt->vk, ff, (unsigned long)tt, (unsigned long)d.storageMode, (unsigned long)d.usage]); return nil; }
+    }
     if ((ff & need) != need) { if (err) *err = n48_err(38, [NSString stringWithFormat:@"pixel format %lu (vk %d): RADV features 0x%x lack sampled/transfer", (unsigned long)_pf, _fmt->vk, ff]); return nil; }
-    BOOL canRT = !is1D && !is3D && !(_fmt->flags & N48F_A8) && (ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT);
+    BOOL canRT = isDS ? ((ff & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0) : (!is1D && !is3D && !(_fmt->flags & N48F_A8) && (ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT));
     if ((d.usage & MTLTextureUsageRenderTarget) && !canRT) {
         if (err) *err = n48_err(39, [NSString stringWithFormat:@"pixel format %lu (vk %d) type %lu cannot be a render target on RADV (features 0x%x)", (unsigned long)_pf, _fmt->vk, (unsigned long)tt, ff]); return nil; }
     BOOL wantSt = (d.usage & MTLTextureUsageShaderWrite) != 0;
@@ -1779,19 +2492,27 @@ static BOOL n48_region_ok(N48Texture *t, MTLRegion r, NSUInteger level, NSUInteg
         if (err) *err = n48_err(40, [NSString stringWithFormat:@"pixel format %lu (vk %d) has no storage-image support on RADV (features 0x%x)", (unsigned long)_pf, _fmt->vk, ff]); return nil; }
     VkImageUsageFlags iu = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
         (canRT ? (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) : 0) |   // 11e-2: framebuffer fetch reads the attachment as an input attachment
-        (wantSt ? VK_IMAGE_USAGE_STORAGE_BIT : 0);   // 11e: storage images only when the client asks (compute writes)
-    VkImageCreateFlags icf = (d.usage & MTLTextureUsagePixelFormatView) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;   // gap census: views may reinterpret the format only when the client asked (DCC stays on otherwise)
-    VkImageType vit = is1D ? VK_IMAGE_TYPE_1D : is3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+        (wantSt ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
+    if (isDS) iu = ((ff & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0) | ((ff & VK_FORMAT_FEATURE_TRANSFER_DST_BIT) ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0) |
+                   ((ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) ? VK_IMAGE_USAGE_SAMPLED_BIT : 0) | (canRT ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0);   // bundle 10   // 11e: storage images only when the client asks (compute writes)
+    VkImageCreateFlags icf = ((d.usage & MTLTextureUsagePixelFormatView) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0) | ti.flags;   // bundle 9: ti.flags = CUBE_COMPATIBLE for a cube   // gap census: views may reinterpret the format only when the client asked (DCC stays on otherwise)
+    VkImageType vit = (VkImageType)ti.imageType;
     VkImageFormatProperties ifp;
     VkResult qr = vkGetPhysicalDeviceImageFormatProperties ? vkGetPhysicalDeviceImageFormatProperties(N48R.pd, _fmt->vk, vit, VK_IMAGE_TILING_OPTIMAL, iu, icf, &ifp) : VK_SUCCESS;
     if (qr != VK_SUCCESS && canRT && !(d.usage & MTLTextureUsageRenderTarget)) {   // not asked to be a render target: drop the attachment usages rather than refuse
-        iu &= ~(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
+        iu &= ~(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
         qr = vkGetPhysicalDeviceImageFormatProperties(N48R.pd, _fmt->vk, vit, VK_IMAGE_TILING_OPTIMAL, iu, icf, &ifp);
     }
     if (qr != VK_SUCCESS) { if (err) *err = n48_err(41, [NSString stringWithFormat:@"RADV refuses image type %s format %d usage 0x%x (vkGetPhysicalDeviceImageFormatProperties = %d)", is1D ? "1D" : is3D ? "3D" : "2D", _fmt->vk, iu, qr]); return nil; }
+    if (ti.samples > 1) {   // bundle 10: the count must be offered for THIS format (and usage) and by the device's framebuffer limits (a depth texture is also a framebuffer depth attachment)
+        unsigned fc = vkGetPhysicalDeviceImageFormatProperties ? (unsigned)ifp.sampleCounts : 0u;
+        if (!n48ms_texture_ok(ti.samples, fc, isDS ? n48_ms_mask() : (unsigned)(N48R.lim.framebufferColorSampleCounts))) {
+            if (err) *err = n48_err(49, [NSString stringWithFormat:@"%u samples are not supported for pixel format %lu (vk %d): the format offers 0x%x, the device's framebuffer limits 0x%x", ti.samples, (unsigned long)_pf, _fmt->vk, fc, isDS ? n48_ms_mask() : (unsigned)N48R.lim.framebufferColorSampleCounts]); return nil; }
+    }
+    if (vkGetPhysicalDeviceImageFormatProperties && ti.layers > ifp.maxArrayLayers) { if (err) *err = n48_err(47, [NSString stringWithFormat:@"%u array layers (%s) > RADV's %u for this format", ti.layers, ti.kind == N48TD_K_CUBE ? "cube: 6 faces" : "array", ifp.maxArrayLayers]); return nil; }
     if (vkGetPhysicalDeviceImageFormatProperties && levels > ifp.maxMipLevels) { if (err) *err = n48_err(42, [NSString stringWithFormat:@"%lu mip levels > RADV's %u for this format", (unsigned long)levels, ifp.maxMipLevels]); return nil; }
     VkImageCreateInfo ic = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = vit, .format = _fmt->vk,
-        .extent = { (uint32_t)_w, (uint32_t)_h, is3D ? (uint32_t)_depth : 1 }, .mipLevels = (uint32_t)_levels, .arrayLayers = is1D ? (uint32_t)_layers : 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .extent = { (uint32_t)_w, (uint32_t)_h, is3D ? (uint32_t)_depth : 1 }, .mipLevels = (uint32_t)_levels, .arrayLayers = ti.layers, .samples = (VkSampleCountFlagBits)ti.samples,   // bundle 10: 1 except a 2D multisample texture
         .flags = icf, .tiling = VK_IMAGE_TILING_OPTIMAL, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .usage = iu };
     VkResult r = vkCreateImage(N48R.dev, &ic, NULL, &_img);
     if (r != VK_SUCCESS) { if (err) *err = n48_err(32, [NSString stringWithFormat:@"vkCreateImage = %d", r]); return nil; }
@@ -1814,8 +2535,8 @@ static BOOL n48_region_ok(N48Texture *t, MTLRegion r, NSUInteger level, NSUInteg
     }
     VkComponentMapping cm = n48_view_map(_fmt, _swz); _viewSwz = !n48_is_identity_map(&cm);
     VkImageViewCreateInfo vc = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = _img,
-        .viewType = is1D ? (_arr1D ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D) : is3D ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D,
-        .format = _fmt->vk, .components = cm, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint32_t)_levels, 0, is1D ? (uint32_t)_layers : 1 } };
+        .viewType = (VkImageViewType)ti.viewType,
+        .format = _fmt->vk, .components = cm, .subresourceRange = { isDS ? n48dp_view_aspect(_aspects) : VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint32_t)_levels, 0, ti.layers } };   // bundle 10: a depth/stencil sampling view has ONE aspect
     r = vkCreateImageView(N48R.dev, &vc, NULL, &_view);
     if (r != VK_SUCCESS) { if (err) *err = n48_err(36, [NSString stringWithFormat:@"vkCreateImageView = %d", r]); return nil; }
     N48LOG("N48Texture %p: %lux%lu%s pf %lu vkformat %d levels %lu (alloc %llu, memtype %d)%s", (__bridge void *)self, (unsigned long)_w, (unsigned long)_h, is3D ? [NSString stringWithFormat:@"x%lu (3D)", (unsigned long)_depth].UTF8String : "",
@@ -1823,18 +2544,23 @@ static BOOL n48_region_ok(N48Texture *t, MTLRegion r, NSUInteger level, NSUInteg
     return self;
 }
 // A single-level, identity-swizzle view for attachments, input attachments and storage images. Level 0 of a one-level, unswizzled texture is the sampling view itself.
-- (VkImageView)n48AttViewLevel:(uint32_t)lv {
+// Bundle 9: a cube or 2D-array texture is attached one layer at a time (a plain 2D view of layer ly); every other texture has only layer 0.
+- (VkImageView)n48AttViewLevel:(uint32_t)lv { return [self n48AttViewLevel:lv layer:0]; }
+- (VkImageView)n48AttViewLevel:(uint32_t)lv layer:(uint32_t)ly {
     if (_root) return _view;
-    if (lv == 0 && _levels <= 1 && !_viewSwz) return _view;
+    BOOL sameAsp = !_aspects || _aspects == n48dp_view_aspect(_aspects);   // bundle 10: the sampling view is the attachment view unless a combined depth/stencil format needs both aspects
+    if (lv == 0 && ly == 0 && _levels <= 1 && !_viewSwz && !n48td_is_layered2d(_tdk) && sameAsp) return _view;
+    n48td_att_t av; if (!n48td_att_view(_tdk, (unsigned)_layers, ly, &av)) { N48LOG("n48AttViewLevel %u layer %u: the texture has %u layer(s); falling back to the sampling view", lv, ly, n48td_nlayers((unsigned)_layers)); return _view; }
     @synchronized (self) {
         if (!_lvViews) _lvViews = [NSMutableDictionary dictionary];
-        NSNumber *have = _lvViews[@(lv)]; if (have) return (VkImageView)(uintptr_t)have.unsignedLongLongValue;
+        NSNumber *key = @(((unsigned long long)ly << 32) | lv);
+        NSNumber *have = _lvViews[key]; if (have) return (VkImageView)(uintptr_t)have.unsignedLongLongValue;
         VkImageViewCreateInfo vc = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = _img,
-            .viewType = _is1D ? (_arr1D ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D) : _is3D ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D, .format = _fmt->vk,
-            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, lv, 1, 0, _is1D ? (uint32_t)_layers : 1 } };
+            .viewType = (VkImageViewType)av.viewType, .format = _fmt->vk,
+            .subresourceRange = { n48dp_barrier_aspect(_aspects), lv, 1, av.baseLayer, av.layerCount } };   // bundle 10: colour, or every depth/stencil aspect of the format
         VkImageView v = VK_NULL_HANDLE; VkResult r = vkCreateImageView(N48R.dev, &vc, NULL, &v);
-        if (r != VK_SUCCESS) { N48LOG("n48AttViewLevel %u: vkCreateImageView = %d; falling back to the sampling view", lv, r); return _view; }
-        _lvViews[@(lv)] = @((unsigned long long)(uintptr_t)v); return v;
+        if (r != VK_SUCCESS) { N48LOG("n48AttViewLevel %u layer %u: vkCreateImageView = %d; falling back to the sampling view", lv, ly, r); return _view; }
+        _lvViews[key] = @((unsigned long long)(uintptr_t)v); return v;
     }
 }
 - (void)n48AdoptHeap:(N48Heap *)h offset:(NSUInteger)o size:(NSUInteger)sz bid:(uint64_t)bid {
@@ -1854,12 +2580,13 @@ static BOOL n48_region_ok(N48Texture *t, MTLRegion r, NSUInteger level, NSUInteg
         if (_imem && _impShared) n48_imp_put(_imem);   // P4: the shared import goes back to the cache (kept 2 s; freed later through the fence)
         else if (_imem) { vkFreeMemory(N48R.dev, _imem, NULL); @synchronized ([Navi48Device class]) { N48R.impTotal -= _ialloc; } }
     }
-    if (_ios) { IOSurfaceDecrementUseCount(_ios); CFRelease(_ios); }
+    if (_led) n48_led_del(self);   // build 16 (P5 Step 0)
+    if (_ios) CFRelease(_ios);   // build 16 (F3): no use count is held for the texture's life any more; a command buffer holds it while in flight
 }
 N48_DNR(N48Texture)
 // ---- 11h.6: IOSurface-backed texture ----
 // Accepts a 2D, page-aligned (P2: any plane of a 2/3-plane surface, via n48_plane.h), page-multiple 32 bpp surface (BGRA8Unorm / RGBA8Unorm descriptors); anything else returns nil + log.
-// The surface is retained and use-counted for the texture's lifetime; its pages are imported once (whole allocation).
+// The surface is retained for the texture's lifetime (build 16, F3: NOT use-counted for its life; a command buffer use-counts it while in flight, n48_ledger.h); its pages are imported once (whole allocation).
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)s plane:(NSUInteger)plane error:(NSError **)err {
     self = [super init];
     if (!self) return nil;
@@ -1900,11 +2627,17 @@ N48_DNR(N48Texture)
     size_t alloc = IOSurfaceGetAllocSize(s);
     uint32_t spf = IOSurfaceGetPixelFormat(s);
     N48LOG("newTexture(iosurface): id %u %zux%zu bpr %zu allocSize %zu base %p pixelFormat 0x%08x planes %zu", IOSurfaceGetID(s), sw, sh, bpr, alloc, base, spf, pc);
+    // F1 (build 16): when the import of the surface is refused (out of the kernel's import budget, an unimportable range) this init does NOT return nil (SkyLight aborts on a nil texture: AbortWithTextureInfo). It jumps to
+    // the "baseless" branch below (same GPU-only image, same classification) with f1 set: the content captured through this wrapper is blank, the process stays up. The import cache is flushed and the import retried
+    // first (n48_imp_get). The branch itself is not edited for this except that a size difference between descriptor and plane no longer refuses and no "protected" note is logged.
+    BOOL f1 = NO;
+    #define N48F1_FALL(...) do { f1 = YES; atomic_fetch_add(&N48LED.f1Fallbacks, 1); static _Atomic int f1log_; if (atomic_fetch_add(&f1log_, 1) < 16) { NSString *w_ = [NSString stringWithFormat:__VA_ARGS__]; N48LOG("F1: the import of IOSurface %u was refused (%s): GPU-only texture instead of nil (the content captured through this wrapper is blank; the process stays up)", IOSurfaceGetID(s), w_.UTF8String); } goto nobase_path; } while (0)
     if (!pbase || !base) {   // P4: a protected IOSurface has no CPU mapping (CoreDisplay's DisplaySurface::GetMTLTexture cannot survive a nil texture). Not refused: a device-local optimal image of the descriptor's
         // size/format that is NOT backed by the surface's memory (the surface's contents are not shared). No import, no _ibuf, no _ibase: n48IsIOS is NO, so no upload/write-back copy and no CPU path touches a NULL base.
         // P6: classified like any other IOSurface texture (below, before return): with only the VkImage as D-copy source (vkCmdCopyImageToBuffer).
-        n48_baseless_note(IOSurfaceGetID(s));
-        if (_w != sw || _h != sh) IOSFAIL(79, @"IOSurface has no CPU mapping and the descriptor %lux%lu differs from the plane %zux%zu", (unsigned long)_w, (unsigned long)_h, sw, sh);
+      nobase_path:
+        if (!f1) n48_baseless_note(IOSurfaceGetID(s));
+        if (!f1 && (_w != sw || _h != sh)) IOSFAIL(79, @"IOSurface has no CPU mapping and the descriptor %lux%lu differs from the plane %zux%zu", (unsigned long)_w, (unsigned long)_h, sw, sh);
         VkFormatFeatureFlags nbf = n48_fmt_feats(_fmt);
         BOOL nbAtt = !(_fmt->flags & N48F_A8) && (nbf & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT);
         VkImageUsageFlags nbu = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | (nbAtt ? (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) : 0) |
@@ -1936,7 +2669,7 @@ N48_DNR(N48Texture)
             .format = _fmt->vk, .components = nbm, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
         nr = vkCreateImageView(N48R.dev, &nvc, NULL, &_view);
         if (nr != VK_SUCCESS) IOSFAIL(91, @"vkCreateImageView = %d", nr);
-        _iosNoBase = YES; _ios = (IOSurfaceRef)CFRetain(s); IOSurfaceIncrementUseCount(s);   // retained + use-counted like any IOSurface texture; set last so a failed init above never decrements
+        _iosNoBase = YES; _ios = (IOSurfaceRef)CFRetain(s); n48_led_add(self, s, 0, spf, (uint32_t)pc, YES); _led = YES;   // retained (F3: not use-counted for its life) and entered in the ledger; set last so a failed init above never releases
         N48LOG("newTexture(iosurface) %p: plane %lu %zux%zu bpr %zu pf %lu -> GPU-ONLY (no CPU mapping): optimal VkImage, not backed by the surface's memory", (__bridge void *)self, (unsigned long)plane, sw, sh, bpr, (unsigned long)_pf);
         // P6: same rule as the mapped surfaces (n48s_classify: geometry/pitch vs the plane + the DisplaySurface::GetMTLTexture backtrace). Inputs: width/height/pixel format/bytesPerRow/allocSize from the IOSurface
         // object (none needs a CPU mapping); alloc 0 -> bpr*height (n48df_nobase_alloc); the cache key's base is 0, which no mapped surface has (a mapped one passed the !base test above).
@@ -1947,7 +2680,7 @@ N48_DNR(N48Texture)
         }
         return self;
     }
-    if (((uintptr_t)base & (N48R.hostAlign - 1)) || !alloc) IOSFAIL(80, @"base %p / allocSize %zu: base not aligned to %llu (page-aligned surfaces only)", base, alloc, (unsigned long long)N48R.hostAlign);
+    if (((uintptr_t)base & (N48R.hostAlign - 1)) || !alloc) N48F1_FALL(@"base %p / allocSize %zu: base not aligned to %llu (page-aligned surfaces only)", base, alloc, (unsigned long long)N48R.hostAlign);
     pin.alloc = alloc; pin.poff = ((uintptr_t)pbase >= (uintptr_t)base) ? (uint64_t)((uintptr_t)pbase - (uintptr_t)base) : UINT64_MAX;
     if (!n48pl_bound(&pin, &pout)) IOSFAIL(pout.code, @"%s", pout.why);
     const NSUInteger poff = (NSUInteger)pout.off;
@@ -1956,23 +2689,23 @@ N48_DNR(N48Texture)
     // Import the whole pages that hold the surface: round up to the host-pointer alignment. The extra tail bytes are the surface's own page, never another object's.
     const size_t ialloc = (alloc + (size_t)N48R.hostAlign - 1) & ~((size_t)N48R.hostAlign - 1);
     if (ialloc != alloc) N48LOG("newTexture(iosurface): allocSize %zu rounded up to %zu for the page-granular import", alloc, ialloc);
-    if (ialloc > 64u << 20) IOSFAIL(82, @"allocSize %zu > 64 MiB (the N48N per-BO import limit)", ialloc);
+    if (ialloc > 64u << 20) N48F1_FALL(@"allocSize %zu > 64 MiB (the N48N per-BO import limit)", ialloc);
     // Import (whole allocation). The kernel refuses BAR pages, unaligned ranges and > 256 MiB per client; that arrives as a vkAllocateMemory error.
     VkMemoryHostPointerPropertiesEXT hp = { .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT };
     uint64_t timp_ = n48_now();
     VkResult r = n48_vkGetMHPP(N48R.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, base, &hp);
-    if (r != VK_SUCCESS || !hp.memoryTypeBits) IOSFAIL(83, @"vkGetMemoryHostPointerPropertiesEXT = %d bits 0x%x", r, hp.memoryTypeBits);
+    if (r != VK_SUCCESS || !hp.memoryTypeBits) N48F1_FALL(@"vkGetMemoryHostPointerPropertiesEXT = %d bits 0x%x", r, hp.memoryTypeBits);
     int hmt = n48_find_mem(hp.memoryTypeBits, 0);
     VkImportMemoryHostPointerInfoEXT imp = { .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = base };
     VkMemoryAllocateInfo ma = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = ialloc, .memoryTypeIndex = (uint32_t)hmt };
     BOOL impHit = NO;
     if (N48IC.on) { r = n48_imp_get(s, base, ialloc, &ma, &_imem, &impHit); _impShared = YES; }   // P4: shared import (a reused one is a hit)
-    else r = vkAllocateMemory(N48R.dev, &ma, NULL, &_imem);
+    else r = n48_import_alloc(&ma, &_imem);
     n48t_add(&T1.imp, n48_now() - timp_);
-    if (r != VK_SUCCESS) { _imem = VK_NULL_HANDLE; _impShared = NO; IOSFAIL(84, @"vkAllocateMemory(import %zu B at %p) = %d", ialloc, base, r); }
+    if (n48f1_action((int)r) == N48F1_FALLBACK) { _imem = VK_NULL_HANDLE; _impShared = NO; N48F1_FALL(@"vkAllocateMemory(import %zu B at %p) = %d, running import total %llu B", ialloc, base, r, (unsigned long long)N48R.impTotal); }
     if (impHit) { static _Atomic int nlog; if (atomic_fetch_add(&nlog, 1) < 8) N48LOG("newTexture(iosurface): id %u import REUSED from the cache (%zu B)", IOSurfaceGetID(s), ialloc); }
     else @synchronized ([Navi48Device class]) { N48R.impTotal += ialloc; N48LOG("newTexture(iosurface): imported %zu B (host memory type %d, bits 0x%x); running import total %llu B", ialloc, hmt, hp.memoryTypeBits, (unsigned long long)N48R.impTotal); }
-    _ialloc = ialloc; _ibase = (uint8_t *)base + poff; _ioff = poff; _ibpr = bpr; _ios = (IOSurfaceRef)CFRetain(s); IOSurfaceIncrementUseCount(s); _size = ialloc;
+    _ialloc = ialloc; _ibase = (uint8_t *)base + poff; _ioff = poff; _ibpr = bpr; _ios = (IOSurfaceRef)CFRetain(s); n48_led_add(self, s, ialloc, spf, (uint32_t)pc, NO); _led = YES; _size = ialloc;   // F3: retained, not use-counted for its life; entered in the ledger
     VkFormatFeatureFlags offs = n48_fmt_feats(_fmt);
     BOOL attOK = !(_fmt->flags & N48F_A8) && (offs & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT);
     VkImageUsageFlags use = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | (attOK ? (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) : 0) |
@@ -1996,8 +2729,8 @@ N48_DNR(N48Texture)
             VkImageSubresource sr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 }; VkSubresourceLayout sl; vkGetImageSubresourceLayout(N48R.dev, li, &sr, &sl);
             VkMemoryRequirements mr; vkGetImageMemoryRequirements(N48R.dev, li, &mr);
             BOOL pitchOK = sl.rowPitch == bpr && sl.offset == 0;
-            N48LOG("newTexture(iosurface): linear layout for %zux%zu: rowPitch %llu offset %llu size %llu vs IOSurface bytesPerRow %zu -> %s; image req size %llu align %llu typeBits 0x%x (host bits 0x%x)",
-                   sw, sh, (unsigned long long)sl.rowPitch, (unsigned long long)sl.offset, (unsigned long long)sl.size, bpr, pitchOK ? "MATCH" : "MISMATCH",
+            N48LOG("newTexture(iosurface): linear layout for %lux%lu (descriptor; surface %zux%zu): rowPitch %llu offset %llu size %llu vs IOSurface bytesPerRow %zu -> %s; image req size %llu align %llu typeBits 0x%x (host bits 0x%x)",
+                   (unsigned long)_w, (unsigned long)_h, sw, sh, (unsigned long long)sl.rowPitch, (unsigned long long)sl.offset, (unsigned long long)sl.size, bpr, pitchOK ? "MATCH" : "MISMATCH",
                    (unsigned long long)mr.size, (unsigned long long)mr.alignment, mr.memoryTypeBits, hp.memoryTypeBits);
             BOOL fits = pitchOK && n48pl_bind_ok(poff, mr.size, mr.alignment, ialloc) && (mr.alignment == 0 || ((uintptr_t)base % mr.alignment) == 0) && (mr.memoryTypeBits & (1u << hmt));
             if (pitchOK && !fits && poff) N48LOG("newTexture(iosurface): plane offset %lu: LINEAR bind at that offset not possible (image align %llu size %llu, import %zu) -> copy path (b)", (unsigned long)poff, (unsigned long long)mr.alignment, (unsigned long long)mr.size, ialloc);
@@ -2043,7 +2776,7 @@ N48_DNR(N48Texture)
     N48LOG("newTexture(iosurface) %p: plane %lu offset %lu %zux%zu bpr %zu pf %lu -> PATH (%s): %s", (__bridge void *)self, (unsigned long)plane, (unsigned long)poff, sw, sh, bpr, (unsigned long)_pf, _iosLinear ? "a" : "b",
            _iosLinear ? "LINEAR VkImage bound directly to the imported IOSurface pages" : "optimal VkImage + copies to/from a VkBuffer over the imported pages (bufferRowLength = bytesPerRow/4)");
     // S5.2a: is this one of CoreDisplay's display surfaces (D-copy source)? A buffer over the import is the copy's source (path (b) already has _ibuf).
-    if (pc <= 1 && n48s_classify(sw, sh, spf, d.usage, bpr, alloc, IOSurfaceGetID(s), base)) {
+    if (pc <= 1 && _w == sw && _h == sh && n48s_classify(sw, sh, spf, d.usage, bpr, alloc, IOSurfaceGetID(s), base)) {   // build 7: only an exact-size texture can be a display surface
         if (_ibuf) _disp = YES;
         else {
             VkBufferCreateInfo dbc = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = alloc, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT };
@@ -2123,6 +2856,11 @@ N48_DNR(N48Texture)
 - (unsigned)n48DispSid { return (_disp && _ios) ? (unsigned)IOSurfaceGetID(_ios) : 0; }
 - (BOOL)n48IsIOS { return (_ios != NULL && !_iosNoBase) || _hostBuf != nil; }   // host-backed: IOSurface memory or a buffer's memory
 - (NSUInteger)n48IOSOffset { return _hostBuf ? _hoff : _ioff; }
+- (IOSurfaceRef)n48UCSurface { return _ios; }
+- (void)n48AliasKey:(uint32_t *)sid off:(uint64_t *)off {
+    if (_hostBuf) { *sid = 0; *off = (uint64_t)(uintptr_t)[_hostBuf contents] + (uint64_t)_hoff; }
+    else { *sid = _ios ? (uint32_t)IOSurfaceGetID(_ios) : 0; *off = (uint64_t)_ioff; }
+}
 - (BOOL)n48IOSLinear { return _iosLinear; }
 - (VkBuffer)n48IOSBuffer { return _hostBuf ? [_hostBuf vkBuffer] : _ibuf; }
 - (size_t)n48IOSBytesPerRow { return _ibpr; }
@@ -2154,7 +2892,7 @@ N48_DNR(N48Texture)
     BOOL ok = n48_oneshot(&err, ^(VkCommandBuffer cmd) {
         n48_tex_to(cmd, self, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkBufferImageCopy bic = { .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0,
-            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)lvl, self->_is3D ? 0 : (uint32_t)slice, 1 }, .imageOffset = { (int32_t)r.origin.x, (int32_t)r.origin.y, (int32_t)r.origin.z },
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)lvl, n48td_base_layer(self->_is3D, slice), 1 }, .imageOffset = { (int32_t)r.origin.x, (int32_t)r.origin.y, (int32_t)r.origin.z },
             .imageExtent = { (uint32_t)r.size.width, (uint32_t)r.size.height, (uint32_t)nz } };
         vkCmdCopyBufferToImage(cmd, sb, [self vkImage], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
         n48_tex_to(cmd, self, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -2185,7 +2923,7 @@ N48_DNR(N48Texture)
     VkBuffer sb = [stg vkBuffer]; VkImageLayout was = [self layout];
     BOOL ok = n48_oneshot(&err, ^(VkCommandBuffer cmd) {
         n48_tex_to(cmd, self, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        VkBufferImageCopy bic = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)lvl, self->_is3D ? 0 : (uint32_t)slice, 1 }, .imageOffset = { (int32_t)r.origin.x, (int32_t)r.origin.y, (int32_t)r.origin.z },
+        VkBufferImageCopy bic = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)lvl, n48td_base_layer(self->_is3D, slice), 1 }, .imageOffset = { (int32_t)r.origin.x, (int32_t)r.origin.y, (int32_t)r.origin.z },
             .imageExtent = { (uint32_t)r.size.width, (uint32_t)r.size.height, (uint32_t)nz } };
         vkCmdCopyImageToBuffer(cmd, [self vkImage], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sb, 1, &bic);
         VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT };
@@ -2201,8 +2939,14 @@ N48_DNR(N48Texture)
 }
 - (VkImage)vkImage { return _root ? [_root vkImage] : _img; }
 - (VkImageView)vkView { return _view; }
-- (uint32_t)n48Layers { return _root ? [_root n48Layers] : (_layers ? (uint32_t)_layers : 1); }
+- (uint32_t)n48Layers { return _root ? [_root n48Layers] : n48td_nlayers((unsigned)_layers); }
 - (uint32_t)n48Levels { return _root ? [_root n48Levels] : (uint32_t)(_levels ? _levels : 1); }
+- (unsigned)n48Aspects { return n48dp_barrier_aspect(_root ? [_root n48Aspects] : _aspects); }
+- (BOOL)n48IsDS { return (_root ? [_root n48Aspects] : _aspects) != 0 && (_root ? [_root n48Aspects] : _aspects) != N48DP_ASP_COLOR; }
+- (BOOL)n48IsUInt { return _fmt != NULL && (_fmt->flags & N48F_UINT) != 0; }
+- (BOOL)n48IsView { return _root != nil; }
+- (NSUInteger)n48Samples { return _root ? 1 : (_samples ? _samples : 1); }
+- (unsigned)n48CopyAspect { return [self n48IsDS] ? n48dp_copy_aspect([self n48Aspects]) : N48DP_ASP_COLOR; }
 - (VkFormat)vkFormat { return _fmt->vk; }
 - (uint32_t)bytesPerPixel { return _fmt->bpp; }
 - (VkImageLayout)layout { return _root ? [_root layout] : _layout; }
@@ -2210,14 +2954,14 @@ N48_DNR(N48Texture)
 - (id)device { return _dev; }
 - (NSString *)label { return _lbl; }
 - (void)setLabel:(NSString *)l { _lbl = [l copy]; }
-- (MTLTextureType)textureType { return _is1D ? (_arr1D ? MTLTextureType1DArray : MTLTextureType1D) : _is3D ? MTLTextureType3D : MTLTextureType2D; }
+- (MTLTextureType)textureType { return (MTLTextureType)n48td_mtl_type(_tdk); }   // bundle 9: from the kind (0 = 2D for view / IOSurface / buffer-backed textures)
 - (MTLPixelFormat)pixelFormat { return _pf; }
 - (NSUInteger)width { return _w; }
 - (NSUInteger)height { return _h; }
 - (NSUInteger)depth { return _is3D ? _depth : 1; }
 - (NSUInteger)mipmapLevelCount { return _root ? 1 : (_levels ? _levels : 1); }
-- (NSUInteger)sampleCount { return 1; }
-- (NSUInteger)arrayLength { return _is1D ? _layers : 1; }
+- (NSUInteger)sampleCount { return [self n48Samples]; }
+- (NSUInteger)arrayLength { return n48td_array_length(_tdk, (unsigned)_layers); }
 - (NSUInteger)usage { return _usage; }
 - (BOOL)isFramebufferOnly { return NO; }
 - (NSUInteger)firstMipmapInTail { return 0; }
@@ -2280,7 +3024,12 @@ N48_RESOURCE_SPI
     if (!root || root->_root) VFAIL(92, @"a view needs a root texture");
     if ([root n48IsIOS]) VFAIL(93, @"views of IOSurface-backed textures are not implemented");
     if (root->_is1D) VFAIL(99, @"views of 1D / 1DArray textures are not implemented");
+    if (n48td_is_layered2d(root->_tdk)) VFAIL(98, @"views of cube / 2D-array textures are not implemented");
+    if (root->_samples > 1) VFAIL(100, @"views of multisample textures are not implemented");
     const N48Fmt *f = n48_fmt(pf);
+    if (root->_aspects) {   // bundle 10: a view of a depth/stencil texture keeps the texture's own format (no reinterpretation) and its single sampling aspect
+        if (pf != root->_pf) VFAIL(101, @"pixel-format views of a depth/stencil texture (%lu -> %lu) are not supported", (unsigned long)root->_pf, (unsigned long)pf);
+        f = root->_fmt; }
     if (!f) VFAIL(94, @"view pixel format %lu not supported", (unsigned long)pf);
     if (pf != root->_pf) {
         if (f->bpp != root->_fmt->bpp) VFAIL(95, @"view pixel format %lu has %u bytes per pixel, the texture has %u", (unsigned long)pf, f->bpp, root->_fmt->bpp);
@@ -2292,7 +3041,7 @@ N48_RESOURCE_SPI
     VkComponentMapping vcm = n48_view_map(f, swz);   // composes the client swizzle with the format's own (A8: (0,0,0,R))
     _levels = 1; _depth = 1; _viewSwz = YES;
     VkImageViewCreateInfo vc = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = [root vkImage], .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = f->vk,
-        .components = vcm, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+        .components = vcm, .subresourceRange = { root->_aspects ? n48dp_view_aspect(root->_aspects) : VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
     VkResult r = vkCreateImageView(N48R.dev, &vc, NULL, &_view);
     if (r != VK_SUCCESS) VFAIL(98, @"vkCreateImageView = %d", r);
     N48LOG("N48Texture view %p of %p: pf %lu -> %lu (vk format %d -> %d), swizzle %u%u%u%u", (__bridge void *)self, (__bridge void *)root, (unsigned long)root->_pf, (unsigned long)pf, root->_fmt->vk, f->vk,
@@ -2323,9 +3072,10 @@ static NSUInteger n48_alup(NSUInteger v, NSUInteger a) { return (NSUInteger)n48h
 // Size and alignment of a texture inside a heap: the tight pixel bytes (all slices), 256-aligned. Device-specific (an Apple-silicon Mac says 16512 for 64x64 RGBA8; any
 // consistent value is correct for a budget).
 static BOOL n48_heap_tex_sa(MTLTextureDescriptor *d, NSUInteger *size, NSUInteger *align) {
-    const N48Fmt *f = n48_fmt(d.pixelFormat); if (!f) return NO;
-    NSUInteger layers = d.textureType == MTLTextureType1DArray ? d.arrayLength : 1, lv = d.mipmapLevelCount ? d.mipmapLevelCount : 1, dp = d.textureType == MTLTextureType3D ? (d.depth ? d.depth : 1) : 1, tot = 0;
+    const N48Fmt *f = n48_fmt_any(d.pixelFormat); if (!f) return NO;   // bundle 10: depth/stencil sizing too
+    NSUInteger layers = (NSUInteger)n48td_heap_layers((unsigned long)d.textureType, d.arrayLength), lv = d.mipmapLevelCount ? d.mipmapLevelCount : 1, dp = d.textureType == MTLTextureType3D ? (d.depth ? d.depth : 1) : 1, tot = 0;
     for (NSUInteger L = 0; L < lv; L++) tot += MAX((NSUInteger)1, d.width >> L) * MAX((NSUInteger)1, d.height >> L) * MAX((NSUInteger)1, dp >> L) * layers * f->bpp;   // m11h9: every level, 3D depth
+    if (d.textureType == MTLTextureType2DMultisample && d.sampleCount > 1) tot *= d.sampleCount;   // bundle 10: every sample is stored
     *size = n48_alup(tot, N48_HEAP_ALIGN); *align = N48_HEAP_ALIGN; return YES;
 }
 @implementation N48Heap {
@@ -2484,19 +3234,30 @@ N48_DNR(N48SamplerState)
 // MTLDepthStencilState: SkyLight and QuartzCore create one each at start-up (-newDepthStencilStateWithDescriptor:, census rdt1), and the compositor sends
 // -setDepthStencilState: on its encoders. The render passes here have colour attachments only (no depth/stencil exist), for which Metal makes the
 // state a no-op, so this object records the descriptor and nothing else.
-@interface N48DepthStencilState : NSObject { id _dev; NSString *_lbl; MTLDepthStencilDescriptor *_d; }
+// bundle 10: the state IS used now (a pipeline with a depth/stencil attachment reads it at every draw): compare, depth write, the two stencil faces (compare, ops, masks).
+typedef struct { unsigned long cmp; int write; n48ds_face_in_t f, b; uint32_t fRead, fWrite, bRead, bWrite; } N48DSInfo;
+static N48DSInfo n48_dsinfo_default(void) { return (N48DSInfo){ N48DS_CMP_ALWAYS, 0, { N48DS_CMP_ALWAYS, 0, 0, 0 }, { N48DS_CMP_ALWAYS, 0, 0, 0 }, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu }; }
+@interface N48DepthStencilState : NSObject { id _dev; NSString *_lbl; MTLDepthStencilDescriptor *_d; N48DSInfo _info; }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLDepthStencilDescriptor *)d;
 - (MTLDepthStencilDescriptor *)n48Descriptor;
+- (N48DSInfo)n48Info;
 @end
 @implementation N48DepthStencilState
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLDepthStencilDescriptor *)d {
     self = [super init]; if (!self) return nil;
     _dev = dev; _d = [d copy]; _lbl = [d.label copy];
-    N48LOG("N48DepthStencilState %p: depth compare %lu write %d (recorded only: no depth/stencil attachments exist)", (__bridge void *)self, (unsigned long)d.depthCompareFunction, (int)d.depthWriteEnabled);
+    _info = n48_dsinfo_default();
+    _info.cmp = (unsigned long)d.depthCompareFunction; _info.write = d.depthWriteEnabled ? 1 : 0;   // bundle 10
+    MTLStencilDescriptor *fs = d.frontFaceStencil, *bs = d.backFaceStencil;   // nil = Always / Keep / masks all ones
+    if (fs) { _info.f = (n48ds_face_in_t){ (unsigned long)fs.stencilCompareFunction, (unsigned long)fs.stencilFailureOperation, (unsigned long)fs.depthFailureOperation, (unsigned long)fs.depthStencilPassOperation }; _info.fRead = fs.readMask; _info.fWrite = fs.writeMask; }
+    if (bs) { _info.b = (n48ds_face_in_t){ (unsigned long)bs.stencilCompareFunction, (unsigned long)bs.stencilFailureOperation, (unsigned long)bs.depthFailureOperation, (unsigned long)bs.depthStencilPassOperation }; _info.bRead = bs.readMask; _info.bWrite = bs.writeMask; }
+    N48LOG("N48DepthStencilState %p: depth compare %lu write %d; stencil front cmp %lu ops %lu/%lu/%lu masks %x/%x, back cmp %lu ops %lu/%lu/%lu masks %x/%x (used by pipelines with a depth/stencil attachment)", (__bridge void *)self,
+           _info.cmp, _info.write, _info.f.cmp, _info.f.fail, _info.f.dfail, _info.f.pass, _info.fRead, _info.fWrite, _info.b.cmp, _info.b.fail, _info.b.dfail, _info.b.pass, _info.bRead, _info.bWrite);
     return self;
 }
 N48_DNR(N48DepthStencilState)
 - (MTLDepthStencilDescriptor *)n48Descriptor { return _d; }
+- (N48DSInfo)n48Info { return _info; }
 - (id)device { return _dev; }
 - (NSString *)label { return _lbl; }
 - (void)setLabel:(NSString *)l { _lbl = [l copy]; }
@@ -2528,22 +3289,278 @@ N48_DNR(N48Fence)
     - (void)useHeaps:(const id __unsafe_unretained *)h count:(NSUInteger)n stages:(NSUInteger)st { (void)h; (void)n; (void)st; N48_ONCE("useHeaps:stages: ignored"); } \
     - (void)useResourceGroup:(id)g usage:(NSUInteger)u stages:(NSUInteger)st { (void)g; (void)u; (void)st; N48_ONCE("useResourceGroup: ignored"); }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Bundle 14: in-process shader translation (an internal design note). The policy, the cache, the crash markers, the reader and the engine are in n48_xlate.h (host tests test-xlate.c and
+// test-xlate-corpus.sh run that very header); this is the glue. A spvcache miss in an ADMITTED APPLICATION (or an N48M_ALLOW root tool with N48M_TEST_INPROC=1) is translated inside the process by the
+// operating system's own LLVM (the bitcode reader, loaded on the first miss only) and Resources/libn48xlate.dylib (the LGPL translator), and installed in the user's cache directory
+// <confstr user cache dir>/com.navi48.xlate/<K>/. WindowServer NEVER applies: it keeps the precompiled spvcache plus the daemon and loads neither library.
+//   /private/tmp/n48m-noinproc      exists (or cannot be read) -> in-process translation OFF for the process (read once); the dump + daemon path is then exactly bundle 13's
+//   METAL2VULKAN_*                  any such variable in the environment -> OFF (several change the translator's output; the cache key does not cover them)
+//   N48M_TEST_INPROC=1              (root + N48M_ALLOW=1) -> a root tool translates in process (retires the add-air.py seeding root probes needed)
+//   N48M_TEST_LLVM_LIB=<dylib>      (root + N48M_ALLOW=1) -> that library is the bitcode reader (a second LLVM for host comparisons)
+//   N48M_TEST_USERCACHE=<dir>       (root + N48M_ALLOW=1) -> replaces confstr(_CS_DARWIN_USER_CACHE_DIR) as the parent of com.navi48.xlate
+// ---------------------------------------------------------------------------------------------------------------
+extern int sandbox_check(pid_t pid, const char *operation, int type, ...);
+extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);   // libdyld (dyld_priv.h): the UUID of the running dyld shared cache; it pins every library in it
+static struct {
+    pthread_mutex_t mu;
+    int gateDone, killed, envDirty;       // read once per process (never in WindowServer)
+    int dirState;                         // 0 not set up, 1 ready, -1 unavailable (sticky)
+    char dir[N48X_PATH_MAX];
+    NSString *dirNS;
+    int engineInit; n48x_engine eng; n48g_sync sw;
+    int sandboxedDone, sandboxed;
+} N48XL = { .mu = PTHREAD_MUTEX_INITIALIZER };
+static NSMutableSet<NSString *> *n48x_logged, *n48x_touched, *n48x_timedout;   // guarded by N48XL.mu
+static BOOL n48x_test_inproc(void) { const char *e = getenv("N48M_TEST_INPROC"); return n48_allow() && e && !strcmp(e, "1"); }
+static void n48x_gate_read(void) {
+    pthread_mutex_lock(&N48XL.mu);
+    if (!N48XL.gateDone) {
+        N48XL.gateDone = 1;
+        if (!n48_is_ws()) {   // WindowServer never reads these: it never applies
+            struct stat st; const int rc = stat(N48X_KILL_FILE, &st), er = errno;
+            N48XL.killed = n48x_killed_from_stat(rc, er);
+            N48XL.envDirty = n48x_env_dirty(*_NSGetEnviron());
+            if (N48XL.killed) N48LOG("inproc: kill file " N48X_KILL_FILE " %s: in-process translation is OFF for this process", rc == 0 ? "exists" : "could not be read (fail closed)");
+            if (N48XL.envDirty) N48LOG("inproc: a " N48X_ENV_PREFIX "* variable is set: in-process translation is OFF for this process");
+        }
+    }
+    pthread_mutex_unlock(&N48XL.mu);
+}
+// Does this process translate in process? (n48_xlate.h n48x_applies; the admitted flag is set by n48_admit before any pipeline exists.)
+static BOOL n48x_active(void) {
+    n48x_gate_read();
+    return n48x_applies(n48_is_ws(), atomic_load(&n48_app_admitted), n48_allow(), n48x_test_inproc(), N48XL.killed, N48XL.envDirty) ? YES : NO;
+}
+static NSString *n48x_resources(void) { return [[NSBundle bundleForClass:[Navi48Device class]] resourcePath]; }
+static NSString *n48x_xlib_path(void) { return [n48x_resources() stringByAppendingPathComponent:@N48X_LIB_NAME]; }
+// Sets up <user cache dir>/com.navi48.xlate/<K> once, after admission (never inside n48_spv_dirs' dispatch_once). Caller holds N48XL.mu.
+static void n48x_setup_locked(void) {
+    uint8_t xl[16], rd[16]; memset(rd, 0, sizeof rd);
+    if (!n48x_file_uuid(n48x_xlib_path().fileSystemRepresentation, xl)) { N48XL.dirState = -1; N48LOG("inproc: %s is missing or has no LC_UUID: in-process translation is unavailable", N48X_LIB_NAME); return; }
+    const char *rl = n48_allow() ? getenv("N48M_TEST_LLVM_LIB") : NULL;
+    if (rl && rl[0]) { if (!n48x_file_uuid(rl, rd)) memset(rd, 0, sizeof rd); }
+    else { uuid_t cu; if (_dyld_get_shared_cache_uuid(cu)) memcpy(rd, cu, 16); }   // the reader lives in the dyld shared cache (no file, not loaded yet): the cache's UUID pins it
+    char osv[64] = ""; size_t osn = sizeof osv; if (sysctlbyname("kern.osversion", osv, &osn, NULL, 0) != 0) osv[0] = 0;
+    uint8_t ov[CC_SHA256_DIGEST_LENGTH]; n48x_override_hash(ov);
+    char key[17]; n48x_key(key, xl, rd, ov, osv);
+    char ucd[1024]; ucd[0] = 0;
+    const char *tu = n48_allow() ? getenv("N48M_TEST_USERCACHE") : NULL;
+    if (tu && tu[0]) snprintf(ucd, sizeof ucd, "%s", tu);
+    else { const size_t cn = confstr(_CS_DARWIN_USER_CACHE_DIR, ucd, sizeof ucd); if (cn == 0 || cn > sizeof ucd) ucd[0] = 0; }
+    char parent[N48X_PATH_MAX];
+    if (!n48x_parent_path(parent, sizeof parent, ucd) || !n48x_dir_path(N48XL.dir, sizeof N48XL.dir, ucd, key)) { N48XL.dirState = -1; N48LOG("inproc: no user cache directory: in-process translation is unavailable"); return; }
+    if (n48x_prepare_dirs(parent, N48XL.dir, key) != 0) { N48XL.dirState = -1; N48LOG("inproc: cannot use the cache directory %s (not a real directory of ours?): in-process translation is unavailable", N48XL.dir); return; }
+    N48XL.dirNS = [NSString stringWithUTF8String:N48XL.dir];
+    N48XL.dirState = 1;
+    N48LOG("inproc: enabled for %s (%s); cache %s (key %s); reader: the OS's GPUCompiler libLLVM, loaded on the first miss", getprogname(), n48_is_ws() ? "WindowServer?!" : n48_allow() ? "root test" : "application", N48XL.dir, key);
+}
+// The user cache directory K, or nil (not applicable, or unavailable).
+static NSString *n48x_user_dir(void) {
+    if (!n48x_active()) return nil;
+    pthread_mutex_lock(&N48XL.mu);
+    if (N48XL.dirState == 0) n48x_setup_locked();
+    NSString *r = N48XL.dirState == 1 ? N48XL.dirNS : nil;
+    pthread_mutex_unlock(&N48XL.mu);
+    return r;
+}
+static BOOL n48x_sandboxed(void) {
+    pthread_mutex_lock(&N48XL.mu);
+    if (!N48XL.sandboxedDone) { N48XL.sandboxed = sandbox_check(getpid(), NULL, 0) != 0; N48XL.sandboxedDone = 1; }
+    const BOOL r = N48XL.sandboxed;
+    pthread_mutex_unlock(&N48XL.mu);
+    return r;
+}
+// A hit in the user cache refreshes the file's modification time once per sha per process (the trim is least-recently-used).
+static void n48x_touch_hit(NSString *path, NSString *sha) {
+    NSString *u = N48XL.dirNS; if (!u || ![path hasPrefix:u]) return;
+    pthread_mutex_lock(&N48XL.mu);
+    if (!n48x_touched) n48x_touched = [NSMutableSet set];
+    const BOOL first = ![n48x_touched containsObject:sha]; if (first) [n48x_touched addObject:sha];
+    pthread_mutex_unlock(&N48XL.mu);
+    if (first) { n48x_touch(path.fileSystemRepresentation); if ([path hasSuffix:@".spv"]) { NSString *m = [[path stringByDeletingPathExtension] stringByAppendingString:@".meta.json"]; n48x_touch(m.fileSystemRepresentation); } }
+}
+// ---- build 18 (P3): linked functions (NATIVE-S8-APPFIX1.md section P3) ----
+// A pipeline stage whose descriptor links functions (MTLLinkedFunctions.functions / privateFunctions / groups) is translated TOGETHER with them: n48xlate's n48x_translate_linked resolves the entry's direct
+// visible-function references (RenderBox's custom effects, Maps' magenta fragment) to the exact authored dependencies. The cache key is n48x_link_sha (entry + sorted dependencies), never the entry's sha alone.
+// The context is per THREAD and per creation call (thread-local, cleared by a cleanup scope): the lookups, the translation request and the hot-swap registration all run on the thread that creates the
+// pipeline, keyed by the entry function object, so no signature changed and a function linked differently in another descriptor never sees this one's key.
+@interface N48LinkCtx : NSObject { @public id fn; NSString *lsha; NSArray<NSDictionary *> *deps; } @end
+@implementation N48LinkCtx @end
+static __thread N48LinkCtx * __unsafe_unretained n48_tl_lk[3];   // 0 vertex, 1 fragment, 2 kernel
+static __thread void *n48_tl_keep[3];                             // the +1 that keeps n48_tl_lk[i] alive until it is replaced or the scope ends
+static void n48_lk_install(int slot, N48LinkCtx *c) {
+    if (n48_tl_keep[slot]) { CFRelease(n48_tl_keep[slot]); n48_tl_keep[slot] = NULL; }
+    n48_tl_lk[slot] = nil;
+    if (c) { n48_tl_keep[slot] = (void *)CFBridgingRetain(c); n48_tl_lk[slot] = c; }
+}
+typedef struct { char unused; } n48_lkscope;
+static void n48_lk_scope_end(n48_lkscope *sc) { (void)sc; for (int i = 0; i < 3; i++) n48_lk_install(i, nil); }
+#define N48_LK_SCOPE n48_lkscope lks_ __attribute__((cleanup(n48_lk_scope_end))) = { 0 }
+static N48LinkCtx *n48_lk_for(id fn) { if (!fn) return nil; for (int i = 0; i < 3; i++) if (n48_tl_lk[i] && n48_tl_lk[i]->fn == fn) return n48_tl_lk[i]; return nil; }
+
+// Translates one function's bitcode in process. YES = a result for it is installed (the caller retries its lookup); NO = not translated (the caller falls through to today's fallback).
+// deadlineNs: the caller's wait ends then (the 3 s of n48_gate.h shared by the pipeline's functions); after N48G_SYNC_STRIKES consecutive timeouts the wait is OFF for the process (the job
+// still runs and the hot-swap picks the result up).
+static BOOL n48x_translate_fn(id fn, const char *role, uint64_t deadlineNs) {
+    NSString *dir = n48x_user_dir(); if (!dir) return NO;
+    SEL sel = NSSelectorFromString(@"bitcodeData");
+    NSData *bc = (fn && [fn respondsToSelector:sel]) ? ((NSData *(*)(id, SEL))objc_msgSend)(fn, sel) : nil;
+    if (!bc.length) return NO;
+    NSString *sha = n48_sha256hex(bc);
+    N48LinkCtx *lk = n48_lk_for(fn);   // build 18 (P3): a linked stage is translated with its dependencies and cached under the linked key
+    if (lk) sha = lk->lsha;
+    NSString *name = [fn respondsToSelector:@selector(name)] ? [fn name] : @"";
+    char spvp[N48X_PATH_MAX]; struct stat sb;
+    if (n48x_file_path(spvp, sizeof spvp, dir.fileSystemRepresentation, sha.UTF8String, N48X_EXT_SPV) && stat(spvp, &sb) == 0 && S_ISREG(sb.st_mode)) return YES;   // installed meanwhile (another thread / process)
+    pthread_mutex_lock(&N48XL.mu);
+    if (!N48XL.engineInit) {
+        const char *rl = n48_allow() ? getenv("N48M_TEST_LLVM_LIB") : NULL;
+        n48x_engine_init(&N48XL.eng, NULL, NULL, rl, n48x_xlib_path().fileSystemRepresentation, N48X_WORKER_STACK);
+        N48XL.engineInit = 1;
+    }
+    const int allowed = n48g_sync_allowed(&N48XL.sw) && ![n48x_timedout containsObject:sha];
+    pthread_mutex_unlock(&N48XL.mu);
+    const uint64_t now = n48_now();
+    int waitMs = (allowed && deadlineNs > now) ? (int)((deadlineNs - now) / 1000000ull) : 0;
+    if (waitMs > N48G_SYNC_WAIT_MS) waitMs = N48G_SYNC_WAIT_MS;
+    char err[256]; const uint64_t t0 = n48_now();
+    int rc;
+    if (lk) {
+        const NSUInteger nd = lk->deps.count; n48x_ldep *ld = (n48x_ldep *)calloc(nd ? nd : 1, sizeof *ld);
+        for (NSUInteger i = 0; i < nd && ld; i++) { NSDictionary *dd = lk->deps[i]; ld[i].symbol = [dd[@"name"] UTF8String]; ld[i].air = (const uint8_t *)[dd[@"bc"] bytes]; ld[i].airLen = [dd[@"bc"] length]; }
+        rc = ld ? n48x_engine_run_linked(&N48XL.eng, dir.fileSystemRepresentation, sha.UTF8String, name.UTF8String, bc.bytes, bc.length, ld, nd, waitMs, err, sizeof err) : N48X_E_IO;
+        free(ld);
+    } else
+    rc = n48x_engine_run(&N48XL.eng, dir.fileSystemRepresentation, sha.UTF8String, name.UTF8String, bc.bytes, bc.length, waitMs, err, sizeof err);
+    const double ms = (double)(n48_now() - t0) / 1e6;
+    pthread_mutex_lock(&N48XL.mu);
+    if (rc == N48X_OK) n48g_sync_result(&N48XL.sw, 1);
+    else if (rc == N48X_E_TIMEOUT && waitMs > 0) { n48g_sync_result(&N48XL.sw, 0); if (!n48x_timedout) n48x_timedout = [NSMutableSet set]; [n48x_timedout addObject:sha]; }
+    const int strikes = N48XL.sw.strikes;
+    if (!n48x_logged) n48x_logged = [NSMutableSet set];
+    const BOOL firstLog = ![n48x_logged containsObject:sha]; if (firstLog) [n48x_logged addObject:sha];
+    pthread_mutex_unlock(&N48XL.mu);
+    if (rc == N48X_OK) N48LOG("inproc OK %s '%s' %s: translated in %.0f ms", role, name.UTF8String, sha.UTF8String, ms);
+    else if (rc == N48X_E_TIMEOUT) N48LOG("inproc TIMEOUT %s '%s' %s: not ready within %d ms (strike %d of %d%s); the fallback is used and the hot-swap installs the result%s", role, name.UTF8String, sha.UTF8String, waitMs, strikes, N48G_SYNC_STRIKES,
+                                          strikes >= N48G_SYNC_STRIKES ? ", waiting is now OFF for this process" : "", waitMs == 0 ? " (not waiting)" : "");
+    else if (firstLog) N48LOG("inproc FAIL %s '%s' %s: code %d: %s", role, name.UTF8String, sha.UTF8String, rc, err);
+    return rc == N48X_OK;
+}
+// "LINKAGE IGNORED" (section 3): linked functions / preloaded libraries are not implemented; one line per pipeline when a descriptor carries any.
+static BOOL n48x_array_nonempty(id obj, const char *prop) {
+    SEL s = sel_registerName(prop);
+    if (!obj || ![obj respondsToSelector:s]) return NO;
+    id v = ((id (*)(id, SEL))objc_msgSend)(obj, s);
+    return [v isKindOfClass:[NSArray class]] && [(NSArray *)v count] > 0;
+}
+static id n48x_prop(id obj, const char *prop) {
+    SEL sl = sel_registerName(prop);
+    return (obj && [obj respondsToSelector:sl]) ? ((id (*)(id, SEL))objc_msgSend)(obj, sl) : nil;
+}
+// Collects what a stage links: the dependency list {name, bc, sha} of `functions` + `privateFunctions` + the members of `groups`, de-duplicated by (name, sha). nil + *why when it cannot be used: a function
+// without a name or bitcode, the same name with two different bodies, more than N48X_MAX_DEPS functions or more than N48X_MAX_DEP_AIR bytes.
+static NSArray<NSDictionary *> *n48x_link_collect(id linked, NSString **why) {
+    NSMutableArray<id> *fns = [NSMutableArray array];
+    { id v = n48x_prop(linked, "functions"); if ([v isKindOfClass:[NSArray class]]) [fns addObjectsFromArray:v]; v = n48x_prop(linked, "privateFunctions"); if ([v isKindOfClass:[NSArray class]]) [fns addObjectsFromArray:v]; }
+    id gr = n48x_prop(linked, "groups");
+    if ([gr isKindOfClass:[NSDictionary class]]) for (id k in [(NSDictionary *)gr allKeys]) { id v = ((NSDictionary *)gr)[k]; if ([v isKindOfClass:[NSArray class]]) [fns addObjectsFromArray:v]; }
+    NSMutableArray<NSDictionary *> *out = [NSMutableArray array]; NSMutableDictionary<NSString *, NSString *> *byName = [NSMutableDictionary dictionary]; NSUInteger total = 0;
+    for (id f in fns) {
+        NSString *nm = [n48x_prop(f, "name") isKindOfClass:[NSString class]] ? n48x_prop(f, "name") : nil;
+        SEL sel = NSSelectorFromString(@"bitcodeData");
+        NSData *bc = (f && [f respondsToSelector:sel]) ? ((NSData *(*)(id, SEL))objc_msgSend)(f, sel) : nil;
+        if (!nm.length || !bc.length) { if (why) *why = [NSString stringWithFormat:@"a linked function ('%@') has no name or no bitcodeData", nm ? nm : @"?"]; return nil; }
+        NSString *sha = n48_sha256hex(bc);
+        NSString *prev = byName[nm];
+        if (prev) { if ([prev isEqualToString:sha]) continue; if (why) *why = [NSString stringWithFormat:@"the name '%@' is linked to two different functions", nm]; return nil; }
+        byName[nm] = sha; total += bc.length;
+        if (out.count >= N48X_MAX_DEPS || total > N48X_MAX_DEP_AIR || !n48x_air_size_ok(bc.length)) { if (why) *why = @"too many linked functions or too much bitcode"; return nil; }
+        [out addObject:@{ @"name": nm, @"bc": bc, @"sha": sha }];
+    }
+    return out;
+}
+static NSString *n48x_names(id arr, BOOL groups) {   // a short, bounded list of function names for the log
+    NSMutableArray<NSString *> *n = [NSMutableArray array];
+    if (groups && [arr isKindOfClass:[NSDictionary class]]) { for (id k in [(NSDictionary *)arr allKeys]) { NSMutableArray *m = [NSMutableArray array]; id v = ((NSDictionary *)arr)[k]; if ([v isKindOfClass:[NSArray class]]) for (id f in v) [m addObject:[n48x_prop(f, "name") description] ?: @"?"];
+        [n addObject:[NSString stringWithFormat:@"%@=[%@]", k, [m componentsJoinedByString:@","]]]; } }
+    else if ([arr isKindOfClass:[NSArray class]]) for (id f in arr) [n addObject:[n48x_prop(f, "name") description] ?: @"?"];
+    if (n.count > 12) { NSUInteger tot = n.count; [n removeObjectsInRange:NSMakeRange(12, n.count - 12)]; [n addObject:[NSString stringWithFormat:@"... (%lu in all)", (unsigned long)tot]]; }
+    return [n componentsJoinedByString:@" "];
+}
+// desc: an MTLRenderPipelineDescriptor or MTLComputePipelineDescriptor; the properties are read by selector (they are newer than the bundle's deployment target).
+// Build 18 (P3): logs everything the stage links (functions, privateFunctions, groups, binaryFunctions, preloaded libraries, with names) once per distinct linkage; in a process that translates in process it also
+// installs the stage's link context (slot 0 vertex, 1 fragment, 2 kernel) when the linkage is usable. REFUSED, with today's behaviour (the entry alone) and the old LINKAGE IGNORED line: binaryFunctions or
+// preloaded libraries present (their bodies are not AIR we can see), a function without bitcode, a name linked to two bodies, over the caps.
+static void n48x_linkage_check(id desc, const char *role, const char *linkedProp, const char *preloadProp, const char *name, id fn, int slot) {
+    n48_lk_install(slot, nil);
+    id linked = n48x_prop(desc, linkedProp);
+    const BOOL f = n48x_array_nonempty(linked, "functions"), bf = n48x_array_nonempty(linked, "binaryFunctions"), pf = n48x_array_nonempty(linked, "privateFunctions"), pl = n48x_array_nonempty(desc, preloadProp);
+    id gr = n48x_prop(linked, "groups"); const BOOL gg = [gr isKindOfClass:[NSDictionary class]] && [(NSDictionary *)gr count] > 0;
+    if (!(f || bf || pf || gg || pl)) return;
+    NSString *why = nil; N48LinkCtx *ctx = nil; NSArray<NSDictionary *> *deps = nil;
+    if (bf || pl) why = @"binaryFunctions or preloaded libraries are present";
+    else if (!n48x_active()) why = @"this process does not translate in process";
+    else if (!(deps = n48x_link_collect(linked, &why)).count && !why) why = @"nothing to link";
+    if (!why && fn) {
+        NSData *ebc = ((NSData *(*)(id, SEL))objc_msgSend)(fn, NSSelectorFromString(@"bitcodeData"));
+        NSString *esha = ebc.length ? n48_sha256hex(ebc) : nil;
+        if (!esha) why = @"the entry function has no bitcodeData";
+        else {
+            const char *syms[N48X_MAX_DEPS], *shas[N48X_MAX_DEPS]; char key[65];
+            for (NSUInteger i = 0; i < deps.count; i++) { syms[i] = [deps[i][@"name"] UTF8String]; shas[i] = [deps[i][@"sha"] UTF8String]; }
+            if (n48x_link_sha(key, esha.UTF8String, deps.count, syms, shas) != 0) why = @"cannot form the linked cache key";
+            else { ctx = [N48LinkCtx new]; ctx->fn = fn; ctx->lsha = [NSString stringWithUTF8String:key]; ctx->deps = deps; }
+        }
+    }
+    static NSMutableSet<NSString *> *seen; static NSLock *lk; static dispatch_once_t once; dispatch_once(&once, ^{ seen = [NSMutableSet set]; lk = [NSLock new]; });
+    NSString *tag = [NSString stringWithFormat:@"%s|%s|%@|%@", role, name ? name : "?", ctx ? ctx->lsha : @"-", why ? why : @""]; BOOL first;
+    [lk lock]; first = ![seen containsObject:tag]; if (first && seen.count < 1024) [seen addObject:tag]; [lk unlock];
+    if (first) N48LOG("LINKAGE %s '%s': functions[%lu] %s | privateFunctions[%lu] %s | groups %s | binaryFunctions %d | preloadedLibraries %d%s%s",
+                      role, name ? name : "?", (unsigned long)[(NSArray *)n48x_prop(linked, "functions") count], n48x_names(n48x_prop(linked, "functions"), NO).UTF8String, (unsigned long)[(NSArray *)n48x_prop(linked, "privateFunctions") count], n48x_names(n48x_prop(linked, "privateFunctions"), NO).UTF8String,
+                      n48x_names(gr, YES).length ? n48x_names(gr, YES).UTF8String : "-", bf, pl, ctx ? " -> resolved in process, key " : "", ctx ? ctx->lsha.UTF8String : "");
+    if (ctx) n48_lk_install(slot, ctx);
+    else if (first) N48LOG("LINKAGE IGNORED %s '%s': %s%s%s%s is set - linked functions / preloaded libraries are not resolved for this pipeline (%s)", role, name ? name : "?", f ? "linkedFunctions.functions " : "", bf ? "linkedFunctions.binaryFunctions " : "", pf ? "linkedFunctions.privateFunctions " : "", pl ? "preloadedLibraries" : "", why.UTF8String);
+}
+static void n48x_linkage_render(id d) {
+    id vf = n48x_prop(d, "vertexFunction"), ff = n48x_prop(d, "fragmentFunction");
+    n48x_linkage_check(d, "vertex", "vertexLinkedFunctions", "vertexPreloadedLibraries", [[n48x_prop(vf, "name") description] UTF8String], vf, 0);
+    n48x_linkage_check(d, "fragment", "fragmentLinkedFunctions", "fragmentPreloadedLibraries", [[n48x_prop(ff, "name") description] UTF8String], ff, 1);
+}
+static void n48x_linkage_compute(id d) {
+    id cf = n48x_prop(d, "computeFunction");
+    n48x_linkage_check(d, "compute", "linkedFunctions", "preloadedLibraries", [[n48x_prop(cf, "name") description] UTF8String], cf, 2);
+}
+
 // ---- spvcache sidecars (<sha>.meta.json, add-air.py) ----
-// Hot-swap H2: the lookup directories, in order: the bundle's Resources/spvcache (read-only in practice), then the side directory
-// /private/var/tmp/n48m-spv (WindowServer-sandbox readable; the profile allows /private/var/tmp; the translator installs new <sha>.meta.json then
-// <sha>.spv there by atomic rename, .spv LAST). Test hooks (root + N48M_ALLOW=1): N48M_TEST_SIDE_DIR replaces the side dir, N48M_TEST_HIDE_BUNDLE_SPV=1 drops the bundle dir.
+// Hot-swap H2: the lookup directories, in order: the bundle's Resources/spvcache (read-only in practice), then (bundle 14, applications that translate in process) the user cache directory K,
+// then the side directory /private/var/tmp/n48m-spv (WindowServer-sandbox readable; the profile allows /private/var/tmp; the translator installs new <sha>.meta.json then
+// <sha>.spv there by atomic rename, .spv LAST). A sandboxed application does not look in the side directory (the sandbox denies it and logs every try).
+// Test hooks (root + N48M_ALLOW=1): N48M_TEST_SIDE_DIR replaces the side dir, N48M_TEST_HIDE_BUNDLE_SPV=1 drops the bundle dir.
 static NSString *n48_side_dir(void) {
     static NSString *d; static dispatch_once_t o;
     dispatch_once(&o, ^{ const char *t = getenv("N48M_TEST_SIDE_DIR"); d = (n48_allow() && t && *t) ? @(t) : @"/private/var/tmp/n48m-spv"; });
     return d;
 }
 static NSArray<NSString *> *n48_spv_dirs(void) {
-    static NSArray *a; static dispatch_once_t o;
+    static NSArray *bundleOnly, *a[4]; static dispatch_once_t o; static NSString *userFor;
     dispatch_once(&o, ^{
-        NSMutableArray *m = [NSMutableArray array]; const char *h = getenv("N48M_TEST_HIDE_BUNDLE_SPV");
-        if (!(n48_allow() && h && !strcmp(h, "1"))) [m addObject:[[[NSBundle bundleForClass:[Navi48Device class]] resourcePath] stringByAppendingPathComponent:@"spvcache"]];
-        [m addObject:n48_side_dir()]; a = m; });
-    return a;
+        const char *h = getenv("N48M_TEST_HIDE_BUNDLE_SPV");
+        if (!(n48_allow() && h && !strcmp(h, "1"))) bundleOnly = @[ [[[NSBundle bundleForClass:[Navi48Device class]] resourcePath] stringByAppendingPathComponent:@"spvcache"] ];
+        else bundleOnly = @[];
+    });
+    NSString *u = n48x_user_dir();                                   // nil unless this process translates in process
+    const BOOL skipSide = u && n48x_skip_side_dir(n48_is_ws(), n48x_sandboxed());
+    const int idx = (u ? 1 : 0) | (skipSide ? 2 : 0);
+    @synchronized ([Navi48Device class]) {
+        if (!a[idx] || (u && ![userFor isEqualToString:u])) {
+            NSMutableArray *m = [bundleOnly mutableCopy];
+            if (u) { [m addObject:u]; userFor = u; }
+            if (!skipSide) [m addObject:n48_side_dir()];
+            a[idx] = m;
+        }
+        return a[idx];
+    }
 }
 static NSDictionary *n48_meta_for(NSString *sha) {
     NSData *d = nil;
@@ -2671,7 +3688,8 @@ static VkBlendOp n48_bo(MTLBlendOperation o, BOOL *bad) {
 @implementation N48HSEntry @end
 static NSMutableArray<N48HSEntry *> *n48hs_reg; static NSLock *n48hs_lock; static dispatch_queue_t n48hs_q; static dispatch_source_t n48hs_timer;
 
-static NSString *n48_fn_sha(id fn) {   // sha256(bitcodeData) of a function, nil when it has none
+static NSString *n48_fn_sha(id fn) {   // sha256(bitcodeData) of a function, nil when it has none; build 18 (P3): the linked key when the function is a linked stage of the pipeline being created
+    N48LinkCtx *lk_ = n48_lk_for(fn); if (lk_) return lk_->lsha;
     SEL sel = NSSelectorFromString(@"bitcodeData");
     NSData *bc = (fn && [fn respondsToSelector:sel]) ? ((NSData *(*)(id, SEL))objc_msgSend)(fn, sel) : nil;
     return bc.length ? n48_sha256hex(bc) : nil;
@@ -2730,6 +3748,39 @@ static void n48hs_register(id obj, NSArray<NSString *> *shas, BOOL metaRequired,
     N48LOG("HOT-SWAP %s: registered (%lu key(s)%s)", name.UTF8String, (unsigned long)shas.count, metaRequired ? ", meta required" : "");
 }
 
+// ---- C1 (bundle build 6): the bounded synchronous wait on a spvcache miss (n48_gate.h n48g_sync_*) ----
+// Only for a process the kernel admitted as an application (n48g_syncwait_applies): WindowServer, the root test switches and the force switch never wait. The caller has ALREADY dumped the AIR
+// (the daemon cannot translate what it has not been given). Polls the lookup directories every N48G_SYNC_POLL_MS for every <sha>.spv (and, for a kernel, its .meta.json) for up to N48G_SYNC_WAIT_MS;
+// N48G_SYNC_STRIKES consecutive timeouts switch the wait off for the process (a daemon that is not running must not cost 3 s per pipeline); a key that timed out once is never waited on again.
+static pthread_mutex_t n48_sw_mu = PTHREAD_MUTEX_INITIALIZER; static n48g_sync n48_sw_state; static NSMutableSet<NSString *> *n48_sw_timedout;
+static BOOL n48_sync_wait(const char *what, NSArray<NSString *> *shas, BOOL needMeta) {
+    if (!n48g_syncwait_applies(n48_is_ws(), atomic_load(&n48_app_admitted), n48_force_fallback(), n48_test_fb_as_ws()) || !shas.count) return NO;
+    NSString *key = [shas componentsJoinedByString:@"+"];
+    pthread_mutex_lock(&n48_sw_mu);
+    const int allowed = n48g_sync_allowed(&n48_sw_state) && ![n48_sw_timedout containsObject:key];
+    pthread_mutex_unlock(&n48_sw_mu);
+    if (!allowed) return NO;
+    const uint64_t t0 = n48_now(); BOOL found = NO; int step;
+    for (;;) {
+        BOOL all = YES;
+        for (NSString *sha in shas) { if (!n48hs_stat(sha, ".spv", YES).present || (needMeta && !n48hs_stat(sha, ".meta.json", NO).present)) { all = NO; break; } }
+        found = all;
+        const int el = (int)((n48_now() - t0) / 1000000ull);
+        step = n48g_sync_step(el, found);
+        if (step <= 0) break;
+        usleep((useconds_t)step * 1000u);
+    }
+    const double ms = (double)(n48_now() - t0) / 1e6;
+    pthread_mutex_lock(&n48_sw_mu);
+    n48g_sync_result(&n48_sw_state, found ? 1 : 0);
+    if (!found) { if (!n48_sw_timedout) n48_sw_timedout = [NSMutableSet set]; [n48_sw_timedout addObject:key]; }
+    const int strikes = n48_sw_state.strikes;
+    pthread_mutex_unlock(&n48_sw_mu);
+    if (found) N48LOG("SYNC-WAIT %s: translation arrived after %.0f ms (no fallback)", what, ms);
+    else N48LOG("SYNC-WAIT %s: no translation within %d ms (strike %d of %d); the hot-swap fallback is used%s", what, N48G_SYNC_WAIT_MS, strikes, N48G_SYNC_STRIKES, strikes >= N48G_SYNC_STRIKES ? "; waiting is now OFF for this process" : "");
+    return found;
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // N48RenderPipelineState (10d/11e): SPIR-V from Resources/spvcache/<sha256(bitcodeData)>.spv -> VkPipeline variants.
 // ---------------------------------------------------------------------------------------------------------------
@@ -2740,6 +3791,7 @@ static void n48hs_register(id obj, NSArray<NSString *> *shas, BOOL metaRequired,
     VkPipelineColorBlendAttachmentState _cba[8]; uint32_t _na; char _vep[128], _fep[128];
     NSMutableDictionary *_variants; NSLock *_lock; NSMutableArray *_owned; BOOL _fallback;
     char _vnm[64], _fnm[64];   // native #12 P1: vertex / fragment function names (CoreDisplay's final pass = fragment "GPUPass")
+    n48pc_t _pc; MTLPixelFormat _dpf, _spf; VkFormat _dsVk; unsigned _dsAsp;   // bundle 10: fixed config (samples, dynamic states, depth bias), the depth / stencil attachment formats, the attachment's VkFormat (UNDEFINED = none) and aspects
     MTLRenderPipelineDescriptor *_hsDesc; _Atomic(uintptr_t) _realp;   // hot-swap: creation descriptor (fallback only); the published real object (+1, written once)
 }
 - (instancetype)initWithDevice:(id)dev descriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)err;
@@ -2748,6 +3800,9 @@ static void n48hs_register(id obj, NSArray<NSString *> *shas, BOOL metaRequired,
 - (BOOL)n48HotRebuild;
 - (VkPipeline)vkPipeline;
 - (VkPipeline)pipelineForTopology:(VkPrimitiveTopology)t cull:(VkCullModeFlags)c front:(VkFrontFace)f;
+- (VkPipeline)pipelineForTopology:(VkPrimitiveTopology)t cull:(VkCullModeFlags)c front:(VkFrontFace)f ds:(uint32_t)dk;   // bundle 10: dk = n48DSKey: (0 for a colour-only pipeline)
+- (uint32_t)n48DSKey:(const void *)dsinfo;   // N48DSInfo *, NULL = the default state (Always, no write, no stencil)
+- (BOOL)n48HasDS; - (BOOL)n48HasDepth; - (BOOL)n48HasStencil; - (VkFormat)n48DSVk; - (unsigned)n48SampleCount;
 - (VkPipelineLayout)layout;
 - (VkDescriptorSetLayout)dsl:(int)i;
 - (const N48PB *)pbV; - (uint32_t)npbV; - (const N48PB *)pbF; - (uint32_t)npbF;
@@ -2755,7 +3810,7 @@ static void n48hs_register(id obj, NSArray<NSString *> *shas, BOOL metaRequired,
 - (BOOL)fetch; - (uint32_t)fetchMax;
 - (const char *)n48VName; - (const char *)n48FName;
 @end
-static VkRenderPass n48_mk_rp(const VkAttachmentDescription *ads, uint32_t na, BOOL fetch);
+static VkRenderPass n48_mk_rp(const VkAttachmentDescription *ads, uint32_t na, uint32_t nd, BOOL fetch);   // bundle 10: nd = 1 when ads[na] is the depth/stencil attachment
 
 // Returns the cached SPIR-V for fn, or nil with *err code 40 (no bitcodeData) / 41 (miss, or N48M_FORCE_FALLBACK).
 // *fname gets the function name for logs; *meta the <sha>.meta.json sidecar when present. Reflection reads the entry-point name out of the SPIR-V itself.
@@ -2763,18 +3818,25 @@ static NSData *n48_spv_lookup_impl(id fn, const char *role, NSError **err, NSStr
     SEL sel = NSSelectorFromString(@"bitcodeData");
     NSData *bc = (fn && [fn respondsToSelector:sel]) ? ((NSData *(*)(id, SEL))objc_msgSend)(fn, sel) : nil;
     if (fname) *fname = (fn && [fn respondsToSelector:@selector(name)]) ? [fn name] : @"?";
-    if (!bc.length) { if (err) *err = n48_err(40, [NSString stringWithFormat:@"%s function has no bitcodeData", role]); return nil; }
+    if (!bc.length) {
+        N48_ONCE("function '%s' (class %s) has no bitcodeData: a Core Image / stitched library function (or a binary archive function) the translator cannot see; no pipeline is built for it", (fn && [fn respondsToSelector:@selector(name)]) ? [[fn name] UTF8String] : "?", fn ? class_getName(object_getClass(fn)) : "nil");
+        if (err) *err = n48_err(40, [NSString stringWithFormat:@"%s function has no bitcodeData", role]); return nil; }
     if (n48_force_fallback()) { if (err) *err = n48_err(41, [NSString stringWithFormat:@"N48M_FORCE_FALLBACK: %s treated as a spvcache miss", role]); return nil; }
     NSString *sha = n48_sha256hex(bc);
     NSString *path = nil; NSData *spv = nil;
-    for (NSString *dir in n48_spv_dirs()) {   // H2: bundle spvcache first, then the side directory
-        path = [dir stringByAppendingPathComponent:[sha stringByAppendingString:@".spv"]];
-        spv = [NSData dataWithContentsOfFile:path];
-        if (spv.length >= 20 && !(spv.length & 3)) break;
-        spv = nil;
+    N48LinkCtx *lk = n48_lk_for(fn);   // build 18 (P3): a linked stage looks under the linked key first, then under the entry's own sha (an entry that needs none of its dependencies translates alone)
+    for (NSString *cs in (lk ? @[ lk->lsha, sha ] : @[ sha ])) {
+        for (NSString *dir in n48_spv_dirs()) {   // H2: bundle spvcache first, then the side directory
+            path = [dir stringByAppendingPathComponent:[cs stringByAppendingString:@".spv"]];
+            spv = [NSData dataWithContentsOfFile:path];
+            if (spv.length >= 20 && !(spv.length & 3)) break;
+            spv = nil;
+        }
+        if (spv) { sha = cs; break; }
     }
     if (!spv) { if (err) *err = n48_err(41, [NSString stringWithFormat:@"spvcache miss for %s: %@", role, [[n48_spv_dirs().firstObject stringByAppendingPathComponent:sha] stringByAppendingString:@".spv"]]); return nil; }
     if (meta) *meta = n48_meta_for(sha);
+    n48x_touch_hit(path, sha);
     N48LOG("spvcache hit %s: %s (%lu bytes%s)", role, path.UTF8String, (unsigned long)spv.length, (meta && *meta) ? ", meta" : ", no meta");
     return spv;
 }
@@ -2799,6 +3861,7 @@ static VkShaderModule n48_spv_module(const void *code, size_t bytes, const char 
 - (BOOL)n48HotRebuild {
     if (!_hsDesc) return NO;
     NSError *e = nil;
+    N48_LK_SCOPE; n48x_linkage_render(_hsDesc);   // build 18 (P3): the rebuild re-reads the descriptor's linkage on the watcher thread, so it looks under the same linked key
     N48RenderPipelineState *r = [[N48RenderPipelineState alloc] initWithDevice:_dev descriptor:_hsDesc noFallback:YES error:&e];
     if (!r) { N48LOG("HOT-SWAP rebuild failed: %s", e.localizedDescription.UTF8String); return NO; }
     r->_lbl = _lbl;
@@ -2820,10 +3883,39 @@ static VkShaderModule n48_spv_module(const void *code, size_t bytes, const char 
     BOOL fb = NO;
     if (!vsd || !fsd) {
         NSError *e = e1 ? e1 : e2;
+        const BOOL inproc = (e.code == 41 && !nofb && n48x_active()) ? YES : NO;
+        if (inproc) {   // bundle 14: translate in this process first (the AIR dump and the daemon wait below are then skipped); a failure or a timeout falls through to today's fallback + hot-swap
+            const uint64_t dl = n48_now() + (uint64_t)N48G_SYNC_WAIT_MS * 1000000ull;
+            const BOOL tv = vsd ? YES : n48x_translate_fn(d.vertexFunction, "vertex", dl), tf = fsd ? YES : n48x_translate_fn(d.fragmentFunction, "fragment", dl);
+            if (tv && tf) {
+                e1 = nil; e2 = nil; mv_ = nil; mf_ = nil;
+                vsd = n48_spv_lookup(d.vertexFunction, "vertex", &e1, &vname, &mv_);
+                fsd = n48_spv_lookup(d.fragmentFunction, "fragment", &e2, &fname, &mf_);
+                strlcpy(_vnm, vname.UTF8String ? vname.UTF8String : "?", sizeof _vnm); strlcpy(_fnm, fname.UTF8String ? fname.UTF8String : "?", sizeof _fnm);
+            }
+        }
+    }
+    if (!vsd || !fsd) {
+        NSError *e = e1 ? e1 : e2;
+        const BOOL inproc = (e.code == 41 && !nofb && n48x_active()) ? YES : NO;
         if (e.code == 41 && n48_fallback_ok() && !nofb) {
-            fb = YES; _fallback = YES;
-            N48LOG("FALLBACK %s / %s (%s)", vname.UTF8String, fname.UTF8String, e.localizedDescription.UTF8String);
-            (void)n48_dump_pipeline(d);
+            if (!inproc) (void)n48_dump_pipeline(d);   // C1: dump FIRST (the daemon translates what it is given), then (applications only) wait up to 3 s for it; bundle 14: not when this process translates in process
+            if (!inproc && n48g_syncwait_applies(n48_is_ws(), atomic_load(&n48_app_admitted), n48_force_fallback(), n48_test_fb_as_ws())) {
+                NSMutableArray<NSString *> *want = [NSMutableArray array];
+                NSString *sv_ = n48_fn_sha(d.vertexFunction), *sf_ = n48_fn_sha(d.fragmentFunction);
+                if (sv_) [want addObject:sv_];
+                if (sf_) [want addObject:sf_];
+                if (n48_sync_wait("render", want, NO)) {
+                    e1 = nil; e2 = nil; mv_ = nil; mf_ = nil;
+                    vsd = n48_spv_lookup(d.vertexFunction, "vertex", &e1, &vname, &mv_);
+                    fsd = n48_spv_lookup(d.fragmentFunction, "fragment", &e2, &fname, &mf_);
+                    strlcpy(_vnm, vname.UTF8String ? vname.UTF8String : "?", sizeof _vnm); strlcpy(_fnm, fname.UTF8String ? fname.UTF8String : "?", sizeof _fnm);
+                }
+            }
+            if (!vsd || !fsd) {
+                fb = YES; _fallback = YES;
+                N48LOG("FALLBACK %s / %s (%s)", vname.UTF8String, fname.UTF8String, e.localizedDescription.UTF8String);
+            }
         } else { if (err) *err = e; return nil; }
     }
     N48sRefl *rv = NULL, *rf = NULL; N48sMod mv = {0}, mf = {0}; char vep[128] = "main", fep[128] = "main";
@@ -2849,7 +3941,13 @@ static VkShaderModule n48_spv_module(const void *code, size_t bytes, const char 
         ok = YES;
     } while (0);
     if (!ok) { free(rv); free(rf); return nil; }
-    VkAttachmentDescription ads[8]; VkAttachmentReference refs[8]; uint32_t na = 0;
+    VkAttachmentDescription ads[9]; VkAttachmentReference refs[8]; uint32_t na = 0;
+    {   // bundle 10: sample count, dynamic states, depth bias: n48pc_config (a colour-only single-sample pipeline gets exactly the old three dynamic states, one sample, no bias)
+        const char *pcwhy = NULL;
+        if (!n48pc_config(d.depthAttachmentPixelFormat != MTLPixelFormatInvalid, d.stencilAttachmentPixelFormat != MTLPixelFormatInvalid, (unsigned long)d.rasterSampleCount, d.alphaToCoverageEnabled ? 1 : 0, n48_ms_mask(), &_pc, &pcwhy)) {
+            N48LOG("pipeline: rasterSampleCount %lu refused: %s (device mask 0x%x)", (unsigned long)d.rasterSampleCount, pcwhy, n48_ms_mask());
+            if (err) *err = n48_err(44, [NSString stringWithFormat:@"rasterSampleCount %lu: %s", (unsigned long)d.rasterSampleCount, pcwhy]); free(rv); free(rf); return nil; }
+    }
     for (NSUInteger i = 0; i < 8; i++) {
         MTLRenderPipelineColorAttachmentDescriptor *ca = d.colorAttachments[i];
         if (ca.pixelFormat == MTLPixelFormatInvalid) continue;
@@ -2863,13 +3961,14 @@ static VkShaderModule n48_spv_module(const void *code, size_t bytes, const char 
           if ((ff & nd) != nd) { N48LOG("pipeline: colour attachment %lu pixel format %lu (vk %d): RADV features 0x%x lack 0x%x", (unsigned long)i, (unsigned long)ca.pixelFormat, f->vk, ff, nd & ~ff);
               if (err) *err = n48_err(43, [NSString stringWithFormat:@"unsupported colour attachment format %lu (RADV lacks attachment%s support)", (unsigned long)ca.pixelFormat, ca.isBlendingEnabled ? "/blend" : ""]); free(rv); free(rf); return nil; } }
         N48LOG("pipeline: colour attachment %lu pixel format %lu (vk %d)", (unsigned long)i, (unsigned long)ca.pixelFormat, f->vk);
-        ads[na] = (VkAttachmentDescription){ .format = f->vk, .samples = VK_SAMPLE_COUNT_1_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+        ads[na] = (VkAttachmentDescription){ .format = f->vk, .samples = (VkSampleCountFlagBits)_pc.samples, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
             .initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
         refs[na] = (VkAttachmentReference){ na, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
         VkColorComponentFlags wm = 0; MTLColorWriteMask m = ca.writeMask;
         if (m & MTLColorWriteMaskRed) wm |= VK_COLOR_COMPONENT_R_BIT; if (m & MTLColorWriteMaskGreen) wm |= VK_COLOR_COMPONENT_G_BIT;
         if (m & MTLColorWriteMaskBlue) wm |= VK_COLOR_COMPONENT_B_BIT; if (m & MTLColorWriteMaskAlpha) wm |= VK_COLOR_COMPONENT_A_BIT;
+        wm = n48if_write_mask(fb, (f->flags & N48F_UINT) != 0, wm);   // bundle 19: the float magenta fallback shader must not write into an integer attachment
         if (rf && !(rf->outmask & (1u << na))) { wm = 0; N48LOG("pipeline: fragment stage does not write output %u: attachment write mask forced to 0 (contents kept)", na); }
         _cba[na] = (VkPipelineColorBlendAttachmentState){ .colorWriteMask = wm };
         if (ca.isBlendingEnabled) {   // 11e: blending from the descriptor (enable, factors, ops, write mask)
@@ -2886,20 +3985,40 @@ static VkShaderModule n48_spv_module(const void *code, size_t bytes, const char 
         na++;
     }
     _na = na;
-    if (d.depthAttachmentPixelFormat != MTLPixelFormatInvalid || d.stencilAttachmentPixelFormat != MTLPixelFormatInvalid) {
-        if (err) *err = n48_err(44, @"depth/stencil attachments not implemented in 10d"); free(rv); free(rf); return nil; }
+    // bundle 10: the depth / stencil attachment.  One Vulkan attachment: the descriptor's depth format and stencil format are the same format (a combined one) or only one of them is set.
+    uint32_t nd = 0; VkAttachmentReference dref = { 0, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+    _dpf = d.depthAttachmentPixelFormat; _spf = d.stencilAttachmentPixelFormat; _dsVk = VK_FORMAT_UNDEFINED; _dsAsp = 0;
+    if (_dpf != MTLPixelFormatInvalid || _spf != MTLPixelFormatInvalid) {
+        MTLPixelFormat dsp = _dpf != MTLPixelFormatInvalid ? _dpf : _spf; n48dp_fmt_t df; const char *dwhy = NULL;
+        if (_dpf != MTLPixelFormatInvalid && _spf != MTLPixelFormatInvalid && _dpf != _spf) dwhy = "separate depth and stencil attachment formats are not supported (use one combined format such as Depth32Float_Stencil8)";
+        else if (!n48dp_fmt((unsigned long)dsp, &df)) dwhy = df.why;
+        else if (_dpf != MTLPixelFormatInvalid && !(df.aspects & N48DP_ASP_DEPTH)) dwhy = "depthAttachmentPixelFormat is a stencil-only format";
+        else if (_spf != MTLPixelFormatInvalid && !(df.aspects & N48DP_ASP_STENCIL)) dwhy = "stencilAttachmentPixelFormat has no stencil aspect";
+        const N48Fmt *dsf = dwhy ? NULL : n48_fmt_ds(dsp);
+        if (!dwhy && !dsf) dwhy = "no Vulkan mapping";
+        if (!dwhy && !(n48_fmt_feats(dsf) & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) dwhy = "the device lacks depth/stencil attachment support for this format";
+        if (dwhy) { N48LOG("pipeline: depth/stencil attachment (depth pf %lu stencil pf %lu): %s", (unsigned long)_dpf, (unsigned long)_spf, dwhy);
+                    if (err) *err = n48_err(44, [NSString stringWithFormat:@"unsupported depth/stencil attachment (depth pf %lu, stencil pf %lu): %s", (unsigned long)_dpf, (unsigned long)_spf, dwhy]); free(rv); free(rf); return nil; }
+        _dsVk = dsf->vk; _dsAsp = df.aspects; nd = 1; dref.attachment = na;
+        ads[na] = (VkAttachmentDescription){ .format = dsf->vk, .samples = (VkSampleCountFlagBits)_pc.samples,
+            .loadOp = (df.aspects & N48DP_ASP_DEPTH) ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE, .storeOp = (df.aspects & N48DP_ASP_DEPTH) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .stencilLoadOp = (df.aspects & N48DP_ASP_STENCIL) ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = (df.aspects & N48DP_ASP_STENCIL) ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+        N48LOG("pipeline: depth/stencil attachment pixel format %lu (vk %d, aspects 0x%x), %u sample(s)", (unsigned long)dsp, dsf->vk, df.aspects, _pc.samples);
+    }
     // 11e-2: a fragment stage with input attachments (ColorInput, binding 192+n, InputAttachmentIndex n) gets the "fetch" render-pass shape:
     // every colour attachment is also an input attachment (same index), layouts GENERAL; the encoder switches to a compatible pass.
     for (int b = 192; rf && b < 200; b++) if (rf->bind[1][b].used && rf->bind[1][b].type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) { _fetch = YES; _fetchMax = (uint32_t)(b - 192); }
     if (_fetch && _fetchMax >= na) { if (err) *err = n48_err(59, [NSString stringWithFormat:@"fragment reads [[color(%u)]] but the pipeline has %u colour attachment(s)", _fetchMax, na]); free(rv); free(rf); return nil; }
+    if (_fetch && _pc.samples > 1) { if (err) *err = n48_err(59, @"framebuffer fetch ([[color(n)]]) on a multisample pipeline is not supported"); free(rv); free(rf); return nil; }
     VkResult r;
     if (_fetch) {
         for (uint32_t i = 0; i < na; i++) ads[i].initialLayout = ads[i].finalLayout = VK_IMAGE_LAYOUT_GENERAL;
-        _rp = n48_mk_rp(ads, na, YES);
+        _rp = n48_mk_rp(ads, na, nd, YES);
         if (!_rp) { if (err) *err = n48_err(45, @"vkCreateRenderPass (framebuffer fetch)"); free(rv); free(rf); return nil; }
     } else {
-    VkSubpassDescription sp = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = na, .pColorAttachments = refs };
-    VkRenderPassCreateInfo rpc = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = na, .pAttachments = ads, .subpassCount = 1, .pSubpasses = &sp };
+    VkSubpassDescription sp = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = na, .pColorAttachments = refs, .pDepthStencilAttachment = nd ? &dref : NULL };
+    VkRenderPassCreateInfo rpc = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = na + nd, .pAttachments = ads, .subpassCount = 1, .pSubpasses = &sp };
     r = vkCreateRenderPass(N48R.dev, &rpc, NULL, &_rp);
     if (r != VK_SUCCESS) { if (err) *err = n48_err(45, [NSString stringWithFormat:@"vkCreateRenderPass = %d", r]); free(rv); free(rf); return nil; }
     }
@@ -2946,9 +4065,10 @@ static VkShaderModule n48_spv_module(const void *code, size_t bytes, const char 
         }
     }
     free(rv); free(rf);
-    NSError *ve = nil; VkPipeline p0 = [self n48Build:VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST cull:VK_CULL_MODE_NONE front:VK_FRONT_FACE_CLOCKWISE error:&ve];
+    uint32_t dk0 = [self n48DSKey:NULL];   // bundle 10: 0 for a colour-only pipeline (the key below is then exactly the old one)
+    NSError *ve = nil; VkPipeline p0 = [self n48Build:VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST cull:VK_CULL_MODE_NONE front:VK_FRONT_FACE_CLOCKWISE ds:dk0 error:&ve];
     if (!p0) { if (err) *err = ve; return nil; }
-    _variants[@((uint32_t)VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST | ((uint32_t)VK_CULL_MODE_NONE << 8) | ((uint32_t)VK_FRONT_FACE_CLOCKWISE << 16))] = [NSValue valueWithPointer:(void *)p0];
+    _variants[@((uint64_t)VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST | ((uint64_t)VK_CULL_MODE_NONE << 8) | ((uint64_t)VK_FRONT_FACE_CLOCKWISE << 16) | ((uint64_t)dk0 << 24))] = [NSValue valueWithPointer:(void *)p0];
     N48LOG("N48RenderPipelineState %p: pipeline %p (%u colour attachment(s), set0 %u / set1 %u bindings, %u vertex input(s), %u vertex binding(s)%s%s)", (__bridge void *)self, (void *)p0, na,
            _npbV, _npbF, _nvia, _nvib, fb ? ", FALLBACK magenta" : "", _fetch ? ", FRAMEBUFFER FETCH (input attachments)" : "");
     if (fb) {   // hot-swap: remember how to rebuild (descriptor copy: the client may reuse its own) and watch for the .spv files
@@ -2960,7 +4080,16 @@ static VkShaderModule n48_spv_module(const void *code, size_t bytes, const char 
     }
     return self;
 }
-- (VkPipeline)n48Build:(VkPrimitiveTopology)topo cull:(VkCullModeFlags)cull front:(VkFrontFace)front error:(NSError **)err {
+- (uint32_t)n48DSKey:(const void *)dsinfo {
+    N48DSInfo di = dsinfo ? *(const N48DSInfo *)dsinfo : n48_dsinfo_default();
+    return n48ds_key(_dpf != MTLPixelFormatInvalid, _spf != MTLPixelFormatInvalid, di.cmp, di.write, &di.f, &di.b);
+}
+- (BOOL)n48HasDS { return _dsVk != VK_FORMAT_UNDEFINED; }
+- (BOOL)n48HasDepth { return _dpf != MTLPixelFormatInvalid; }
+- (BOOL)n48HasStencil { return _spf != MTLPixelFormatInvalid; }
+- (VkFormat)n48DSVk { return _dsVk; }
+- (unsigned)n48SampleCount { return _pc.samples; }
+- (VkPipeline)n48Build:(VkPrimitiveTopology)topo cull:(VkCullModeFlags)cull front:(VkFrontFace)front ds:(uint32_t)dk error:(NSError **)err {
     VkPipelineShaderStageCreateInfo st[2] = {
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = _vs, .pName = _vep },
         { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = _fs, .pName = _fep } };
@@ -2970,24 +4099,30 @@ static VkShaderModule n48_spv_module(const void *code, size_t bytes, const char 
     VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = topo, .primitiveRestartEnable = strip };
     VkPipelineViewportStateCreateInfo vps = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
     VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL,
-        .cullMode = cull, .frontFace = front, .lineWidth = 1.0f };
-    VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+        .cullMode = cull, .frontFace = front, .lineWidth = 1.0f, .depthBiasEnable = _pc.depthBias ? VK_TRUE : VK_FALSE };   // bundle 10: the bias VALUES are dynamic (setDepthBias:), on for depth pipelines only
+    VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = (VkSampleCountFlagBits)_pc.samples, .alphaToCoverageEnable = _pc.alphaToCoverage ? VK_TRUE : VK_FALSE };
+    n48ds_vk_t dv; n48ds_decode(dk, &dv);
+    VkPipelineDepthStencilStateCreateInfo dss = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .depthTestEnable = dv.depthTest ? VK_TRUE : VK_FALSE, .depthWriteEnable = dv.depthWrite ? VK_TRUE : VK_FALSE, .depthCompareOp = (VkCompareOp)dv.depthCompareOp, .stencilTestEnable = dv.stencilTest ? VK_TRUE : VK_FALSE,
+        .front = { (VkStencilOp)dv.front.failOp, (VkStencilOp)dv.front.passOp, (VkStencilOp)dv.front.depthFailOp, (VkCompareOp)dv.front.compareOp, 0, 0, 0 },
+        .back = { (VkStencilOp)dv.back.failOp, (VkStencilOp)dv.back.passOp, (VkStencilOp)dv.back.depthFailOp, (VkCompareOp)dv.back.compareOp, 0, 0, 0 } };
     VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = _na, .pAttachments = _cba };
-    VkDynamicState dyn[3] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS };
-    VkPipelineDynamicStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 3, .pDynamicStates = dyn };
+    VkDynamicState dyn[8]; for (unsigned i = 0; i < _pc.ndyn && i < 8; i++) dyn[i] = (VkDynamicState)_pc.dyn[i];   // bundle 10: viewport, scissor, blend constants (+ stencil masks / reference and depth bias for a depth/stencil pipeline)
+    VkPipelineDynamicStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = _pc.ndyn, .pDynamicStates = dyn };
     VkGraphicsPipelineCreateInfo gpc = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 2, .pStages = st, .pVertexInputState = &vi,
-        .pInputAssemblyState = &ia, .pViewportState = &vps, .pRasterizationState = &rs, .pMultisampleState = &ms, .pColorBlendState = &cb,
+        .pInputAssemblyState = &ia, .pViewportState = &vps, .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = _pc.hasDS ? &dss : NULL, .pColorBlendState = &cb,
         .pDynamicState = &ds, .layout = _pl, .renderPass = _rp };
     VkPipeline p = VK_NULL_HANDLE; uint64_t t_ = n48_now(); VkResult r = vkCreateGraphicsPipelines(N48R.dev, N48R.pc, 1, &gpc, NULL, &p); n48t_add(&T1.gfx, n48_now() - t_); atomic_fetch_add(&n48_pipes_new, 1);
     if (r != VK_SUCCESS) { if (err) *err = n48_err(47, [NSString stringWithFormat:@"vkCreateGraphicsPipelines = %d", r]); return VK_NULL_HANDLE; }
     return p;
 }
-- (VkPipeline)pipelineForTopology:(VkPrimitiveTopology)topo cull:(VkCullModeFlags)cull front:(VkFrontFace)front {
-    NSNumber *k = @((uint32_t)topo | ((uint32_t)cull << 8) | ((uint32_t)front << 16));
+- (VkPipeline)pipelineForTopology:(VkPrimitiveTopology)topo cull:(VkCullModeFlags)cull front:(VkFrontFace)front { return [self pipelineForTopology:topo cull:cull front:front ds:[self n48DSKey:NULL]]; }
+- (VkPipeline)pipelineForTopology:(VkPrimitiveTopology)topo cull:(VkCullModeFlags)cull front:(VkFrontFace)front ds:(uint32_t)dk {
+    NSNumber *k = @((uint64_t)topo | ((uint64_t)cull << 8) | ((uint64_t)front << 16) | ((uint64_t)dk << 24));
     [_lock lock];
     NSValue *v = _variants[k];
     if (!v) {
-        NSError *e = nil; VkPipeline p = [self n48Build:topo cull:cull front:front error:&e];
+        NSError *e = nil; VkPipeline p = [self n48Build:topo cull:cull front:front ds:dk error:&e];
         if (!p) N48LOG("pipeline variant (topology %d cull %d front %d) failed: %s", topo, cull, front, e.localizedDescription.UTF8String);
         else { v = [NSValue valueWithPointer:(void *)p]; _variants[k] = v; N48LOG("pipeline variant topology %d cull %d front %d created", topo, cull, front); }
     }
@@ -3101,6 +4236,7 @@ static int n48_plan(const uint32_t threads[3], const uint32_t nom[3], N48Region 
     id _dev; NSString *_lbl; VkShaderModule _sm; VkPipelineLayout _pl; VkDescriptorSetLayout _dsl; N48PB *_pb; uint32_t _npb; uint32_t _pcSize;
     uint32_t _local[3]; int _mode; uint32_t _pcOff; char _ep[128]; NSMutableDictionary *_variants; NSLock *_lock; NSMutableArray *_owned; BOOL _noop;
     id _hsFn; _Atomic(uintptr_t) _realp;   // hot-swap (placeholder only): the kernel function to rebuild from; the published real object (+1, written once)
+    N48LinkCtx *_hsLk;   // build 18 (P3): the kernel's link context at creation (nil = none); the rebuild on the watcher thread installs it
 }
 - (instancetype)initWithDevice:(id)dev function:(id)fn error:(NSError **)err;
 - (instancetype)initPlaceholderWithDevice:(id)dev function:(id)fn;   // #12 R1: valid state whose dispatches encode nothing (hot-swapped when the .spv + .meta.json appear)
@@ -3118,7 +4254,7 @@ static int n48_plan(const uint32_t threads[3], const uint32_t nom[3], N48Region 
     _dev = dev; _lock = [NSLock new]; _variants = [NSMutableDictionary dictionary]; _owned = [NSMutableArray array]; _noop = YES;
     NSString *sha = n48_fn_sha(fn);
     if (sha) {
-        _hsFn = fn;
+        _hsFn = fn; _hsLk = n48_lk_for(fn);
         n48hs_register(self, @[ sha ], YES, [NSString stringWithFormat:@"kernel %@", [fn respondsToSelector:@selector(name)] ? [fn name] : @"?"], ^BOOL(id o) { return [(N48ComputePipelineState *)o n48HotRebuild]; });
     }
     return self;
@@ -3128,6 +4264,7 @@ static int n48_plan(const uint32_t threads[3], const uint32_t nom[3], N48Region 
 - (BOOL)n48HotRebuild {
     if (!_hsFn) return NO;
     NSError *e = nil;
+    N48_LK_SCOPE; if (_hsLk) n48_lk_install(2, _hsLk);   // build 18 (P3)
     N48ComputePipelineState *r = [[N48ComputePipelineState alloc] initWithDevice:_dev function:_hsFn error:&e];
     if (!r) { N48LOG("HOT-SWAP kernel rebuild failed: %s", e.localizedDescription.UTF8String); return NO; }
     r->_lbl = _lbl;
@@ -3267,19 +4404,28 @@ static n48crc_rec_t *n48s_crc_check(N48Texture *dt, int slot, uint64_t seq) {
     uint32_t _dsid;   // #12: IOSurface id of the display surface this cb writes (0 = unknown)
     int _dcls; uint64_t _dcid, _dbid;   // #12 D2: write class of the presented frame; chain id of this frame and of its base (0 = full copy)
     int _dslot;   // S5.2a: the scanout slot this command buffer's appended copy targets (-1 = none)
+    int _dinst;   // bundle 13: the instance that slot belongs to (0 = the DP's, 2 = the monitor B's)
     BOOL _dcrc; N48Texture *_dtex;   // CRC diagnostic: this frame is checked; the display texture whose import memory is sampled
     struct n48dw { __unsafe_unretained N48Texture *t; uint32_t mask; const void *lastpso; char fns[128]; n48df_wr_t wr; } _dw[4]; int _ndw;   // native #12 P1: per display surface written, how it was written
     uint64_t _tBeg; BOOL _frame;   // native #12 T1: creation time; wrote a display surface (a "frame")
     uint64_t _cbid, _tcommit; uint32_t _cbw[N48CB_MAXW], _cbr[N48CB_MAXR], _ncbw, _ncbr; int _cbcls; uint32_t _cbdsid;   // Stage 0b: log id, commit time, IOSurface ids written / read (sampled or loaded), display write class+1 and sid
     NSMutableArray *_evWait, *_evSig; NSUInteger _prot;   // gap census: encodeWaitForEvent / encodeSignalEvent (CPU emulation), protection options
     uint64_t _pser;   // P1: fence serial taken when this command buffer was created (0 = pool OFF); closed when its fence completed / it failed to submit / it was dropped unsubmitted
+    struct n48ojob { n48occ *o; VkQueryPool qp; uint32_t base; } *_oj; uint32_t _noj, _coj; NSMutableArray *_ojb; NSMutableArray *_qpools; uint32_t _qpUsed; VkQueryPool _qpCur;   // build 18 (P2): per-pass occlusion jobs (+ their visibility buffers), the query pools of this command buffer, the chunk cursor of the newest one
+    n48uc_list _uc; BOOL _ucLive; n48ia _ia;   // build 16: F3 the surfaces this command buffer use-counts while in flight (n48UCRelease gives them back, exactly once); P1 the per-range aliasing state
 }
 - (void)n48PoolDone;
+- (n48occ *)n48OccNew:(N48Buffer *)vb accumulate:(int)acc pool:(VkQueryPool *)qp base:(uint32_t *)base;   // build 18 (P2)
+- (void)n48OccResolve;   // build 18 (P2): called from n48PoolDone
 - (BOOL)n48WaitEvents:(NSError **)err;
 - (uint64_t)n48TBegin;
 - (BOOL)n48IsFrame;
 - (void)n48SignalEvents;
 - (BOOL)n48IOFirstTouch:(N48Texture *)t;
+- (n48ia_act)n48IOAlias:(N48Texture *)t need:(BOOL)need write:(BOOL)w;   // build 16 (P1): the aliasing decision for this touch
+- (N48Texture *)n48IOTex:(uintptr_t)key;
+- (void)n48IOUnwrite:(N48Texture *)t;
+- (void)n48UCRelease;
 - (void)n48IOWritten:(N48Texture *)t;
 - (void)n48CBRead:(N48Texture *)t;   // Stage 0b: t's IOSurface is sampled / loaded by this command buffer
 - (void)n48CBSubmit:(uint64_t)tq;    // Stage 0b: call with the submit lock held, right before vkQueueSubmit (after n48DispSeq)
@@ -3454,19 +4600,56 @@ static void n48_ios_writeback(VkCommandBuffer cmd, N48Texture *t) {
 // the caller brackets this with n48_full_barrier (writes before, slot writes visible after). Same plan as n48s_record_copy: full = one region of the whole image; D2 partial = the base slot first
 // (buffer -> buffer), a WAW barrier, then the rect from the image at the same byte offsets (n48df_img_region). The image is the plane's size and 4 bytes per texel (checked before the slot is taken).
 static void n48s_record_copy_img(VkCommandBuffer cmd, N48Texture *t, const n48df_plan_t *pl) {
-    int slot = pl->slot; VkDeviceSize all = (VkDeviceSize)N48S.pitch * N48S.ph; n48df_imgreg_t g;
-    n48df_rect_t full = { 0, 0, (int32_t)N48S.pw, (int32_t)N48S.ph };
+    int slot = pl->slot; n48df_imgreg_t g;
+    const n48x_desc_t *const xd = n48x_desc((uint32_t)pl->inst);   // bundle 15: the instance's geometry for an HDMI plan
+    const uint32_t gw = xd ? xd->w : N48S.pw, gh = xd ? xd->h : N48S.ph, gp = xd ? xd->pitch_bytes : N48S.pitch;
+    VkDeviceSize all = (VkDeviceSize)gp * gh;
+    n48df_rect_t full = { 0, 0, (int32_t)gw, (int32_t)gh };
     n48_tex_to(cmd, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     if (pl->base >= 0) {
         VkBufferCopy bc = { .srcOffset = 0, .dstOffset = 0, .size = all }; vkCmdCopyBuffer(cmd, N48S.buf[pl->base], N48S.buf[slot], 1, &bc);
         VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT };
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);   // WAW: the region copy must land after the base copy
     }
-    if (!n48df_img_region(pl->base >= 0 ? pl->rect : full, N48S.pw, N48S.ph, N48S.pitch, 4, &g)) return;   // empty partial rectangle: only the base copy (same as the buffer path); full frames were validated by n48df_img_ok
+    if (!n48df_img_region(pl->base >= 0 ? pl->rect : full, gw, gh, gp, 4, &g)) return;   // empty partial rectangle: only the base copy (same as the buffer path); full frames were validated by n48df_img_ok
     VkBufferImageCopy bic = { .bufferOffset = g.buf_off, .bufferRowLength = g.row_len, .bufferImageHeight = 0, .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         .imageOffset = { (int32_t)g.x, (int32_t)g.y, 0 }, .imageExtent = { g.w, g.h, 1 } };
-    vkCmdCopyImageToBuffer(cmd, [t vkImage], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, N48S.buf[slot], 1, &bic);
+    vkCmdCopyImageToBuffer(cmd, [t vkImage], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, xd ? N48XI(pl->inst).buf[slot] : N48S.buf[slot], 1, &bic);   // the planned instance's slot buffer
     atomic_fetch_add(&n48s_imgcopies, 1);
+}
+// Build 16 (P1): the touch of an IOSurface texture `t` by command buffer `cb`: retains it, takes the F3 use count, and does what the aliasing rules (n48_ioalias.h) demand before the caller's own commands:
+//   * a PATH (b) writer that another wrapper of the same surface range touches is copied back NOW (and leaves the end-of-command-buffer write-back list), so the pages are current;
+//   * a path (b) toucher whose image is stale (another wrapper wrote since) uploads again, even if it was touched before in this command buffer.
+// endPass (may be NULL) is called, once, before the first recorded command: a render encoder ends its Vulkan render pass there (a copy cannot be recorded inside one).
+// WindowServer and the kill file /private/tmp/n48m-noioalias keep build 14's rule exactly (upload at the first touch that needs the contents) and only COUNT the cases the rules would have acted on.
+// Returns YES when commands were recorded. The caller guarantees [t n48IsIOS].
+static BOOL n48_ios_touch(N48CommandBuffer *cb, N48Texture *t, BOOL need, BOOL write, void (^endPass)(void)) {
+    const BOOL first = [cb n48IOFirstTouch:t];
+    const n48ia_act d = [cb n48IOAlias:t need:need write:write];
+    BOOL did = NO;
+    if (!n48_ioalias_acts()) {
+        if (d.flush) atomic_fetch_add(&N48LED.iaWsFlush, 1);
+        if (d.reupload) atomic_fetch_add(&N48LED.iaWsReup, 1);
+        if (first && need) { if (endPass) endPass(); n48_ios_upload([cb vk], t); did = YES; }
+        return did;
+    }
+    if (d.flush) {
+        N48Texture *x = [cb n48IOTex:d.flush];
+        if (x && [x n48IsIOS]) {
+            if (endPass) endPass();
+            n48_ios_writeback([cb vk], x);   // image -> pages (path (b)), then the host-visibility barrier
+            n48_full_barrier([cb vk]);       // ... and the transfer write must be visible to whatever the GPU does next with those pages
+            [cb n48IOUnwrite:x];             // the end-of-command-buffer write-back must not copy the (now older) image over a later writer
+            atomic_fetch_add(&N48LED.iaFlush, 1); did = YES;
+        }
+    }
+    if (d.upload) {
+        if (endPass) endPass();
+        n48_ios_upload([cb vk], t);
+        if (d.reupload) atomic_fetch_add(&N48LED.iaReup, 1);
+        did = YES;
+    }
+    return did;
 }
 // Call OUTSIDE a render pass. needContents NO = the caller clears the whole texture, so the upload is skipped.
 static void n48_ios_usek(N48CommandBuffer *cb, N48Texture *t, BOOL needContents, BOOL write, uint32_t kind) {
@@ -3477,7 +4660,7 @@ static void n48_ios_usek(N48CommandBuffer *cb, N48Texture *t, BOOL needContents,
         }
         return;
     }
-    if ([cb n48IOFirstTouch:t] && needContents) n48_ios_upload([cb vk], t);
+    (void)n48_ios_touch(cb, t, needContents, write, NULL);   // build 16 (P1): the upload / flush decision; was: first touch && needContents -> upload
     if (needContents) [cb n48CBRead:t];
     if (write) { [cb n48IOWritten:t]; if (kind) [cb n48DispNote:t bits:kind pso:nil]; }
 }
@@ -3487,7 +4670,26 @@ static void n48_ios_use(N48CommandBuffer *cb, N48Texture *t, BOOL needContents, 
 - (BOOL)n48IOFirstTouch:(N48Texture *)t {
     if (!_iot) { _iot = [NSMutableArray array]; _iow = [NSMutableArray array]; }
     if ([_iot indexOfObjectIdenticalTo:t] != NSNotFound) return NO;
-    [_iot addObject:t]; [self n48Retain:t]; return YES;
+    [_iot addObject:t]; [self n48Retain:t];
+    n48_led_latch();
+    if ([t n48UCSurface]) {   // F3: from the first touch until the command buffer is finished with the GPU the surface is use-counted (n48UCRelease); a buffer-backed texture has no surface and no ledger entry
+        (void)n48uc_take(&_uc, N48LED.ucMode, (void *)[t n48UCSurface], n48_uc_inc, NULL);
+        n48_led_touch(t, 1); _ucLive = YES;
+    }
+    return YES;
+}
+- (n48ia_act)n48IOAlias:(N48Texture *)t need:(BOOL)need write:(BOOL)w {
+    uint32_t sid = 0; uint64_t off = 0; [t n48AliasKey:&sid off:&off];
+    return n48ia_touch(&_ia, sid, off, (uintptr_t)(__bridge void *)t, [t n48IOSLinear] ? 0 : 1, need ? 1 : 0, w ? 1 : 0);
+}
+- (N48Texture *)n48IOTex:(uintptr_t)key { for (N48Texture *x in _iot) if ((uintptr_t)(__bridge void *)x == key) return x; return nil; }
+- (void)n48IOUnwrite:(N48Texture *)t { [_iow removeObjectIdenticalTo:t]; }   // P1: flushed (copied back) mid-command-buffer: the end-of-command-buffer write-back must not copy it again over a later writer
+// F3: this command buffer is finished with the GPU (or never will be): give back every use count it took, once. Called from n48PoolDone (completed / lost / failed to submit) and -dealloc (never submitted; a 60 s hang).
+- (void)n48UCRelease {
+    if (!_ucLive) return;
+    _ucLive = NO;
+    n48uc_release(&_uc, n48_uc_dec, NULL);
+    for (N48Texture *t in _iot) if ([t n48UCSurface]) n48_led_touch(t, -1);
 }
 - (uint64_t)n48TBegin { return _tBeg; }
 - (BOOL)n48IsFrame { return _frame; }
@@ -3589,12 +4791,15 @@ static void n48_ios_use(N48CommandBuffer *cb, N48Texture *t, BOOL needContents, 
     return self;
 }
 - (void)dealloc {
+    [self n48UCRelease]; n48uc_free(&_uc); n48ia_destroy(&_ia);   // build 16
+    for (uint32_t j = 0; j < _noj; j++) free(_oj[j].o); free(_oj);   // build 18 (P2): bookkeeping of passes that never resolved
     if (N48R.ok) {
         if (_pser && !_fence) n48_fence_close(_pser);   // P1: never submitted (a submitted one is closed by its completion block; a hung one stays open)
         for (NSValue *v in _pools) { VkDescriptorPool dp_ = (VkDescriptorPool)v.pointerValue; if (!(N48P.on && n48_dp_give(dp_))) vkDestroyDescriptorPool(N48R.dev, dp_, NULL); }   // P1: ON -> the pool goes to the fence-gated free list (cap 32)
+        for (NSValue *v in _qpools) vkDestroyQueryPool(N48R.dev, (VkQueryPool)v.pointerValue, NULL);   // build 18 (P2)
         for (NSValue *v in _fbs) vkDestroyFramebuffer(N48R.dev, (VkFramebuffer)v.pointerValue, NULL);
         for (NSValue *v in _rps) vkDestroyRenderPass(N48R.dev, (VkRenderPass)v.pointerValue, NULL);
-        if (_dslot >= 0) { int s = _dslot; _dslot = -1; n48s_complete(s, VK_ERROR_UNKNOWN, 0, 0, NULL, 0, 0); }   // never presented
+        if (_dslot >= 0) { int s = _dslot; _dslot = -1; n48s_complete(_dinst, s, VK_ERROR_UNKNOWN, 0, 0, NULL, 0, 0); }   // never presented
         if (_fence) vkDestroyFence(N48R.dev, _fence, NULL);
         if (_vk && _nq) { n48_qlock(); VkCommandBuffer c = _vk; vkFreeCommandBuffers(N48R.dev, [_nq pool], 1, &c); pthread_mutex_unlock(&N48R.qlock); }
     }
@@ -3650,13 +4855,13 @@ N48_DNR(N48CommandBuffer)
 - (NSError *)n48Error { return _encErr; }
 - (void)n48DispDone:(VkResult)r {
     int s = _dslot; if (s < 0) return; _dslot = -1;
-    n48crc_rec_t *rec = (_dcrc && r == VK_SUCCESS && _dtex) ? n48s_crc_check(_dtex, s, _dseq) : NULL;
+    n48crc_rec_t *rec = (_dcrc && r == VK_SUCCESS && _dtex && _dinst == 0) ? n48s_crc_check(_dtex, s, _dseq) : NULL;   // bundle 13: the CRC diagnostic is the DP's alone
     _dtex = nil;
-    n48s_complete(s, r, _dseq, _dsid, rec, _dcls, _tcommit);
+    n48s_complete(_dinst, s, r, _dseq, _dsid, rec, _dcls, _tcommit);
 }
 - (void)n48DispSeq {
     if (_dslot >= 0 || (_dcrc && _dtex)) _dseq = atomic_fetch_add(&N48S.seq, 1) + 1;
-    if (_dslot >= 0 && (_dsid || _dcid)) { pthread_mutex_lock(&N48S.mu); if (_dsid) n48df_submit(&N48S.sm, _dsid, _dseq); n48df_chain_submit(&N48S.sm, _dslot, _dcid, _dbid); pthread_mutex_unlock(&N48S.mu); }   // #12: only frames WITH a slot supersede earlier ones
+    if (_dslot >= 0 && (_dsid || _dcid)) { pthread_mutex_lock(&N48S.mu); n48df_t *const dsm = n48x_desc((uint32_t)_dinst) ? &N48XI(_dinst).sm : &N48S.sm; if (_dsid) n48df_submit(dsm, _dslot, _dsid, _dseq); n48df_chain_submit(dsm, _dslot, _dcid, _dbid); pthread_mutex_unlock(&N48S.mu); }   // #12: only frames WITH a slot supersede earlier ones
     if (_dcrc && _dtex && [_dtex n48IOSRef]) n48s_crc_note(IOSurfaceGetID([_dtex n48IOSRef]), _dseq);   // CRC diagnostic: which surface this submission wrote
 }   // call with the submit lock held, right before vkQueueSubmit
 - (BOOL)n48Finish:(NSError **)err {
@@ -3677,21 +4882,74 @@ N48_DNR(N48CommandBuffer)
         if (dt) {
             _frame = YES; _cbcls = n48df_class(dmask) + 1; _cbdsid = [dt n48DispSid];
             BOOL imgsrc = [dt n48DispImgOnly];   // P6: a protected display surface: copy from its VkImage
-            BOOL take = n48s_disp_account(dmask, [dt n48DispSid], dfns, atomic_fetch_add(&N48S.cbno, 1) + 1, dwr);   // native #12 P1/P2/D1: only a presentable frame takes a slot
-            n48df_plan_t pl; pl.slot = -1;
-            if (take && imgsrc && !(n48df_img_ok(N48S.pw, N48S.ph, N48S.pitch, 4) && [dt bytesPerPixel] == 4 && [dt width] == N48S.pw && [dt height] == N48S.ph && [dt n48Levels] == 1)) {   // refuse before a slot is taken
-                static _Atomic int rl; if (atomic_fetch_add(&rl, 1) < 8) N48LOG("scanout: display surface %u has no CPU mapping and its image cannot be copied to the slot (%lux%lu bpp %lu, plane %ux%u pitch %u): frame not copied", [dt n48DispSid], (unsigned long)[dt width], (unsigned long)[dt height], (unsigned long)[dt bytesPerPixel], N48S.pw, N48S.ph, N48S.pitch);
+            int pinst = 0, ptent = 0;   // bundle 13/15: the instance this frame is PLANNED for (0 = the DP, 1 = the monitor A, 2 = the monitor B) and whether the plan is only tentative (unknown surface: instance 0 only)
+            BOOL take = n48s_disp_account(dmask, [dt n48DispSid], dfns, atomic_fetch_add(&N48S.cbno, 1) + 1, dwr, &pinst, &ptent);   // native #12 P1/P2/D1: only a presentable frame takes a slot
+            n48df_plan_t pl; pl.slot = -1; pl.inst = 0; pl.tent = 0;
+            const n48x_desc_t *const pxd = n48x_desc((uint32_t)pinst);   // bundle 15: the planned instance's geometry (the DP's plane for instance 0)
+            const uint32_t gw_ = pxd ? pxd->w : N48S.pw, gh_ = pxd ? pxd->h : N48S.ph, gp_ = pxd ? pxd->pitch_bytes : N48S.pitch;
+            // bundle 17 (R-B1): the width / height check applies to EVERY frame, not only the image-sourced ones; a buffer-sourced frame (the surface's pages) also needs bytes-per-row == the plan's pitch (the copy reads pitch*height bytes of the surface)
+            if (take && !((imgsrc ? n48df_img_ok(gw_, gh_, gp_, 4) : (BOOL)YES) && [dt bytesPerPixel] == 4 && [dt width] == gw_ && [dt height] == gh_ && [dt n48Levels] == 1 && (imgsrc || [dt n48IOSBytesPerRow] == gp_))) {   // refuse before a slot is taken
+                static _Atomic int rl; if (atomic_fetch_add(&rl, 1) < 8) N48LOG("scanout: display surface %u cannot be copied to the slot (%lux%lu bpp %lu bpr %lu, %s; plan %ux%u pitch %u): frame not copied", [dt n48DispSid], (unsigned long)[dt width], (unsigned long)[dt height], (unsigned long)[dt bytesPerPixel], (unsigned long)(imgsrc ? 0 : [dt n48IOSBytesPerRow]), imgsrc ? "no CPU mapping" : "buffer source", gw_, gh_, gp_);
                 take = NO; }
-            int sl = take ? n48s_plan(dwr, &pl) : -1;
-            if (sl >= 0) { n48_full_barrier(_vk); if (imgsrc) n48s_record_copy_img(_vk, dt, &pl); else n48s_record_copy(_vk, [dt n48DispBuf], &pl); n48_full_barrier(_vk); _dslot = sl; _dcls = n48df_class(dmask); _dcid = pl.id; _dbid = pl.baseid; _dsid = [dt n48DispSid]; }
-            if (n48s_crc_on()) { _dcrc = YES; _dtex = dt; }
+            int sl = take ? n48s_plan(dwr, pinst, ptent, &pl) : -1;
+            if (sl >= 0) { n48_full_barrier(_vk); if (imgsrc) n48s_record_copy_img(_vk, dt, &pl); else n48s_record_copy(_vk, [dt n48DispBuf], &pl); n48_full_barrier(_vk); _dslot = sl; _dinst = pl.inst; _dcls = n48df_class(dmask); _dcid = pl.id; _dbid = pl.baseid; _dsid = [dt n48DispSid]; }
+            if (n48s_crc_on() && pinst == N48X_PLAN_DP) { _dcrc = YES; _dtex = dt; }   // bundle 13: the CRC diagnostic reads the DP's slot: never a monitor B frame
         }
     }
     VkResult r = vkEndCommandBuffer(_vk);
     if (r != VK_SUCCESS) { [self n48DispDone:r]; if (err) *err = n48_err(55, [NSString stringWithFormat:@"vkEndCommandBuffer = %d", r]); return NO; }
     return YES;
 }
-- (void)n48PoolDone { if (_pser) n48_fence_close(_pser); }
+// build 18 (P2): hand a render pass its occlusion bookkeeping and N48OCC_MAXQ reset-able query indices from this command buffer's pool (a pool holds 2 chunks; a new pool is made when it is used up).
+// Returns the n48occ (owned by this command buffer; never nil once the buffer is usable). *qp == VK_NULL_HANDLE: no pool could be made, so the pass answers "visible" for every offset it selects.
+- (n48occ *)n48OccNew:(N48Buffer *)vb accumulate:(int)acc pool:(VkQueryPool *)qp base:(uint32_t *)base {
+    n48occ *o = calloc(1, sizeof *o);
+    if (!o) { *qp = VK_NULL_HANDLE; return NULL; }
+    n48occ_init(o, (uint64_t)[vb length], acc);
+    *qp = VK_NULL_HANDLE; *base = 0;
+    if (N48R.occOK) {
+        if (!_qpCur || _qpUsed + N48OCC_MAXQ > 2 * N48OCC_MAXQ) {
+            VkQueryPoolCreateInfo qi = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_OCCLUSION, .queryCount = 2 * N48OCC_MAXQ };
+            VkQueryPool np = VK_NULL_HANDLE; VkResult r = vkCreateQueryPool(N48R.dev, &qi, NULL, &np);
+            if (r == VK_SUCCESS) { if (!_qpools) _qpools = [NSMutableArray array]; [_qpools addObject:[NSValue valueWithPointer:(void *)np]]; _qpCur = np; _qpUsed = 0; }
+            else { N48LOG("occlusion: vkCreateQueryPool = %d: this pass answers visible", r); _qpCur = VK_NULL_HANDLE; }
+        }
+        if (_qpCur) { *qp = _qpCur; *base = _qpUsed; _qpUsed += N48OCC_MAXQ; }
+    }
+    if (*qp == VK_NULL_HANDLE) n48occ_dead(o);
+    if (_noj == _coj) { uint32_t nc = _coj ? _coj * 2 : 4; void *nn = realloc(_oj, nc * sizeof *_oj); if (!nn) { free(o); *qp = VK_NULL_HANDLE; return NULL; } _oj = nn; _coj = nc; }
+    _oj[_noj].o = o; _oj[_noj].qp = *qp; _oj[_noj].base = *base; _noj++;
+    if (!_ojb) _ojb = [NSMutableArray array];
+    [_ojb addObject:vb]; [self n48Retain:vb];
+    return o;
+}
+// The GPU is finished with this command buffer (or it never ran): write every selected offset of every visibility buffer, once. Results are read WITHOUT waiting (a lost device must not hang the completion thread):
+// only when the fence reads VK_SUCCESS are the queries read, with availability; anything else answers "visible" (the fail-safe in n48_occ.h).
+- (void)n48OccResolve {
+    if (!_noj) return;
+    BOOL ran = NO;
+    if (N48R.ok && N48R.occOK && _fence != VK_NULL_HANDLE) ran = vkGetFenceStatus(N48R.dev, _fence) == VK_SUCCESS;
+    uint32_t nj = _noj; _noj = 0;
+    for (uint32_t j = 0; j < nj; j++) {
+        n48occ *o = _oj[j].o; N48Buffer *vb = _ojb[j]; uint8_t *base = (uint8_t *)[vb contents];
+        uint64_t res[N48OCC_MAXQ]; BOOL ok = ran && _oj[j].qp != VK_NULL_HANDLE;
+        if (ok && o->nq) {
+            uint64_t raw[2 * N48OCC_MAXQ];   // (result, availability) pairs
+            VkResult r = vkGetQueryPoolResults(N48R.dev, _oj[j].qp, _oj[j].base, o->nq, sizeof raw, raw, 2 * sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            if (r != VK_SUCCESS) ok = NO;
+            if (ok && !n48occ_read(o, raw, res)) ok = NO;   // an interval that is not available answers visible
+        }
+        if (!ok) N48LOGR("occlusion: pass with %u offset(s) answered VISIBLE (fail-safe: fence %s, %u interval(s), overflow %d)", o->nu, ran ? "done" : "not done", o->nq, o->overflow);
+        for (uint32_t u = 0; u < o->nu && base; u++) {
+            uint64_t *slot = (uint64_t *)(void *)(base + o->u[u].off);
+            *slot = n48occ_final(o, u, ok ? res : NULL, ok, *slot);
+        }
+        N48LOGR("occlusion: resolved %u interval(s) into %u offset(s) (%s)", o->nq, o->nu, o->accumulate ? "Accumulate" : "Reset");
+        free(o); _oj[j].o = NULL;
+    }
+    [_ojb removeAllObjects];
+}
+- (void)n48PoolDone { [self n48UCRelease]; [self n48OccResolve]; if (_pser) n48_fence_close(_pser); }
 // Copies bytes into the command buffer's upload ring (Shared memory, 256-byte aligned: covers every storage/uniform offset alignment).
 - (BOOL)n48Bytes:(const void *)p length:(NSUInteger)n buffer:(N48Buffer * __strong *)ob offset:(NSUInteger *)oo {
     NSUInteger need = ((n ? n : 1) + 255) & ~(NSUInteger)255;
@@ -3758,6 +5016,7 @@ N48_DNR(N48CommandBuffer)
                 uint32_t ix = p->binding - 32 + k; N48Texture *t = ix < 128 ? st->tex[ix] : nil;
                 if (!t) { N48LOG("WARN %s texture(%u) is used by the shader but was never bound: 1x1 dummy", nm, ix); t = n48_dummy_texture(dev); }
                 if (!t) { [self n48Fail:@"no dummy texture"]; return NO; }
+                if ([t n48Samples] > 1) { [self n48Fail:[NSString stringWithFormat:@"%s texture(%u): a %lu-sample texture is bound to a sampled-image slot; sampling a multisample texture (texture2d_ms) is not supported - resolve it first", nm, ix, (unsigned long)[t n48Samples]]]; return NO; }   // bundle 10
                 [self n48Retain:t];
                 ii[nii++] = (VkDescriptorImageInfo){ VK_NULL_HANDLE, [t vkView], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
             }
@@ -3826,11 +5085,11 @@ static VkPrimitiveTopology n48_topo(MTLPrimitiveType t) {
 // one attachment is read and written in the same subpass), and a framebuffer-local self-dependency lets the encoder put a barrier between draws so a
 // draw reads what earlier draws wrote (Metal ordering between draws). Within one draw, overlapping primitives are NOT ordered (no
 // rasterization_order_attachment_access on this RADV).
-static VkRenderPass n48_mk_rp(const VkAttachmentDescription *ads, uint32_t na, BOOL fetch) {
-    VkAttachmentReference refs[8], ins[8];
+static VkRenderPass n48_mk_rp(const VkAttachmentDescription *ads, uint32_t na, uint32_t nd, BOOL fetch) {
+    VkAttachmentReference refs[8], ins[8], dref = { na, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };   // bundle 10: nd = 1: ads[na] is the depth/stencil attachment
     for (uint32_t i = 0; i < na; i++) { refs[i] = (VkAttachmentReference){ i, fetch ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL }; ins[i] = (VkAttachmentReference){ i, VK_IMAGE_LAYOUT_GENERAL }; }
     VkSubpassDescription sp = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = na, .pColorAttachments = refs,
-        .inputAttachmentCount = fetch ? na : 0, .pInputAttachments = fetch ? ins : NULL };
+        .inputAttachmentCount = fetch ? na : 0, .pInputAttachments = fetch ? ins : NULL, .pDepthStencilAttachment = nd ? &dref : NULL };
     VkSubpassDependency deps[3] = {
         { .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0, .srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, .dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
           .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT },
@@ -3840,7 +5099,7 @@ static VkRenderPass n48_mk_rp(const VkAttachmentDescription *ads, uint32_t na, B
           .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
           .dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT } };
     // deps[0] = external in, deps[1] = external out, deps[2] = the fetch self-dependency (only declared for a fetch pass)
-    VkRenderPassCreateInfo rpc = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = na, .pAttachments = ads, .subpassCount = 1,
+    VkRenderPassCreateInfo rpc = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = na + nd, .pAttachments = ads, .subpassCount = 1,
         .pSubpasses = &sp, .dependencyCount = fetch ? 3 : 2, .pDependencies = deps };
     VkRenderPass rp = VK_NULL_HANDLE; VkResult r = vkCreateRenderPass(N48R.dev, &rpc, NULL, &rp);
     if (r != VK_SUCCESS) { N48LOG("render pass: vkCreateRenderPass = %d", r); return VK_NULL_HANDLE; }
@@ -3848,17 +5107,17 @@ static VkRenderPass n48_mk_rp(const VkAttachmentDescription *ads, uint32_t na, B
 }
 // P5b: n48_mk_rp through the device-wide render-pass cache. *cached = YES: the pass belongs to the cache for the life of the device (the caller must NOT destroy it and hands VK_NULL_HANDLE
 // to keepRenderPass:). OFF, or the cache is full: exactly n48_mk_rp (the caller owns the pass as before).
-static VkRenderPass n48_mk_rp_c(const VkAttachmentDescription *ads, uint32_t na, BOOL fetch, BOOL *cached) {
+static VkRenderPass n48_mk_rp_c(const VkAttachmentDescription *ads, uint32_t na, uint32_t nd, BOOL fetch, BOOL *cached) {
     *cached = NO;
-    if (!N48DO.on || na > 8) return n48_mk_rp(ads, na, fetch);
-    n48dc_rpkey k; memset(&k, 0, sizeof k); k.na = na; k.fetch = fetch ? 1 : 0;
-    for (uint32_t i = 0; i < na; i++)
+    if (!N48DO.on || na + nd > 8) return n48_mk_rp(ads, na, nd, fetch);   // bundle 10: the key counts every attachment; 8 colour + depth is not cached
+    n48dc_rpkey k; memset(&k, 0, sizeof k); k.na = na + nd; k.fetch = (fetch ? 1u : 0u) | (nd << 1);   // nd == 0: exactly the old key
+    for (uint32_t i = 0; i < na + nd; i++)
         k.a[i] = (n48dc_att){ (uint32_t)ads[i].format, (uint32_t)ads[i].samples, (uint32_t)ads[i].loadOp, (uint32_t)ads[i].storeOp, (uint32_t)ads[i].stencilLoadOp,
                               (uint32_t)ads[i].stencilStoreOp, (uint32_t)ads[i].initialLayout, (uint32_t)ads[i].finalLayout };
     uint64_t h;
     pthread_mutex_lock(&N48DO.mu); h = n48dc_rp_find(N48DO.rp, &k); pthread_mutex_unlock(&N48DO.mu);
     if (h) { atomic_fetch_add(&N48DO.rpHits, 1); *cached = YES; return (VkRenderPass)(uintptr_t)h; }
-    VkRenderPass rp = n48_mk_rp(ads, na, fetch); if (!rp) return VK_NULL_HANDLE;
+    VkRenderPass rp = n48_mk_rp(ads, na, nd, fetch); if (!rp) return VK_NULL_HANDLE;
     pthread_mutex_lock(&N48DO.mu);
     h = n48dc_rp_find(N48DO.rp, &k);   // another thread may have entered the same key meanwhile
     if (!h && n48dc_rp_add(N48DO.rp, &k, (uint64_t)(uintptr_t)rp)) { pthread_mutex_unlock(&N48DO.mu); atomic_fetch_add(&N48DO.rpCreated, 1); *cached = YES; return rp; }
@@ -3870,10 +5129,14 @@ static VkRenderPass n48_mk_rp_c(const VkAttachmentDescription *ads, uint32_t na,
 
 @interface N48RenderEncoder : _MTLCommandEncoder {
     N48CommandBuffer *_cb; BOOL _ended, _inPass, _begun; uint32_t _w, _h, _na; NSString *_lbl;
-    VkRenderPass _rp1; BOOL _rp1c; VkFramebuffer _fb, _fbf; VkClearValue _cvs[8]; VkAttachmentDescription _ads[8];
-    VkImageView _views[8]; N48Texture *_tex[8]; VkImageLayout _curLay[8]; BOOL _fetch;   // 11e-2: _fetch = the current/next pass is the framebuffer-fetch shape
+    VkRenderPass _rp1; BOOL _rp1c; VkFramebuffer _fb, _fbf; VkClearValue _cvs[9]; VkAttachmentDescription _ads[9];
+    VkImageView _views[9]; N48Texture *_tex[9]; VkImageLayout _curLay[9]; BOOL _fetch;   // bundle 10: slot [_na] is the depth/stencil attachment when _nd == 1; 11e-2: _fetch = the current/next pass is the framebuffer-fetch shape
+    uint32_t _nd; VkFormat _dsVkFmt; unsigned _encSamples;   // bundle 10: depth/stencil attachment present; its VkFormat (UNDEFINED = none); the pass's sample count (0 until the first attachment, then >= 1)
+    id _rtex[8]; uint32_t _slvl[8], _sslice[8], _rlvl[8], _rslice[8]; NSUInteger _sact[8];   // bundle 10: per colour attachment the resolve texture (+ level, slice), its source level / slice and the store action
+    N48DSInfo _dsi; uint32_t _sref[2]; float _bias[3];   // bundle 10: the bound MTLDepthStencilState, the stencil reference values (front, back) and depth bias (constant, clamp, slope)
     N48RenderPipelineState *_pso; N48StageState _sv, _sf; MTLViewport _vp; MTLScissorRect _sr; float _blend[4]; MTLCullMode _cull; MTLWinding _wind;
     n48dc_enc _dc; BOOL _dcOn;   // P5b: per-draw redundancy state (_dcOn = the n48m-drawopt switch as latched at device creation)
+    n48occ *_occ; VkQueryPool _qp; uint32_t _qbase;   // build 18 (P2): this pass's occlusion bookkeeping (owned by the command buffer), its query pool and the first of its N48OCC_MAXQ reserved query indices
     uint32_t _clrm; NSUInteger _dvc;   // #12 D2: attachments whose load action was Clear and not yet consumed by a presentable draw; vertex/index count of the draw being prepared (diagnostic)
 }
 - (instancetype)initWithCommandBuffer:(id)cb descriptor:(MTLRenderPassDescriptor *)d;
@@ -3885,73 +5148,196 @@ static VkRenderPass n48_mk_rp_c(const VkAttachmentDescription *ads, uint32_t na,
     if (!self) return nil;
     _cb = cb; _wind = MTLWindingClockwise;
     _dcOn = N48DO.on; if (_dcOn) n48dc_enc_init(&_dc);
-    VkImageView views[8]; uint32_t na = 0;
+    VkImageView views[9]; uint32_t na = 0; _dsi = n48_dsinfo_default();
     for (NSUInteger i = 0; i < 8; i++) {
         MTLRenderPassColorAttachmentDescriptor *ca = d.colorAttachments[i];
         N48Texture *t = (N48Texture *)ca.texture;
         if (!t) continue;
         if (![t isKindOfClass:[N48Texture class]]) { N48LOG("render pass: attachment %lu is not an N48Texture", (unsigned long)i); return nil; }
+        NSUInteger tsm = [t n48Samples];   // bundle 10: every attachment of a pass has the same sample count
+        if (_encSamples && tsm != _encSamples) { N48LOG("render pass: attachment %lu has %lu samples, the others %u; refused", (unsigned long)i, (unsigned long)tsm, _encSamples); return nil; }
+        _encSamples = (unsigned)tsm;
         // m11h9: a mip level of a 2D texture can be the attachment (the compositor renders into the base level of mipmapped textures and generates the rest)
         NSUInteger lvl = ca.level;
-        if (lvl >= [t mipmapLevelCount] || ca.slice != 0 || ca.depthPlane != 0) { N48LOG("render pass: attachment %lu level %lu slice %lu depthPlane %lu outside the texture (%lu level(s)); refused", (unsigned long)i, (unsigned long)lvl, (unsigned long)ca.slice, (unsigned long)ca.depthPlane, (unsigned long)[t mipmapLevelCount]); return nil; }
+        if (lvl >= [t mipmapLevelCount] || ca.slice >= [t n48Layers] || ca.depthPlane != 0) { N48LOG("render pass: attachment %lu level %lu slice %lu depthPlane %lu outside the texture (%lu level(s)); refused", (unsigned long)i, (unsigned long)lvl, (unsigned long)ca.slice, (unsigned long)ca.depthPlane, (unsigned long)[t mipmapLevelCount]); return nil; }
         if (na == 0) { _w = (uint32_t)MAX((NSUInteger)1, t.width >> lvl); _h = (uint32_t)MAX((NSUInteger)1, t.height >> lvl); }
         n48_ios_use(_cb, t, ca.loadAction != MTLLoadActionClear, YES);   // 11h.6: IOSurface contents are never discarded (only Clear skips the upload)
         [_cb n48DispNote:t bits:(N48DF_W_PASS | (ca.loadAction == MTLLoadActionClear ? N48DF_W_CLEAR : 0)) pso:nil];   // native #12 P1
         BOOL load = (ca.loadAction == MTLLoadActionLoad || ([t n48IsIOS] && ca.loadAction != MTLLoadActionClear)) && [t layout] != VK_IMAGE_LAYOUT_UNDEFINED;
         // The layout of a texture is tracked for the WHOLE image. A render pass only transitions its attachment's level, so a multi-level texture is moved to the attachment layout
         // explicitly (outside any pass: the previous encoder has ended) and the pass then starts from that layout.
-        if ([t n48Levels] > 1) n48_tex_to([_cb vk], t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        BOOL wholeImg = [t n48Levels] > 1 || [t n48Layers] > 1;   // bundle 9: a layered texture is moved as a whole too (the pass only transitions its one layer)
+        if (wholeImg) n48_tex_to([_cb vk], t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         // storeOp is always STORE: a pass may be split (a texture bound mid-encoder needs a layout change outside the pass) and the
         // continuation LOADs what the first part stored.
-        _ads[na] = (VkAttachmentDescription){ .format = [t vkFormat], .samples = VK_SAMPLE_COUNT_1_BIT,
+        _ads[na] = (VkAttachmentDescription){ .format = [t vkFormat], .samples = (VkSampleCountFlagBits)tsm,
             .loadOp = ca.loadAction == MTLLoadActionClear ? VK_ATTACHMENT_LOAD_OP_CLEAR : load ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
             .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-            .initialLayout = ([t n48Levels] > 1) ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : load ? [t layout] : VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+            .initialLayout = wholeImg ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : load ? [t layout] : VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
         if (ca.loadAction == MTLLoadActionClear) _clrm |= 1u << na;
-        views[na] = [t n48AttViewLevel:(uint32_t)lvl]; _views[na] = views[na]; _tex[na] = t; _sf.att[na] = t;
+        views[na] = [t n48AttViewLevel:(uint32_t)lvl layer:(uint32_t)ca.slice]; _views[na] = views[na]; _tex[na] = t; _sf.att[na] = t;
         MTLClearColor c = ca.clearColor;
+        if ([t n48IsUInt]) {   // bundle 19: an integer attachment is cleared through .uint32 with Metal's conversion (truncate, saturate; measured on an Apple-silicon Mac, n48_intfmt.h); .float32 would put float bits in the texture
+            _cvs[na] = (VkClearValue){ .color = { .uint32 = { n48if_clear_u(c.red, 16), n48if_clear_u(c.green, 16), n48if_clear_u(c.blue, 16), n48if_clear_u(c.alpha, 16) } } };
+        } else
         _cvs[na] = (VkClearValue){ .color = { .float32 = { (float)c.red, (float)c.green, (float)c.blue, (float)c.alpha } } };
         [t setLayout:VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL];
         [_cb n48Retain:t];
+        // bundle 10: store action / multisample resolve.  The attachment itself is always stored; a resolve texture receives vkCmdResolveImage at endEncoding (a pass may be split, so never inside it).
+        _slvl[na] = (uint32_t)lvl; _sslice[na] = (uint32_t)ca.slice; _sact[na] = (NSUInteger)ca.storeAction; _rtex[na] = ca.resolveTexture; _rlvl[na] = (uint32_t)ca.resolveLevel; _rslice[na] = (uint32_t)ca.resolveSlice;
+        { n48sa_t sat; if (!n48sa_map((unsigned long)ca.storeAction, ca.resolveTexture != nil, tsm > 1, &sat)) { N48LOG("render pass: attachment %lu: %s; refused", (unsigned long)i, sat.why); return nil; }
+          if (sat.resolve && ![self n48CheckResolve:na]) return nil; }
         na++;
     }
-    if (!na) { N48LOG("render pass: no colour attachments"); return nil; }
+    if (d.depthAttachment.texture || d.stencilAttachment.texture) {   // bundle 10: the depth / stencil attachment (one Vulkan attachment: one texture, depth and/or stencil aspect)
+        id dtI = d.depthAttachment.texture, stI = d.stencilAttachment.texture;
+        MTLRenderPassDepthAttachmentDescriptor *da = d.depthAttachment; MTLRenderPassStencilAttachmentDescriptor *sa = d.stencilAttachment;
+        if (dtI && stI && dtI != stI) { N48LOG("render pass: separate depth and stencil textures are not supported (use one Depth32Float_Stencil8 texture); refused"); return nil; }
+        id ti = dtI ? dtI : stI;
+        if (![ti isKindOfClass:[N48Texture class]]) { N48LOG("render pass: the depth/stencil attachment is not an N48Texture"); return nil; }
+        N48Texture *dt = ti; unsigned asp = [dt n48Aspects];
+        if (![dt n48IsDS]) { N48LOG("render pass: the depth/stencil attachment texture has a colour pixel format; refused"); return nil; }
+        if ((dtI && !(asp & N48DP_ASP_DEPTH)) || (stI && !(asp & N48DP_ASP_STENCIL))) { N48LOG("render pass: the %s attachment texture (pixel format %lu) has no %s aspect; refused", dtI ? "depth" : "stencil", (unsigned long)dt.pixelFormat, dtI ? "depth" : "stencil"); return nil; }
+        if ([dt n48IsView] && asp != n48dp_view_aspect(asp)) { N48LOG("render pass: a view of a combined depth/stencil texture cannot be an attachment; refused"); return nil; }
+        if (dtI && stI && (da.level != sa.level || da.slice != sa.slice)) { N48LOG("render pass: the depth and stencil attachments name different levels / slices; refused"); return nil; }
+        NSUInteger lvl = dtI ? da.level : sa.level, slc = dtI ? da.slice : sa.slice, dpl = dtI ? da.depthPlane : sa.depthPlane;
+        if (lvl >= [dt mipmapLevelCount] || slc >= [dt n48Layers] || dpl != 0) { N48LOG("render pass: the depth/stencil attachment level %lu slice %lu depthPlane %lu is outside the texture; refused", (unsigned long)lvl, (unsigned long)slc, (unsigned long)dpl); return nil; }
+        NSUInteger tsm = [dt n48Samples];
+        if (_encSamples && tsm != _encSamples) { N48LOG("render pass: the depth/stencil attachment has %lu samples, the colour attachments %u; refused", (unsigned long)tsm, _encSamples); return nil; }
+        _encSamples = (unsigned)tsm;
+        uint32_t dw = (uint32_t)MAX((NSUInteger)1, dt.width >> lvl), dh = (uint32_t)MAX((NSUInteger)1, dt.height >> lvl);
+        if (na == 0) { _w = dw; _h = dh; }
+        else if (dw < _w || dh < _h) { N48LOG("render pass: the depth/stencil attachment (%ux%u) is smaller than the colour attachments (%ux%u); refused", dw, dh, _w, _h); return nil; }
+        { n48sa_t sat; const char *rw = NULL;
+          if (dtI && !n48sa_map((unsigned long)da.storeAction, da.resolveTexture != nil, tsm > 1, &sat)) { N48LOG("render pass: depth attachment: %s; refused", sat.why); return nil; }
+          if (dtI && sat.resolve) { (void)n48sa_target_ok(dw, dh, [dt vkFormat], asp, dw, dh, [dt vkFormat], 1, &rw); N48LOG("render pass: depth attachment resolve: %s; refused", rw); return nil; }
+          if (stI && !n48sa_map((unsigned long)sa.storeAction, sa.resolveTexture != nil, tsm > 1, &sat)) { N48LOG("render pass: stencil attachment: %s; refused", sat.why); return nil; }
+          if (stI && sat.resolve) { (void)n48sa_target_ok(dw, dh, [dt vkFormat], asp, dw, dh, [dt vkFormat], 1, &rw); N48LOG("render pass: stencil attachment resolve: %s; refused", rw); return nil; } }
+        n48rp_ds_t ops; n48rp_ds(asp, dtI != nil, (unsigned)da.loadAction, stI != nil, (unsigned)sa.loadAction, [dt layout] == VK_IMAGE_LAYOUT_UNDEFINED, &ops);
+        BOOL wholeImg = [dt n48Levels] > 1 || [dt n48Layers] > 1;
+        if (wholeImg) n48_tex_to([_cb vk], dt, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        _ads[na] = (VkAttachmentDescription){ .format = [dt vkFormat], .samples = (VkSampleCountFlagBits)tsm,
+            .loadOp = (VkAttachmentLoadOp)ops.depthLoad, .storeOp = (VkAttachmentStoreOp)ops.depthStore, .stencilLoadOp = (VkAttachmentLoadOp)ops.stencilLoad, .stencilStoreOp = (VkAttachmentStoreOp)ops.stencilStore,
+            .initialLayout = wholeImg ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : ops.undefinedInitial ? VK_IMAGE_LAYOUT_UNDEFINED : [dt layout], .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+        _cvs[na] = (VkClearValue){ .depthStencil = { (float)da.clearDepth, (uint32_t)sa.clearStencil } };
+        views[na] = [dt n48AttViewLevel:(uint32_t)lvl layer:(uint32_t)slc]; _views[na] = views[na]; _tex[na] = dt; _dsVkFmt = [dt vkFormat]; _nd = 1;
+        [dt setLayout:VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL];
+        [_cb n48Retain:dt];
+        N48LOGR("render pass: depth/stencil attachment %p pixel format %lu (vk %d) aspects 0x%x level %lu slice %lu, %lu sample(s), depth load %u store %u, stencil load %u store %u", (__bridge void *)dt, (unsigned long)dt.pixelFormat, [dt vkFormat], asp,
+                (unsigned long)lvl, (unsigned long)slc, (unsigned long)tsm, ops.depthLoad, ops.depthStore, ops.stencilLoad, ops.stencilStore);
+    }
+    if (!_encSamples) _encSamples = 1;
+    if (!na && !_nd) { N48LOG("render pass: no colour or depth/stencil attachments"); return nil; }
     _na = na;
-    for (uint32_t i = 0; i < na; i++) _curLay[i] = _ads[i].initialLayout;
-    _rp1 = n48_mk_rp_c(_ads, na, NO, &_rp1c); if (!_rp1) return nil;
-    VkFramebufferCreateInfo fbc = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = _rp1, .attachmentCount = na, .pAttachments = views, .width = _w, .height = _h, .layers = 1 };
+    for (uint32_t i = 0; i < na + _nd; i++) _curLay[i] = _ads[i].initialLayout;
+    _rp1 = n48_mk_rp_c(_ads, na, _nd, NO, &_rp1c); if (!_rp1) return nil;
+    VkFramebufferCreateInfo fbc = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = _rp1, .attachmentCount = na + _nd, .pAttachments = views, .width = _w, .height = _h, .layers = 1 };
     VkResult r = vkCreateFramebuffer(N48R.dev, &fbc, NULL, &_fb);
     if (r != VK_SUCCESS) { N48LOG("render pass: vkCreateFramebuffer = %d", r); if (!_rp1c) vkDestroyRenderPass(N48R.dev, _rp1, NULL); return nil; }
     [_cb keepRenderPass:_rp1c ? VK_NULL_HANDLE : _rp1 framebuffer:_fb];
     // Metal's default viewport = the attachment, y down; translated shaders do not flip clip Y (F6): the viewport is emitted with a negative height.
     _vp = (MTLViewport){ 0, 0, _w, _h, 0, 1 }; _sr = (MTLScissorRect){ 0, 0, _w, _h };
     N48LOGR("N48RenderEncoder %p: %u x %u, %u attachment(s); the Vulkan render pass begins at the first draw (or at endEncoding)", (__bridge void *)self, _w, _h, na);
+    [self n48OccInit:d];   // build 18 (P2): outside any render pass (the previous encoder has ended), so the query reset is legal
     return self;
 }
 N48_DNR(N48RenderEncoder)
+// ---- build 18 (P2): occlusion queries (n48_occ.h has the model and the measured Metal semantics) ----
+// Called at the end of the encoder's init. A pass with a visibility result buffer gets N48OCC_MAXQ query indices from the command buffer's pool, reset HERE (a reset is illegal inside a render pass).
+- (void)n48OccInit:(MTLRenderPassDescriptor *)d {
+    id vb = d.visibilityResultBuffer;
+    if (!vb) return;
+    if (![vb isKindOfClass:[N48Buffer class]] || ![(N48Buffer *)vb contents]) { N48_ONCE("occlusion: the visibility result buffer is not a CPU-mapped N48Buffer; its offsets are not written"); return; }
+    int acc = 0;
+    if ([d respondsToSelector:@selector(visibilityResultType)]) acc = (long)[(id)d visibilityResultType] == 1;   // MTLVisibilityResultTypeAccumulate
+    n48occ *o = [_cb n48OccNew:(N48Buffer *)vb accumulate:acc pool:&_qp base:&_qbase];
+    if (!o) return;
+    _occ = o;
+    if (_qp != VK_NULL_HANDLE) vkCmdResetQueryPool([_cb vk], _qp, _qbase, N48OCC_MAXQ);
+    N48LOGR("occlusion: pass with a visibility buffer (%lu bytes, %s)", (unsigned long)[vb length], acc ? "Accumulate" : "Reset");
+}
+- (void)n48OccEndQuery {   // the open interval ends here: always BEFORE the render pass it began in ends
+    uint32_t q;
+    if (_occ && n48occ_end(_occ, &q)) vkCmdEndQuery([_cb vk], _qp, _qbase + q);
+}
+- (void)n48OccDraw {   // inside the render pass, right before a draw is recorded
+    uint32_t q; int precise = 0;
+    if (_occ && n48occ_draw(_occ, &q, &precise)) vkCmdBeginQuery([_cb vk], _qp, _qbase + q, (precise && N48R.occPrecise) ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+}
+- (void)n48EndPass {   // THE one place a Vulkan render pass of this encoder ends (the pass is split by layout changes, uploads, barriers, framebuffer fetch; each part is a new query interval)
+    if (!_inPass) return;
+    [self n48OccEndQuery];
+    vkCmdEndRenderPass([_cb vk]); _inPass = NO;
+}
+// ---- build 18: the VETTED list (void / scalar selectors only; everything else keeps today's crash, logged first by N48_DNR) ----
+// V1 setFragmentVisibleFunctionTable:atBufferIndex: (named by the P3 evidence: RenderBox's __TEXT carries this selector). Safe value: NO-OP. Why that is safe: a fragment function that CALLS through a visible
+// function table uses the air.get_function_pointer_visible_function_table intrinsics, which the translator accepts only inside a linkage translation (air_intrinsics.rs "StaticLinkage"); this bundle's pipeline
+// creation never supplies a table linkage, so such a pipeline is refused at creation and can never read the binding; for every other pipeline the binding is irrelevant. (SUSPECTED, not run on a real app.)
+- (void)setFragmentVisibleFunctionTable:(id)t atBufferIndex:(NSUInteger)i { (void)t; (void)i; N48_ONCE("setFragmentVisibleFunctionTable:atBufferIndex: ignored (vetted no-op: pipelines that call through a function table are refused at creation)"); }
+- (void)setVisibilityResultMode:(NSUInteger)mode offset:(NSUInteger)offset {
+    if (!_occ) { N48_ONCE("setVisibilityResultMode:offset: on a pass without a (usable) visibility result buffer: ignored"); return; }
+    int endq = 0; int rc = n48occ_set(_occ, mode, offset, &endq);
+    if (endq) vkCmdEndQuery([_cb vk], _qp, _qbase + _occ->activeQ);   // n48occ_set closed the interval; activeQ names its query
+    if (rc) N48LOG("setVisibilityResultMode:%lu offset:%lu REJECTED (mode > 2, offset not a multiple of 8 or past the %llu-byte buffer): treated as Disabled", (unsigned long)mode, (unsigned long)offset, (unsigned long long)_occ->buflen);
+}
 - (NSString *)label { return _lbl; }
 - (void)setLabel:(NSString *)l { _lbl = [l copy]; }
 - (NSUInteger)getType { return 1; }
 
+// ---- bundle 10: multisample resolve ----
+// 1 when colour attachment i's resolve texture is usable (a 2D single-sample texture of the attachment's size and format); logs and returns 0 otherwise.
+- (BOOL)n48CheckResolve:(uint32_t)i {
+    N48Texture *src = _tex[i]; id r = _rtex[i];
+    if (![r isKindOfClass:[N48Texture class]]) { N48LOG("render pass: attachment %u: the resolve texture is not an N48Texture; refused", i); return NO; }
+    N48Texture *dst = r;
+    if (dst == src || [dst n48IsView] || [dst textureType] == MTLTextureType3D) { N48LOG("render pass: attachment %u: the resolve texture is the attachment itself, a view or a 3D texture; refused", i); return NO; }
+    if (_rlvl[i] >= [dst mipmapLevelCount] || _rslice[i] >= [dst n48Layers]) { N48LOG("render pass: attachment %u: resolve level %u slice %u is outside the resolve texture; refused", i, _rlvl[i], _rslice[i]); return NO; }
+    unsigned sw = (unsigned)MAX((NSUInteger)1, src.width >> _slvl[i]), sh = (unsigned)MAX((NSUInteger)1, src.height >> _slvl[i]), dw = (unsigned)MAX((NSUInteger)1, dst.width >> _rlvl[i]), dh = (unsigned)MAX((NSUInteger)1, dst.height >> _rlvl[i]);
+    const char *why = NULL;
+    if (!n48sa_target_ok(sw, sh, (unsigned)[src vkFormat], [src n48Aspects], dw, dh, (unsigned)[dst vkFormat], (unsigned)[dst n48Samples], &why)) { N48LOG("render pass: attachment %u: %s; refused", i, why); return NO; }
+    return YES;
+}
+// At endEncoding (after the last vkCmdEndRenderPass): every colour attachment whose FINAL store action resolves is resolved into its resolve texture.
+- (void)n48ResolveAll {
+    VkCommandBuffer cmd = [_cb vk];
+    for (uint32_t i = 0; i < _na; i++) {
+        if (!_rtex[i]) continue;
+        n48sa_t sat; N48Texture *src = _tex[i];
+        if (!n48sa_map((unsigned long)_sact[i], YES, [src n48Samples] > 1, &sat)) { [_cb n48Fail:[NSString stringWithFormat:@"attachment %u: %s", i, sat.why]]; continue; }
+        if (!sat.resolve) continue;
+        if (![self n48CheckResolve:i]) { [_cb n48Fail:[NSString stringWithFormat:@"attachment %u: the resolve texture is unusable (see the log)", i]]; continue; }
+        N48Texture *dst = _rtex[i]; [_cb n48Retain:dst];
+        n48_ios_usek(_cb, dst, NO, YES, N48DF_W_BLIT);
+        n48_tex_to(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL); n48_tex_to(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageResolve rg = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, _slvl[i], _sslice[i], 1 }, .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, _rlvl[i], _rslice[i], 1 },
+            .extent = { (uint32_t)MAX((NSUInteger)1, src.width >> _slvl[i]), (uint32_t)MAX((NSUInteger)1, src.height >> _slvl[i]), 1 } };
+        vkCmdResolveImage(cmd, [src vkImage], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, [dst vkImage], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rg);
+        N48LOGR("render pass: attachment %u (%lu samples) resolved into texture %p level %u slice %u", i, (unsigned long)[src n48Samples], (__bridge void *)dst, _rlvl[i], _rslice[i]);
+    }
+}
 // ---- pass management ----
 - (void)n48BeginPass {
     if (_inPass) return;
     if (_dcOn) n48dc_enc_reset_bound(&_dc);   // P5b: a new Vulkan render pass starts: forget the bound pipeline and the cached descriptor sets
-    VkRenderPass rp = _rp1; VkFramebuffer fb = _fb; uint32_t ncv = _begun ? 0 : _na;
+    VkRenderPass rp = _rp1; VkFramebuffer fb = _fb; uint32_t ncv = _begun ? 0 : _na + _nd;
     BOOL rpc = _rp1c;
     if (_begun || _fetch) {   // continuation and/or framebuffer-fetch pass: built on demand from the attachments' CURRENT layouts (destroyed with the command buffer)
-        VkAttachmentDescription a2[8];
+        VkAttachmentDescription a2[9];
         for (uint32_t i = 0; i < _na; i++) {
             a2[i] = _ads[i]; a2[i].initialLayout = _curLay[i];
             if (_begun) a2[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             a2[i].finalLayout = _fetch ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         }
-        rp = n48_mk_rp_c(a2, _na, _fetch, &rpc);
+        if (_nd) {   // bundle 10: the depth/stencil attachment continues with what the first part stored
+            a2[_na] = _ads[_na]; a2[_na].initialLayout = _curLay[_na]; a2[_na].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            if (_begun) { a2[_na].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; a2[_na].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD; }
+        }
+        rp = n48_mk_rp_c(a2, _na, _nd, _fetch, &rpc);
         if (!rp) { [_cb n48Fail:@"cannot create the continuation / framebuffer-fetch render pass"]; return; }
         if (_fetch) {
             if (!_fbf) {   // the fetch framebuffer: same views, a fetch-shaped (input-attachment) render pass for compatibility
-                VkFramebufferCreateInfo fbc = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = rp, .attachmentCount = _na, .pAttachments = _views, .width = _w, .height = _h, .layers = 1 };
+                VkFramebufferCreateInfo fbc = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = rp, .attachmentCount = _na + _nd, .pAttachments = _views, .width = _w, .height = _h, .layers = 1 };
                 VkResult r = vkCreateFramebuffer(N48R.dev, &fbc, NULL, &_fbf);
                 if (r != VK_SUCCESS) { _fbf = VK_NULL_HANDLE; if (!rpc) vkDestroyRenderPass(N48R.dev, rp, NULL); [_cb n48Fail:[NSString stringWithFormat:@"vkCreateFramebuffer (fetch) = %d", r]]; return; }
                 [_cb keepRenderPass:rpc ? VK_NULL_HANDLE : rp framebuffer:_fbf];
@@ -3960,6 +5346,7 @@ N48_DNR(N48RenderEncoder)
         } else [_cb keepRenderPass:rpc ? VK_NULL_HANDLE : rp framebuffer:VK_NULL_HANDLE];
     }
     for (uint32_t i = 0; i < _na; i++) { _curLay[i] = _fetch ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; [_tex[i] setLayout:_curLay[i]]; }
+    if (_nd) { _curLay[_na] = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL; [_tex[_na] setLayout:_curLay[_na]]; }
     VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = rp, .framebuffer = fb,
         .renderArea = { { 0, 0 }, { _w, _h } }, .clearValueCount = ncv, .pClearValues = _cvs };
     vkCmdBeginRenderPass([_cb vk], &rbi, VK_SUBPASS_CONTENTS_INLINE);
@@ -3967,7 +5354,7 @@ N48_DNR(N48RenderEncoder)
 }
 - (void)n48Need:(N48Texture *)t layout:(VkImageLayout)l {
     if ([t layout] == l) return;
-    if (_inPass) { vkCmdEndRenderPass([_cb vk]); _inPass = NO; N48LOGR("render pass split: texture %p needs layout %d (was %d)", (__bridge void *)t, l, [t layout]); }
+    if (_inPass) { [self n48EndPass]; N48LOGR("render pass split: texture %p needs layout %d (was %d)", (__bridge void *)t, l, [t layout]); }
     n48_tex_to([_cb vk], t, l);
 }
 
@@ -3984,16 +5371,20 @@ N48_DNR(N48RenderEncoder)
 - (void)setScissorRects:(const MTLScissorRect *)r count:(NSUInteger)n { if (n) _sr = r[0]; if (n > 1) N48LOG("setScissorRects: %lu rects, only the first is used", (unsigned long)n); }
 - (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a { _blend[0] = r; _blend[1] = g; _blend[2] = b; _blend[3] = a; }
 - (void)setTriangleFillMode:(MTLTriangleFillMode)m { if (m != MTLTriangleFillModeFill) N48LOG("setTriangleFillMode %lu: NOT IMPLEMENTED (fill)", (unsigned long)m); }
-- (void)setDepthClipMode:(NSUInteger)m { (void)m; }
-- (void)setDepthBias:(float)a slopeScale:(float)b clamp:(float)c { (void)a; (void)b; (void)c; }
-- (void)setStencilReferenceValue:(uint32_t)v { (void)v; }
-- (void)setDepthStencilState:(id)s { if (s) N48_ONCE("setDepthStencilState: ignored (render passes have no depth/stencil attachments)"); }
+- (void)setDepthClipMode:(NSUInteger)m { if (m) N48_ONCE("setDepthClipMode: Clamp is not implemented (depth clip stays on)"); }
+- (void)setDepthBias:(float)a slopeScale:(float)b clamp:(float)c { _bias[0] = a; _bias[1] = N48R.dbClamp ? c : 0.0f; _bias[2] = b; if (c != 0.0f && !N48R.dbClamp) N48_ONCE("setDepthBias: a non-zero clamp is ignored (the device lacks depthBiasClamp)"); }   // bundle 10
+- (void)setStencilReferenceValue:(uint32_t)v { _sref[0] = _sref[1] = v; }
+- (void)setDepthStencilState:(id)s {   // bundle 10: recorded; read at every draw of a pipeline that has a depth/stencil attachment (a colour-only pipeline never looks at it)
+    if (!s) { _dsi = n48_dsinfo_default(); return; }
+    if (![s isKindOfClass:[N48DepthStencilState class]]) { N48LOG("setDepthStencilState: not an N48DepthStencilState"); return; }
+    _dsi = [(N48DepthStencilState *)s n48Info]; [_cb n48Retain:s];
+}
 // ---- gap census: barriers, fences, residency, store actions (QuartzCore sends -memoryBarrierWithScope:afterStages:beforeStages: 6369 times in 45 s) ----
 // A barrier between draws of one encoder = end the Vulkan render pass (the next draw starts a LOADing continuation pass; the pass-split machinery already
 // exists for layout changes) plus a full memory barrier, which orders everything before it against everything after it.
 - (void)n48Barrier:(const char *)what {
     if (_ended) return;
-    if (_inPass) { vkCmdEndRenderPass([_cb vk]); _inPass = NO; }
+    if (_inPass) { [self n48EndPass]; }
     n48_full_barrier([_cb vk]);
     N48_ONCE("render encoder %s: render pass split + full barrier", what);
 }
@@ -4002,13 +5393,13 @@ N48_DNR(N48RenderEncoder)
 - (void)textureBarrier { [self n48Barrier:"textureBarrier"]; }
 - (void)updateFence:(id)f afterStages:(NSUInteger)st { (void)f; (void)st; N48_ONCE("render updateFence: ordered by submission order; ignored"); }
 - (void)waitForFence:(id)f beforeStages:(NSUInteger)st { (void)f; (void)st; N48_ONCE("render waitForFence: ordered by submission order; ignored"); }
-- (void)setColorStoreAction:(NSUInteger)a atIndex:(NSUInteger)i { (void)a; (void)i; N48_ONCE("setColorStoreAction: ignored (colour attachments are always stored)"); }
+- (void)setColorStoreAction:(NSUInteger)a atIndex:(NSUInteger)i { if (i < _na) _sact[i] = a; else N48_ONCE("setColorStoreAction: index past the colour attachments; ignored"); }   // bundle 10: only a resolve changes anything (colour attachments are always stored)
 - (void)setColorStoreActionOptions:(NSUInteger)a atIndex:(NSUInteger)i { (void)a; (void)i; }
 - (void)setDepthStoreAction:(NSUInteger)a { (void)a; }
 - (void)setDepthStoreActionOptions:(NSUInteger)a { (void)a; }
 - (void)setStencilStoreAction:(NSUInteger)a { (void)a; }
 - (void)setStencilStoreActionOptions:(NSUInteger)a { (void)a; }
-- (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b { (void)f; (void)b; }
+- (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b { _sref[0] = f; _sref[1] = b; }
 N48_ENCODER_NOOPS
 - (void)pushDebugGroup:(NSString *)s { (void)s; }
 - (void)popDebugGroup {}
@@ -4056,10 +5447,8 @@ N48_ENCODER_NOOPS
 
 // ---- P5b helpers (only reached when the n48m-drawopt switch is ON) ----
 - (void)n48NeedTex:(N48Texture *)t layout:(VkImageLayout)l {   // the body of needTex in n48PrepareDraw, verbatim
-    if ([t n48IsIOS] && [_cb n48IOFirstTouch:t]) {
-        if (_inPass) { vkCmdEndRenderPass([_cb vk]); _inPass = NO; N48LOGR("render pass split: IOSurface texture %p uploaded", (__bridge void *)t); }
-        n48_ios_upload([_cb vk], t);
-    }
+    if ([t n48IsIOS]) (void)n48_ios_touch(_cb, t, YES, l == VK_IMAGE_LAYOUT_GENERAL, ^{   // 11h.6 / build 16 (P1): upload / flush outside the render pass (splits it if one is open)
+        if (self->_inPass) { [self n48EndPass]; N48LOGR("render pass split: IOSurface texture %p uploaded", (__bridge void *)t); } });
     [_cb n48CBRead:t];
     if ([t n48DispImgOnly]) (void)[_cb n48IOFirstTouch:t];   // P6: retained for the command buffer, nothing to upload
     if (([t n48IsIOS] || [t n48DispImgOnly]) && l == VK_IMAGE_LAYOUT_GENERAL) { [_cb n48IOWritten:t]; [_cb n48DispNote:t bits:N48DF_W_COMPUTE pso:nil]; }
@@ -4121,22 +5510,24 @@ N48_ENCODER_NOOPS
       if (r) { _pso = r; [_cb n48Retain:r]; N48LOGR("HOT-SWAP: render encoder now uses the real pipeline %p", (__bridge void *)r); } }
     VkCullModeFlags cull = _cull == MTLCullModeFront ? VK_CULL_MODE_FRONT_BIT : _cull == MTLCullModeBack ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
     VkFrontFace front = _wind == MTLWindingCounterClockwise ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;   // both are window-space (y down) senses
+    if ([_pso n48DSVk] != _dsVkFmt || [_pso n48SampleCount] != _encSamples) {   // bundle 10: the pipeline's attachments must be the pass's (Metal validation; a Vulkan render-pass compatibility rule)
+        [_cb n48Fail:[NSString stringWithFormat:@"the render pipeline's depth/stencil format (vk %d) or sample count (%u) differs from the pass's (vk %d, %u)", (int)[_pso n48DSVk], [_pso n48SampleCount], (int)_dsVkFmt, _encSamples]]; return NO; }
+    uint32_t dk = [_pso n48DSKey:&_dsi];   // bundle 10: 0 for a colour-only pipeline
+    uint32_t fkey = (uint32_t)front | (dk << 1);   // the last-answer cache compares (topology, cull, front, pso): the depth/stencil variant rides in the front word
     VkPipeline vkp;
     if (_dcOn) {   // P5b item 3: the last (topology, cull, front, pso) -> VkPipeline answer skips pipelineForTopology's NSNumber / NSLock / NSDictionary
         uint64_t pp;
-        if (n48dc_enc_pc_get(&_dc, (uint32_t)topo, (uint32_t)cull, (uint32_t)front, (__bridge const void *)_pso, &pp)) vkp = (VkPipeline)(uintptr_t)pp;
-        else { vkp = [_pso pipelineForTopology:topo cull:cull front:front]; n48dc_enc_pc_put(&_dc, (uint32_t)topo, (uint32_t)cull, (uint32_t)front, (__bridge const void *)_pso, (uint64_t)(uintptr_t)vkp); }
-    } else vkp = [_pso pipelineForTopology:topo cull:cull front:front];
+        if (n48dc_enc_pc_get(&_dc, (uint32_t)topo, (uint32_t)cull, fkey, (__bridge const void *)_pso, &pp)) vkp = (VkPipeline)(uintptr_t)pp;
+        else { vkp = [_pso pipelineForTopology:topo cull:cull front:front ds:dk]; n48dc_enc_pc_put(&_dc, (uint32_t)topo, (uint32_t)cull, fkey, (__bridge const void *)_pso, (uint64_t)(uintptr_t)vkp); }
+    } else vkp = [_pso pipelineForTopology:topo cull:cull front:front ds:dk];
     if (!vkp) { [_cb n48Fail:@"cannot build a pipeline variant for this draw"]; return NO; }
     const uint32_t *need = [_pso needBindings]; uint32_t nn = [_pso nNeed];
     for (uint32_t i = 0; i < nn; i++) if (need[i] != 31 && !_sv.buf[need[i]].b) {
         [_cb n48Fail:[NSString stringWithFormat:@"vertex buffer at index %u is read by the vertex descriptor but never bound", need[i]]]; return NO; }
     id dev = [_cb device];
     void (^needTex)(N48Texture *, VkImageLayout) = ^(N48Texture *t, VkImageLayout l) {
-        if ([t n48IsIOS] && [self->_cb n48IOFirstTouch:t]) {   // 11h.6: first use in this command buffer: upload outside the render pass (splits it if one is open)
-            if (self->_inPass) { vkCmdEndRenderPass([self->_cb vk]); self->_inPass = NO; N48LOGR("render pass split: IOSurface texture %p uploaded", (__bridge void *)t); }
-            n48_ios_upload([self->_cb vk], t);
-        }
+        if ([t n48IsIOS]) (void)n48_ios_touch(self->_cb, t, YES, l == VK_IMAGE_LAYOUT_GENERAL, ^{   // 11h.6 / build 16 (P1): upload / flush outside the render pass (splits it if one is open)
+            if (self->_inPass) { [self n48EndPass]; N48LOGR("render pass split: IOSurface texture %p uploaded", (__bridge void *)t); } });
         [self->_cb n48CBRead:t];   // Stage 0b: sampled (or storage-accessed) by a render draw
         if ([t n48DispImgOnly]) (void)[self->_cb n48IOFirstTouch:t];   // P6: retained for the command buffer, nothing to upload
         if (([t n48IsIOS] || [t n48DispImgOnly]) && l == VK_IMAGE_LAYOUT_GENERAL) { [self->_cb n48IOWritten:t]; [self->_cb n48DispNote:t bits:N48DF_W_COMPUTE pso:nil]; }   // a storage-image write from a render pass
@@ -4151,11 +5542,12 @@ N48_ENCODER_NOOPS
     }
     if ([_pso fetch] != _fetch) {   // 11e-2: framebuffer-fetch draws need the input-attachment render-pass shape; a change of shape is a pass split (LOAD continuation)
         if ([_pso fetch] && [_pso fetchMax] >= _na) { [_cb n48Fail:[NSString stringWithFormat:@"pipeline reads [[color(%u)]] but the encoder has %u colour attachment(s)", [_pso fetchMax], _na]]; return NO; }
-        if (_inPass) { vkCmdEndRenderPass([_cb vk]); _inPass = NO; N48LOGR("render pass split: framebuffer fetch %s", [_pso fetch] ? "on" : "off"); }
+        if (_inPass) { [self n48EndPass]; N48LOGR("render pass split: framebuffer fetch %s", [_pso fetch] ? "on" : "off"); }
         _fetch = [_pso fetch];
     }
     [self n48BeginPass];
     if ([_cb n48Error]) return NO;
+    [self n48OccDraw];   // build 18 (P2): the first draw after a visibility mode / offset change (or pass split) begins its query interval
     {   // native #12 P1/D1: this draw writes a display surface; GPUPass = CoreDisplay's final display pass, ColorFill = a fill, anything else a SkyLight composite
         BOOL anyd = NO; for (uint32_t i = 0; i < _na; i++) if ([_tex[i] n48IsDisp]) anyd = YES;
         if (anyd) {
@@ -4196,6 +5588,12 @@ N48_ENCODER_NOOPS
     VkViewport vp = { (float)_vp.originX, (float)(_vp.originY + _vp.height), (float)_vp.width, -(float)_vp.height, (float)_vp.znear, (float)_vp.zfar };
     VkRect2D sc = { { (int32_t)_sr.x, (int32_t)_sr.y }, { (uint32_t)_sr.width, (uint32_t)_sr.height } };
     vkCmdSetViewport(cmd, 0, 1, &vp); vkCmdSetScissor(cmd, 0, 1, &sc); vkCmdSetBlendConstants(cmd, _blend);
+    if ([_pso n48HasDS]) {   // bundle 10: the dynamic depth/stencil state (masks and reference per face; the bias when the pipeline has depth)
+        vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_BIT, _dsi.fRead); vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_BACK_BIT, _dsi.bRead);
+        vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_BIT, _dsi.fWrite); vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_BACK_BIT, _dsi.bWrite);
+        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_BIT, _sref[0]); vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_BACK_BIT, _sref[1]);
+        if ([_pso n48HasDepth]) vkCmdSetDepthBias(cmd, _bias[0], _bias[1], _bias[2]);
+    }
     for (uint32_t i = 0; i < nn; i++) {
         N48Buffer *b; NSUInteger off;
         if (need[i] == 31) { b = n48_dummy_buffer(dev); off = 0; if (!b) { [_cb n48Fail:@"no dummy buffer"]; return NO; } [_cb n48Retain:b]; }
@@ -4249,7 +5647,8 @@ N48_ENCODER_NOOPS
         atomic_fetch_add(&N48DO.draws, _dc.draws); atomic_fetch_add(&N48DO.setsReused, _dc.setsReused); atomic_fetch_add(&N48DO.setsAlloc, _dc.setsAllocated);
         atomic_fetch_add(&N48DO.pipesSkipped, _dc.pipesSkipped); atomic_fetch_add(&N48DO.pipesBound, _dc.pipesBound); atomic_fetch_add(&N48DO.pcHits, _dc.pcHits);
     }
-    if (_inPass) { vkCmdEndRenderPass([_cb vk]); _inPass = NO; }
+    if (_inPass) { [self n48EndPass]; }
+    [self n48ResolveAll];   // bundle 10: multisample resolve, outside the pass
     n48_full_barrier([_cb vk]);
     N48LOGR("N48RenderEncoder endEncoding (render pass ended)");
     [super endEncoding];
@@ -4382,7 +5781,7 @@ N48_ENCODER_NOOPS
 static VkBufferImageCopy n48_bic(N48Texture *t, NSUInteger off, NSUInteger bpr, NSUInteger bpi, NSUInteger level, NSUInteger slice, MTLOrigin o, MTLSize sz) {
     BOOL is3 = [t textureType] == MTLTextureType3D; uint32_t bpp = [t bytesPerPixel];
     return (VkBufferImageCopy){ .bufferOffset = off, .bufferRowLength = (uint32_t)(bpr / bpp), .bufferImageHeight = (is3 && sz.depth > 1 && bpr) ? (uint32_t)(bpi / bpr) : 0,
-        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)level, is3 ? 0 : (uint32_t)slice, 1 },
+        .imageSubresource = { [t n48CopyAspect], (uint32_t)level, n48td_base_layer(is3, slice), 1 },   // bundle 10: colour, or the one depth / stencil aspect
         .imageOffset = { (int32_t)o.x, (int32_t)o.y, is3 ? (int32_t)o.z : 0 }, .imageExtent = { (uint32_t)sz.width, (uint32_t)sz.height, is3 ? (uint32_t)sz.depth : 1 } };
 }
 static BOOL n48_blit_region_ok(N48Texture *t, MTLOrigin o, MTLSize sz, NSUInteger level, NSUInteger slice, const char *what) {
@@ -4408,6 +5807,7 @@ N48_DNR(N48BlitEncoder)
     if (![src isKindOfClass:[N48Texture class]] || ![dst isKindOfClass:[N48Buffer class]]) { [_cb n48Fail:@"blit copyFromTexture:toBuffer: bad classes"]; return; }
     N48Texture *t = src; N48Buffer *b = dst;
     [_cb n48Retain:t]; [_cb n48Retain:b];
+    if (![t n48CopyAspect] || [t n48Samples] > 1) { [_cb n48Fail:@"blit copyFromTexture:toBuffer: a combined depth/stencil texture or a multisample texture cannot be copied to a buffer here"]; return; }   // bundle 10
     if (!n48_blit_region_ok(t, so, sz, sl, ss, "blit copyFromTexture:toBuffer:")) { [_cb n48Fail:@"blit copyFromTexture:toBuffer: region outside the texture level"]; return; }
     n48_ios_use(_cb, t, YES, NO);
     VkCommandBuffer cmd = [_cb vk];
@@ -4422,6 +5822,7 @@ N48_DNR(N48BlitEncoder)
              toTexture:(id)dst destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dorg {
     if (![src isKindOfClass:[N48Buffer class]] || ![dst isKindOfClass:[N48Texture class]]) { [_cb n48Fail:@"blit copyFromBuffer:toTexture: bad classes"]; return; }
     N48Texture *t = dst; [_cb n48Retain:src]; [_cb n48Retain:t];
+    if (![t n48CopyAspect] || [t n48Samples] > 1) { [_cb n48Fail:@"blit copyFromBuffer:toTexture: a combined depth/stencil texture or a multisample texture cannot be filled from a buffer here"]; return; }   // bundle 10
     if (bpr % [t bytesPerPixel]) { [_cb n48Fail:@"blit copyFromBuffer:toTexture: bytesPerRow is not a multiple of the pixel size"]; return; }
     if (!n48_blit_region_ok(t, dorg, sz, dl, ds, "blit copyFromBuffer:toTexture:")) { [_cb n48Fail:@"blit copyFromBuffer:toTexture: region outside the texture level"]; return; }
     n48_ios_usek(_cb, t, YES, YES, N48DF_W_BLIT);
@@ -4435,6 +5836,7 @@ N48_DNR(N48BlitEncoder)
               toTexture:(id)dst destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dorg {
     if (![src isKindOfClass:[N48Texture class]] || ![dst isKindOfClass:[N48Texture class]]) { [_cb n48Fail:@"blit copyFromTexture:toTexture: bad classes"]; return; }
     N48Texture *a = src, *b = dst; [_cb n48Retain:a]; [_cb n48Retain:b];
+    if ([a n48Aspects] != [b n48Aspects] || [a n48Samples] != [b n48Samples]) { [_cb n48Fail:@"blit copyFromTexture:toTexture: the textures differ in aspects (colour / depth / stencil) or sample count"]; return; }   // bundle 10
     if (!n48_blit_region_ok(a, so, sz, sl, ss, "blit copyFromTexture:toTexture: (source)") || !n48_blit_region_ok(b, dorg, sz, dl, ds, "blit copyFromTexture:toTexture: (destination)")) {
         [_cb n48Fail:@"blit copyFromTexture:toTexture: region outside a texture level"]; return; }
     n48_ios_use(_cb, a, YES, NO); n48_ios_usek(_cb, b, YES, YES, N48DF_W_BLIT);
@@ -4442,8 +5844,8 @@ N48_DNR(N48BlitEncoder)
     BOOL a3 = [a textureType] == MTLTextureType3D, b3 = [b textureType] == MTLTextureType3D;
     n48_tex_to(cmd, a, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     n48_tex_to(cmd, b, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkImageCopy ic = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)sl, a3 ? 0 : (uint32_t)ss, 1 }, .srcOffset = { (int32_t)so.x, (int32_t)so.y, a3 ? (int32_t)so.z : 0 },
-        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)dl, b3 ? 0 : (uint32_t)ds, 1 }, .dstOffset = { (int32_t)dorg.x, (int32_t)dorg.y, b3 ? (int32_t)dorg.z : 0 },
+    VkImageCopy ic = { .srcSubresource = { [a n48Aspects], (uint32_t)sl, a3 ? 0 : (uint32_t)ss, 1 }, .srcOffset = { (int32_t)so.x, (int32_t)so.y, a3 ? (int32_t)so.z : 0 },
+        .dstSubresource = { [b n48Aspects], (uint32_t)dl, b3 ? 0 : (uint32_t)ds, 1 }, .dstOffset = { (int32_t)dorg.x, (int32_t)dorg.y, b3 ? (int32_t)dorg.z : 0 },
         .extent = { (uint32_t)sz.width, (uint32_t)sz.height, (a3 || b3) ? (uint32_t)sz.depth : 1 } };
     vkCmdCopyImage(cmd, [a vkImage], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, [b vkImage], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
     n48_full_barrier(cmd);
@@ -4470,6 +5872,7 @@ N48_ENCODER_NOOPS
 - (void)generateMipmapsForTexture:(id)tex {
     if (![tex isKindOfClass:[N48Texture class]]) { [_cb n48Fail:@"blit generateMipmapsForTexture: bad class"]; return; }
     N48Texture *t = tex; uint32_t nl = [t n48Levels];
+    if ([t n48IsDS] || [t n48Samples] > 1) { [_cb n48Fail:@"blit generateMipmapsForTexture: depth/stencil and multisample textures cannot be mip-mapped here"]; return; }   // bundle 10
     if (nl <= 1) { N48_ONCE("generateMipmapsForTexture: the texture has a single level; nothing to generate"); return; }
     VkFormatProperties fp = {0}; vkGetPhysicalDeviceFormatProperties(N48R.pd, [t vkFormat], &fp);
     if ((fp.optimalTilingFeatures & (VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT)) != (VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
@@ -4538,12 +5941,7 @@ N48_ENCODER_NOOPS
 - (id)computeCommandEncoderWithDispatchType:(NSUInteger)t { (void)t; return [self computeCommandEncoder]; }
 @end
 
-// MTLGPUFamily values (public enum).
-enum {
-    N48_Mac1 = 2001, N48_Mac2 = 2002,
-    N48_Common1 = 3001, N48_Common2 = 3002, N48_Common3 = 3003,
-    N48_Metal3 = 5001,
-};
+// MTLGPUFamily values: n48_gate.h (N48G_FAMILY_*, n48g_supports_family).
 
 // Conservative limits, from our RADV gfx1201 vulkaninfo (~/navi48-native/mesa-mac-out/vulkaninfo-full.txt):
 // device-local heap 16911433728 B (15.75 GiB); maxStorageBufferRange 4294967295.
@@ -4584,6 +5982,22 @@ enum {
     { const char *n[] = { "MTLDepthStencilState" }; n48_add_protocols([N48DepthStencilState class], n, 1, "N48DepthStencilState"); }
     { const char *n[] = { "MTLFence" }; n48_add_protocols([N48Fence class], n, 1, "N48Fence"); }
     { const char *n[] = { "MTLHeap" }; n48_add_protocols([N48Heap class], n, 1, "N48Heap"); }
+    {   // build 18: the census (n48_census.h): which instance methods of the running system's Metal protocols do our classes lack? Computed here, logged by a process that gets a device (or printed with N48M_CENSUS=1).
+        const n48cen_pair pairs[] = { { [N48RenderEncoder class], "N48RenderEncoder", "MTLRenderCommandEncoder" }, { [N48ComputeEncoder class], "N48ComputeEncoder", "MTLComputeCommandEncoder" },
+            { [N48BlitEncoder class], "N48BlitEncoder", "MTLBlitCommandEncoder" }, { [N48CommandBuffer class], "N48CommandBuffer", "MTLCommandBuffer" }, { self, "Navi48Device", "MTLDevice" },
+            { [N48Texture class], "N48Texture", "MTLTexture" }, { [N48Buffer class], "N48Buffer", "MTLBuffer" },
+            { [N48RenderPipelineState class], "N48RenderPipelineState", "MTLRenderPipelineState" }, { [N48ComputePipelineState class], "N48ComputePipelineState", "MTLComputePipelineState" },   // (extra, beyond the contract: where RenderBox's newVisibleFunctionTableWithDescriptor:stage: lives)
+            { [N48CommandQueue class], "N48CommandQueue", "MTLCommandQueue" }, { [N48SamplerState class], "N48SamplerState", "MTLSamplerState" }, { [N48DepthStencilState class], "N48DepthStencilState", "MTLDepthStencilState" },
+            { [N48Fence class], "N48Fence", "MTLFence" }, { [N48Heap class], "N48Heap", "MTLHeap" }, { Nil, NULL, NULL } };
+        unsigned total = n48cen_run(pairs);
+        if (getenv("N48M_CENSUS")) { for (NSString *l in n48cen_lines) fprintf(stderr, "%s\n", l.UTF8String); fprintf(stderr, "census: %u selector(s) missing in all\n", total); }
+    }
+}
+// build 18: the census lines saved by +load, logged once by a process that got a device.
+static void n48_census_log(void) {
+    static _Atomic int done_; if (atomic_exchange(&done_, 1)) return;
+    for (NSString *l in n48cen_lines) N48LOG("%s", l.UTF8String);
+    N48LOG("census: %lu (class, selector) pair(s) missing in this process", (unsigned long)n48cen_missing_set.count);
 }
 
 // lazyInitialize: log, then run the base (only if some superclass implements it).
@@ -4628,20 +6042,43 @@ enum {
 // ---- 11e R2: compute pipelines from the SPIR-V cache (a miss dumps the AIR; in WindowServer it returns a no-op placeholder (#12 R1), elsewhere an NSError) ----
 - (id)n48NewComputePipeline:(id)fn error:(NSError **)error {
     NSError *e = nil;
+    N48_LK_SCOPE;   // build 18 (P3): the descriptor variants install the kernel's link context just before calling this; a plain function-based call must never see an old one
+    if (n48_lk_for(fn) == nil) n48_lk_install(2, nil);
     N48ComputePipelineState *p = [[N48ComputePipelineState alloc] initWithDevice:self function:fn error:&e];
     if (p) return p;
-    N48LOG("compute pipeline creation failed: %s", e.localizedDescription.UTF8String);
+    const BOOL inproc = (e.code == 41 && n48x_active()) ? YES : NO;
+    // build 16 (P4): the first attempt of an application that translates in process is NOT a failure: it is a miss in the bundle's own cache, followed by "inproc OK" and a created pipeline (0 COMPUTE FALLBACK lines in the b14 trial).
+    if (inproc) N48LOG("compute pipeline: not in the bundle's spvcache (%s); trying the in-process translation", e.localizedDescription.UTF8String);
+    else N48LOG("compute pipeline creation failed: %s", e.localizedDescription.UTF8String);
+    if (inproc && n48x_translate_fn(fn, "kernel", n48_now() + (uint64_t)N48G_SYNC_WAIT_MS * 1000000ull)) {   // bundle 14: translate in this process first; the dump + daemon wait below are then skipped
+        NSError *e3 = nil;
+        N48ComputePipelineState *p3 = [[N48ComputePipelineState alloc] initWithDevice:self function:fn error:&e3];
+        if (p3) return p3;
+        N48LOG("compute pipeline creation failed after the in-process translation: %s", e3.localizedDescription.UTF8String);
+    }
+    if (!inproc && e.code == 41 && n48_fallback_ok() && n48g_syncwait_applies(n48_is_ws(), atomic_load(&n48_app_admitted), n48_force_fallback(), n48_test_fb_as_ws())) {
+        // C1 (build 6): an admitted application dumps the kernel's AIR, then waits up to 3 s for the daemon's translation before it settles for the no-op placeholder below.
+        NSMutableArray *dp = [NSMutableArray array], *dn = [NSMutableArray array];
+        n48_dump_function(fn, "kernel", dp, dn);
+        NSString *ksha = n48_fn_sha(fn);
+        if (ksha && n48_sync_wait("kernel", @[ ksha ], YES)) {
+            NSError *e2 = nil;
+            N48ComputePipelineState *p2 = [[N48ComputePipelineState alloc] initWithDevice:self function:fn error:&e2];
+            if (p2) return p2;
+            N48LOG("compute pipeline creation failed after the wait: %s", e2.localizedDescription.UTF8String);
+        }
+    }
     if (e.code == 41 && n48_fallback_ok()) {
         // #12 R1: WindowServer (or N48M_FORCE_FALLBACK with N48M_ALLOW) gets a VALID pipeline whose dispatches are no-ops: MPS aborts
         // (MTLReportFailure) on a compute pipeline error, a missing desktop effect is survivable. Same rule as the render FALLBACK.
         NSMutableArray *paths = [NSMutableArray array], *notes = [NSMutableArray array];
-        n48_dump_function(fn, "kernel", paths, notes);
-        N48LOG("COMPUTE FALLBACK %s (%s); AIR dumped: %s", ([fn respondsToSelector:@selector(name)] ? [fn name] : @"?").UTF8String, e.localizedDescription.UTF8String, [paths componentsJoinedByString:@"; "].UTF8String);
+        if (!inproc) n48_dump_function(fn, "kernel", paths, notes);
+        N48LOG("COMPUTE FALLBACK %s (%s); %s: %s", ([fn respondsToSelector:@selector(name)] ? [fn name] : @"?").UTF8String, e.localizedDescription.UTF8String, inproc ? "not dumped (in-process translation did not produce it)" : "AIR dumped", [paths componentsJoinedByString:@"; "].UTF8String);
         return [[N48ComputePipelineState alloc] initPlaceholderWithDevice:self function:fn];
     }
     if (e.code == 41) {
         NSMutableArray *paths = [NSMutableArray array], *notes = [NSMutableArray array];
-        n48_dump_function(fn, "kernel", paths, notes);
+        if (!inproc) n48_dump_function(fn, "kernel", paths, notes);
         e = n48_err(100, [NSString stringWithFormat:@"Navi48Metal: compute pipeline not in spvcache; AIR dumped for offline translation: %@%@", [paths componentsJoinedByString:@"; "],
                           notes.count ? [@" | problems: " stringByAppendingString:[notes componentsJoinedByString:@"; "]] : @""]);
         N48LOG("%s", e.localizedDescription.UTF8String);
@@ -4660,13 +6097,13 @@ enum {
 // -newComputePipelineStateWithDescriptor:error: (CONFIRMED: selector reference at QuartzCore 0x7ff80d2e6c74 resolves through the cache). That selector was not
 // implemented here, the inherited one returned nil although the spvcache has the kernel, and QuartzCore aborts on nil (abort_with_payload, function=compute_average_luma).
 - (id)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d error:(NSError **)error {
-    N48LOG("newComputePipelineStateWithDescriptor:error:"); return [self n48NewComputePipeline:d.computeFunction error:error]; }
+    n48x_linkage_compute(d); N48LOG("newComputePipelineStateWithDescriptor:error:"); return [self n48NewComputePipeline:d.computeFunction error:error]; }
 - (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d completionHandler:(void (^)(id, NSError *))h {
-    N48LOG("newComputePipelineStateWithDescriptor:completionHandler:"); NSError *e = nil; id p = [self n48NewComputePipeline:d.computeFunction error:&e]; if (h) h(p, e); }
+    n48x_linkage_compute(d); N48LOG("newComputePipelineStateWithDescriptor:completionHandler:"); NSError *e = nil; id p = [self n48NewComputePipeline:d.computeFunction error:&e]; if (h) h(p, e); }
 - (id)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(NSUInteger)o reflection:(void *)r error:(NSError **)error {
-    (void)o; (void)r; N48LOG("newComputePipelineStateWithDescriptor:options:reflection:error:"); return [self n48NewComputePipeline:d.computeFunction error:error]; }
+    (void)o; (void)r; n48x_linkage_compute(d); N48LOG("newComputePipelineStateWithDescriptor:options:reflection:error:"); return [self n48NewComputePipeline:d.computeFunction error:error]; }
 - (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(NSUInteger)o completionHandler:(void (^)(id, id, NSError *))h {
-    (void)o; N48LOG("newComputePipelineStateWithDescriptor:options:completionHandler:"); NSError *e = nil; id p = [self n48NewComputePipeline:d.computeFunction error:&e]; if (h) h(p, nil, e); }
+    (void)o; n48x_linkage_compute(d); N48LOG("newComputePipelineStateWithDescriptor:options:completionHandler:"); NSError *e = nil; id p = [self n48NewComputePipeline:d.computeFunction error:&e]; if (h) h(p, nil, e); }
 
 // ---- 10c: textures ----
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
@@ -4735,7 +6172,9 @@ enum {
 - (NSUInteger)currentAllocatedSize { return (NSUInteger)atomic_load(&n48_alloc_total); }
 - (NSUInteger)maxThreadgroupMemoryLength { return 32768; }   // Metal reports 32 KiB on every Mac GPU; RADV's local-memory limit is larger, so any kernel that fits here fits there
 - (MTLSize)maxThreadsPerThreadgroup { return MTLSizeMake(1024, 1024, 1024); }   // maxComputeWorkGroupSize 1024,1024,1024 (RADV gfx1201)
-- (BOOL)supportsSampleCount:(NSUInteger)n { return n == 1; }   // textures refuse MSAA (initWithDevice:descriptor: sampleCount != 1)
+// bundle 10: 1 always; 2 / 4 / 8 when the device's framebuffer colour AND depth/stencil counts include them (RADV open); before RADV is open (asking must not open it) 4 only, which Vulkan requires of every device.
+- (BOOL)supportsSampleCount:(NSUInteger)n { unsigned m = n48_ms_mask(); return n48ms_device_supports((unsigned long)n, N48R.ok ? 1 : 0, m, m) ? YES : NO; }
+- (BOOL)supportsTextureSampleCount:(NSUInteger)n { return [self supportsSampleCount:n]; }
 - (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(MTLPixelFormat)pf { (void)pf; return 256; }
 - (BOOL)isDepth24Stencil8PixelFormatSupported { return NO; }
 
@@ -4758,10 +6197,13 @@ enum {
 // MTLCompiler is nil on _MTLDevice, F1) ----
 - (id)n48NewPipeline:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
     NSError *e = nil;
+    N48_LK_SCOPE;   // build 18 (P3): the link contexts live for this creation only
+    n48x_linkage_render(d);   // bundle 14 (section 3): one LINKAGE IGNORED line per pipeline whose descriptor links functions
     N48RenderPipelineState *p = [[N48RenderPipelineState alloc] initWithDevice:self descriptor:d error:&e];
     if (p) return p;
-    N48LOG("pipeline creation failed: %s", e.localizedDescription.UTF8String);
-    NSError *dump = n48_dump_pipeline(d);   // cache miss: leave the AIR for the host Mac to translate
+    if (e.code == 41 && n48x_active()) N48LOG("render pipeline: not in the bundle's spvcache (%s); the in-process translation was already tried for its functions", e.localizedDescription.UTF8String);   // build 16 (P4)
+    else N48LOG("pipeline creation failed: %s", e.localizedDescription.UTF8String);
+    NSError *dump = n48x_active() ? e : n48_dump_pipeline(d);   // cache miss: leave the AIR for the host Mac to translate (bundle 14: not when this process translates in process - it already tried)
     if (error) *error = [e.code == 41 ? dump : e copy];
     return nil;
 }
@@ -4806,6 +6248,8 @@ enum {
         return nil;
     }
     os_log(OS_LOG_DEFAULT, "Navi48Metal: initWithAcceleratorPort 0x%x -> %{public}s", port, self ? "ok" : "nil");
+    if (self) n48_census_log();   // build 18: once per process that got a device
+    if (self && n48_is_ws() && !n48_acc_port) n48_acc_port = port;   // bundle 11: WindowServer reads the kernel's surface table through the parent (the nub) of this accelerator
     return self;
 }
 
@@ -4824,13 +6268,20 @@ enum {
 
 #if N48_9D
 - (BOOL)supportsFamily:(NSInteger)family {
-    switch (family) {
-    case N48_Mac2: case N48_Common1: case N48_Common2: case N48_Common3: case N48_Metal3:
-        return YES;
-    default:            // Apple1..9 (1001..1009), Mac1, MacCatalyst, Metal4, unknown -> NO
-        return NO;
-    }
+    // Bundle build 6 (C1 finding B): Metal3 is NOT claimed (it implies argument buffers / gpuAddress, which this bundle does not implement). Mac2 and Common1..3 are kept. Table: n48_gate.h, test-gate.c.
+    if (family == N48G_FAMILY_METAL3 && !n48_is_ws()) N48_ONCE("supportsFamily(Metal3) -> NO for this application: argument buffers / gpuAddress are not implemented (build 6; WindowServer keeps YES)");
+    return n48g_supports_family((long)family, n48_is_ws() ? 1 : 0) ? YES : NO;   // Apple1..9 (1001..1009), Mac1, MacCatalyst, Metal3, Metal4, unknown -> NO
 }
+// The lowest tier (MTLArgumentBuffersTier1 == 0); the base class's value is unknown, so it is pinned here (build 6, C1 finding B).
+- (NSUInteger)argumentBuffersSupport {   // WindowServer: the base class's answer, exactly as before build 6; applications: Tier1
+    if (n48_is_ws()) {   // the base class's answer, as before build 6 (it is not in our private header, so ask the runtime)
+        Class sc = [MTLIOAccelDevice class];
+        if ([sc instancesRespondToSelector:@selector(argumentBuffersSupport)]) {
+            struct objc_super sup = { self, sc };
+            return ((NSUInteger (*)(struct objc_super *, SEL))objc_msgSendSuper)(&sup, @selector(argumentBuffersSupport));
+        }
+    }
+    N48_ONCE("argumentBuffersSupport -> Tier1 (0) for this application: argument buffers beyond the basics are not implemented"); return (NSUInteger)N48G_ARGBUF_TIER1; }
 - (NSUInteger)maxBufferLength                { return (NSUInteger)N48_MAX_BUFFER_LENGTH; }
 - (uint64_t)recommendedMaxWorkingSetSize     { return N48_RECOMMENDED_WORKING_SET; }
 - (BOOL)hasUnifiedMemory { return NO; }

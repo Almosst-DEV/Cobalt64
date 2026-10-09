@@ -99,7 +99,7 @@ static inline int n48_dp_read(n48_dp_reader rd, const void *vm, uint64_t va, uin
  * fill's own pixels), refused as `keyMoved` if it moved. Set only in n48_dl_unmap_rng, only while the switch is on, and
  * cleared by the next n48_dl_set of the same (ctx, VA) - a re-feed is a fresh proof. */
 #define N48_DL_F_WITHDRAWN 2u
-/* `flags` (build 0.0.485, switch 58 - L1 of notes/design/LOGIN-SCREEN-PATH.md): N48_DL_F_MID = this entry's base page
+/* `flags` (build 0.0.485, switch 58 - L1 of an internal design note): N48_DL_F_MID = this entry's base page
  * was looked up in a PER-DRAW colour-target row (n48_dl_pgx_extend below), not in one of the frame's IB-END rows (hVa/hPage).
  * It changes no answer: the ask reads `page`, never this bit. It exists so the ledger's own report can say how many proofs
  * the switch added, and so an un-feed that treated such an entry differently would be a visible, testable defect. */
@@ -147,7 +147,7 @@ typedef struct {
      * unmapNoExtent = entries dropped because they carried NO extent and the unmap did not end at or below their base: the
      * FAIL-CLOSED path, and the number that says how much of the run is still 0.0.382's behaviour. */
     uint64_t entExtent, entNoExtent, unmapKeptExtent, unmapNoExtent;
-    /* C5 part 1 (hygiene, notes/design/C5-CONTINUOUS.md Q4) — THE UN-FEED (n48_dl_unfeed_tok). unfeedAsks = calls made
+    /* C5 part 1 (hygiene, an internal design note Q4) — THE UN-FEED (n48_dl_unfeed_tok). unfeedAsks = calls made
      * (one per keystone-withdrawn / token-mismatched / never-run commit); unfeedRemoved = entries actually taken back
      * out, summed across every call. unfeedRemoved can be 0 on a call whose frame fed nothing this ledger ever held
      * (e.g. `dp` was off, or every target it named already refused a key) - that is not a defect, it is the call
@@ -164,7 +164,7 @@ typedef struct {
      * attached to a shape that producer never actually wrote. A re-feed whose mode/page/size MATCH is unaffected -
      * it is not counted here, and the entry's `tok`/`arm_ep` stay exactly as 0.0.446 left them. */
     uint64_t reFeedDropped;
-    /* build 0.0.485 (switch 58, notes/design/LOGIN-SCREEN-PATH.md "The ledger wall (L1, L2)").
+    /* build 0.0.485 (switch 58, an internal design note "The ledger wall (L1, L2)").
      * `replace` - the switch mirrored into the ledger by its ONE caller (the kext's feed site, under gXdLock), exactly as
      * `keep` mirrors 29. 0 (the default and the boot value) = the A6 drop above, byte for byte. 1 = a re-feed of an existing
      * (ctx, va) whose mode, page or size DIFFERS REPLACES the entry with the re-feeding producer's (mode, page, size, flags,
@@ -234,7 +234,7 @@ static inline int n48_dl_tiled_ok(n48_dl *l, uint64_t ctx, uint64_t va, uint32_t
     return n48_dl_tiled_ok_pg(l, ctx, va, mode, 0ull, 0u);
 }
 
-/* build 0.0.488 (notes/design/DCC-DESC.md Q2 option (A), switch 60) — THE ONLY PROOF A STRIPPED DCC T# MAY HAVE.
+/* build 0.0.488 (an internal design note Q2 option (A), switch 60) — THE ONLY PROOF A STRIPPED DCC T# MAY HAVE.
  * xlat12's XLAT12_EXTRA_DCC_STRIP admits a stripped DCC record only through ex->desc_dcc_ok; the kext's gfxsrc_desc_dcc_ok
  * answers it through THIS function and nothing else. It asks the two lists that can only hold surfaces written by OUR
  * translated colour targets (whose CB never had DCC - repack_CB_COLOR0_INFO keeps no DCC_ENABLE and CB_COLOR0_DCC_BASE is
@@ -336,7 +336,7 @@ static inline void n48_dl_set(n48_dl *l, uint64_t ctx, uint64_t va, uint32_t mod
              * `flags` follows it, exactly as 0.0.394 documented (K10: a re-feed clears the withdrawn mark); flags
              * feed counters and the empty-why classification only, never an ask's answer. */
             if (l->e[k].mode != mode || l->e[k].page != page || l->e[k].size != size) {
-                /* build 0.0.485 (switch 58, L2 of notes/design/LOGIN-SCREEN-PATH.md; run10d F26/F35: the composite
+                /* build 0.0.485 (switch 58, L2 of an internal design note; run10d F26/F35: the composite
                  * re-written 8_8_8_8 -> 2_10_10_10, the drop below left it unrecorded and every later plane refused).
                  * A COMMITTED frame that re-writes this (ctx, va) in a different shape IS the surface's producer now: its
                  * values REPLACE the entry's, ALL of them, the token included - so the OLD producer's proof does not
@@ -356,7 +356,7 @@ static inline void n48_dl_set(n48_dl *l, uint64_t ctx, uint64_t va, uint32_t mod
                 return;
             }
             l->e[k].flags = flags;
-            /* 0.0.444 (C5-RING-REVIEW.md (B) item 9c, Q7c) — KEEP THE PREVIOUS PRODUCER'S PROOF. Through 0.0.443
+            /* 0.0.444 (an internal review note (B) item 9c, Q7c) — KEEP THE PREVIOUS PRODUCER'S PROOF. Through 0.0.443
              * this line was `l->e[k].tok = l->feedTok; l->e[k].arm_ep = l->feedArmEp;` ("the LAST producer is the
              * one that counts", 0.0.390) — but n48_dl_feed runs for every COMMITTED frame, and a frame that
              * committed here can still be un-fed LATER by its own token if a later stage withdraws or NOPs it
@@ -406,7 +406,7 @@ static inline uint64_t n48_dl_pg_of_ix(const n48_dl_pgmap *m, uint64_t va, uint3
 }
 
 /* =====================================================================================================================
- * build 0.0.485 — L1 OF notes/design/LOGIN-SCREEN-PATH.md: EVERY COLOUR TARGET A COMMITTED FRAME WROTE GETS ITS OWN PAGE.
+ * build 0.0.485 — L1 OF an internal design note: EVERY COLOUR TARGET A COMMITTED FRAME WROTE GETS ITS OWN PAGE.
  *
  * THE DEFECT (CONFIRMED on hardware, run10c/run10d). n48_dl_from_output already enters EVERY draw's CB0 target of a committed
  * segment into the ledger, but it looks each one's base page up in the frame's IB-END rows only (the kext's hVa/hPage, filled
@@ -634,7 +634,7 @@ static inline void n48_dl_unmap_rng(n48_dl *l, uint64_t ctx, uint64_t va, uint64
         if (w != k) {
             l->e[w].ctx = l->e[k].ctx; l->e[w].va = l->e[k].va; l->e[w].page = l->e[k].page;
             l->e[w].mode = l->e[k].mode; l->e[w].flags = l->e[k].flags; l->e[w].size = l->e[k].size;
-            /* 0.0.444 (C5-RING-REVIEW.md (B) item 9b, Q7b, CONFIRMED) — `tok`/`arm_ep` MUST MOVE WITH THE ENTRY TOO.
+            /* 0.0.444 (an internal review note (B) item 9b, Q7b, CONFIRMED) — `tok`/`arm_ep` MUST MOVE WITH THE ENTRY TOO.
              * Through 0.0.443 this copy dropped both, so a surviving entry compacted down from slot k to slot w kept
              * whatever `tok`/`arm_ep` slot w had held BEFORE this call (another entry's producer identity, or 0 at
              * the tail) - a drop of an unrelated entry between the feed and the un-feed made n48_dl_unfeed_tok miss
@@ -647,7 +647,7 @@ static inline void n48_dl_unmap_rng(n48_dl *l, uint64_t ctx, uint64_t va, uint64
     }
     l->n = w;
 }
-/* C5 part 1 (hygiene, notes/design/C5-CONTINUOUS.md Q4) — THE LEDGER UN-FEED.
+/* C5 part 1 (hygiene, an internal design note Q4) — THE LEDGER UN-FEED.
  *
  * n48_dl_feed is asked from ONE fact alone: the COMMIT gate answered N48_CM_OK for this frame (n48_dl_frame's own
  * `committed`/`gate`/`verdict`). That answer is recorded at the GATE, before the keystone even runs — so a frame
@@ -684,7 +684,7 @@ static inline uint32_t n48_dl_unfeed_tok(n48_dl *l, uint32_t tok)
 }
 
 /* =====================================================================================================================
- * 0.0.444 (C5-RING-REVIEW.md (B) item 9a, Q7a, CONFIRMED) — THE UN-FEED QUEUE.
+ * 0.0.444 (an internal review note (B) item 9a, Q7a, CONFIRMED) — THE UN-FEED QUEUE.
  *
  * All three un-feed call sites live in hook_gfxCommitIB, on Apple's submit thread, WITHOUT gXdLock — the SAME lock
  * gfxsrc_desc_unmap's locked compaction (n48_dl_unmap_rng, via xd_led_drain_locked/n48_dl_sync at the top of the

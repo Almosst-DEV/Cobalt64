@@ -1,0 +1,6 @@
+#!/bin/bash
+case "$1" in
+  showloaded) echo "  250 0 0xffffff7f9a000000 0x1a0000 0x1a0000 com.navi48.bringup (0.0.664) <8 6 3>"; [ -f "$SIM_DIR/kv/nub" ] && echo "  251 0 0xffffff7f9b000000 0x20000 0x20000 com.navi48.accelprobe (0.0.7) <250>" ;;
+  inspect) echo "com.navi48.accelprobe 0.0.7 /Library/Extensions/Navi48Accel-0.0.7.kext" ;;
+esac
+exit 0

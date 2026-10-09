@@ -1,0 +1,240 @@
+From 33b4189e784d05927d976e69a7b31247de4bb623 Mon Sep 17 00:00:00 2001
+From: Navi48-MacOS contributors <noreply@example.invalid>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH 9/9] radv/darwin: radv_darwin_n48n_call (selectors 22..26
+ only) + radv_darwin_n48n_bo_handle for the monitor B's scanout, ABI 1.11 header
+ synced (Navi48 M6 Stage 1b)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ include/darwin/navi48_native_abi.h            | 16 +++++++-
+ src/amd/common/darwin/ac_darwin_kext.c        | 13 +++++++
+ src/amd/common/darwin/ac_darwin_kext.h        | 14 +++++++
+ src/amd/common/darwin/test/acd_kext_test.c    | 30 ++++++++++++++
+ .../winsys/amdgpu/radv_darwin_scanout.c       | 39 ++++++++++++++++++-
+ .../winsys/amdgpu/radv_darwin_scanout.h       |  7 ++++
+ 6 files changed, 116 insertions(+), 3 deletions(-)
+
+diff --git a/include/darwin/navi48_native_abi.h b/include/darwin/navi48_native_abi.h
+index 58ce3739e20..c5d165c4e9d 100644
+--- a/include/darwin/navi48_native_abi.h
++++ b/include/darwin/navi48_native_abi.h
+@@ -26,7 +26,7 @@
+ 
+ #define N48N_UC_TYPE       0x4E34384Eu      /* 'N48N' */
+ #define N48N_ABI_VERSION   1u            /* the MAJOR: unchanged, so every v1.0 client (Mesa, n48native, s1d-replay) still handshakes */
+-#define N48N_ABI_MINOR     10u           /* 1.10 (kext 0.0.640, GPU-apps G4): n48n_info.reserved[3..7] report the session's VRAM budget (N48N_INFO_R_* / N48N_BUDGET_* below), so a user-space allocator (Mesa/RADV) can size its VRAM heap; no selector, no struct size changes. A third client role (APP, a non-root uid >= 501 process on the kernel allow-list) exists behind the boot-args navi48-apps=1 + navi48-multisession=1: it reaches selectors 0, 1, 3..8 and 21 only (never ReadRegs 2, never scanout 9..14, never 15..20); a refused selector is kIOReturnNotPrivileged. 1.9 (kext 0.0.612): selector 21 N48N_SEL_BO_IMPORT_HOST (milestone #11 step 11c: import a page-aligned range of the CALLER's address space as a SYSTEM-memory BO; limits 64 MiB per BO, 256 MiB per client), the class of the N48N user client is renamed IOAccelNavi48NativeClient (WindowServer's sandbox admits iokit-open only for IOAccel* classes; the service name and type 'N48N' are unchanged), and a uid-88 caller is admitted behind the boot-arg navi48-metal-ws=1; 1.8 (kext 0.0.610): selectors 19 N48N_SEL_METAL_NUB_PUBLISH and 20 N48N_SEL_METAL_NUB_WITHDRAW (milestone #9 route A: the software Navi48MetalNub the aux accelerator kext matches; published only on demand, only with the boot-arg navi48-metal=1); 1.7 (kext 0.0.609): HELD mode for row 120: selector 17 N48N_SEL_MODE_HOLD (enter row 120 and RETURN with the mode up, a scanout client may then Acquire and present at 120 Hz) and selector 18 N48N_SEL_MODE_RELEASE (end it, wait, return the final result); verdict 16 HELD, deny 25 / 26, N48N_HOLD_* words; the result's former reserved0 / reserved1 (offsets 204 / 252) are hold_end / hold_flags (the size stays 512 B); 1.6 (kext 0.0.608): row 120's blanked-transition underflow reads, DIO attribution and lock-hold witness code in the result's former reserved[8] (the size stays 512 B); 1.5 (kext 0.0.607): row 120 (the 1440p 120 Hz trial) runs behind the boot-arg navi48-row120=1 with the clock hold (P4); the result's ext.reserved words carry the hold report (its size is unchanged); new deny reasons 22 / 23, verdict 15, flags 22..24; 1.4 (kext 0.0.606): selector 16's result grows from 256 to 512 B (underflow / resync / OTG-lock report) and it accepts the rows 1 (DP1 resync) and 2 (V_TOTAL under the OTG lock) and a flags word; 1.3 (kext 0.0.605): the timed mode-trial selector 16, native-S2d; 1.2 (kext 0.0.604): the DAL experiment selector 15, native-S2-DISPCLK; 1.1 (kext 0.0.603): the scanout selectors 9..14, native-S2a. Reported when Hello asks (below) and in n48n_info.reserved[2]. */
++#define N48N_ABI_MINOR     11u           /* 1.11 (kext 0.0.661, M6 Stage 1b): selectors 22..26 N48N_SEL_SCANX_* - the scanout of INSTANCE 2 (the monitor B: HUBP2 / OTG2), poll-only, behind the boot-args navi48-m6=1 AND navi48-m6flip=1 (a latch OFF answers every one with Unsupported and touches nothing); N48N_SCANQ_M6FLIP in scan_query.flags says both are on; no struct changes. 1.10 (kext 0.0.640, GPU-apps G4): n48n_info.reserved[3..7] report the session's VRAM budget (N48N_INFO_R_* / N48N_BUDGET_* below), so a user-space allocator (Mesa/RADV) can size its VRAM heap; no selector, no struct size changes. A third client role (APP, a non-root uid >= 501 process on the kernel allow-list) exists behind the boot-args navi48-apps=1 + navi48-multisession=1: it reaches selectors 0, 1, 3..8 and 21 only (never ReadRegs 2, never scanout 9..14, never 15..20); a refused selector is kIOReturnNotPrivileged. 1.9 (kext 0.0.612): selector 21 N48N_SEL_BO_IMPORT_HOST (milestone #11 step 11c: import a page-aligned range of the CALLER's address space as a SYSTEM-memory BO; limits 64 MiB per BO, 256 MiB per client), the class of the N48N user client is renamed IOAccelNavi48NativeClient (WindowServer's sandbox admits iokit-open only for IOAccel* classes; the service name and type 'N48N' are unchanged), and a uid-88 caller is admitted behind the boot-arg navi48-metal-ws=1; 1.8 (kext 0.0.610): selectors 19 N48N_SEL_METAL_NUB_PUBLISH and 20 N48N_SEL_METAL_NUB_WITHDRAW (milestone #9 route A: the software Navi48MetalNub the aux accelerator kext matches; published only on demand, only with the boot-arg navi48-metal=1); 1.7 (kext 0.0.609): HELD mode for row 120: selector 17 N48N_SEL_MODE_HOLD (enter row 120 and RETURN with the mode up, a scanout client may then Acquire and present at 120 Hz) and selector 18 N48N_SEL_MODE_RELEASE (end it, wait, return the final result); verdict 16 HELD, deny 25 / 26, N48N_HOLD_* words; the result's former reserved0 / reserved1 (offsets 204 / 252) are hold_end / hold_flags (the size stays 512 B); 1.6 (kext 0.0.608): row 120's blanked-transition underflow reads, DIO attribution and lock-hold witness code in the result's former reserved[8] (the size stays 512 B); 1.5 (kext 0.0.607): row 120 (the 1440p 120 Hz trial) runs behind the boot-arg navi48-row120=1 with the clock hold (P4); the result's ext.reserved words carry the hold report (its size is unchanged); new deny reasons 22 / 23, verdict 15, flags 22..24; 1.4 (kext 0.0.606): selector 16's result grows from 256 to 512 B (underflow / resync / OTG-lock report) and it accepts the rows 1 (DP1 resync) and 2 (V_TOTAL under the OTG lock) and a flags word; 1.3 (kext 0.0.605): the timed mode-trial selector 16, native-S2d; 1.2 (kext 0.0.604): the DAL experiment selector 15, native-S2-DISPCLK; 1.1 (kext 0.0.603): the scanout selectors 9..14, native-S2a. Reported when Hello asks (below) and in n48n_info.reserved[2]. */
+ #define N48N_HELLO_F_MINOR (1u << 8)     /* Hello flags bit 8: "report the minor": out[0] = ABI | (MINOR << 16). Without it out[0] is exactly the major, as in v1.0. Bit 8, not 0: flags = 1, which T1 leg 1 sends and expects refused, still is. */
+ #define N48N_MAX_IBS       64u
+ #define N48N_MAX_BOS       4096u            /* handles 1..4095; 0 is never valid */
+@@ -71,8 +71,18 @@ enum {
+     N48N_SEL_BO_IMPORT_HOST = 21, /* in: [0] host VA (4 KiB aligned, in the CALLER's address space) [1] size (4 KiB multiple, 1 page .. 64 MiB) [2] flags (0, or with [3] != 0 the GemVa vm flags R/W/X/MTYPE of the mapping) [3] GPU VA to map at (0 = do not map: map later with GemVa MAP on the handle, as RADV does)
+                                      out: [0] BO handle [1] size [2] GPU VA mapped at import (canonical; 0 when [3] was 0) [3] placed bits (N48N_PLACED_HOST_IMPORT). Wires the pages (IOMemoryDescriptor::withAddressRange(task) + prepare()) and records their physical addresses; a mapping (here or by GemVa MAP) is SYSTEM|SNOOPED, per page. Total imported <= 4 GiB per client (0.0.621; 2 GiB in 0.0.620, 256 MiB before; separate from the GTT cap).
+                                      BoFree, and the close of the client, unmap the PTEs, flush the TLB, then complete() and release the pages (under the HUNG latch they are leaked, never released). A host BO cannot be a scanout slot, a user-fence target or CPU-mapped by clientMemoryForType (NotPermitted). Errors: BadArgument (alignment, size 0, > 64 MiB, user range, flags), NoMemory (the per-client cap, no descriptor, no page table space), NotReady (no Hello), Aborted / Timeout (HUNG). */
+-    N48N_SEL_COUNT_1_9     = 22
++    N48N_SEL_COUNT_1_9     = 22,
++    /* ---- ABI 1.11 (kext 0.0.661, M6 Stage 1b): the scanout of INSTANCE 2 (the monitor B, HUBP2 / OTG2). Every selector takes in[0] = the instance, which must be 2 (anything else, a non-zero flag word or a foreign session is refused before any register read). Need Hello and
++          the session must already hold instance 0 (the plane Acquire of selector 10). Slot ids of instance 2 are TAGGED: 0x20 | k. Behind navi48-m6=1 AND navi48-m6flip=1: with either OFF each answers Unsupported. Not for APP clients or the accelerator route. ---- */
++    N48N_SEL_SCANX_ACQUIRE  = 22, /* in: [0] instance (2) [1] flags (0)   out: [0] A (instance 2's console MC) [1] OTG2 frame count (extended) [2] the M6 surface-table generation */
++    N48N_SEL_SCANX_REGISTER = 23, /* in: [0] instance (2)   struct in: n48n_scan_reg (32 B)   out: [0] tagged slot id (0x20|k) [1] slot MC */
++    N48N_SEL_SCANX_PRESENT  = 24, /* in: [0] instance (2) [1] tagged slot id [2] flags (0)   out: [0] present id [1] target frame [2] 0 */
++    N48N_SEL_SCANX_STATUS   = 25, /* in: [0] instance (2)   struct out: n48n_scan_status (256 B; console_mc = A; slot ids tagged)   out: [0] M6 table generation [1] reuse_inuse_refused [2] restores | restore failures << 32 [3] write refusals | write failures << 32. A call IS the keep-alive. */
++    N48N_SEL_SCANX_RELEASE  = 26, /* in: [0] instance (2)   out: [0] restore of A verified (1/0) [1] plane MC after; idempotent */
++    N48N_SEL_COUNT_1_11     = 27
+ };
++#define N48N_SCANX_INSTANCE   2u
++#define N48N_SCANX_SLOT_TAG   0x20u
+ 
+ /* ---- the drm values the kernel interprets (identical to include/drm-uapi/amdgpu_drm.h) ----------------------- */
+ #define N48N_GEM_DOMAIN_CPU        0x1u
+@@ -214,6 +224,8 @@ struct n48n_info {                 /* 192 B */
+ #define N48N_SCANQ_ACQUIRED   (1u << 2)    /* the plane is taken (by this or an earlier call of this client) */
+ #define N48N_SCANQ_GEOM_OK    (1u << 3)    /* linear ARGB8888, no DCC, plausible viewport/pitch: Acquire would proceed */
+ #define N48N_SCANQ_DTO_VALID  (1u << 4)    /* refresh derived from the DP DTO; else from the EDID row matching the raster, else 0 */
++#define N48N_SCANQ_M6FLIP     (1u << 6)    /* 0.0.661 (M6 Stage 1b): boot-arg navi48-m6flip=1 is latched ON as well as navi48-m6=1: ABI 1.11's selectors 22..26 (instance 2) are live; a flag bit in an existing word */
++#define N48N_SCANQ_M6         (1u << 5)    /* 0.0.659 (M6 Stage 1a): boot-arg navi48-m6=1 is latched ON: the bundle presents only surfaces the kernel maps to instance 0 (property Navi48,M6Surf of the Metal nub); ABI minor unchanged (a flag bit in an existing word) */
+ /* n48n_scan_slot.flags */
+ #define N48N_SCANSLOT_PENDING  (1u << 0)   /* this slot's Present is programmed and has not latched */
+ #define N48N_SCANSLOT_INUSE    (1u << 1)   /* HUBP0 EARLIEST_INUSE equals this slot's MC: the hardware is still fetching it */
+diff --git a/src/amd/common/darwin/ac_darwin_kext.c b/src/amd/common/darwin/ac_darwin_kext.c
+index eb0bb648acc..15cf72d8b16 100644
+--- a/src/amd/common/darwin/ac_darwin_kext.c
++++ b/src/amd/common/darwin/ac_darwin_kext.c
+@@ -598,6 +598,19 @@ acd_kext_wait_deadline(struct acd_kext *k, uint64_t seq, uint64_t abs_deadline_n
+    }
+ }
+ 
++/* ---- ABI 1.11 (Navi48 M6 Stage 1b): the instance-2 scanout selectors, passed through ---- */
++
++int
++acd_kext_call(struct acd_kext *k, uint32_t sel, const uint64_t *sin, uint32_t nsin, const void *stin, size_t stinsz,
++              uint64_t *sout, uint32_t *nsout, void *stout, size_t *stoutsz)
++{
++   if (sel < ACD_SEL_SCANX_ACQUIRE || sel > ACD_SEL_SCANX_RELEASE)
++      return -EPERM;
++   if (sel == ACD_SEL_SCANX_REGISTER || sel == ACD_SEL_SCANX_PRESENT)
++      acd_sfence(); /* CPU-written (WC) scanout pixels must be visible before the flip */
++   return kcall(k, sel, sin, nsin, stin, stinsz, sout, nsout, stout, stoutsz);
++}
++
+ /* ---- ABI 1.1 scanout ---- */
+ 
+ int
+diff --git a/src/amd/common/darwin/ac_darwin_kext.h b/src/amd/common/darwin/ac_darwin_kext.h
+index dfa19a40f73..0ec81c83b9b 100644
+--- a/src/amd/common/darwin/ac_darwin_kext.h
++++ b/src/amd/common/darwin/ac_darwin_kext.h
+@@ -42,8 +42,17 @@ enum acd_sel {
+    ACD_SEL_SCAN_RELEASE = 14,
+    /* ABI 1.9 (kext 0.0.612) */
+    ACD_SEL_BO_IMPORT_HOST = 21,
++   /* ABI 1.11 (kext 0.0.661, Navi48 M6 Stage 1b): instance 2's scanout */
++   ACD_SEL_SCANX_ACQUIRE = 22,
++   ACD_SEL_SCANX_REGISTER = 23,
++   ACD_SEL_SCANX_PRESENT = 24,
++   ACD_SEL_SCANX_STATUS = 25,
++   ACD_SEL_SCANX_RELEASE = 26,
+ };
+ 
++/* The first ABI minor with selectors 22..26 (the monitor B's scanout, M6 Stage 1b). */
++#define ACD_ABI_MINOR_SCANX 11
++
+ /* The first ABI minor with BoImportHost (selector 21): RADV's VK_EXT_external_memory_host needs it. */
+ #define ACD_ABI_MINOR_IMPORT_HOST 9
+ 
+@@ -197,6 +206,11 @@ int acd_kext_scan_status(struct acd_kext *k, struct n48n_scan_status *st);
+ /* out[0] console restore verified, [1] plane MC after */
+ int acd_kext_scan_release(struct acd_kext *k, uint64_t out[2]);
+ 
++/* ABI 1.11: a thin wrapper over kcall for the instance-2 scanout selectors 22..26 ONLY (any other selector is refused with -EPERM before the kernel is asked). The kernel judges everything else
++ * (the instance, the latches, the session). Same argument conventions as kcall. */
++int acd_kext_call(struct acd_kext *k, uint32_t sel, const uint64_t *sin, uint32_t nsin, const void *stin, size_t stinsz,
++                  uint64_t *sout, uint32_t *nsout, void *stout, size_t *stoutsz);
++
+ uint64_t acd_kext_now_ns(struct acd_kext *k);
+ 
+ #ifdef __cplusplus
+diff --git a/src/amd/common/darwin/test/acd_kext_test.c b/src/amd/common/darwin/test/acd_kext_test.c
+index 395c580c5ff..f7799341903 100644
+--- a/src/amd/common/darwin/test/acd_kext_test.c
++++ b/src/amd/common/darwin/test/acd_kext_test.c
+@@ -385,6 +385,35 @@ test_misc(void)
+    acd_kext_destroy(k);
+ }
+ 
++/* ABI 1.11 (Navi48 M6 Stage 1b): acd_kext_call passes selectors 22..26 ONLY, unchanged (scalars, one struct in, one out), and refuses every other selector with -EPERM before the kernel is asked. */
++static void
++test_scanx_call(void)
++{
++   struct fake f;
++   struct acd_kext *k = mk(&f);
++   uint64_t sin[3] = {2, 0x21, 0}, sout[4] = {0};
++   uint32_t nout = 4;
++   CHECK(ACD_SEL_SCANX_ACQUIRE == 22 && ACD_SEL_SCANX_REGISTER == 23 && ACD_SEL_SCANX_PRESENT == 24 && ACD_SEL_SCANX_STATUS == 25 && ACD_SEL_SCANX_RELEASE == 26);
++   CHECK(N48N_SEL_SCANX_ACQUIRE == 22 && N48N_SEL_SCANX_RELEASE == 26 && N48N_ABI_MINOR >= ACD_ABI_MINOR_SCANX);
++   CHECK(acd_kext_call(k, ACD_SEL_SCANX_PRESENT, sin, 3, NULL, 0, sout, &nout, NULL, NULL) == 0);
++   CHECK(f.ncalls == 1 && f.calls[0].sel == 24 && f.calls[0].nsin == 3 && f.calls[0].sin[0] == 2 && f.calls[0].sin[1] == 0x21 && f.calls[0].stinsz == 0);
++   struct n48n_scan_reg reg = {.handle = 9, .pitch_bytes = 10240, .height = 1440, .width = 2560, .format = N48N_SCAN_FMT_ARGB8888};
++   uint64_t one[1] = {2};
++   nout = 2;
++   CHECK(acd_kext_call(k, ACD_SEL_SCANX_REGISTER, one, 1, &reg, sizeof(reg), sout, &nout, NULL, NULL) == 0);
++   CHECK(f.ncalls == 2 && f.calls[1].sel == 23 && f.calls[1].nsin == 1 && f.calls[1].stinsz == 32);
++   /* anything else is refused BEFORE the kernel is asked */
++   const uint32_t bad[] = {0, 2, 3, 7, 9, 10, 14, 15, 16, 19, 20, 21, 27, 255};
++   for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
++      CHECK(acd_kext_call(k, bad[i], one, 1, NULL, 0, sout, &nout, NULL, NULL) == -EPERM);
++   CHECK(f.ncalls == 2);
++   f.next_kr = (int)ACD_KR_UNSUPPORTED;
++   CHECK(acd_kext_call(k, ACD_SEL_SCANX_ACQUIRE, one, 1, NULL, 0, sout, &nout, NULL, NULL) == -EINVAL); /* a latch OFF in the kernel */
++   f.next_kr = (int)ACD_KR_BUSY;
++   CHECK(acd_kext_call(k, ACD_SEL_SCANX_STATUS, one, 1, NULL, 0, sout, &nout, NULL, NULL) == -EBUSY);
++   acd_kext_destroy(k);
++}
++
+ /* ABI 1.9: BoImportHost marshals selector 21 with exactly [host va, size, flags 0, GPU VA 0] and no struct, and maps the results. */
+ static void
+ test_import_host(void)
+@@ -445,6 +474,7 @@ main(void)
+    test_wait();
+    test_misc();
+    test_import_host();
++   test_scanx_call();
+    test_service_class();
+    printf("acd_kext_test: %d checks, %d failures\n", checks, failures);
+    return failures != 0;
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.c b/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.c
+index 15b98bc45e0..622695f3150 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.c
+@@ -1,7 +1,7 @@
+ /*
+  * SPDX-License-Identifier: MIT
+  *
+- * Darwin scanout API: VkDevice / VkDeviceMemory -> kext BO handle -> selectors 9..14.
++ * Darwin scanout API: VkDevice / VkDeviceMemory -> kext BO handle -> selectors 9..14 (and, ABI 1.11, the instance-2 selectors 22..26 through radv_darwin_n48n_call).
+  */
+ 
+ #include "radv_darwin_scanout.h"
+@@ -29,6 +29,43 @@ scan_kext(VkDevice _dev)
+    return (k && minor >= 1) ? k : NULL;
+ }
+ 
++static struct acd_kext *
++scanx_kext(VkDevice _dev)
++{
++   VK_FROM_HANDLE(radv_device, device, _dev);
++   if (!device)
++      return NULL;
++   uint32_t minor = 0;
++   struct acd_kext *k = ac_drm_darwin_kext(radv_amdgpu_winsys(device->ws)->dev, &minor);
++   return (k && minor >= ACD_ABI_MINOR_SCANX) ? k : NULL;
++}
++
++/* ABI 1.11 (Navi48 M6 Stage 1b): the instance-2 (monitor B) scanout selectors 22..26 on the SAME N48N connection. A thin passthrough: any other selector is -EPERM
++ * (this is not a general escape hatch), a kernel older than ABI 1.11 is -ENOSYS (the caller keeps instance 2 OFF). The kernel refuses everything else. */
++API int
++radv_darwin_n48n_call(VkDevice dev, uint32_t sel, const uint64_t *sin, uint32_t nsin, const void *stin, size_t stinsz,
++                      uint64_t *sout, uint32_t *nsout, void *stout, size_t *stoutsz)
++{
++   struct acd_kext *k = scanx_kext(dev);
++   if (!k)
++      return -ENOSYS;
++   return acd_kext_call(k, sel, sin, nsin, stin, stinsz, sout, nsout, stout, stoutsz);
++}
++
++/* The kext BO handle behind a VkDeviceMemory (the bundle builds the n48n_scan_reg of selector 23 with it). -EINVAL: no BO. */
++API int
++radv_darwin_n48n_bo_handle(VkDevice dev, VkDeviceMemory _mem, uint32_t *handle)
++{
++   struct acd_kext *k = scanx_kext(dev);
++   if (!k)
++      return -ENOSYS;
++   VK_FROM_HANDLE(radv_device_memory, mem, _mem);
++   if (!mem || !mem->bo || !handle)
++      return -EINVAL;
++   *handle = radv_amdgpu_winsys_bo(mem->bo)->bo_handle;
++   return 0;
++}
++
+ API int
+ radv_darwin_set_service_class(const char *cls)
+ {
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.h b/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.h
+index 8e21bccecbe..f76f23bb5ef 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.h
++++ b/src/amd/vulkan/winsys/amdgpu/radv_darwin_scanout.h
+@@ -31,6 +31,13 @@ int radv_darwin_scanout_status(VkDevice dev, struct n48n_scan_status *st);
+ /* Restores the console; out[0] = restore verified, [1] plane MC after (out may be NULL). Idempotent. */
+ int radv_darwin_scanout_release(VkDevice dev, uint64_t out[2]);
+ 
++/* ABI 1.11 (Navi48 M6 Stage 1b): the instance-2 (the monitor B's) scanout selectors 22..26 through the SAME connection. radv_darwin_n48n_call passes selectors 22..26 ONLY (anything else: -EPERM; a
++ * kernel with ABI minor < 11: -ENOSYS, and the caller must keep instance 2 OFF). The argument conventions are kcall's: scalar in / out words, one optional struct in and out. radv_darwin_n48n_bo_handle returns
++ * the kernel BO handle of a VkDeviceMemory (for n48n_scan_reg). The six exports above are unchanged. */
++int radv_darwin_n48n_call(VkDevice dev, uint32_t sel, const uint64_t *sin, uint32_t nsin, const void *stin, size_t stinsz,
++                          uint64_t *sout, uint32_t *nsout, void *stout, size_t *stoutsz);
++int radv_darwin_n48n_bo_handle(VkDevice dev, VkDeviceMemory mem, uint32_t *handle);
++
+ /* G6 (sandboxed applications): choose the IOService the 'N48N' connection is opened on. cls is "Navi48Bringup" (the default: WindowServer, root tools,
+  * command-line programs) or "Navi48Accelerator" (the aux kext's IOAccelerator, the only service a sandboxed application's profile lets it open a user client
+  * on). Returns 0, or -EINVAL for any other name (the previous choice stays). The Metal bundle calls it, for the APP class only, after dlopen and BEFORE

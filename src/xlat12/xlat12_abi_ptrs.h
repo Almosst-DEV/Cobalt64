@@ -31,7 +31,7 @@
 
 #include <stdint.h>
 
-/* build 0.0.470 (notes/design/NO-SAMPLER-CLASS10.md section 2): 4 -> 6. ws_AZ_TimgBdrkXhn_IsrcCrd (class 10) and
+/* build 0.0.470 (an internal design note section 2): 4 -> 6. ws_AZ_TimgBdrkXhn_IsrcCrd (class 10) and
  * ws_J_VfxXghb each declare FIVE 64-bit pointers; the largest row in this file is now 5. A row whose `nptr` exceeds this
  * cap is NOT silently truncated any more: xlat12_abi_ptr_n (below) is the one place every reader of a row takes its
  * count from, and it sets the caller's `over` flag (xlat12_draw_stats.in_over) when the row declares more pointers
@@ -168,7 +168,7 @@ static const xlat12_abi_ptrs kXlat12AbiPtrs[] = {
      *   declared pointers directly, like AE/AD. Fragment: s_n is user-data slot n. */
     { "ws_W_downsample_8_frag_lph", 246u, 0xcdd8abb9u, 0u, 3u, { 0u, 8u, 10u, 0u } },
     { "ws_X_narrow_blur_7_frag_lph", 118u, 0xc5e80d66u, 0u, 3u, { 0u, 8u, 10u, 0u } },
-    /* COVERAGE TASK S6 batch 1 (notes/design/S6-COVERAGE-PART2.md Q1/Q2/Q4), transcribed from the JUST-REBUILT
+    /* COVERAGE TASK S6 batch 1 (an internal design note Q1/Q2/Q4), transcribed from the JUST-REBUILT
      * re/pc-26.6.2/xlat/windowserver-r2/work/{AB,AC,T}/ (each label's own .abi.json, tools/m4-xlat/ws_programs.py
      * translate --round 2):
      *   AB (TcimXh_Icir.abi.json) — ONE user_data entry: "s2:s3 buffer location 1 (uniforms)" (class 3, evidence
@@ -194,7 +194,7 @@ static const xlat12_abi_ptrs kXlat12AbiPtrs[] = {
     { "ws_AB_TcimXh_Icir", 96u, 0xb5f82cf4u, 0u, 1u, { 2u, 0u, 0u, 0u } },
     { "ws_AC_variable_blur_vert_lph", 101u, 0x0f5fd702u, 1u, 3u, { 4u, 6u, 8u, 0u } },
     { "ws_T_Tc3sXhu_Idst", 103u, 0xdb5bb19du, 0u, 2u, { 0u, 4u, 0u, 0u } },
-    /* COVERAGE TASK S6 batches 2 + 3 (notes/design/S6-COVERAGE-PART2.md Q7/Q8, design/NO-SAMPLER-CLASS10.md
+    /* COVERAGE TASK S6 batches 2 + 3 (an internal design note Q7/Q8, design/NO-SAMPLER-CLASS10.md
      * section 4), transcribed from the JUST-REBUILT re/pc-26.6.2/xlat/windowserver-r2/work/{AP..AY}/ (each
      * label's own .abi.json, tools/m4-xlat/ws_programs.py translate --round 2). Every row excludes class-1
      * (texture index) and class-2 (sampler index) words - not raw pointers, same reasoning as every row above.
@@ -240,7 +240,7 @@ static const xlat12_abi_ptrs kXlat12AbiPtrs[] = {
     { "ws_AW_BlsoXh", 88u, 0x814caab6u, 0u, 2u, { 0u, 4u, 0u, 0u } },
     { "ws_AX_BvcmXh", 170u, 0x0e3b2d5au, 0u, 2u, { 0u, 4u, 0u, 0u } },
     { "ws_AY_TimgXh_IsrcN3Oc3mtc3nlnlnl", 279u, 0x46e5cc0eu, 0u, 4u, { 0u, 4u, 6u, 10u } },
-    /* COVERAGE TASK S6 batch 4 (notes/design/S6-COVERAGE-PART2.md Q5/Q7/Q8), re/pc-26.6.2/xlat/windowserver-r2/
+    /* COVERAGE TASK S6 batch 4 (an internal design note Q5/Q7/Q8), re/pc-26.6.2/xlat/windowserver-r2/
      *   work/{BA,BB}/(each label).abi.json — WORD-FOR-WORD IDENTICAL role lists to ws_AI_TmuaXh_Isrc_Isrc's own:
      *   "s0:s1 descriptor table (class 19)", "s4:s5 sampler-index table (class 11)", "s6:s7 buffer location 1
      *   (uniforms)", "s8:s9 buffer location 2 (lod_bias)" - the SAME four raw pointers at the SAME slots as AI/AN
@@ -249,14 +249,14 @@ static const xlat12_abi_ptrs kXlat12AbiPtrs[] = {
      *   F00044 0x400603900). Fragment: s_n is user-data slot n. */
     { "ws_BA_TdfgXh_Isrc", 120u, 0x8e1812e4u, 0u, 4u, { 0u, 4u, 6u, 8u } },
     { "ws_BB_TbvcXh_Isrc_Isrc", 207u, 0x6be37df7u, 0u, 4u, { 0u, 4u, 6u, 8u } },
-    /* COVERAGE TASK S6 batch 4 (notes/design/S6-COVERAGE-PART2.md Q5/Q7/Q8), re/pc-26.6.2/xlat/windowserver-r2/
+    /* COVERAGE TASK S6 batch 4 (an internal design note Q5/Q7/Q8), re/pc-26.6.2/xlat/windowserver-r2/
      *   work/BC/TimgXh_IsrcCcl.abi.json — WORD-FOR-WORD IDENTICAL role list to ws_AO_TmuaXh_IsrcCcl_Icir's own
      *   (NO class-11 word): "s0:s1 descriptor table (class 19)", "s4:s5 buffer location 1 (uniforms)", "s6:s7
      *   buffer location 2 (lod_bias)" - the same shape as ws_AJ/ws_AK/ws_AL/ws_P/ws_AO above. Its texture (s8:s9,
      *   class 1) and sampler (s10:s11, class 2) are i32 index pairs into the descriptor table, not raw pointers,
      *   so they are not transcribed here either. Fragment: s_n is user-data slot n. */
     { "ws_BC_TimgXh_IsrcCcl", 60u, 0xd53dee91u, 0u, 3u, { 0u, 4u, 6u, 0u } },
-    /* build 0.0.470 (notes/design/NO-SAMPLER-CLASS10.md section 2, XLAT12_ABI_PTR_MAX 4 -> 6), re/pc-26.6.2/xlat/
+    /* build 0.0.470 (an internal design note section 2, XLAT12_ABI_PTR_MAX 4 -> 6), re/pc-26.6.2/xlat/
      *   windowserver-r2/work/AZ/TimgBdrkXhn_IsrcCrd.abi.json `args` (CONFIRMED, read by this build): "s0:s1 descriptor
      *   table (class 19)", "s4:s5 texture-index table (class 10, apiSlot 0)", "s6:s7 buffer location 1 (uniforms)",
      *   "s8:s9 buffer location 2 (lod_bias)", "s10:s11 buffer location 5 (noise_scale)" - FIVE pointers; the class-2
@@ -282,7 +282,7 @@ static const xlat12_abi_ptrs kXlat12AbiPtrs[] = {
      *   trace, pd1 1) names exactly these five slots. */
     { "ws_AZ_TimgBdrkXhn_IsrcCrd", 181u, 0xf27e9612u, 0u, 5u, { 0u, 4u, 6u, 8u, 10u, 0u } },
     { "ws_J_VfxXghb", 291u, 0xfa0982efu, 1u, 5u, { 4u, 6u, 8u, 10u, 12u, 0u } },
-    /* build 0.0.484 (notes/design/GLASS.md Q4) — ws_BD_glass_background_lph / ws_BE_glass_background_lph, FRAGMENT,
+    /* build 0.0.484 (an internal design note Q4) — ws_BD_glass_background_lph / ws_BE_glass_background_lph, FRAGMENT,
      * the GLASS v3 build's work/{BD,BE}/glass_background_lph.abi.json `user_data` (CONFIRMED, identical for the two):
      * "descriptor table" class 19 at sgprs [0,1]; "buffer location 1 (u)" class 3 at [8,9]; "buffer location 6
      * (edr_scale)" class 3 at [10,11] - THREE 64-bit pointers. The two class-1 words (s4 source_texture, s6 sdf_texture)
@@ -371,7 +371,7 @@ static inline const xlat12_abi_ptrs *xlat12_abi_ptr_row(uint32_t ndw, uint32_t f
     return xlat12_abi_ptr_row_stage(ndw, fnv, 0u);
 }
 
-/* build 0.0.470 (notes/design/NO-SAMPLER-CLASS10.md section 2, "the latent silent truncation"): THE ONE PLACE A
+/* build 0.0.470 (an internal design note section 2, "the latent silent truncation"): THE ONE PLACE A
  * ROW'S POINTER COUNT IS READ. Returns how many of `ap`'s pointers a reader may walk (min(nptr, XLAT12_ABI_PTR_MAX))
  * and, when the row declares MORE than that, sets `*over` to 1 - the reader's list is then incomplete, which every
  * consumer of xlat12_draw_stats.in_over already refuses on. Through 0.0.455 every loop read `q < ap->nptr && q <

@@ -19,7 +19,7 @@
 #endif
 #include "xlat12_desc.h"                   /* 0.0.232: gfx10.3 -> gfx12 image and sampler descriptors (tools/gen-desc-xlat.py) */
 #include "xlat12_shader_desc.h"            /*: which identities read a client descriptor (tools/gfx-shader-desc.py) */
-#include "xlat12_readset.h"                /* D4' (notes/design/D4-PRIME.md item 2): GENERATED read-set rows, tools/gfx-readset.py */
+#include "xlat12_readset.h"                /* D4' (an internal design note item 2): GENERATED read-set rows, tools/gfx-readset.py */
 #include "xlat12_scissor.h"                /* build 0.0.499: gfx12 scissor BR is INCLUSIVE - d_scissor */
 
 #define PT(h)   (((h) >> 30) & 3u)
@@ -1425,7 +1425,7 @@ static void d_rs_ptr_add(xlat12_draw_stats *ds, uint64_t ptrVa)
  * in the file. */
 static int d_vs_slot_known(const xlat12_draw_extra *ex, uint32_t seen, const uint32_t *pos, const uint32_t *out, uint32_t k);
 
-/* D4' (notes/design/D4-PRIME.md item 3) — ONE STAGE'S CONTRIBUTION to the accumulated read-set, at ONE draw. `row1` is
+/* D4' (an internal design note item 3) — ONE STAGE'S CONTRIBUTION to the accumulated read-set, at ONE draw. `row1` is
  * the profile's ps_readset1 or vs_readset1 (0 = no row: UNKNOWN, declines). `seen`/`pos` are the stage's OWN user-data
  * record (p->ud_seen/ud_pos for PS, p->vsud_seen/vsud_pos for VS), `udn` its width (D_PS_UDN/D_VS_UDN). Declines the
  * WHOLE SEGMENT (ds->rs_declined) whenever the row is missing or its proof bits do not admit it - never a silent
@@ -1486,7 +1486,7 @@ static void d_readset_stage(uint32_t row1, uint32_t seen, const uint32_t *pos, u
     }
 }
 
-/* D4' (notes/design/D4-PRIME.md item 3), NARROWED by D4-PRIME-FIXES.md item 1 (D4-1) — BOTH STAGES, at
+/* D4' (an internal design note item 3), NARROWED by D4-PRIME-FIXES.md item 1 (D4-1) — BOTH STAGES, at
  * ONE draw whose in-force fragment program binds NO class-19 table (`ps_table_abi1 == 0`). Through 0.0.441 this ran
  * for every draw regardless of `ps_table_abi1`; item 1 makes the two paths MUTUALLY EXCLUSIVE per draw - a
  * table-bound draw is accumulated by d_readset_from_table below, from the table step's OWN export, which proves a
@@ -1648,7 +1648,7 @@ static __attribute__((noinline)) uint32_t d_inline_desc(const xlat12_draw_profil
  * the mechanism table-driven so AI's entry is one row later"), so this path is UNREACHABLE from any real program
  * today and OFF-identity holds trivially. XLAT12_TDESC_TABLE_MAX_SAMP (xlat12_ib.h) bounds nsamp exactly as
  * D_TBL_ABIS bounds ntex (2, AI's own count). */
-/* build 0.0.470 (notes/design/NO-SAMPLER-CLASS10.md sections 1-2 and its ADDENDUM) — THE TWO NEW SHAPES, by GROWING
+/* build 0.0.470 (an internal design note sections 1-2 and its ADDENDUM) — THE TWO NEW SHAPES, by GROWING
  * this struct rather than adding a second path (the design's decision: a parallel path would need a parallel branch at
  * every reader of ps_table_abi1, and a missed branch is a fail-open):
  *   - NO SAMPLER (T, AP, AR, AV, AW, AX): `samp == 0xff && samptbl == 0xff && textbl1 == 0`. The program image_loads
@@ -1806,7 +1806,7 @@ typedef struct { uint32_t ndw, fnv; uint8_t table, ntex, tex[3], samp, samptbl, 
      * s_load_b128 s[20:23], +0x90 F4006302 s_load_b256 s[12:19], 4 image_sample (+0xD0..+0xF4) on that pair,
      * override +0x5C 85069F06 / +0x64 BF078106 / +0xC4 98150715; s_endpgm +0x1D4 (118 dw). GATED (switch 43). */
     /* build 0.0.455 item 4 — ws_AS_TbdsXh_Icir_Isrc, ws_AT_TbdsXh_Isup_Isrc, ws_AU_TcimXh_Isrc, ws_AY_TimgXh_
-     * IsrcN3Oc3mtc3nlnlnl (notes/design/NO-SAMPLER-CLASS10.md's reviewer ADDENDUM, S6 batches 2+3 commit 5636278,
+     * IsrcN3Oc3mtc3nlnlnl (an internal design note's reviewer ADDENDUM, S6 batches 2+3 commit 5636278,
      * itself filled from each program's own re-run ABI JSON and gfx1201 disassembly): all four fit TODAY'S
      * direct-sampler DTableAbi shape (no class-10/no-sampler code change needed) - table s0:s1, ONE OR TWO
      * textures by direct SGPR index, ONE direct sampler index; the extra class-3 buffer pointers each program's
@@ -1867,7 +1867,7 @@ typedef struct { uint32_t ndw, fnv; uint8_t table, ntex, tex[3], samp, samptbl, 
      * +0x2C F4002000 `s_load_b64 s[0:1], s[0:1], 0x0`, +0x34 8406840A `s_lshl_b32 s6, s10, 4`, +0x38 84088508 `s_lshl_b32 s8,
      * s8, 5`, +0x8C 85089F0A `s_lshr_b32 s8, s10, 31`, one image_sample (+0xB0); s_endpgm +0xEC = 60 dw, FNV 0xd53dee91.
      * Switch 43 only (an existing shape). */
-    /* build 0.0.484 (notes/design/GLASS.md Q4) — ws_BD_glass_background_lph and ws_BE_glass_background_lph, indices 33-34:
+    /* build 0.0.484 (an internal design note Q4) — ws_BD_glass_background_lph and ws_BE_glass_background_lph, indices 33-34:
      * the FIRST no-sampler rows with TWO textures (the 0.0.470 no-sampler shape, which d_tbl_row_ok admits for ntex <= 2,
      * had only ever shipped ntex 1). CONFIRMED against each program's own ABI JSON (the GLASS v3 build,
      * work/{BD,BE}/glass_background_lph.abi.json, identical for the two) `user_data`: class 19 at sgprs [0,1] api_slot 2
@@ -2347,7 +2347,7 @@ static D_NOINLINE uint32_t *d_unit_pend(xlat12_unit *U, const DTableAbi *a, cons
 }
 
 /* Gather, translate and place the class-19 records of the fragment program in force at THIS draw; redirect its user data. */
-/* ---- build 0.0.500 (xlat12_ib.h XLAT12_EXTRA_DRAW_ELIDE, switch 66; notes/design/DRAW-ELIDE.md Q4) -------------------
+/* ---- build 0.0.500 (xlat12_ib.h XLAT12_EXTRA_DRAW_ELIDE, switch 66; an internal design note Q4) -------------------
  * THE POLICY TABLE. A row names a fragment program by its kDTableAbi identity (ndw, fnv), the class that enables it
  * (ex->draw_elide_rows), and whether its refused texture must be a stripped DCC record. Every row's program is store-free:
  * CONFIRMED on its gfx1201 object (re/pc-26.6.2/xlat/windowserver-r2/work/<P>/<name>.pal.o, `llvm-objdump -d --mcpu=gfx1201`,
@@ -2576,7 +2576,7 @@ static __attribute__((noinline)) uint32_t d_table_desc(const xlat12_draw_profile
                 ds->in_vptr[ds->in_nvptr++] = (uint64_t)out[p->vsud_pos[s0]] | ((uint64_t)out[p->vsud_pos[s0 + 1u]] << 32);
             }
         } else if ((ex->flags & XLAT12_EXTRA_READSET) && cp->vs_readset1 && cp->vs_readset1 <= XLAT12_READSET_COUNT) {
-            /* 0.0.444 (C5-RING-REVIEW.md (B) item K(i), D1 hole) — NO xlat12_abi_ptrs.h ROW for this
+            /* 0.0.444 (an internal review note (B) item K(i), D1 hole) — NO xlat12_abi_ptrs.h ROW for this
              * VERTEX program (I, G, V and attr - a table-bound draw's own vertex programs - have none;'s own
              * finding). Through 0.0.443 this left `in_vptr_known` 0 unconditionally, which n48_cp_build_consumer
              * (gfx_cp_build.h) reads as `over` for the WHOLE segment - a table draw with one of these four vertex
@@ -3118,7 +3118,7 @@ static void d_pair_pre(const xlat12_draw_profile *base, const xlat12_draw_extra 
 }
 
 /* =================================================================================================================
- * build 0.0.480 — CONTINUATION UNITS (xlat12_ib.h XLAT12_EXTRA_UNIT; notes/design/CONTINUATION-UNITS.md Q11).
+ * build 0.0.480 — CONTINUATION UNITS (xlat12_ib.h XLAT12_EXTRA_UNIT; an internal design note Q11).
  * Every helper below runs only when d_unit_of() returns non-NULL, i.e. only under the flag; OFF none is reached.
  * They are separate NOINLINE functions so that the unit path adds no locals to translate_draw_ex's own frame (the
  * design's stack budget: translate_draw_ex <= 0x4e8, d_table_desc <= 0x1e8); all their state is the caller's.
@@ -3297,7 +3297,7 @@ static uint32_t d_unit_fit_from(uint64_t va, uint32_t len, uint32_t mask, uint32
     return (o < len && blen <= len - o) ? o : 0xFFFFFFFFu;
 }
 
-/* build 0.0.501 (notes/design/UNIT-ROOM.md Q3 C2, ; xlat12_ib.h `pack`, switch 67) - THE PACK LOOP.
+/* build 0.0.501 (an internal design note Q3 C2, ; xlat12_ib.h `pack`, switch 67) - THE PACK LOOP.
  * The same blocks, in the same order, first-fit over the same runs as the loop in d_unit_finish (own run 0, own run 1, then
  * the frame pool) - but every block placed in a run goes inside ONE PACKET3(NOP) per run: the run's first block opens it
  * (the header at the run's cursor, the body at the first dword after it aligned to the block's mask), a later block is
@@ -3647,7 +3647,7 @@ uint32_t xlat12_ib_de_backstop(const uint32_t *out, uint32_t n, xlat12_draw_stat
     return 1u;
 }
 
-/* ---- build 0.0.487 (xlat12_ib.h XLAT12_EXTRA_CS_ELIDE, switch 57; notes/design/COMPUTE-N.md Q6) ----------------------
+/* ---- build 0.0.487 (xlat12_ib.h XLAT12_EXTRA_CS_ELIDE, switch 57; an internal design note Q6) ----------------------
  * P2's register set: the bit of gfx10 compute register `g10` in DPair.cs_ok, or -1 for any other address. */
 static int d_cs_bit(uint32_t g10)
 {
@@ -5084,7 +5084,7 @@ const char *xlat12_shader_id_name(int id)
 {
     return (id >= 0 && (uint32_t)id < XLAT12_SHADER_ID_COUNT) ? kXlat12ShaderIds[id].name : "none";
 }
-/* 0.0.434 (notes/design/PGMID-COPYGUARD.md Part 1): see xlat12_ib.h. */
+/* 0.0.434 (an internal design note Part 1): see xlat12_ib.h. */
 int xlat12_shader_id_row(uint32_t i, uint32_t *stage, uint32_t *ndw, uint32_t head[4])
 {
     if (i >= XLAT12_SHADER_ID_COUNT || !stage || !ndw || !head) return 0;
@@ -5240,7 +5240,7 @@ static uint32_t d_vs_abi_ptr_of(int id)
     return 0u;
 }
 
-/* D4' (notes/design/D4-PRIME.md item 2) — THE xlat12_readset.h ROW of an identity, by that identity's own (ndw, fnv)
+/* D4' (an internal design note item 2) — THE xlat12_readset.h ROW of an identity, by that identity's own (ndw, fnv)
  * AT ITS OWN STAGE. index + 1 into kXlat12Readset, 0 = none (UNKNOWN, never "declares no pointers" -
  * xlat12_readset.h's own banner). Exactly the d_table_abi_of / d_vs_abi_ptr_of pattern, for either stage: the row's
  * OWN `stage` field (0 = fragment, 1 = vertex) is asked rather than assumed. proof_depth1_data_only /

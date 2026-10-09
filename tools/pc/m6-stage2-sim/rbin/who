@@ -1,0 +1,6 @@
+#!/bin/bash
+r=$(cat "$SIM_DIR/kv/restart_epoch" 2>/dev/null || echo -1)
+now=$(( 1791470000 + $(cat "$SIM_DIR/vclock_ms") / 1000 ))
+la=$(cat "$SIM_DIR/cfg/login_at" 2>/dev/null || echo 1000000000); la=${la%.*}
+if [ "$r" -ge 0 ] && [ $((now-r)) -ge "$la" ]; then echo "henry    console  Oct  8 13:00"; fi
+exit 0

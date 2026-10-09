@@ -1,0 +1,39 @@
+From 16089ba034889567abd84fe23fcf3dda24ad787d Mon Sep 17 00:00:00 2001
+From: Navi48-MacOS contributors <noreply@example.invalid>
+Date: Thu, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH 7/9] radv/darwin: take GB_ADDR_CONFIG from QueryInfo (ReadRegs
+ is root-only and refused for G4 APP sessions); ReadRegs only as the fallback
+ when the field is 0
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/amd/common/darwin/ac_darwin_drm.c | 16 ++++++++++------
+ 1 file changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+index 0dd5fd9a992..9e35f8434dc 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -142,12 +142,16 @@ acd_native_handshake(struct acd_kext *kext, const struct amdgpu_device *canned,
+       return r;
+    }
+ 
+-   /* GB_ADDR_CONFIG: the tiling layout the canned info and S1d's image assume. */
+-   uint32_t gb = 0;
+-   r = acd_kext_read_regs(kext, ACD_GB_ADDR_CONFIG_REG, 1, &gb);
+-   if (r) {
+-      fprintf(stderr, "radv-darwin: ReadRegs(GB_ADDR_CONFIG) failed: %d\n", r);
+-      return r;
++   /* GB_ADDR_CONFIG: the tiling layout the canned info and S1d's image assume. QueryInfo carries the live value
++    * (n48n_info.gb_addr_config); ReadRegs is root-only and refused for a user-application (G4 APP) session, so it is
++    * only the fallback for a kernel that left the field 0. */
++   uint32_t gb = info.gb_addr_config;
++   if (!gb) {
++      r = acd_kext_read_regs(kext, ACD_GB_ADDR_CONFIG_REG, 1, &gb);
++      if (r) {
++         fprintf(stderr, "radv-darwin: ReadRegs(GB_ADDR_CONFIG) failed: %d\n", r);
++         return r;
++      }
+    }
+    if (gb != ACD_GB_ADDR_CONFIG_GFX1201 && !env_is_1("RADV_DARWIN_ALLOW_ADDRCFG")) {
+       fprintf(stderr, "radv-darwin: live GB_ADDR_CONFIG 0x%08x != canned gfx1201 0x%08x (set "
