@@ -1,5 +1,16 @@
-Navi48-MacOS
-The first public unofficial MacOS GPU driver.
+Cobalt64
+Native macOS GPU acceleration for AMD Radeon GPUs that Apple does not support.
+(Formerly Navi48-MacOS.)
+
+The goal is to bring a GPU-accelerated macOS desktop to unsupported AMD GPUs. The first
+supported family is RDNA4: the RX 9070 XT (Navi 48), which is where all development and
+testing happens today. Other families (for example RDNA3 / RX 7000) are future work; much
+of the stack is shared, but each GPU generation needs its own display and power-management
+bring-up, and someone with that hardware to test it.
+
+Internal names (the navi48-bringup kext, the navi48metal bundle, file paths) still carry
+the Navi48 name; they will be renamed together with a planned restructure into shared
+core code and per-GPU-family code.
 
 What this repo contains
 -----------------------
