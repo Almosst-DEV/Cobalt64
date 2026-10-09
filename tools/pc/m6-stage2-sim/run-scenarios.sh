@@ -6,7 +6,7 @@
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=${N48_ROOT:-$(cd "$HERE/../../.." && pwd)}
 KIT=${KIT:-$ROOT/tools/pc/m6-stage2-run.sh}
-SCR=${SIM_SCRATCH:-/private/tmp/claude-501/m6s2-sim}
+SCR=${SIM_SCRATCH:-/private/tmp/m6s2-sim}
 FAKECLI=${FAKECLI:-$SCR/fakecli}
 KEEP=0; [ "${1:-}" = "-k" ] && { KEEP=1; shift; }
 mkdir -p "$SCR"

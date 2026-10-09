@@ -5,7 +5,6 @@ Subject: [PATCH 9/9] radv/darwin: radv_darwin_n48n_call (selectors 22..26
  only) + radv_darwin_n48n_bo_handle for the monitor B's scanout, ABI 1.11 header
  synced (Navi48 M6 Stage 1b)
 
-Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
 ---
  include/darwin/navi48_native_abi.h            | 16 +++++++-
  src/amd/common/darwin/ac_darwin_kext.c        | 13 +++++++

@@ -15,7 +15,6 @@ shares the handle space, DRM-style -1/errno).  RADV_DARWIN_MOCK=1 runs the
 contract's selectors in process for host-side end-to-end tests; the ABI
 header is the kext builder's, byte for byte.
 
-Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
 ---
  include/darwin/navi48_native_abi.h            | 183 +++++
  src/amd/common/ac_linux_drm.c                 |   5 +

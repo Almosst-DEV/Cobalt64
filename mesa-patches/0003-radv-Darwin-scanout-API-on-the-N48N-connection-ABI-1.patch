@@ -11,7 +11,6 @@ Status/Release) and exports radv_darwin_scanout_* from libvulkan_radeon
 (VkDevice/VkDeviceMemory -> BO handle) so present shares the one per-process
 connection (D-S2-1). The mock models the scanout with a 60 Hz frame counter.
 
-Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
 ---
  include/darwin/navi48_native_abi.h            |  82 ++++++-
  src/amd/common/ac_linux_drm.c                 |   9 +

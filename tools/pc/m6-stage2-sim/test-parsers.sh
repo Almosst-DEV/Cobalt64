@@ -3,7 +3,7 @@
 # notes/logs/runs/m6-s1b/20261008-123836 (0.0.663 CLI, instance 2). Sources the kit as a library (M6S2_LIB=1 DRYRUN=1): nothing runs, no ssh.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=${N48_ROOT:-$(cd "$HERE/../../.." && pwd)}
-SCR=${SIM_SCRATCH:-/private/tmp/claude-501/m6s2-sim}; mkdir -p "$SCR"
+SCR=${SIM_SCRATCH:-/private/tmp/m6s2-sim}; mkdir -p "$SCR"
 FAKECLI=${FAKECLI:-$SCR/fakecli}; [ -x "$FAKECLI" ] || "$HERE/build.sh" "$FAKECLI" >/dev/null || exit 1
 W=$(mktemp -d "$SCR/parsers.XXXXXX"); export SIM_DIR=$W/sd SIM_FR=$W/fr
 mkdir -p "$SIM_DIR/cfg" "$SIM_DIR/kv" "$SIM_FR/private/tmp"

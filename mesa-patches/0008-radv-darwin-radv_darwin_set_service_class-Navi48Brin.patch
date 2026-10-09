@@ -5,7 +5,6 @@ Subject: [PATCH 8/9] radv/darwin: radv_darwin_set_service_class (Navi48Bringup
  default | Navi48Accelerator for sandboxed apps through the IOAccelerator
  connection, G6)
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  src/amd/common/darwin/ac_darwin_iokit.c       | 14 ++++++----
  src/amd/common/darwin/ac_darwin_kext.c        | 23 +++++++++++++++

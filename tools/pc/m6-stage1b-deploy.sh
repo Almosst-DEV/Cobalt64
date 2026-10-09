@@ -1,7 +1,7 @@
 #!/bin/bash
 # m6-stage1b-deploy.sh - DEPLOY PLAN for M6 Stage 1b (first GPU pixels on the monitor B): bring-up 0.0.661 + Metal bundle 13 (with the Mesa dylib inside the bundle tar) + variant
 # stage17-native-1440-metal-disp-amfi-m6flip (latches navi48-m6=1 navi48-m6flip=1). The aux kext stays 0.0.7 (already installed at /Library/Extensions/Navi48Accel-0.0.7.kext): NO aux step, only a check.
-# RUN ON THE AIR. Contacts the PC (host alias `navi48`) ONLY when the brief grants PC operation; follow .claude/skills/navi48-brief-agent/pc-protocol.md. `DRYRUN=1` prints every ssh/scp command and runs none.
+# RUN ON THE AIR. Contacts the PC (host alias `navi48`) ONLY when the brief grants PC operation; follow the project PC-run protocol. `DRYRUN=1` prints every ssh/scp command and runs none.
 # Derived from tools/pc/m6-stage1a-deploy.sh (committed cd79ca1d..87bf2d52) and the build contract an internal design note "## Q2" item 13.
 # UNTRACKED (not committed) until the reviewer says so.
 #
@@ -48,7 +48,7 @@ LOG=$OUT/deploy.log
 SSHO="-o BatchMode=yes -o ConnectTimeout=8"
 STEPNO=0
 
-if [ "$DRYRUN" = 1 ]; then OUT=${DRYRUN_OUT:-/private/tmp/claude-501/m6-s1b-deploy-dry-$TS}; LOG=$OUT/deploy.log; fi
+if [ "$DRYRUN" = 1 ]; then OUT=${DRYRUN_OUT:-/private/tmp/m6-s1b-deploy-dry-$TS}; LOG=$OUT/deploy.log; fi
 mkdir -p "$OUT" || { echo "cannot create $OUT"; exit 1; }
 
 say() { printf '%s\n' "$*" | tee -a "$LOG"; }
@@ -111,8 +111,8 @@ chkl "build proof: 'GPU-HELD' appears $n_kext2 times in the kext binary (want >=
 n_kext3=$(strings -a "$KEXT/Contents/MacOS/Navi48Bringup" 2>/dev/null | /usr/bin/grep -c 'm6stat page')
 chkl "build proof: 'm6stat page' (0.0.659+ code) appears $n_kext3 times in the kext binary (want >= 1)" test "${n_kext3:-0}" -ge 1
 chkl "bundle tar exists" test -f "$BUNDLE_TAR"
-BT=$(mktemp -d /private/tmp/claude-501/m6s1b-bt.XXXXXX) || die "mktemp failed"
-case "$BT" in /private/tmp/claude-501/m6s1b-bt.*) ;; *) die "unexpected temp dir $BT" ;; esac
+BT=$(mktemp -d /private/tmp/m6s1b-bt.XXXXXX) || die "mktemp failed"
+case "$BT" in /private/tmp/m6s1b-bt.*) ;; *) die "unexpected temp dir $BT" ;; esac
 if [ -f "$BUNDLE_TAR" ] && tar -xf "$BUNDLE_TAR" -C "$BT" 2>/dev/null; then
   chkl "bundle CFBundleVersion is $WANT_BUNDLE (got '$(pver "$BT/Navi48Metal.bundle/Contents/Info.plist")')" test "$(pver "$BT/Navi48Metal.bundle/Contents/Info.plist")" = "$WANT_BUNDLE"
   n_b=$(strings -a "$BT"/Navi48Metal.bundle/Contents/MacOS/* 2>/dev/null | /usr/bin/grep -c 'n48m-noflip2')
@@ -125,7 +125,7 @@ if [ -f "$BUNDLE_TAR" ] && tar -xf "$BUNDLE_TAR" -C "$BT" 2>/dev/null; then
   say "  host Mac dylib sha256: $DYLIB_SHA (D5 compares the PC's installed copy with it)"
 else say "  DRYRUN/UNPACK: bundle tar not unpacked (missing or unreadable)"; [ "$DRYRUN" = 1 ] || die "bundle tar unreadable"; fi
 # prefix-checked removal of OUR temp dir only (reported):
-case "$BT" in /private/tmp/claude-501/m6s1b-bt.*) rm -rf "$BT"; say "  [rm] removed own temp dir $BT" ;; esac
+case "$BT" in /private/tmp/m6s1b-bt.*) rm -rf "$BT"; say "  [rm] removed own temp dir $BT" ;; esac
 chkl "CLI binary exists" test -x "$CLI"
 n_cli=$(strings -a "$CLI" 2>/dev/null | /usr/bin/grep -c 'm6xstat')
 chkl "build proof: 'm6xstat' appears $n_cli times in the CLI (want >= 1; the new verb, action 107)" test "${n_cli:-0}" -ge 1

@@ -1,7 +1,7 @@
 #!/bin/bash
 # m6-stage1a-deploy.sh - DEPLOY PLAN for M6 Stage 1a (bring-up 0.0.659 + aux 0.0.7 + Metal bundle 11 + latch navi48-m6=1).
 # RUN ON THE AIR. Contacts the PC (host alias `navi48`) ONLY when the brief grants PC operation; follow
-# .claude/skills/navi48-brief-agent/pc-protocol.md. `DRYRUN=1` prints every ssh/scp command and runs none of them.
+# the project PC-run protocol. `DRYRUN=1` prints every ssh/scp command and runs none of them.
 # Written from: NATIVE-S7-MULTIMON.md "### Stage 1a", tools/native/navi48accel/INSTALL.md (0.0.7 step 4b, as written by the builder),
 # tools/native/navi48metal/INSTALL.md (bundle 11), pc-protocol.md sections 2, 3, 8, queue 286 (Run B deploy plan).
 #
@@ -51,7 +51,7 @@ LOG=$OUT/deploy.log
 SSHO="-o BatchMode=yes -o ConnectTimeout=8"
 STEPNO=0
 
-if [ "$DRYRUN" = 1 ]; then OUT=${DRYRUN_OUT:-/private/tmp/claude-501/m6-s1a-deploy-dry-$TS}; LOG=$OUT/deploy.log; fi
+if [ "$DRYRUN" = 1 ]; then OUT=${DRYRUN_OUT:-/private/tmp/m6-s1a-deploy-dry-$TS}; LOG=$OUT/deploy.log; fi
 mkdir -p "$OUT" || { echo "cannot create $OUT"; exit 1; }
 
 say() { printf '%s\n' "$*" | tee -a "$LOG"; }
@@ -117,15 +117,15 @@ chkl "aux kext is signed" test -f "$AUX/Contents/_CodeSignature/CodeResources"
 n_aux=$(strings -a "$AUX/Contents/MacOS/Navi48Accel" 2>/dev/null | /usr/bin/grep -c 'navi48-m6')
 chkl "build proof: 'navi48-m6' appears $n_aux times in the aux binary (want >= 1; the R1 lift)" test "${n_aux:-0}" -ge 1
 chkl "bundle tar exists" test -f "$BUNDLE_TAR"
-BT=$(mktemp -d /private/tmp/claude-501/m6s1a-bt.XXXXXX) || die "mktemp failed"
-case "$BT" in /private/tmp/claude-501/m6s1a-bt.*) ;; *) die "unexpected temp dir $BT" ;; esac
+BT=$(mktemp -d /private/tmp/m6s1a-bt.XXXXXX) || die "mktemp failed"
+case "$BT" in /private/tmp/m6s1a-bt.*) ;; *) die "unexpected temp dir $BT" ;; esac
 if [ -f "$BUNDLE_TAR" ] && tar -xf "$BUNDLE_TAR" -C "$BT" 2>/dev/null; then
   chkl "bundle CFBundleVersion is $WANT_BUNDLE (got '$(pver "$BT/Navi48Metal.bundle/Contents/Info.plist")')" test "$(pver "$BT/Navi48Metal.bundle/Contents/Info.plist")" = "$WANT_BUNDLE"
   n_b=$(strings -a "$BT"/Navi48Metal.bundle/Contents/MacOS/* 2>/dev/null | /usr/bin/grep -c 'Navi48,M6Surf')
   chkl "build proof: 'Navi48,M6Surf' appears $n_b times in the bundle binary (want >= 1)" test "${n_b:-0}" -ge 1
 else say "  DRYRUN/UNPACK: bundle tar not unpacked (missing or unreadable)"; [ "$DRYRUN" = 1 ] || die "bundle tar unreadable"; fi
 # prefix-checked removal of OUR temp dir only (reported):
-case "$BT" in /private/tmp/claude-501/m6s1a-bt.*) rm -rf "$BT"; say "  [rm] removed own temp dir $BT" ;; esac
+case "$BT" in /private/tmp/m6s1a-bt.*) rm -rf "$BT"; say "  [rm] removed own temp dir $BT" ;; esac
 chkl "CLI binary exists" test -x "$CLI"
 n_cli=$(strings -a "$CLI" 2>/dev/null | /usr/bin/grep -c 'm6stat')
 chkl "build proof: 'm6stat' appears $n_cli times in the CLI (want >= 1)" test "${n_cli:-0}" -ge 1

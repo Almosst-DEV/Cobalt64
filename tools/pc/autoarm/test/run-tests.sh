@@ -1,10 +1,10 @@
 #!/bin/bash
 # run-tests.sh - fake-environment harness for n48-autoarm.sh / install.sh / uninstall.sh. host Mac only: no ssh, nothing contacts the PC.
 # Fake navi48test / n48nub / stat / who / pgrep / killall / ioreg / sysctl / kmutil / launchctl / shutdown / nohup / sleep on PATH, a fake root for the /Library and /private/tmp paths.
-# Every scenario asserts the exact command sequence the script issued (fake logs: $FAKE_DIR/cmds.log). Temporaries: one mktemp dir under /private/tmp/claude-501/, removed at the end with a prefix check.
+# Every scenario asserts the exact command sequence the script issued (fake logs: $FAKE_DIR/cmds.log). Temporaries: one mktemp dir under /private/tmp/, removed at the end with a prefix check.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd); SRC=$(cd "$HERE/.." && pwd)
-BASE=/private/tmp/claude-501; mkdir -p "$BASE"
+BASE=/private/tmp; mkdir -p "$BASE"
 W=$(mktemp -d "$BASE/autoarm-test.XXXXXX") || exit 1
 case "$W" in "$BASE"/autoarm-test.*) ;; *) echo "bad temp dir $W"; exit 1 ;; esac
 PASS=0; FAIL=0; SCN=""

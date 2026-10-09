@@ -78,7 +78,7 @@ FAST_SLEEP=${FAST_SLEEP:-6}
 SSHO="-o BatchMode=yes -o ConnectTimeout=8"
 TS=$(date '+%Y%m%d-%H%M%S')
 RUN=$ROOT/notes/logs/runs/m6-s1b/$TS
-[ "$DRYRUN" = 1 ] && { RUN=${DRYRUN_OUT:-/private/tmp/claude-501/m6-s1b-run-dry-$TS}; WATCH_MIN=2; }
+[ "$DRYRUN" = 1 ] && { RUN=${DRYRUN_OUT:-/private/tmp/m6-s1b-run-dry-$TS}; WATCH_MIN=2; }
 LOG=$RUN/run.log
 mkdir -p "$RUN" || { echo "cannot create $RUN"; exit 1; }
 T='~/navi48-staging/navi48test'

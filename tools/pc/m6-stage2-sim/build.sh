@@ -3,7 +3,7 @@
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=${N48_ROOT:-$(cd "$HERE/../../.." && pwd)}
 OUT=${1:-$HERE/fakecli}
-W=$(mktemp -d /private/tmp/claude-501/m6s2sim-build.XXXXXX)      # own mktemp dir, removed below only if it has that prefix
+W=$(mktemp -d /private/tmp/m6s2sim-build.XXXXXX)      # own mktemp dir, removed below only if it has that prefix
 sed -e 's/^static int dr_call(uint64_t action, uint64_t arg, uint64_t out\[16\]) {/static int dr_call_real(uint64_t action, uint64_t arg, uint64_t out[16]) {/' \
     -e 's/^static int open_service(void) {/static int open_service_real(void) {/' "$ROOT/tools/pc/navi48test.c" >"$W/navi48test_sim.c"
 /usr/bin/grep -q 'dr_call_real' "$W/navi48test_sim.c" && /usr/bin/grep -q 'open_service_real' "$W/navi48test_sim.c" || { echo "build.sh: the sed anchors no longer match navi48test.c (dr_call / open_service signatures changed)"; exit 1; }
@@ -27,5 +27,5 @@ PY
 clang -O1 -w -Dmain=real_main -I "$ROOT/tools/pc" -I "$ROOT/src/navi48-bringup/src/apple" -framework IOKit -framework CoreFoundation -c "$W/navi48test_sim.c" -o "$W/navi48test_sim.o"
 clang -O1 -w -I "$ROOT/tools/pc" -c "$HERE/sim.c" -o "$W/sim.o"
 clang "$W/navi48test_sim.o" "$W/sim.o" -framework IOKit -framework CoreFoundation -o "$OUT"
-case "$W" in /private/tmp/claude-501/m6s2sim-build.*) rm -r "$W" ;; esac
+case "$W" in /private/tmp/m6s2sim-build.*) rm -r "$W" ;; esac
 echo "built $OUT"

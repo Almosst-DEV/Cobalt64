@@ -4,7 +4,6 @@ Date: Thu, 1 Jan 2026 00:00:00 +0000
 Subject: [PATCH 6/9] radv/darwin: report the kext's per-session VRAM budget
  (ABI 1.10) as the app's VRAM heap
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  include/darwin/navi48_native_abi.h           | 19 ++++-
  src/amd/common/darwin/ac_darwin_budget.h     | 66 +++++++++++++++++

@@ -9,7 +9,6 @@ buf[cdw - 4] with cdw = 0 (WindowServer SEGV at ...fff0 on an earlier run).
 Both paths now return with the stream in error, emitting into the old IB or
 a host scratch buffer that reset restores.
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c | 54 +++++++++++++++++--
  1 file changed, 51 insertions(+), 3 deletions(-)

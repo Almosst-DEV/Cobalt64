@@ -5,7 +5,6 @@ Subject: [PATCH 7/9] radv/darwin: take GB_ADDR_CONFIG from QueryInfo (ReadRegs
  is root-only and refused for G4 APP sessions); ReadRegs only as the fallback
  when the field is 0
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  src/amd/common/darwin/ac_darwin_drm.c | 16 ++++++++++------
  1 file changed, 10 insertions(+), 6 deletions(-)

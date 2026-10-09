@@ -4,7 +4,6 @@ Date: Thu, 1 Jan 2026 00:00:00 +0000
 Subject: [PATCH 4/9] darwin: host-pointer import (userptr) via N48N
  BoImportHost when the kernel ABI is >= 1.9; ABI header synced to 1.9
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  include/darwin/navi48_native_abi.h         | 297 ++++++++++++++++++++-
  src/amd/common/ac_gpu_info.c               |   5 +-

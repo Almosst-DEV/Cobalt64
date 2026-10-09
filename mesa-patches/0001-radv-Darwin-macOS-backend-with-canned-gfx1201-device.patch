@@ -17,7 +17,6 @@ vkCreateDevice succeeds; the first real stub then is CS submit.
 Stand-in headers for xf86drm.h, amdgpu.h (libdrm's, verbatim) and libsync.h
 live in include/darwin.
 
-Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
 ---
  cross-x86_64.ini                              |   13 +
  include/darwin/amdgpu.h                       | 2102 +++++++++++++++++

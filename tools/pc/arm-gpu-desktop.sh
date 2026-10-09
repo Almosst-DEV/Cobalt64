@@ -1,6 +1,6 @@
 #!/bin/bash
 # Arm the GPU (Metal) desktop on the DP. 0 users only (restarts WindowServer). Recipe from queue 146/151/265.
-# Runs ON the PC (copy it there; paths below are the PC's).  Based on the reviewer's working copy /tmp/claude-501/arm-gpu-desktop.sh, with two changes:
+# Runs ON the PC (copy it there; paths below are the PC's).  Based on the reviewer's working copy, with two changes:
 #   1. the first nub check no longer attempts a second publish when the nub is already published: `n48nub status` prints "Navi48MetalNub present, registry ID ..." (exit 0) or
 #      "NO Navi48MetalNub in the registry" (exit 1); the old grep for "state 1\|published" never matched either text, so it always published twice;
 #   2. the app-crash-study backstop (bundle 9, an internal design note "App crash study" item 1): CI_USE_MTL_DAG_FOR_CIKL_SRC=0 in the user launchd domain, for processes that
