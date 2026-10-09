@@ -1,0 +1,73 @@
+# Navi48-MacOS - changes since the previous public snapshot (5 October 2026)
+
+Kext: Navi48Bringup 0.0.664. Metal bundle: revision 20.
+Mesa patches: nine (was five), still on the same pinned Mesa commit. Everything below is
+experimental, has been exercised on one test PC with one RX 9070 XT, and several parts sit
+behind boot-args that are OFF by default.
+
+## Multi-display (milestone "M6")
+
+- **Stage 1a** (kext 0.0.659, boot-arg `navi48-m6=1`)
+  The second display's pipe is adopted on Apple's presentation path beside the first:
+  every pipe is adopted, and the surface-ID table is learned in the submit hook.
+- **Stage 1b** (0.0.661, `navi48-m6=1` and `navi48-m6flip=1`)
+  The second display gets its own scanout (instance 2): user-client ABI 1.11, selectors
+  22..26 (acquire / register / present / status / release), poll-only. Mesa patch 0009
+  adds the matching radv_darwin_n48n_call / bo_handle entry points.
+- **Stage 2** (0.0.662, additionally `navi48-m6flip1=1`)
+  A third display (instance 1): per-instance descriptors (HUBP1/OTG1), scanout state,
+  locks, pins and watchdog, a teardown-all path, and clash checks against the other
+  instances. ABI 1.12 (selectors 22..26 also accept instance 1; an extra output word).
+- **Review fixes:** a self-healing surface table (staleness, re-learn, eviction), a serialised
+  table publish, the blob sizing hot fix in 0.0.661, and DP-plane geometry checks in the
+  Metal bundle. Run kits: `tools/pc/m6-stage1a-*`, `m6-stage1b-*`, `m6-stage2-run.sh` and a
+  simulation harness (`tools/pc/m6-stage2-sim`) that checks the scripts' parsers and
+  scenarios without hardware.
+
+## Resizable BAR (0.0.663, 0.0.664)
+
+The kext can map a BAR0 larger than 256 MiB (up to 1 GiB). The decision is a pure,
+unit-tested function (`src/navi48-bringup/src/amd/rebar_pure.h`, `plan_bar0`) that refuses a
+zero or non-power-of-two length, a misaligned base, a disagreement between IOPCIFamily and
+config space, a ReBAR size mismatch and over-large maps. 0.0.664 adds review fixes: the
+doorbell self-ring is not enabled after a BASE_LOW/HIGH read-back mismatch, and BAR2 is
+refused when IOPCIFamily and config space disagree.
+
+## In-process shader translation (Metal bundle 14)
+
+Processes other than WindowServer (sandboxed applications) can translate Metal AIR to
+SPIR-V inside the process: Apple's own compiler library prints the AIR as LLVM text, and a
+small C-ABI library (libn48xlate) translates it, replacing the helper daemon. The library
+is the LGPL-3.0 n48xlate crate, a wrapper around metal2vulkan; it is NOT part of the MIT
+code and lives, with our changes to metal2vulkan, in `third-party/metal2vulkan-n48/`
+(see its NOTICE). `tools/native/navi48metal/n48_xlate.h` is the loader.
+
+## Application fixes (Metal bundles 15..20)
+
+- WindowServer import-memory exhaustion: a live-import ledger, a refused import never
+  returns nil, an import cache on by default.
+- Occlusion queries (setVisibilityResultMode) over a per-command-buffer Vulkan query pool;
+  resolve before the command buffer completion handler.
+- RG16Uint pixel format mapped to VK_FORMAT_R16G16_UINT (menus whose shadow pass needs it).
+- Visible-function linking for translated shaders (ABI 2 of libn48xlate).
+- HDMI scanout "rubber band" fix: routed non-tentative writes are scanout writes while the
+  routing latch is on; per-slot supersede marks replace an 8-entry surface table.
+- GPU-application allow-list (kext: Navi48AppKey.h, appallow), default-deny.
+
+## Auto-arm (`tools/pc/autoarm`)
+
+A LaunchDaemon (once per boot) plus a fail-safe script that brings up the multi-display
+GPU desktop unattended at the login window. The first failing step stops it and leaves the
+CPU-rendered desktop; it stops if a user logs in; WindowServer is restarted exactly once.
+The expected display CRC is measured on the boot itself (or set with `AA_CRC_RG2` /
+`AA_CRC_B2`) rather than compiled in. Kill switch: a file named `autoarm-off`. `install.sh` and
+`uninstall.sh` are provided; `run-tests.sh` runs the script against fake tools on a host Mac.
+
+## Other
+
+- New pure-function headers with host-run test suites and "planted break" scripts
+  (`src/navi48-bringup/tests/native_*_plant.sh`).
+- kext Makefile / BUILDING.md / firmware handling unchanged from the previous snapshot:
+  the build still needs MacKernelSDK from RDNA4FB and the AMD firmware from linux-firmware.
+- Not included, as before: AMD firmware, captures and fixtures derived from Apple software,
+  translated Apple shaders (spvcache), build outputs, notes.

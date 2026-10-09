@@ -22,7 +22,7 @@ CXX_SRCS := src/Navi48Bringup.cpp src/Navi48UserClient.cpp src/Navi48NativeClien
 # time into src/fw/ (gitignored) by tools/embed-firmware.py: symbol fw_<blob>[] + fw_<blob>_size.
 FW_BINS  := $(wildcard firmware/*.bin)
 FW_SRCS  := $(patsubst firmware/%.bin,src/fw/fw_%.c,$(FW_BINS))
-# REQUIRED blobs: AMD firmware from linux-firmware, NOT in this repository (see BUILDING.txt and
+# REQUIRED blobs: AMD firmware from linux-firmware, NOT in this repository (see BUILDING.md and
 # tools/fetch-firmware.sh). The kext cannot link without them, so fail early with a clear message.
 FW_REQUIRED := gc_12_0_1_imu gc_12_0_1_me gc_12_0_1_mec gc_12_0_1_pfp gc_12_0_1_rlc gc_12_0_1_uni_mes \
                psp_14_0_3_sos psp_14_0_3_ta sdma_7_0_1 smu_14_0_3
@@ -115,7 +115,7 @@ $(OBJS): | check-firmware
 check-firmware:
 	@if [ -n "$(FW_MISSING)" ]; then \
 	  echo "error: missing required firmware in firmware/: $(addsuffix .bin,$(FW_MISSING))"; \
-	  echo "       copy them from a linux-firmware checkout: tools/fetch-firmware.sh <path> (see BUILDING.txt)"; exit 1; fi
+	  echo "       copy them from a linux-firmware checkout: tools/fetch-firmware.sh <path> (see BUILDING.md)"; exit 1; fi
 .PHONY: check-firmware
 
 # Header dependency tracking (-MMD): a struct change in a shared header (e.g. DeviceContext
