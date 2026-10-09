@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8a7dff"/>
+      <stop offset=".45" stop-color="#4560ff"/>
+      <stop offset="1" stop-color="#1a24a6"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity=".45"/>
+      <stop offset=".5" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2=".7" y2="1">
+      <stop offset="0" stop-color="#fff"/>
+      <stop offset=".55" stop-color="#eef1ff" stop-opacity=".94"/>
+      <stop offset="1" stop-color="#c9d2ff" stop-opacity=".82"/>
+    </linearGradient>
+    <clipPath id="sq"><rect width="128" height="128" rx="29"/></clipPath>
+  </defs>
+
+  <g clip-path="url(#sq)">
+    <rect width="128" height="128" fill="url(#bg)"/>
+    <rect width="128" height="64" fill="url(#sheen)"/>
+    <rect x=".75" y=".75" width="126.5" height="126.5" rx="28.3" fill="none" stroke="#fff" stroke-opacity=".28" stroke-width="1.5"/>
+  </g>
+
+  <!-- C: soft shadow, glass body, specular edge -->
+  <path d="M85.2 42.8A30 30 0 1 0 85.2 85.2" fill="none" stroke="#0b1270" stroke-opacity=".3" stroke-width="19" stroke-linecap="round" transform="translate(0 3.5)"/>
+  <path d="M85.2 42.8A30 30 0 1 0 85.2 85.2" fill="none" stroke="url(#glass)" stroke-width="18" stroke-linecap="round"/>
+  <path d="M30.2 51.7A36 36 0 0 1 51.7 30.2" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round"/>
+</svg>
