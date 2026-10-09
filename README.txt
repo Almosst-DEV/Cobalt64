@@ -23,18 +23,20 @@ What this repo contains
 
 Status
 ------
-Reached on one x86_64 test PC with an RX 9070 XT: a 60 fps
-GPU-composited macOS desktop on one DisplayPort display, macOS Tahoe 26.6.2, x86_64
-PC booted through OpenCore. The Metal compositor runs on this driver stack. A lot is
-still rough. Only one display path has been exercised at length, performance and
-stability work is ongoing, and many pieces exist to work around one specific macOS
-build.
+Reached on one x86_64 test PC with an RX 9070 XT, macOS Tahoe 26.6.2, booted through
+OpenCore: a GPU-composited macOS desktop on three displays at once (one DisplayPort,
+two HDMI), with the Metal compositor running on this driver stack, Resizable BAR, and
+the driver arming itself at boot. A set of built-in apps (Maps, Preview, Photos,
+System Settings, Music and others) render through it. This is a preview: a lot is
+still rough, the display modes supported are limited to what the test PC's monitors
+needed, and many pieces exist to work around one specific macOS build.
 
 Coming Soon
 -----------
-Multi-monitor support
-Multiple display paths
-Native GPU rendering for app content
+4K output over HDMI
+Higher refresh rates and smoother frame pacing
+Native GPU rendering for more apps (Safari, Chromium/Electron apps)
+Display support driven by each monitor's EDID instead of fixed modes
 
 Can I install this?
 -------------------
