@@ -16,7 +16,6 @@
 </p>
 
 <p align="center">
-  <img alt="GPUs: AMD RDNA 4, RDNA 3 planned" src="https://img.shields.io/badge/GPUs-RDNA%204%20%C2%B7%20RDNA%203%20planned-ED1C24?logo=amd&logoColor=white">
   <img alt="macOS Tahoe 26.6.2" src="https://img.shields.io/badge/macOS-Tahoe%2026.6.2-000000?logo=apple&logoColor=white">
   <img alt="Bootloader: OpenCore" src="https://img.shields.io/badge/bootloader-OpenCore-555555">
 </p>
