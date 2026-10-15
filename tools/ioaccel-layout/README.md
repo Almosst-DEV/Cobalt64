@@ -4,7 +4,7 @@ Reconstructs the C++ vtable layout and instance sizes of Apple's `IOAcceleratorF
 **your own** kernel collections, and emits a header that lets a `-fapple-kext` subclass reproduce that layout without
 Apple's private headers.
 
-This repository contains only the scripts. It contains no Apple binaries, symbol tables, vtable dumps or generated headers,
+This directory contains only the scripts. It contains no Apple binaries, symbol tables, vtable dumps or generated headers,
 and you must not redistribute what the scripts write. The output is derived from Apple software on your machine and
 stays on your machine.
 
