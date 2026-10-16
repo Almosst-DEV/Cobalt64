@@ -62,3 +62,10 @@ and the render-translation arms refuse. Everything else, including the compute t
 (`src/navi48-bringup/shaders/store_magic*.s` with their assembled `.bin`), is in the tree.
 
 Boot-args and loading are described in the source comments; this file only covers building.
+
+## Linux RADV backend validation
+
+The patched Mesa backend and the existing Vulkan image/depth workloads can be
+built and run on Linux with RDNA3. See [the Linux build and run instructions](docs/linux-rdna3.md).
+This validates Vulkan work through Linux amdgpu; the kext and Metal bundle above
+remain macOS targets.
