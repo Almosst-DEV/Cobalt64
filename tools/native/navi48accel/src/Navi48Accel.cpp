@@ -1,5 +1,5 @@
 //
-//  Navi48Accel.cpp - the Aux-KC accelerator kext (com.navi48.accelprobe 0.0.7, display name Navi48Accel) of milestone #9, route A; 0.0.5 (G6) overrides Navi48Accelerator::newUserClient (slot 239) so that a type 'N48N' open reaches the bring-up kext's native client through the ops table's ABI-3 native_open (an internal design note "G6 design"); 0.0.3 adds the display pipe of #11; 0.0.4 adds the monitor B framebuffer of M5
+//  Navi48Accel.cpp - the Aux-KC accelerator kext (com.navi48.accelprobe 0.0.8, display name Navi48Accel) of milestone #9, route A; 0.0.8 adds the Navi48LoadAccelerator IOPropertyMatch gate to the personality (Info.plist): the accelerator matches a Navi48MetalNub only while that nub carries the property, which the bring-up kext writes at publish and withholds with boot-arg navi48-accelbind=0; 0.0.5 (G6) overrides Navi48Accelerator::newUserClient (slot 239) so that a type 'N48N' open reaches the bring-up kext's native client through the ops table's ABI-3 native_open (an internal design note "G6 design"); 0.0.3 adds the display pipe of #11; 0.0.4 adds the monitor B framebuffer of M5
 //  (Navi48Framebuffer : IOFramebuffer, an internal design note "M5 build spec": matches ONLY a Navi48DisplayNub with Navi48DisplayIndex 1 (the monitor B) or, since 0.0.6, 2 (the monitor A; two personalities, one class),
 //  published on demand by the bring-up kext's `fbpublish 2` / `fbpublish 1`, never at boot; it answers from the immutable snapshot of Navi48DisplayOps.h (ABI 2: the per-index geometry) and touches no register).
 //  (Navi48DisplayPipe : IOAccelDisplayPipe, an internal design note section 3.4 + the binding "11h.1 RE facts" section), OFF unless the bring-up kext's ops
@@ -9,7 +9,7 @@
 //  runtime vtable/layout gate) and vtable-shaped trampolines into the versioned ops table of the bring-up kext (Navi48MetalOps.h). See n48accel_pure.h
 //  for what stays here and why.
 //
-//  It matches ONLY a Navi48MetalNub (published on demand by the bring-up kext, never at boot): no PCI match, no IOResources personality, nothing runs
+//  It matches ONLY a Navi48MetalNub that carries the Navi48LoadAccelerator gate (the nub is published by the bring-up kext - at boot since 0.0.670, or on demand by the n48nub tool): no PCI match, no IOResources personality, nothing runs
 //  at boot except the OSMetaClass registrations of the classes below. It touches no hardware, no PCI config space, no interrupts.
 //
 #include <IOKit/IOService.h>

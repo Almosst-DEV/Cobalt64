@@ -132,9 +132,9 @@ plant 49 $CLI "the CLI usage string forgets vramstat" '|m6xstat [0|1|2]|vramstat
 plant 50 $SR/Navi48UserClient.cpp "the user client's table comment forgets the verb" '108 = vramstat' '108 = (removed)'
 # ---- version ----
 plant 51 $K/Info.plist "the version is not bumped" '<key>CFBundleVersion</key>
-	<string>0.0.664</string>' '<key>CFBundleVersion</key>
+	<string>0.0.670</string>' '<key>CFBundleVersion</key>
 	<string>0.0.662</string>'
-plant 52 $SR/amd/native_s1c.h "Hello reports the old build" 'constexpr uint32_t kN1cKextBuild = 664;' 'constexpr uint32_t kN1cKextBuild = 662;'
+plant 52 $SR/amd/native_s1c.h "Hello reports the old build" 'constexpr uint32_t kN1cKextBuild = 670;' 'constexpr uint32_t kN1cKextBuild = 662;'
 # ---- item 9: the variants ----
 V=variants/configs
 plant 53 $V/stage17-native-1440-metal-disp-amfi-ms-apps-rebar0.plist "-rebar0 keeps npci=0x2000" '-v keepsyms=1 alcid=7' '-v keepsyms=1 npci=0x2000 alcid=7'

@@ -165,7 +165,7 @@ plant(112, GLUE, 'scan_query does not report the m6flip latch', 'if (n48m6_latch
 plant(113, CLI, 'the CLI has no m6xstat verb', 'else if (what && !strcmp(what, "m6xstat")) in = 107;', '')
 plant(114, BRG, 'accelExperiment does not serve action 107', 'n48dcn::scanXReport(argScalar, v, 13)', 'n48dcn::scanXReport(argScalar, v, 12)')
 plant(115, DPURE, 'action 107 is not admitted', 'action == kActM6Stat || action == kActM6XStat || action == kActVramStat)); }', 'action == kActM6Stat)); }')
-plant(116, PLIST, 'the kext version is not bumped', '<key>CFBundleVersion</key>\n\t<string>0.0.664</string>', '<key>CFBundleVersion</key>\n\t<string>0.0.660</string>')
+plant(116, PLIST, 'the kext version is not bumped', '<key>CFBundleVersion</key>\n\t<string>0.0.670</string>', '<key>CFBundleVersion</key>\n\t<string>0.0.660</string>')
 plant(117, 'variants/configs/stage17-native-1440-metal-disp-amfi-m6flip.plist', 'the m6flip variant lacks the boot-arg', 'navi48-m6=1 navi48-m6flip=1</string>', 'navi48-m6=1</string>')
 plant(118, 'variants/configs/stage17-native-1440-metal-disp-amfi-m6.plist', 'the m6 variant gains navi48-m6flip (the OFF variant must stay as it was)', 'navi48-m6=1</string>', 'navi48-m6=1 navi48-m6flip=1</string>')
 # ---- the review items --------------------------------------------------------------------------------------------------------------------------------------------------------------------------

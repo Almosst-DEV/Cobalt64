@@ -56,15 +56,15 @@ D=$K/src/amd/native_disp_pure.h
 
 # ---- the brief's five ----
 plant 1  $E '    const uint64_t own = __atomic_load_n(&s->emitted, __ATOMIC_ACQUIRE);' '    const uint64_t own = emitted_now();' "BREAK 1: the own wait waits on the GLOBAL emitted count instead of the session's own last seqno"
-plant 2  $P 'constexpr uint8_t slot_after_close(bool parked, bool ownIdle) { return (parked && ownIdle) ? (uint8_t)kSlotFree : (uint8_t)kSlotDead; }' 'constexpr uint8_t slot_after_close(bool parked, bool ownIdle) { (void)parked; (void)ownIdle; return (uint8_t)kSlotFree; }' "BREAK 2 (pure): a VMID is handed out again while its work may still be in use"
-plant 3  $E '    gSlotState[s->slot] = slot_after_close(parked, ownIdle);' '    gSlotState[s->slot] = kSlotFree;' "BREAK 2 (kernel): close frees the slot (VMID) even after a leak"
-plant 4  $P '    for (uint32_t i = 0; i < kMaxSessions; i++) if (state[i] == kSlotFree) return OpenPick{ kOk, i };' '    for (uint32_t i = 0; i < kMaxSessions; i++) if (state[i] != kSlotOpen) return OpenPick{ kOk, i };' "BREAK 2 (pure): open_pick reuses a DEAD slot"
+plant 2  $P 'constexpr uint8_t cli_after_close(bool parked, bool ownIdle) { return (parked && ownIdle) ? (uint8_t)kCliFree : (uint8_t)kCliQuarantined; }' 'constexpr uint8_t cli_after_close(bool parked, bool ownIdle) { (void)parked; (void)ownIdle; return (uint8_t)kCliFree; }' "BREAK 2 (pure): a pool handle is released while the client's work may still be in use"
+plant 3  $E '    gCliState[s->cli] = nst;' '    gCliState[s->cli] = kCliFree;' "BREAK 2 (kernel): close releases the pool handle even when the park or the own wait failed"
+plant 4  $P '    for (uint32_t i = 0; i < n; i++) if (state[i] == kCliFree) return CliPick{ kOk, i };' '    for (uint32_t i = 0; i < n; i++) if (state[i] != kCliOpen) return CliPick{ kOk, i };' "BREAK 2 (pure): open_pick reuses a QUARANTINED record"
 plant 5  $E '    __atomic_store_n(&gs->poisoned, 1u, __ATOMIC_SEQ_CST);
 ' '' "BREAK 3: the recovery never poisons the guilty session"
 plant 6  $E '    if (s != nullptr && sess_poisoned(s)) return n48native::g2::poison_rc(true);
 ' '' "BREAK 3: a poisoned session passes the GPU gate (its submits are accepted)"
 plant 7  $P 'constexpr uint32_t poison_rc(bool poisoned) { return poisoned ? kAborted : kOk; }' 'constexpr uint32_t poison_rc(bool poisoned) { (void)poisoned; return kOk; }' "BREAK 3 (pure): poisoning returns success"
-plant 8  $P '    if (!multi) return (openCount == 0u && state[0] == kSlotFree) ? OpenPick{ kOk, 0u } : OpenPick{ kExclusive, kNoSlot };' '    if (!multi) return (state[0] == kSlotFree || state[1] == kSlotFree) ? OpenPick{ kOk, state[0] == kSlotFree && openCount == 0u ? 0u : 1u } : OpenPick{ kExclusive, kNoSlot };' "BREAK 4 (pure): the OFF path admits a second session"
+plant 8  $P '    if (!multi) return (openCount == 0u && n > 0u && state[0] == kCliFree) ? CliPick{ kOk, 0u } : CliPick{ kExclusive, kNoSlot };' '    if (!multi) return (n > 1u && (state[0] == kCliFree || state[1] == kCliFree)) ? CliPick{ kOk, state[0] == kCliFree && openCount == 0u ? 0u : 1u } : CliPick{ kExclusive, kNoSlot };' "BREAK 4 (pure): the OFF path admits a second session"
 plant 9  $E '    if (!multi && !OSCompareAndSwap(0, 1, &gOpenFlag)) {' '    if (!multi && !OSCompareAndSwap(0, 1, &gOpenFlag) && false) {' "BREAK 4 (kernel): the OFF compare-and-swap no longer refuses a second open"
 plant 10 $N '	if (opened) { n48disp_on_ws_client_closed(wsSession); amdgpu::n1c_unmap_for_close(amdgpu::N1cRef{ sessSlot, sessId }, this); amdgpu::n1c_close(amdgpu::N1cRef{ sessSlot, sessId }, "clientClose");' '	if (opened) { n48disp_on_ws_client_closed(!adminClient); amdgpu::n1c_close(amdgpu::N1cRef{ sessSlot, sessId }, "clientClose");' "BREAK 5: the close-disarm is keyed on 'not admin' again"
 plant 11 $D 'constexpr bool ws_close_disarms(bool latchOn, bool closingIsWsSession) { return latchOn && closingIsWsSession; }' 'constexpr bool ws_close_disarms(bool latchOn, bool closingIsWsSession) { return latchOn && !closingIsWsSession; }' "BREAK 5 (pure): the rule disarms on the OTHER sessions' close"
@@ -72,8 +72,8 @@ plant 11 $D 'constexpr bool ws_close_disarms(bool latchOn, bool closingIsWsSessi
 plant 12 $P '    const uint64_t seq = retired + 1ull;
     const OwnerEnt &x' '    const uint64_t seq = retired;
     const OwnerEnt &x' "the guilty seqno is the last RETIRED one (off by one)"
-plant 13 $P '    if (!multi || !guiltyKnown || guiltySlot >= kMaxSessions || !userSession || guiltyIsWs || mesTimedOut || g1Holds) return kStallLatch;' '    if (!multi || !guiltyKnown || guiltySlot >= kMaxSessions || !userSession || (guiltyIsWs && false) || mesTimedOut || g1Holds) return kStallLatch;' "WindowServer's own hang is auto-recovered"
-plant 14 $P '    if (!multi || !guiltyKnown || guiltySlot >= kMaxSessions || !userSession || guiltyIsWs || mesTimedOut || g1Holds) return kStallLatch;' '    if ((!multi && false) || !guiltyKnown || guiltySlot >= kMaxSessions || !userSession || guiltyIsWs || mesTimedOut || g1Holds) return kStallLatch;' "the switch OFF still auto-recovers"
+plant 13 $P '    if (!multi || !guiltyKnown || guiltySlot >= kMaxClients || !userSession || guiltyIsWs || mesTimedOut || g1Holds) return kStallLatch;' '    if (!multi || !guiltyKnown || guiltySlot >= kMaxClients || !userSession || (guiltyIsWs && false) || mesTimedOut || g1Holds) return kStallLatch;' "WindowServer's own hang is auto-recovered"
+plant 14 $P '    if (!multi || !guiltyKnown || guiltySlot >= kMaxClients || !userSession || guiltyIsWs || mesTimedOut || g1Holds) return kStallLatch;' '    if ((!multi && false) || !guiltyKnown || guiltySlot >= kMaxClients || !userSession || guiltyIsWs || mesTimedOut || g1Holds) return kStallLatch;' "the switch OFF still auto-recovers"
 plant 15 $E '    const uint32_t act = stall_action_budgeted(multi_on(), g.known, g.slot, user, ws, mes_timeout_seen(), g1_holds(), tried);' '    const uint32_t act = stall_action_budgeted(multi_on(), g.known, g.slot, user, false, mes_timeout_seen(), g1_holds(), tried);' "the kernel never tells the decision the guilty session is WindowServer's"
 plant 16 $E '    if (r == kIOReturnSuccess) {
         uint32_t dw[8];' '    if (true) {
@@ -81,11 +81,11 @@ plant 16 $E '    if (r == kIOReturnSuccess) {
 plant 17 $E '    n48native::g2::owner_note(gOwners, seq, ownerSlot, ownerId, startWc);
 ' '' "the ring no longer records the owner of a seqno"
 # ---- VMIDs, waits, budget ----
-plant 18 $E 'va, by, nIbs, s->vmid, hasFence,
-                                    fenceAddr, gCtx->cp.wb_bus + kWbOffsetNativeSeq, seq);
-    if (n == 0u) { IOLockUnlock(gRingLock); return' 'va, by, nIbs, kNativeVmid, hasFence,
-                                    fenceAddr, gCtx->cp.wb_bus + kWbOffsetNativeSeq, seq);
-    if (n == 0u) { IOLockUnlock(gRingLock); return' "every session's IB runs on VMID 8"
+plant 18 $E 'va, by, nIbs, vm, hasFence,
+                                        fenceAddr, gCtx->cp.wb_bus + kWbOffsetNativeSeq, seq);
+        if (n == 0u) { IOLockUnlock(gRingLock); return' 'va, by, nIbs, kNativeVmid, hasFence,
+                                        fenceAddr, gCtx->cp.wb_bus + kWbOffsetNativeSeq, seq);
+        if (n == 0u) { IOLockUnlock(gRingLock); return' "every client's IB runs on VMID 8 (the pool handle is ignored)"
 plant 19 $E '    const uint32_t rrc = n48native::g2::own_wait_resolve(target, em, __atomic_load_n(&s->emitted, __ATOMIC_ACQUIRE), &res);' '    const uint32_t rrc = n48native::g2::own_wait_resolve(target, em, em, &res);' "WaitSeq LAST waits for every session's work"
 plant 20 $P '    return !multi || isWs || !s1c::would_exceed(othersHeld, add, others_vram_cap(vramTotal));' '    return !multi || (isWs && false) || !s1c::would_exceed(othersHeld, add, others_vram_cap(vramTotal));' "WindowServer is charged against the apps' budget"
 plant 21 $E '            if (!n48native::g2::vram_budget_ok(multi, s->ws, gVramOthers, p.size, vram_total())) {' '            if (false && !n48native::g2::vram_budget_ok(multi, s->ws, gVramOthers, p.size, vram_total())) {' "BoCreate ignores the VRAM budget"
@@ -109,13 +109,20 @@ plant 37 $E '        if (!n48native::g2::sys_budget_ok(multi_on(), s->ws, gSysHe
 plant 38 $E '        if (b.kind == kBoGtt) { sysmem_free(b.sm); sys_release(b); }' '        if (b.kind == kBoGtt) sysmem_free(b.sm);' "R4: a closing session's GTT pages stay counted forever"
 plant 39 $E 'aLo = hub_rd(0x15d2), aHi' 'aLo = hub_rd(0x15d4), aHi' "R5: the wrong fault-address register"
 plant 40 $E '        g.faultPrev = gFaultPrev; gFaultPrev = g.faultNow;' '        g.faultPrev = g.faultNow;' "R5: the previous sessstat word is never kept (a change cannot be seen)"
-plant 41 $E '        s->faultAtOpen = fault_snap("open", slot);   // R5: read only' '' "R5: no fault word at session open"
+plant 41 $E '        s->faultAtOpen = fault_snap("open", cli);   // R5: read only' '' "R5: no fault word at session open"
 plant 42 $P 'o[11] = g.faultNow; o[12] = g.faultPrev;' 'o[11] = g.faultNow; o[12] = 0;' "R5 (pure): the global page drops the previous word"
 plant 43 $E '        if (mrc != kOk) {' '        if (false) {' "R6: BoFree frees a CPU-mapped visible-VRAM BO"
 plant 44 $P 'descriptorRefs > 1u) ? kBusy : kOk;' 'descriptorRefs > 2u) ? kBusy : kOk;' "R6 (pure): one live mapping is not seen"
 plant 45 $E '    if (!multi_on()) { hang_from_wait(); return n48native::g2::kBoundStalled; }' '    if (!multi_on()) { return n48native::g2::kBoundNoBlame; }' "R2: the switch OFF no longer latches at the ring-wait bound"
+# ---- 0.0.670: the POOLED VMID HANDLES ----
+plant 46 $P '    for (uint32_t i = 0; i < kVmidPoolSize; i++) if (((usable >> i) & 1u) != 0u && idle[i]) return VmidPick{ kOk, i, owner[i] };' '    for (uint32_t i = 0; i < kVmidPoolSize; i++) if (((usable >> i) & 1u) != 0u) return VmidPick{ kOk, i, owner[i] };' "POOL (pure): a handle is STOLEN from a client whose work has NOT retired"
+plant 47 $P '    for (uint32_t i = 0; i < n; i++) if (state[i] == kCliQuarantined && idle[i]) return i;' '    for (uint32_t i = 0; i < n; i++) if (state[i] == kCliQuarantined) return i;' "POOL (pure): a quarantined record is reclaimed BEFORE its work is proven retired"
+plant 48 $P 'constexpr uint32_t kMaxClients   = 64u;' 'constexpr uint32_t kMaxClients   = kVmidPoolSize;' "POOL (pure): the client table collapses back onto the VMID count (the model in which a client was a VMID)"
+plant 49 $E '        const uint32_t reclaimed = cli_reclaim_locked();' '' "POOL (kernel): n1c_open never runs the reclaim pass (a quarantine would cost a record for good)"
+plant 50 $E '        if (arc != kOk && arc != kNotReady) { rc = (IOReturn)arc; break; }' '        if (arc != kOk) { rc = (IOReturn)arc; break; }' "POOL (kernel): an exhausted pool makes the OPEN fail instead of opening the client non-resident"
+plant 51 $P '    for (uint32_t i = 0; i < kVmidPoolSize; i++) if (((usable >> i) & 1u) != 0u && owner[i] == kNoClient) return VmidPick{ kOk, i, kNoClient };' '    for (uint32_t i = 0; i < kVmidPoolSize; i++) if (owner[i] == kNoClient) return VmidPick{ kOk, i, kNoClient };' "POOL (pure): a handle without the native geometry is handed out anyway"
 plant 25 $K/Info.plist '<key>CFBundleVersion</key>
-	<string>0.0.664</string>' '<key>CFBundleVersion</key>
+	<string>0.0.670</string>' '<key>CFBundleVersion</key>
 	<string>0.0.626</string>' "the version is not bumped"
 
 echo "native_g2_plant: $((total - 1)) plants (+ the baseline), $escaped escaped or did not apply"

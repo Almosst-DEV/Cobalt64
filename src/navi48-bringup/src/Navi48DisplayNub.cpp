@@ -78,7 +78,7 @@ void op_trace(uint32_t ev, uint64_t a, uint64_t b) {
 	FBLOG("framebuffer trace: event %u a %#llx b %#llx", ev, (unsigned long long)a, (unsigned long long)b);
 }
 const N48DispOps gDispOps = {
-	N48_DISP_OPS_MAGIC, N48_DISP_ABI, (uint32_t)sizeof(N48DispOps), 664u, 0u, 0u,
+	N48_DISP_OPS_MAGIC, N48_DISP_ABI, (uint32_t)sizeof(N48DispOps), 666u, 0u, 0u,
 	op_snapshot, op_power, op_trace,
 	nullptr, nullptr, nullptr,
 };

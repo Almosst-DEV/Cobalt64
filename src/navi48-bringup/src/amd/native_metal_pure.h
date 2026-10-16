@@ -3,8 +3,10 @@
 //  review MUST-FIX 1, 2, 5, 6). No IOKit, no kernel: tests/native_metal_test.cpp compiles this very file and drives it, with planted breaks.
 //
 //  What lives here (and NOT in the aux kext, which every rebuild of requires a security approval (Allow click) from the user): the publish / withdraw verdicts, the nub state machine,
-//  the IOAccelConfig contents and its static check, the stamp-page and task-window rules, the factory mask. Default OFF: nothing here runs unless a native
-//  client calls the new selectors, and the nub is published only with boot-arg navi48-metal=1 on a native boot whose S1b reported POSITIVE PASS.
+//  the IOAccelConfig contents and its static check, the stamp-page and task-window rules, the factory mask, and - 0.0.670 - the BOOT publish verdict and the boot hold's
+//  transition table. Default OFF: nothing here runs unless a native client calls the new selectors, and the nub is published only with boot-arg navi48-metal=1 on a native boot whose S1b
+//  reported POSITIVE PASS. 0.0.670 adds a SECOND, in-kernel publish path (publish_at_boot / publish_at_boot_verdict below, used by Navi48MetalNub::bootPublish from the boot worker of
+//  amd/native_armboot.cpp) whose only difference from the selector's gate is that it does not require a native SESSION: at boot there is none.
 //
 #pragma once
 #include <stdint.h>
@@ -56,8 +58,28 @@ inline uint32_t withdraw_verdict(const GateIn &g, State st) {
     if (st == kTerminating) return kBusy;
     return kNotFound;
 }
-// Boot: the nub is NEVER published by the kext itself. (Pinned by a source scan: the only caller of the publish code is the native client's selector.)
-inline bool publish_at_boot() { return false; }
+// ---- the BOOT publish path (0.0.670) ----------------------------------------------------------------------------------------------------------------------
+// The nub had exactly ONE publisher: the native client's selector N48N_SEL_METAL_NUB_PUBLISH, i.e. a USERSPACE client
+// (a userspace daemon polls `n48nub publish` at every boot). That is what made "Metal at boot with no trigger" impossible: Navi48Accel.kext's
+// personality has IOProviderClass = Navi48MetalNub (tools/native/navi48accel/Info.plist), so no nub at boot = no accelerator at boot, and the
+// accelerator is what the Metal plugin's device is built on.
+// 0.0.670 gives the kext its own in-kernel publish path (Navi48MetalNub::bootPublish, called by the boot worker of amd/native_armboot.cpp). The
+// switch is pure and lives here so the host suite can drive every direction of it:
+//   masterLatch: boot-arg navi48-armboot == 1 (the same latch that asks the kext to take the display pipe over at boot)
+//   killSwitch : boot-arg navi48-nubboot == 0, i.e. "publish on demand only" = the selector-only behaviour, one boot-arg away
+inline bool publish_at_boot(bool masterLatch, bool killSwitch) { return masterLatch && !killSwitch; }
+
+// The verdict for that path: publish_verdict with the SESSION term removed and NOTHING else. The boot publish runs inside
+// Navi48Bringup::start(), before any user client can exist, so `hello` cannot be true there; requiring it (as publish_verdict does) would make
+// the boot path dead code. Every other term - the flags word, the boot-arg, the S1b gate / ran / POSITIVE / stopped, HUNG, the display-nub
+// interlock and the state machine - is the SAME check in the SAME order, because this IS publish_verdict, called with hello forced true: the
+// boot is the session. (A test drives the equality of the two verdicts over all 128 gate combinations, and a plant removes the one line that
+// makes the boot path able to publish.)
+inline uint32_t publish_at_boot_verdict(const GateIn &g, State st) {
+    GateIn boot = g;
+    boot.hello = true;                       // the boot IS the session: the only difference from publish_verdict, and it is this one line
+    return publish_verdict(boot, st);
+}
 
 // ---- IOAccelConfig (MUST-FIX 1) --------------------------------------------------------------------------------------------------------------------------
 // AppleParavirtAccelerator::populateAccelConfig (0x142b78f4 in the paravirt kext), 12 stores (CONFIRMED by disassembly; the design review said 13):
@@ -195,6 +217,49 @@ constexpr uint32_t kReadyYes = 1u, kReadyNo = 0u;
 constexpr uint32_t ready_at_publish(bool stickyNo, bool hungNow) { return (stickyNo || hungNow) ? kReadyNo : kReadyYes; }
 // The next sticky state after an event: once No, always No.
 constexpr bool ready_sticky_after(bool stickyNo, bool hangEvent) { return stickyNo || hangEvent; }
+
+// ---- the BOOT HOLD (0.0.670) --------------------------------------------------------------------------------------------------
+// WHY IT EXISTS. WindowServer's IOKitWaitQuiet blocks until the registry is quiet, and a service whose busyState is non-zero is not quiet
+// (IOKit/IOService.h: "Busy state indicates discovery, matching or termination is in progress", and "a change in the busyState to or from zero
+// will change the IOService object's provider's busyState by one" - so a hold on the bring-up service marks the IOPCIDevice busy too). This driver takes
+// adjustBusy(1) in start() and releases it only once the display is armed, so
+// WindowServer's FIRST start already finds an armed pipe - which is why no WindowServer restart is needed at all. The userspace route did the
+// opposite (opening a restart window and restarting WindowServer), and that restart
+// is what 0.0.670 removes.
+//
+// THE THREE STATES AND THE FOUR TRANSITIONS. One word, every transition a compare-and-swap on it; the pure half is here so the host suite can
+// drive each direction and the plants can break each one. The word is n48metal::HoldState:
+//   none    -> held     take()    the kext's start() took the hold. Only from none: ONE hold per boot.
+//   held    -> claimed  claim()   THE WORKER: it has reached the arm and will release the busy count itself when it is done.
+//   held    -> none     cap()     THE CAP TIMER: the bring-up did not finish in time, so the busy count is released AND THE ARM IS REFUSED FROM
+//                                 THEN ON. This is the guard against a bring-up that overran its cap and armed anyway, and it
+//                                 is why a stuck bring-up can never become a stuck boot.
+//   claimed -> none     release() the worker's own release, after the arm. This is the ONE adjustBusy(-1) of the two above.
+// A claim that fails means the cap already released the hold: WindowServer is up or on its way, and the bring-up must NOT arm behind it
+// ("NOT arming with WindowServer up"). That is the CAS guard, and it is the same decision hold_claim_ok() answers.
+enum HoldState : uint32_t { kHoldNone = 0u, kHoldHeld = 1u, kHoldClaimed = 2u };
+inline bool hold_take_ok(HoldState s)    { return s == kHoldNone; }      // start(): one hold per boot
+inline bool hold_claim_ok(HoldState s)   { return s == kHoldHeld; }      // the worker: may arm (and then release)
+inline bool hold_cap_ok(HoldState s)     { return s == kHoldHeld; }      // the cap timer: releases, and refuses the arm from then on
+inline bool hold_release_ok(HoldState s) { return s == kHoldClaimed; }   // the worker's release, after the arm
+inline HoldState hold_after_take()       { return kHoldHeld; }
+inline HoldState hold_after_claim()      { return kHoldClaimed; }
+inline HoldState hold_after_cap()        { return kHoldNone; }
+inline HoldState hold_after_release()    { return kHoldNone; }
+// The hold is released by the cap OR by the worker, never by both: the CAS is the arbiter, and the two states above are what make the count of
+// adjustBusy(-1) calls exactly one. (A test walks all four transitions from all three states.)
+
+// The cap, in milliseconds: 40 s. There is no BAR settle to add, so the default IS 40 s. The boot-arg
+// navi48-holdcap overrides it, CLAMPED: a typo must neither disable the guard (a hold that never expires is a boot that never finishes) nor make
+// it fire before the bring-up could have finished (the chain the cap covers is aux kext load -> nub publish -> the four display
+// verbs, which completes well inside the 40 s default; the kext's start() precedes all of it).
+constexpr uint32_t kHoldCapMsDefault = 40000u, kHoldCapMsMin = 5000u, kHoldCapMsMax = 120000u;
+inline uint32_t hold_cap_ms(bool argPresent, uint32_t argValue) {
+    if (!argPresent || argValue == 0u) return kHoldCapMsDefault;
+    if (argValue < kHoldCapMsMin) return kHoldCapMsMin;
+    if (argValue > kHoldCapMsMax) return kHoldCapMsMax;
+    return argValue;
+}
 
 // ---- the ops table's identity ----------------------------------------------------------------------------------------------------------------------------
 constexpr uint32_t kOpsFlags = N48_METAL_F_SOFTWARE_ONLY;

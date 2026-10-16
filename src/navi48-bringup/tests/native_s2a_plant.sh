@@ -93,7 +93,7 @@ plant 38 $D '__atomic_load_n(&gScan.active, __ATOMIC_ACQUIRE) == 0u &&
 	    gDcn.dceEntries - gDcn.entriesAtEnable > kDceStormCap' 'gDcn.dceEntries - gDcn.entriesAtEnable > kDceStormCap' "the cumulative storm cap still trips while the plane is taken"
 plant 39 $D 'if (!gDcn.goldenValid && amdgpu::native_s1b_state().gate == n48native::kGateOn) {' 'if (false) {' "no dcnmode golden copy at bind"
 plant 40 $D 'scanEscape("explicit dcnflip 0");' ';' "dcnflip 0 does nothing on a native boot"
-plant 41 $SR/amd/native_s1c.h 'kN1cKextBuild = 664;' 'kN1cKextBuild = 601;' "Hello reports a stale kext build"
+plant 41 $SR/amd/native_s1c.h 'kN1cKextBuild = 670;' 'kN1cKextBuild = 601;' "Hello reports a stale kext build"
 plant 42 $E '    Session *s = sess_lock(ref, true);
     if (s == nullptr) return kIOReturnNotReady;   // closed while we waited for the lock
     IOLockLock(gCliLock);

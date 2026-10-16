@@ -18,6 +18,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/OSAtomic.h>
+#include <libkern/c++/OSBoolean.h>      // 0.0.670: kOSBooleanTrue, the value of the accelerator's IOPropertyMatch gate
 #include <pexpert/pexpert.h>
 
 #define MNLOG(fmt, ...) AMDGPU_LOG("metal", fmt, ##__VA_ARGS__)
@@ -177,7 +178,7 @@ void *op_pci_device(void *ctx) { return n48disp_pci_device(ctx); }
 // TWO tables, the one published chosen by the latch (n48disp::ops_shape): with the display flag ONLY with boot-arg navi48-metal-disp=1 (gOps); otherwise gOpsOff, whose display members are zero (the aux kext then takes every
 // 0.0.2 display default). Both are ABI 3 / 152 bytes since 0.0.656 (G6): native_open is the last member and carries its own capability bit.
 const N48MetalOps gOps = {
-	N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 664u, n48metal::kOpsFlags, 0u,
+	N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 666u, n48metal::kOpsFlags, 0u,
 	op_device_open, op_device_close, op_populate_config, op_stamp_memory, op_stamp_va, op_task_window,
 	op_factory_mask, op_mm_hook, op_trace,
 	op_vhook, n48metal::kOpsCaps, 0,
@@ -186,7 +187,7 @@ const N48MetalOps gOps = {
 };
 // 0.0.656: the OFF table is ABI 3 too (native_open must exist with the display OFF, the normal case): the display members are zero (flags 0, no hook, no PCI getter), which is "display off" to every aux kext.
 const N48MetalOps gOpsOff = {
-	N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 664u, n48metal::kOpsFlags, 0u,
+	N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 666u, n48metal::kOpsFlags, 0u,
 	op_device_open, op_device_close, op_populate_config, op_stamp_memory, op_stamp_va, op_task_window,
 	op_factory_mask, op_mm_hook, op_trace,
 	op_vhook, n48metal::kOpsCaps, 0,
@@ -198,6 +199,17 @@ void ensure_lock() {
 	if (gLock) return;
 	IOLock *l = IOLockAlloc();
 	if (l && !OSCompareAndSwapPtr(nullptr, l, &gLock)) IOLockFree(l);
+}
+
+// 0.0.670: may an accelerator match our nub on this boot? The answer is the property N48_METAL_ACCEL_GATE_KEY that the personality in
+// tools/native/navi48accel/Info.plist requires (IOPropertyMatch). Apple's accelerator chain is three such gates in a row - LoadHWServices ->
+// LoadController -> LoadAccelerator, each written by the stage before it - and this is ours: one step, written here at publish, withheld by
+// boot-arg navi48-accelbind=0. Withholding it means the aux kext's personality cannot match at all, so the machine keeps the software desktop
+// (RDNA4FB) with no kext, ESP or AuxKC change: one boot-arg, and it is read on every publish (not latched), so it is also the emergency lever.
+bool accel_bind_allowed() {
+	uint32_t v = 1u;
+	if (!PE_parse_boot_argn("navi48-accelbind", &v, sizeof(v))) return true;   // absent = allowed (only a present-and-zero argument withholds the gate)
+	return v != 0u;
 }
 
 n48metal::GateIn gate_now(uint64_t flags, bool wantBootArg) {
@@ -219,16 +231,22 @@ n48metal::GateIn gate_now(uint64_t flags, bool wantBootArg) {
 bool n48metal_nub_published(void) { return __atomic_load_n(&gEverPublished, __ATOMIC_ACQUIRE) != 0u; }   // 0.0.653
 
 // ---- the selectors --------------------------------------------------------------------------------------------------------------------------------------
-IOReturn Navi48MetalNub::selectorPublish(Navi48Bringup *owner, uint64_t flags, uint64_t out[4]) {
+// THE publish implementation (0.0.670): the selector and the boot path are one-line wrappers around this, so the verdict order, the
+// allocation, the attach, the retention across registerService() and the failure path can never drift apart between the two.
+static IOReturn publish_impl(Navi48Bringup *owner, uint64_t flags, uint64_t out[4], bool boot) {
 	if (!owner || !out) return kIOReturnBadArgument;
 	ensure_lock();
 	if (!gLock) return kIOReturnNoMemory;
 	IOLockLock(gLock);
 	const n48metal::GateIn g = gate_now(flags, true);
-	const uint32_t verdict = n48metal::publish_verdict(g, (n48metal::State)gState);
+	// The ONLY difference between the two publishers: the boot path has no session, and n48metal::publish_at_boot_verdict is exactly
+	// publish_verdict with hello forced true (the boot IS the session). Everything else - flags, boot-arg, S1b, HUNG, the display-nub
+	// interlock, the state machine - is the same check in the same order, by construction.
+	const uint32_t verdict = boot ? n48metal::publish_at_boot_verdict(g, (n48metal::State)gState)
+	                             : n48metal::publish_verdict(g, (n48metal::State)gState);
 	if (verdict != n48metal::kOk) {
 		IOLockUnlock(gLock);
-		MNLOG("nub publish refused: %#x (hello %d flags %llu bootarg %d gate %d ran %d positive %d stopped %d hung %d state %u)", verdict, (int)g.hello, (unsigned long long)flags,
+		MNLOG("nub publish refused (%s): %#x (hello %d flags %llu bootarg %d gate %d ran %d positive %d stopped %d hung %d state %u)", boot ? "boot" : "selector", verdict, (int)g.hello, (unsigned long long)flags,
 		      (int)g.bootarg, (int)g.s1bGateOn, (int)g.s1bRan, (int)g.s1bPositive, (int)g.s1bStopped, (int)g.hung, (unsigned)gState);
 		return (IOReturn)verdict;
 	}
@@ -249,6 +267,9 @@ IOReturn Navi48MetalNub::selectorPublish(Navi48Bringup *owner, uint64_t flags, u
 			nub->setProperty("Navi48,TaskVASize", va);
 			nub->setProperty("Navi48,VRAMBytes", vram);
 			nub->setProperty("Navi48,Ready", ready);
+			// 0.0.670: the accelerator's IOPropertyMatch gate (N48_METAL_ACCEL_GATE_KEY, shared with the aux kext). Written at publish,
+			// BEFORE registerService(), so the aux kext's probe sees it: a nub without it entrains no accelerator.
+			if (accel_bind_allowed()) nub->setProperty(N48_METAL_ACCEL_GATE_KEY, kOSBooleanTrue);
 			if (nub->attach(owner)) {
 				gNub = nub;                                                       // our reference (from alloc) is kept until withdraw
 				gState = n48metal::sm_after_publish((n48metal::State)gState);
@@ -272,10 +293,23 @@ IOReturn Navi48MetalNub::selectorPublish(Navi48Bringup *owner, uint64_t flags, u
 	}
 	nub->retain();                                                                // held across registerService(): a racing withdraw must not free the nub under it
 	IOLockUnlock(gLock);
-	MNLOG("nub published (id %llu, ops ABI %u, %u bytes): the aux kext may now match it", (unsigned long long)out[1], (unsigned)out[2], (unsigned)out[3]);
+	MNLOG("nub published by the %s (id %llu, ops ABI %u, %u bytes): the aux kext may now match it", boot ? "KEXT AT BOOT" : "native client's selector",
+	      (unsigned long long)out[1], (unsigned)out[2], (unsigned)out[3]);
 	nub->registerService();                                                       // outside the lock: matching may run the aux kext's probe, which calls back into the ops
 	nub->release();                                                               // the extra reference taken under the lock
 	return kIOReturnSuccess;
+}
+
+// ---- the two publishers (0.0.670) ----------------------------------------------------------------------------------------------------------------------
+// selectorPublish: N48N selector 19, a Hello'd session, n48metal::publish_verdict.
+IOReturn Navi48MetalNub::selectorPublish(Navi48Bringup *owner, uint64_t flags, uint64_t out[4]) {
+	return publish_impl(owner, flags, out, /*boot=*/false);
+}
+// bootPublish: the kext itself, at boot, before any session exists - n48metal::publish_at_boot_verdict. `flags` is 0 by construction (there is no
+// caller to pass one) and `out` is discarded: the boot path's verdict is the log line and the registry.
+IOReturn Navi48MetalNub::bootPublish(Navi48Bringup *owner) {
+	uint64_t out[4] = { 0 };
+	return publish_impl(owner, 0, out, /*boot=*/true);
 }
 
 IOReturn Navi48MetalNub::selectorWithdraw(uint64_t flags, uint64_t out[1]) {

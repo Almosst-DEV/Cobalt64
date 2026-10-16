@@ -130,6 +130,6 @@ plant 41 $T $O "native_open moves (inserted before disp_flags)" '    int32_t (*n
 plant 42 $T $O "the capability bit collides with VHOOK" '#define N48_CAP_NATIVE_OPEN   (1ull << 1)' '#define N48_CAP_NATIVE_OPEN   (1ull << 0)'
 plant 43 $T $O "the ops ABI stays 2" '#define N48_METAL_ABI         3u ' '#define N48_METAL_ABI         2u '
 plant 44 $T $O "the type constant is not N48N" '#define N48_METAL_UC_N48N     0x4E34384Eu ' '#define N48_METAL_UC_N48N     0x4E34384Fu '
-plant 45 $T $SR/amd/native_s1c.h "Hello reports the old build" 'constexpr uint32_t kN1cKextBuild = 664;' 'constexpr uint32_t kN1cKextBuild = 654;'
+plant 45 $T $SR/amd/native_s1c.h "Hello reports the old build" 'constexpr uint32_t kN1cKextBuild = 670;' 'constexpr uint32_t kN1cKextBuild = 654;'
 echo "plants: $total run, $escaped escaped/failed"
 [ "$escaped" -eq 0 ]

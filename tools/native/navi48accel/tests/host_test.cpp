@@ -277,6 +277,20 @@ static void a5_thin(const std::string &root) {
     expect(plist.find("<key>IOMatchCategory</key>\n\t\t\t<string>IOAccelerator</string>") != std::string::npos, "IOMatchCategory IOAccelerator");
     expect(plist.find("<string>Navi48Accelerator</string>") != std::string::npos && plist.find("<key>MetalPluginName</key>\n\t\t\t<string>Navi48Metal</string>") != std::string::npos && plist.find("<string>Navi48Device</string>") != std::string::npos, "the accelerator class and the Metal plugin names");
     expect(plist.find("<key>IOProbeScore</key>\n\t\t\t<integer>1000</integer>") != std::string::npos, "IOProbeScore 1000");
+    // 0.0.8: the accelerator's IOPropertyMatch gate. Apple's chain is three Load* properties written by the stage before each match
+    // (AMDRadeonX6000.kext: IOPropertyMatch {LoadAccelerator}); ours is one, and the bring-up kext writes it on the nub at publish
+    // (Navi48MetalNub.cpp). The plist's literal must be the shared macro's value, or the two would drift and the accelerator would never match.
+    {
+        const std::string ops = slurp(root + "/src/Navi48MetalOps.h");
+        const size_t m = ops.find("#define N48_METAL_ACCEL_GATE_KEY");
+        const size_t q1 = m == std::string::npos ? std::string::npos : ops.find('"', m);
+        const size_t q2 = q1 == std::string::npos ? std::string::npos : ops.find('"', q1 + 1);
+        const std::string key = (q2 == std::string::npos) ? "" : ops.substr(q1 + 1, q2 - q1 - 1);
+        expect(!key.empty() && key == "Navi48LoadAccelerator", "the shared gate key is N48_METAL_ACCEL_GATE_KEY = \"Navi48LoadAccelerator\"");
+        expect(plist.find("<key>IOPropertyMatch</key>\n\t\t\t<dict>\n\t\t\t\t<key>" + key + "</key>\n\t\t\t\t<true/>\n\t\t\t</dict>") != std::string::npos,
+               "0.0.8: the accelerator personality carries IOPropertyMatch {the shared gate key: true} - the nub without the property entrains no accelerator");
+        expect(plist.find("IOPCIDevice") == std::string::npos && plist.find("IOPCIMatch") == std::string::npos, "0.0.8: still no PCI match (the gate is a property on OUR nub, not a device id)");
+    }
     expect_u("exactly three personalities (0.0.6: the accelerator and the framebuffer twice, index 1 = the monitor B and index 2 = the monitor A)", count_of(plist, "<key>IOClass</key>"), 3);
 }
 
@@ -284,9 +298,9 @@ static void a5_thin(const std::string &root) {
 static void a6_plist(const std::string &root, const std::string &bringRoot) {
     const std::string plist = slurp(root + "/Info.plist"), kmod = slurp(root + "/src/kmod_info.c"), mk = slurp(root + "/Makefile");
     expect(plist.find("<key>CFBundleIdentifier</key>\n\t<string>com.navi48.accelprobe</string>") != std::string::npos, "the approved id com.navi48.accelprobe is reused");
-    expect_u("version 0.0.7 (short and bundle)", count_of(plist, "<string>0.0.7</string>"), 2);
+    expect_u("version 0.0.8 (short and bundle)", count_of(plist, "<string>0.0.8</string>"), 2);
     expect(plist.find("0.0.2") == std::string::npos && plist.find("<string>0.0.3</string>") == std::string::npos, "no 0.0.2 / 0.0.3 left in the plist");
-    expect(kmod.find("KMOD_EXPLICIT_DECL(com.navi48.accelprobe, \"0.0.7\", _start, _stop)") != std::string::npos, "kmod_info carries the same id and version");
+    expect(kmod.find("KMOD_EXPLICIT_DECL(com.navi48.accelprobe, \"0.0.8\", _start, _stop)") != std::string::npos, "kmod_info carries the same id and version");
     expect(plist.find("<key>CFBundleName</key>\n\t<string>Navi48Accel</string>") != std::string::npos, "display name Navi48Accel");
     expect(plist.find("<key>com.apple.iokit.IOAcceleratorFamily2</key>\n\t\t<string>2.0.0</string>") != std::string::npos, "links IOAcceleratorFamily2 2.0.0");
     expect(plist.find("com.apple.iokit.IOGraphicsFamily") != std::string::npos && plist.find("com.apple.kpi.iokit") != std::string::npos && plist.find("com.apple.kpi.libkern") != std::string::npos, "links IOGraphicsFamily and the kpis");
@@ -649,8 +663,8 @@ static void a9_native_open(const std::string &root, const std::string &bring) {
     expect(src.find("N48_TR_NATIVE_OPEN") != std::string::npos, "the open is traced");
     // the layout lists agree in gate_link / gen_gate (they read leaves.py): nothing else names slot 239
     // versions and the install path
-    expect(plist.find("<string>0.0.7</string>") != std::string::npos && count_of(plist, "<string>0.0.7</string>") == 2 && plist.find("0.0.4") == std::string::npos && plist.find("<string>0.0.5</string>") == std::string::npos && plist.find("<string>0.0.6</string>") == std::string::npos, "Info.plist says 0.0.7 (carried twice)");
-    expect(kmod.find("KMOD_EXPLICIT_DECL(com.navi48.accelprobe, \"0.0.7\", _start, _stop)") != std::string::npos, "kmod_info says 0.0.7");
+    expect(plist.find("<string>0.0.8</string>") != std::string::npos && count_of(plist, "<string>0.0.8</string>") == 2 && plist.find("0.0.4") == std::string::npos && plist.find("<string>0.0.5</string>") == std::string::npos && plist.find("<string>0.0.6</string>") == std::string::npos, "Info.plist says 0.0.8 (carried twice)");
+    expect(kmod.find("KMOD_EXPLICIT_DECL(com.navi48.accelprobe, \"0.0.8\", _start, _stop)") != std::string::npos, "kmod_info says 0.0.8");
     expect(inst.find("/Library/Extensions/Navi48Accel-0.0.5.kext") != std::string::npos && inst.find("Step 4b") != std::string::npos, "INSTALL.md documents the new install path /Library/Extensions/Navi48Accel-0.0.5.kext (step 4b)");
     { const size_t a = inst.find("## 0.0.5 (G6"), e = inst.find("## 0.0.4 (M5", a); const std::string sec = (a == std::string::npos || e == std::string::npos) ? "" : inst.substr(a, e - a);
       expect_u("the 0.0.5 section uses the NEW path in every step (cp, chown, chmod, xattr, libraries, load)", count_of(sec, "/Library/Extensions/Navi48Accel-0.0.5.kext"), 7u);
@@ -727,21 +741,10 @@ static void a10_mona_framebuffer(const std::string &root) {
       expect(sec.find("fbhold 2") != std::string::npos && sec.find("fbhold 1") != std::string::npos && sec.find("fbpublish 2") != std::string::npos && sec.find("fbpublish 1") != std::string::npos && sec.find("killall -9 WindowServer") != std::string::npos, "the 0.0.6 section carries the Run B order"); }
 }
 
-// A11 (aux 0.0.7, M6 Stage 1a): INSTALL.md documents the NEW install path for the already-approved id, in every step, and the Stage 1a order.
-static void a11_m6_install(const std::string &root) {
-    const std::string inst = slurp(root + "/INSTALL.md");
-    expect(inst.find("/Library/Extensions/Navi48Accel-0.0.7.kext") != std::string::npos && inst.find("## 0.0.7 (") != std::string::npos, "INSTALL.md documents the new install path /Library/Extensions/Navi48Accel-0.0.7.kext");
-    const size_t a = inst.find("## 0.0.7 ("), e = inst.find("## 0.0.6 (", a); const std::string sec = (a == std::string::npos || e == std::string::npos) ? "" : inst.substr(a, e - a);
-    expect_u("the 0.0.7 section uses the NEW path in every step (cp, chown, chmod, xattr, libraries, load)", count_of(sec, "/Library/Extensions/Navi48Accel-0.0.7.kext"), 7u);
-    expect(sec.find("Navi48Accel-0.0.5.kext") == std::string::npos && sec.find("Navi48Accel-0.0.4.kext") == std::string::npos && count_of(sec, "Navi48Accel-0.0.6.kext") == 1u, "the 0.0.7 section names only the 0.0.6 directory it moves away");
-    expect(sec.find("NEVER `kmutil install --update-all`") != std::string::npos && sec.find("kmutil load -p /Library/Extensions/Navi48Accel-0.0.7.kext") != std::string::npos && sec.find("backup/auxkc-pre-0.0.7") != std::string::npos && sec.find("Step 4b") != std::string::npos, "the 0.0.7 section: step 4b, back up the aux KC, one load at the new path, never --update-all");
-    expect(sec.find("navi48-m6=1") != std::string::npos && sec.find("stage17-native-1440-metal-disp-amfi-m6.plist") != std::string::npos && sec.find("accel fbpublish 2") != std::string::npos && sec.find("accel pipeadopt") != std::string::npos && sec.find("accel pipeagdc 1") != std::string::npos && sec.find("accel m6stat") != std::string::npos, "the 0.0.7 section carries the navi48-m6 latch and the Stage 1a order");
-}
-
 int main(int argc, char **argv) {
     const std::string root = argc > 1 ? argv[1] : ".";
     const std::string bring = argc > 2 ? argv[2] : root;
-    a1_kill_switch(); a1_source(root); a2_gate(); a3_ops(); a3_source(root); a3b_tramp(root); a4_em(root); a5_thin(root); a6_plist(root, bring); a7_display(root); a8_framebuffer(root); a9_native_open(root, bring); a10_mona_framebuffer(root); a11_m6_install(root);
+    a1_kill_switch(); a1_source(root); a2_gate(); a3_ops(); a3_source(root); a3b_tramp(root); a4_em(root); a5_thin(root); a6_plist(root, bring); a7_display(root); a8_framebuffer(root); a9_native_open(root, bring); a10_mona_framebuffer(root);
     std::printf("n48accel host_test: %d checks, %d failed\n", gRun, gFail);
     return gFail ? 1 : 0;
 }

@@ -156,7 +156,7 @@ plant 68 $SR/amd/native_s1c.cpp '    if (!sess_hello(ref)) return kIOReturnNotRe
 plant 69 $SR/Navi48NativeClient.cpp 'if (!shape(2, 0, 0, sizeof(n48n_dal_result))) return kIOReturnBadArgument;' 'if (!shape(2, 0, 0, 0)) return kIOReturnBadArgument;' "selector 15's output shape is not checked"
 plant 70 $SR/Navi48NativeABI.h '#define N48N_ABI_MINOR     12u ' '#define N48N_ABI_MINOR     1u ' "the ABI minor is not raised"
 plant 71 $K/Info.plist '<key>CFBundleVersion</key>
-	<string>0.0.664</string>' '<key>CFBundleVersion</key>
+	<string>0.0.670</string>' '<key>CFBundleVersion</key>
 	<string>0.0.603</string>' "Info.plist version is stale"
 plant 72 an internal design note '## ABI 1.2 addendum' '## ABI 1.2 notes' "the contract addendum is missing"
 plant 73 tools/native/n48dal.c '{ N48N_ABI_VERSION, N48N_HELLO_F_MINOR }' '{ N48N_ABI_VERSION, 0 }' "the tool does not ask for the minor"

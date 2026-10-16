@@ -4703,8 +4703,8 @@ int main(int argc, char **argv) {
         expect(cli.find("accel disp2 timing1440 2") != std::string::npos && cli.find("INSTANCE 2 at 2560x1440@60 (0.0.634") != std::string::npos, "0.0.634 CLI: the printed run script carries the 1440p sequence");
     }
     {   // 5. the version, the banned strings
-        expect(count_of(plist, "0.0.664") == 2 && plist.find("0.0.630") == std::string::npos, "Info.plist is 0.0.664, carried twice");
-        expect(s1c.find("kN1cKextBuild = 664;") != std::string::npos && count_of(nub, "664u") == 2, "the native client and both ops tables report build 664");
+        expect(count_of(plist, "0.0.670") == 2 && plist.find("0.0.630") == std::string::npos, "Info.plist is 0.0.670, carried twice");
+        expect(s1c.find("kN1cKextBuild = 670;") != std::string::npos && count_of(nub, "666u") == 2, "the native client reports build 670 and both ops tables 666");
         const std::string p1 = std::string("pipe+") + "0x280", p2 = std::string("+") + "0x282", p3 = std::string("+") + "0x299";
         const size_t c0 = cli.find("// ---- 0.0.631 (multi-monitor stage M4d)"), c1 = cli.find("static int cmd_accel(const char *what", c0 == std::string::npos ? 0 : c0);
         const std::string cliNew = (c0 == std::string::npos || c1 == std::string::npos) ? std::string("missing") : cli.substr(c0, c1 - c0);

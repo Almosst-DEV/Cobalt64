@@ -1961,7 +1961,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
     if (in == 89 && !arg) { fprintf(stderr, "accel pipevbl: give 0 or 1 explicitly (read the state with `accel pipestat 4`)\n"); return 2; }
     // 0.0.623 (G1): hangtest's only mode is 1 (the default); hangrecover's method is never defaulted (0 would run `auto`).
     if (in == 100 && !arg) in2[1] = 1;
-    if (in == 103 && !arg) in2[1] = 4;   // 0.0.627 (G2): sessstat defaults to the global page
+    if (in == 103 && !arg) in2[1] = 8;   // the global page is kStatGlobal = kMaxSessions = 8 (0.0.669: 9 = the client table, 0..7 one VMID pool handle each)
     if (in == 101 && !arg) { fprintf(stderr, "accel hangrecover: give the method: 0 auto, 1 release, 2 mesreset, 3 remap, 4 abandon (read the state with `accel hangstat`)\n"); return 2; }
     // 0.0.416 (an internal design note, G2): mode 7 carries its source VRAM offset as a SECOND CLI token
     // (`accel scanout 7 <vramOff> [gcr]`) and packs it into the ONE ABI scalar with the mode and the GCR flag
@@ -2342,11 +2342,21 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
         return c == 0 || c == 4 || c == 5 ? 0 : 3;
     }
     if (in == 103) {
-        // 0.0.627 (G2): out[3 + i] = v[i] of amdgpu::n1c_g2_stat (amd/native_g2_pure.h sess_out / global_out); v[0] is the code.
+        // 0.0.627 (G2): out[3 + i] = v[i] of amdgpu::n1c_g2_stat (amd/native_g2_pure.h sess_out / global_out / cli_out); v[0] is the code.
+        // 0.0.669: page 0..7 = ONE VMID POOL HANDLE each, page 8 (kStatGlobal) = the global page, page 9 (kStatClients) = the client table.
+        // A bare `sessstat` must print the global page, so the branches below key on the page number and never on a hard-coded one: a hard-coded
+        // number silently stops matching the moment the page numbering changes.
         const unsigned long long c = out[3];
         printf("  code                    : %llu (%s)\n", c, c == 0 ? "ok" : c == 1 ? "OFF: boot-arg navi48-multisession is not 1" : c == 2 ? "bad page" : "?");
-        if (c == 0 && out[4] == 4) {
-            printf("  open / DEAD slots / HUNG: %llu / %llu / %llu\n", out[5] & 0xff, (out[5] >> 8) & 0xff, (out[5] >> 16) & 1);
+        if (c == 0 && out[4] == 9) {
+            /* 0.0.669: the CLIENT TABLE page. o[2] = open | quarantined << 8 | records allocated << 16 | kMaxClients << 24; o[3] the free list, o[4] the pool
+               size, o[5] the free handles, o[6] the held handles, o[7] the quarantined records. */
+            printf("  client records          : %llu open of %llu in the table (%llu allocated, %llu on the free list)\n",
+                   out[5] & 0xff, (out[5] >> 24) & 0xff, (out[5] >> 16) & 0xff, out[6]);
+            printf("  quarantined records     : %llu (a close that could not prove its work retired: HELD, not lost - the reclaim pass returns it)\n", (out[5] >> 8) & 0xff);
+            printf("  VMID pool               : %llu handle(s) free, %llu held, %llu live address spaces is the hardware limit\n", out[8], out[9], out[7]);
+        } else if (c == 0 && out[4] == 8) {
+            printf("  open / QUARANTINED / HUNG: %llu / %llu / %llu\n", out[5] & 0xff, (out[5] >> 8) & 0xff, (out[5] >> 16) & 1);
             if ((out[5] >> 20) & 0xffff) printf("  BOs leaked at close     : %llu (a CPU mapping outlived the session: the range stays out of the pool until reboot; 0.0.640)\n", (out[5] >> 20) & 0xffff);
             if ((out[5] >> 56) != 0)   /* 0.0.641: apps ON: the visible-pool use of non-WindowServer sessions and its cap (boot-arg navi48-appvis) */
                 printf("  non-WS visible VRAM     : %llu KiB held of a %llu MiB cap (boot-arg navi48-appvis, default 64; WindowServer is not capped)\n", (out[5] >> 36) & 0xfffff, (out[5] >> 56));
@@ -2355,7 +2365,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
             printf("  automatic recoveries    : %llu (last guilty slot %llu, seq %llu; collateral submissions %llu; at most 3 per boot)\n", out[10], out[11], out[12], out[13]);
             /* 0.0.629 (R5): the GCVM L2 protection-fault word (STATUS_LO32 | ADDR_LO32 << 32), READ ONLY: now, and at the previous `sessstat 4` */
             printf("  gcvm fault now / prev   : %#llx (vmid %llu) / %#llx (vmid %llu)%s\n", out[14], (out[14] >> 20) & 0xf, out[15], (out[15] >> 20) & 0xf,
-                   out[14] != out[15] ? "  CHANGED since the previous sessstat 4" : "");
+                   out[14] != out[15] ? "  CHANGED since the previous sessstat 8" : "");
         } else if (c == 0 && out[4] == 5) {
             /* 0.0.650 (G5 Stage 1): out[3 + i] = v[i] of amdgpu::n1c_g5_stat (amd/native_g5_pure.h stat_out); exists only with boot-arg navi48-g5=1 */
             printf("  G5 flags                : G5 on%s%s\n", (out[5] & 2) ? ", WindowServer ACTIVE (submitted in the last 100 ms)" : ", WindowServer idle", (out[5] & 4) ? ", WindowServer open" : ", no WindowServer open");
@@ -2366,14 +2376,23 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
             if (out[14] == ~0ull) printf("  since WindowServer's last submit : never\n"); else printf("  since WindowServer's last submit : %llu ms\n", out[14]);
             printf("  WindowServer ring reserve: %llu dwords (only WindowServer may use the last of the ring)\n", out[15]);
         } else if (c == 0) {
+            /* 0.0.669: page 0..7 describes the POOL HANDLE, not a session record: out[6] = VMID 8 + the page, out[15] = the client index holding it
+               (0xffffffff = free) and the 0x1000 flag bit says the handle is FREE. */
             const unsigned long long st = out[5] & 0xff;
-            printf("  slot / VMID / session   : %llu / %llu / %llu\n", out[4], out[6], out[7]);
-            printf("  state                   : %s%s%s%s\n", st == 0 ? "free" : st == 1 ? "OPEN" : st == 2 ? "DEAD (its VMID is never reused this boot)" : "?",
+            const unsigned long long cli = out[15];
+            char who[32];
+            if (out[5] & 0x1000) snprintf(who, sizeof who, "NOBODY (free)");
+            else if (cli == ~0ull) snprintf(who, sizeof who, "? (no owner recorded)");
+            else snprintf(who, sizeof who, "%llu", cli);
+            printf("  VMID handle             : %llu (VMID %llu), held by client %s\n", out[4], out[6], who);
+            if (out[5] & 0x1000) { printf("  this handle is FREE     : no client's context is programmed here (the pool's own page; it costs nothing)\n"); return c == 0 ? 0 : 3; }
+            if (cli != ~0ull) printf("  client record / session : %llu / %llu\n", cli, out[7]);
+            printf("  state                   : %s%s%s%s\n", st == 0 ? "free" : st == 1 ? "OPEN" : st == 2 ? "QUARANTINED (held until the reclaim pass can prove its work retired; NOT lost)" : "?",
                    (out[5] & 0x100) ? ", WindowServer" : "", (out[5] & 0x200) ? ", hello" : "", (out[5] & 0x400) ? ", POISONED (guilty of a recovered hang)" : "");
             if (out[5] & 0x800) printf("  role                    : APP (an allow-listed user application: no ReadRegs, no scanout, the 25%% VRAM budget; 0.0.640)\n");
             printf("  VRAM / GTT / imported   : %llu / %llu / %llu KiB\n", out[8] >> 10, out[9] >> 10, out[10] >> 10);
             printf("  page tables / last seq / BOs : %llu KiB / %llu / %llu\n", out[11] >> 10, out[12], out[13]);
-            printf("  gcvm fault at open      : %#llx (vmid %llu)   (0.0.629: compare with sessstat 4)\n", out[14], (out[14] >> 20) & 0xf);   /* R5, read only */
+            printf("  gcvm fault at open      : %#llx (vmid %llu)   (0.0.629: compare with sessstat 8)\n", out[14], (out[14] >> 20) & 0xf);   /* R5, read only */
         }
         return c == 0 ? 0 : 3;
     }
@@ -3575,7 +3594,7 @@ static int cmd_accel(const char *what, const char *arg, const char *arg2, const 
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s info|counters|reg <dw>|regs (list on stdin)|poke|submit|log|metrics|power <n>|logreset|\n       accel [status|fire [1 gate closed|2 gate open]|memenable|synctables|enablerings|startengines|ringstate|dumpring|programqueue|ringhooks|dumpib|rebaseib|enablequeue|kickdoorbell|ringrefs|queuestate|opengate|neuterpoll|chanstate|pokecompletion|signalcompletion|bindchannel|schedstate|stampstate|signalstamp|stampgap|runcheckts|runadvance|xlatregs|srbmprobe|resume|pm4powerup|setvspace|kiqenable|kiqstamp|kiqchan|gfxmap|gfxstate|sdmamap|sdmastate|faultclear|vmstate|vmib [va]|ringib [chan]|pagecopy [1]|flushdrop|kernsub [1|2|3]|vmpage [va]|renderxlat [0|1|3|4|5|0x101|base|flags|n<<4|6 or 7]|eopbridge [1|2]|bootchain [mode]|shadercache [1|2|3]|vmroots [addr]|ringmap [0|1]|vmctx|rootwrite [0|1]|rearmdrain [0|1]|pairing [1|2]|drain|flushhook [1|2|3]|scanout [0|1|2|3|4|5|6|7 <vramOff> [gcr]|8|full [file]|10]|sdmadcc [0|1|2]|gfxcensus [1|2]|gfxneuter [1|2]|finishread|gfxcapture [1|2]|gfxprobe [1|2]|pipeguard [1]|agdc [1]|agdchold [ms 1..5000]|cqprobe|ucprobe [0|1|2]|fbbench [rows]|fbwc [1]|pipeshim [0|1|2|3|4|5]|pipemode [0|1]|emcensus [0|1|2]|routea [0|1|2]|dcnstate [1]|dcnvbl [0|1|2]|dcnflip [0|1|2..30|1002..1240]|dcnmode [0|1..30|101..130]|fbname [0|1]|pipeadopt|pipearm [0|1]|pipestat [0|1|2|3|4]|pipestamps|pipeshortcut [0|1]|pipeagdc [0|1]|pipevbl [0|1]|pipereload [0|1]|ddcread <line 2|3> <block 0..3>|dmubring [0|1..25|0x80]|dispcensus [0|1|2..9]|region4read <off> [1..64]|region4dump|dmubsend detect <ctx>/begin/end/setmode <ctx>/enable <ctx>/disable <0x7000|0x7800>/replay <slot_off>/pclk otg3-on|otg3-off|otg1-on|otg1-off/phyc enable|disable/digc setup|dmubmode save/restore/0x1a6/0x1d4|dmubctx <ctx> status <v>|disp2 [timing|timing1440|connect|off|status [1|2]|plane|show|flipA|flipB|crc|planeoff 2]|hangtest [1]|hangrecover <0..4>|hangstat [0..8]|sessstat [0..5]|scdcread <line 2|3> <off 0..0x5f> [len 1..16]|appallow add <name>/remove <name>/list/strikes]|fbpublish 2|1|m6stat [0|1|2|3]|m6xstat [0|1|2]|vramstat|capstream <file> [ms] [s] [stopfile]|bigmem [mb]|test <id> <iters> [us]|suite [iters]\n", argv[0]);
+        fprintf(stderr, "usage: %s info|counters|reg <dw>|regs (list on stdin)|poke|submit|log|metrics|power <n>|logreset|\n       accel [status|fire [1 gate closed|2 gate open]|memenable|synctables|enablerings|startengines|ringstate|dumpring|programqueue|ringhooks|dumpib|rebaseib|enablequeue|kickdoorbell|ringrefs|queuestate|opengate|neuterpoll|chanstate|pokecompletion|signalcompletion|bindchannel|schedstate|stampstate|signalstamp|stampgap|runcheckts|runadvance|xlatregs|srbmprobe|resume|pm4powerup|setvspace|kiqenable|kiqstamp|kiqchan|gfxmap|gfxstate|sdmamap|sdmastate|faultclear|vmstate|vmib [va]|ringib [chan]|pagecopy [1]|flushdrop|kernsub [1|2|3]|vmpage [va]|renderxlat [0|1|3|4|5|0x101|base|flags|n<<4|6 or 7]|eopbridge [1|2]|bootchain [mode]|shadercache [1|2|3]|vmroots [addr]|ringmap [0|1]|vmctx|rootwrite [0|1]|rearmdrain [0|1]|pairing [1|2]|drain|flushhook [1|2|3]|scanout [0|1|2|3|4|5|6|7 <vramOff> [gcr]|8|full [file]|10]|sdmadcc [0|1|2]|gfxcensus [1|2]|gfxneuter [1|2]|finishread|gfxcapture [1|2]|gfxprobe [1|2]|pipeguard [1]|agdc [1]|agdchold [ms 1..5000]|cqprobe|ucprobe [0|1|2]|fbbench [rows]|fbwc [1]|pipeshim [0|1|2|3|4|5]|pipemode [0|1]|emcensus [0|1|2]|routea [0|1|2]|dcnstate [1]|dcnvbl [0|1|2]|dcnflip [0|1|2..30|1002..1240]|dcnmode [0|1..30|101..130]|fbname [0|1]|pipeadopt|pipearm [0|1]|pipestat [0|1|2|3|4]|pipestamps|pipeshortcut [0|1]|pipeagdc [0|1]|pipevbl [0|1]|pipereload [0|1]|ddcread <line 2|3> <block 0..3>|dmubring [0|1..25|0x80]|dispcensus [0|1|2..9]|region4read <off> [1..64]|region4dump|dmubsend detect <ctx>/begin/end/setmode <ctx>/enable <ctx>/disable <0x7000|0x7800>/replay <slot_off>/pclk otg3-on|otg3-off|otg1-on|otg1-off/phyc enable|disable/digc setup|dmubmode save/restore/0x1a6/0x1d4|dmubctx <ctx> status <v>|disp2 [timing|timing1440|connect|off|status [1|2]|plane|show|flipA|flipB|crc|planeoff 2]|hangtest [1]|hangrecover <0..4>|hangstat [0..8]|sessstat [0..9]|scdcread <line 2|3> <off 0..0x5f> [len 1..16]|appallow add <name>/remove <name>/list/strikes]|fbpublish 2|1|m6stat [0|1|2|3]|m6xstat [0|1|2]|vramstat|capstream <file> [ms] [s] [stopfile]|bigmem [mb]|test <id> <iters> [us]|suite [iters]\n", argv[0]);
         return 2;
     }
     if (open_service() < 0) return 1;

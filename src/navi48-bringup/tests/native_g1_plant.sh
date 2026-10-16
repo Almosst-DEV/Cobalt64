@@ -135,7 +135,7 @@ plant 35 $M '    return mes_remove_hw_queue_flags(dev, mes, queue_type, pipe_id,
                                      kRemoveQueueFlag_unmap_legacy_queue);' '    return mes_remove_hw_queue_flags(dev, mes, queue_type, pipe_id, queue_id, doorbell_offset,
                                      kRemoveQueueFlag_preempt_legacy_gfx);' "the teardown REMOVE_QUEUE frame changes"
 plant 36 $K/Info.plist '<key>CFBundleVersion</key>
-	<string>0.0.664</string>' '<key>CFBundleVersion</key>
+	<string>0.0.670</string>' '<key>CFBundleVersion</key>
 	<string>0.0.621</string>' "the version is not bumped"
 plant 37 $P '    o[4] = kWaitRefNever;' '    o[4] = 0u;' "the WAIT_REG_MEM reference is the zero the poll dword holds (the test IB would not hang)"
 

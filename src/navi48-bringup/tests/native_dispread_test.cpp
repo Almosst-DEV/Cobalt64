@@ -1156,9 +1156,9 @@ static void s_pins(const std::string &root) {
       expect(cli.find("verbs 91..99") != std::string::npos, "the CLI's admission hint names verbs 91..99");
     }
     // 7. the version
-    expect(count_of(plist, "0.0.664") == 2 && plist.find("0.0.622") == std::string::npos, "Info.plist is 0.0.664, carried twice");
-    expect(s1c.find("kN1cKextBuild = 664;") != std::string::npos, "the native client reports build 660");
-    expect(count_of(nub, "664u") == 2 && nub.find("622u") == std::string::npos, "both ops tables carry the build 664");
+    expect(count_of(plist, "0.0.670") == 2 && plist.find("0.0.622") == std::string::npos, "Info.plist is 0.0.670, carried twice");
+    expect(s1c.find("kN1cKextBuild = 670;") != std::string::npos, "the native client reports build 670");
+    expect(count_of(nub, "666u") == 2 && nub.find("622u") == std::string::npos, "both ops tables carry the build 666");
     // 8. the project rule: the banned strings appear in none of the new files
     const std::string banned[3] = { std::string("pipe") + "+0x2" + "80", std::string("+0x2") + "82", std::string("+0x2") + "99" };
     for (const std::string &b : banned) for (const std::string *f : { &flow, &hdr, &glue }) expect(f->find(b) == std::string::npos, "the project rule: no forbidden pipe-offset spelling in the new code");

@@ -81,7 +81,8 @@ static void t1_switch() {
     expect(!args_ok(false, 103u, 5ull), "T1: sessstat 5 with G5 OFF is BadArgument as before");
     expect(!args_ok(true, 103u, 4ull) && !args_ok(true, 103u, 6ull) && !args_ok(true, 103u, 0ull), "T1: only page 5 is G5's");
     expect(!args_ok(true, 104u, 5ull) && !args_ok(true, 102u, 5ull), "T1: only action 103");
-    expect(!g2::native_exempt(true, 103u, 5ull) && g2::native_exempt(true, 103u, 4ull) && g2::native_exempt(true, 103u, 0ull), "T1: G2's own admission is unchanged (page 5 is not G2's)");
+    expect(!g2::native_exempt(true, 103u, g2::kStatClients + 1u) && g2::native_exempt(true, 103u, g2::kStatClients) && g2::native_exempt(true, 103u, g2::kStatGlobal) && g2::native_exempt(true, 103u, 0ull),
+           "T1: 0.0.670: G2 admits 0..kStatClients (the pool pages, the global page and the new client-table page) and refuses kStatClients+1");
     expect_u("T1: kStatPage", kStatPage, 5u);
 }
 
@@ -147,30 +148,30 @@ static void t3_in_flight() {
 // ---- T4 ---------------------------------------------------------------------------------------------------------------------------------------------------------
 static void t4_older() {
     const uint64_t S = kSinceStaleNs, now = 100ull * S;
-    uint64_t sc[kMaxSessions] = { 0, 0, 0, 0 };
+    uint64_t sc[kMaxClients] = { 0, 0, 0, 0 };
     expect(!older_waiter(sc, 2, now, S), "T4: nobody waits");
     sc[1] = now - 10; expect(older_waiter(sc, 2, now, S), "T4: a slot that is not waiting yet is the newest: an older waiter exists");
     sc[2] = now - 5; expect(older_waiter(sc, 2, now, S), "T4: another slot waits longer");
     sc[2] = now - 20; expect(!older_waiter(sc, 2, now, S), "T4: I wait longer than the other");
-    uint64_t sc2[kMaxSessions] = { 0, 0, 0, 0 };
+    uint64_t sc2[kMaxClients] = { 0, 0, 0, 0 };
     sc2[1] = now - 10; sc2[2] = now - 10;
     expect(!older_waiter(sc2, 1, now, S), "T4: tie, I am the lower slot: nobody is older");
     expect(older_waiter(sc2, 2, now, S), "T4: tie, I am the higher slot: the lower slot goes first");
     // stale and future entries are ignored
-    uint64_t sc3[kMaxSessions] = { 1, 0, 0, 0 };   // slot 0 began waiting at ns 1, "now" is 100 stale periods later: a leaked entry
+    uint64_t sc3[kMaxClients] = { 1, 0, 0, 0 };   // slot 0 began waiting at ns 1, "now" is 100 stale periods later: a leaked entry
     expect(!older_waiter(sc3, 2, now, S), "T4: a leaked entry older than the stale bound is ignored (self-healing)");
     sc3[0] = now - S; expect(older_waiter(sc3, 2, now, S), "T4: exactly at the stale bound it still counts");
     sc3[0] = now - S - 1ull; expect(!older_waiter(sc3, 2, now, S), "T4: one ns past the stale bound it is ignored");
     sc3[0] = now + 5; expect(!older_waiter(sc3, 2, now, S), "T4: an entry in the future (clock went backwards) is ignored");
-    uint64_t sc4[kMaxSessions] = { 0, now + 5, now + 10, 0 };   // both in the future: the other one would be the older of the two if it were honoured
+    uint64_t sc4[kMaxClients] = { 0, now + 5, now + 10, 0 };   // both in the future: the other one would be the older of the two if it were honoured
     expect(!older_waiter(sc4, 2, now, S), "T4: a future entry is ignored even when this slot's own entry is later still");
     // helpers
-    uint64_t h[kMaxSessions] = { 0, 0, 0, 0 };
+    uint64_t h[kMaxClients] = { 0, 0, 0, 0 };
     since_mark(h, 1, 50); since_mark(h, 1, 99);
     expect_u("T4: since_mark keeps the FIRST time", h[1], 50);
     since_clear(h, 1);
     expect_u("T4: since_clear", h[1], 0);
-    since_mark(h, kMaxSessions, 5); since_clear(h, kMaxSessions);
+    since_mark(h, kMaxClients, 5); since_clear(h, kMaxClients);
     expect(h[0] == 0 && h[1] == 0 && h[2] == 0 && h[3] == 0, "T4: an out-of-range slot touches nothing");
 }
 
@@ -215,7 +216,7 @@ static void t5_admit() {
 // ---- T6 ---------------------------------------------------------------------------------------------------------------------------------------------------------
 static void t6_ws_slot1() {
     log_reset();
-    uint64_t sc[kMaxSessions] = { 0, 0, 0, 0 };
+    uint64_t sc[kMaxClients] = { 0, 0, 0, 0 };
     sc[0] = 5; sc[2] = 6;   // two apps waiting
     for (uint64_t q = 1; q <= 6; q++) note(q, 0u, 20u);   // slot 0 is an APP (slot 0 is not WindowServer here), six app jobs in flight
     // WindowServer lives on slot 1 (session id 9): never gated, whatever the credit, the reserve and the queue say
@@ -225,7 +226,7 @@ static void t6_ws_slot1() {
     expect_u("T6: ... and slot 0 as an app with isWs false is what the credit gates", admission(gLog, AdmitIn{ true, false, true, 1000ull, 1001ull, 1u, 0ull, 6ull, 9u, 4095u, 23u, sc, 0u }), kWait);
     // the app on slot 0 with WindowServer on slot 1 counts as an app; WindowServer's own seqnos are skipped
     log_reset(); note(1, 1u, 9u); note(2, 1u, 9u); note(3, 1u, 9u);
-    uint64_t none[kMaxSessions] = { 0, 0, 0, 0 };
+    uint64_t none[kMaxClients] = { 0, 0, 0, 0 };
     expect_u("T6: only WindowServer's own jobs in flight: an app is admitted (they are not app jobs)", admission(gLog, AdmitIn{ true, false, true, 1000ull, 1001ull, 1u, 0ull, 3ull, 9u, 4095u, 23u, none, 0u }), kAdmit);
     expect_u("T6: the same log, WindowServer id unknown (0): they WOULD be app jobs (fail closed)", admission(gLog, AdmitIn{ true, false, true, 1000ull, 1001ull, 1u, 0ull, 3ull, 0u, 4095u, 23u, none, 0u }), kWait);
     expect_u("T6: OFF: the composite admits an app with everything adverse", admission(gLog, AdmitIn{ false, false, true, 1000ull, 1001ull, 1u, 0ull, 3ull, 9u, 0u, 23u, sc, 0u }), kAdmit);
@@ -273,7 +274,7 @@ struct Job { uint64_t seq; int owner; uint64_t gpuNs; uint32_t dw; };
 struct Sim {
     std::vector<std::pair<uint64_t, int>> admits;   // (tick time, app index) in order
     uint32_t maxAhead = 0, wsEmits = 0, wsWaits = 0, maxAppInFlight = 0;
-    uint64_t adm[kMaxSessions] = { 0, 0, 0, 0 };
+    uint64_t adm[kMaxClients] = { 0, 0, 0, 0 };
     uint64_t totalAdm = 0;
 };
 static Sim simulate(int mode, uint32_t K, uint32_t wsSlot, bool wsTalks, uint32_t nApps, uint64_t durationNs, uint64_t appGpuNs, uint32_t ringUsedStart = 0u) {
@@ -281,13 +282,13 @@ static Sim simulate(int mode, uint32_t K, uint32_t wsSlot, bool wsTalks, uint32_
     constexpr uint32_t kWsDw = 20u, kRing = 4095u, wsId = 77u;
     log_reset();
     Sim out;
-    uint64_t since[kMaxSessions] = { 0, 0, 0, 0 };
+    uint64_t since[kMaxClients] = { 0, 0, 0, 0 };
     std::deque<Job> q;
     uint64_t em = 0, re = 0, headLeft = 0, lastWs = 0, nextWs = 0;
     uint32_t used = ringUsedStart;
-    bool busy[kMaxSessions] = { false, false, false, false };
+    bool busy[kMaxClients] = { false, false, false, false };
     std::vector<uint32_t> appSlots;
-    for (uint32_t s = 0; s < kMaxSessions && appSlots.size() < nApps; s++) if (s != wsSlot) appSlots.push_back(s);
+    for (uint32_t s = 0; s < kMaxClients && appSlots.size() < nApps; s++) if (s != wsSlot) appSlots.push_back(s);
     const uint32_t appDw = s1c::submit_dwords(1u, true);
     for (uint64_t t = 0; t < durationNs; t += kTick) {
         // the GPU
@@ -380,7 +381,7 @@ static void t8_ordering() {
     // a leaked since[] entry (a waiter that died) must not wedge the others: the entry is ignored once stale
     {
         log_reset();
-        uint64_t sc[kMaxSessions] = { 0, 0, 0, 0 };
+        uint64_t sc[kMaxClients] = { 0, 0, 0, 0 };
         sc[2] = 5ull;   // leaked at the start of time
         const uint64_t late = 5ull + kSinceStaleNs + 1000ull;
         expect_u("T8: a leaked waiter older than the stale bound does not block the next app", admission(gLog, AdmitIn{ true, false, false, 0ull, late, 1u, 0ull, 0ull, 0u, 4095u, 23u, sc, 1u }), kAdmit);
@@ -426,29 +427,39 @@ static void t10_pins(const std::string &root) {
         hdr = slurp(root + "/src/navi48-bringup/src/amd/native_s1c.h"), brg = slurp(root + "/src/navi48-bringup/src/Navi48Bringup.cpp"),
         cli = slurp(root + "/tools/pc/navi48test.c"), plist = slurp(root + "/src/navi48-bringup/Info.plist");
     expect(!eng.empty() && !pure.empty() && !hdr.empty() && !brg.empty() && !cli.empty() && !plist.empty(), "T10: the sources were read");
-    // OFF identity: ring_submit is the 0.0.642 text, and the OFF branch is the old call
-    expect(fn_body(eng, "static uint32_t ring_submit(Session *s,") == kRingSubmit642, "T10: ring_submit is byte-for-byte the 0.0.642 function");
+    // 0.0.667: byte-for-byte is no longer the contract - the 2 s space wait moved out of gRingLock. Assert the SHAPE instead (and that it did
+    // change), so a revert to "wait inside the lock" fails here.
+    { const std::string rs = fn_body(eng, "static uint32_t ring_submit(Session *s,");
+      expect(!rs.empty() && rs != kRingSubmit642, "T10: ring_submit is no longer the 0.0.642 function (0.0.667 moved the space wait out of gRingLock)");
+      const size_t lk = rs.find("IOLockLock(gRingLock)"), ul = rs.find("IOLockUnlock(gRingLock)"), sl = rs.find("IOSleep(1)");
+      expect(lk != std::string::npos && ul != std::string::npos && sl != std::string::npos && lk < ul && ul < sl && rs.find("kWaitCapNs") != std::string::npos,
+             "T10: ring_submit keeps the 2 s budget (kWaitCapNs), the lock over seqno/build/put and the sleep outside it"); }
     const std::string sub = fn_body(eng, "IOReturn n1c_submit(");
-    expect(!sub.empty() && in_order(sub, { "const uint32_t gate = gpu_gate(s);", "id_live(s->ctxUsed, N48N_MAX_CTX, v.ctx)", "resolve_fence(s, v.fenceHandle, v.fenceOffset, &fenceAddr);", "uint32_t er;",
+    expect(!sub.empty() && in_order(sub, { "const uint32_t gate = gpu_gate(s);", "id_live(s->ctxUsed, N48N_MAX_CTX, v.ctx)", "resolve_fence(s, v.fenceHandle, v.fenceOffset, &fenceAddr);", "const uint32_t vrc = vmid_need(s, true);", "uint32_t er = kOk;",
                                           "if (!g5_on()) er = ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut);   // G5 OFF: exactly 0.0.642",
                                           "else if (s->ws) { __atomic_store_n(&gWsLastNs, now_ns(), __ATOMIC_RELEASE); er = ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut); }",
                                           "else er = ring_submit_app_g5(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut);", "if (er != kOk) { rc = (IOReturn)er; break; }" }),
-           "T10: n1c_submit keeps gpu_gate, the IB checks and resolve_fence, then: OFF -> ring_submit unchanged; ON + WindowServer -> stamp + ring_submit; ON + other -> ring_submit_app_g5");
+           "T10: n1c_submit keeps gpu_gate, the IB checks and resolve_fence, then (0.0.670) takes its VMID handle, then: OFF -> ring_submit unchanged; ON + WindowServer -> stamp + ring_submit; ON + other -> ring_submit_app_g5");
     expect_u("T10: ring_submit_app_g5 is reached from exactly one place (the definition and one call)", count_of(eng, "ring_submit_app_g5("), 2);
     expect_u("T10: the app path is reached only after !g5_on() and s->ws were both false (an else-if chain)", count_of(sub, "else er = ring_submit_app_g5("), 1);
     expect_u("T10: ring_submit call sites: the definition, two in n1c_submit, the two G1 kernel paths", count_of(eng, "ring_submit("), 5);
     expect_u("T10: the G1 kernel paths still call ring_submit on gSess", count_of(eng, "ring_submit(&gSess, &va, &by, 1u, false, 0ull, &seq)"), 2);
     expect_u("T10: gWsLastNs is stored in exactly one place (WindowServer's branch)", count_of(eng, "__atomic_store_n(&gWsLastNs,"), 1);
-    expect_u("T10: gG5Since is written only through since_mark / since_clear", count_of(eng, "gG5Since[s->slot] ="), 0);
+    expect_u("T10: gG5Since is written only through since_mark / since_clear", count_of(eng, "gG5Since[s->cli] ="), 0);
     expect_u("T10: the OFF path writes nothing: the only users of gG5 are the app path, the stat page", count_of(eng, "stat_admit(gG5") + count_of(eng, "stat_timeout(gG5") + count_of(eng, "v.st = gG5;"), 3);
     // the app path
     const std::string ap = fn_body(eng, "static uint32_t ring_submit_app_g5(");
     expect(!ap.empty(), "T10: ring_submit_app_g5 exists");
-    expect(in_order(ap, { "const uint32_t need = submit_dwords(nIbs, hasFence);", "IOLockLock(gRingLock);", "g5_fill_in_locked(s, K, need);", "admission(gOwners, gG5In) == kAdmit", "since_clear(gG5Since, s->slot); waiting = false;",
-                          "const uint64_t seq = emitted_now() + 1ull;", "build_submit(", "ring_put_locked(gSubmitBuf, n, seq, (uint8_t)s->slot, s->id, s);", "stat_admit(gG5, waitedNs);", "IOLockUnlock(gRingLock);" }),
-           "T10: the admission verdict comes BEFORE the seqno, inside the same lock hold, and the ring write follows");
+    // 0.0.667: the verdict/seqno/write order under ONE lock hold is unchanged; what moved is the BOOKKEEPING - stat_admit / since_clear now happen
+    // only in the branch where the put succeeded (a transient ring-full falls through to the shared wait tail instead of failing the app's Submit).
+    expect(in_order(ap, { "const uint32_t need = submit_dwords(nIbs, hasFence);", "IOLockLock(gRingLock);", "g5_fill_in_locked(s, K, need);", "admission(gOwners, gG5In) == kAdmit",
+                          "const uint64_t seq = emitted_now() + 1ull;", "build_submit(", "ring_put_locked(gSubmitBuf, n, seq, (uint8_t)s->cli, s->id, s);", "if (er == kOk) {",
+                          "stat_admit(gG5, waitedNs);", "since_clear(gG5Since, s->cli); waiting = false;", "IOLockUnlock(gRingLock);" }),
+           "T10: the admission verdict comes BEFORE the seqno, inside the same lock hold, the ring write follows, and the bookkeeping runs only after the put succeeded (0.0.667)");
     expect_u("T10: exactly one seqno assignment in the app path", count_of(ap, "emitted_now() + 1ull"), 1);
-    expect(ap.find("va, by, nIbs, s->vmid, hasFence,") != std::string::npos && ap.find("kNativeVmid") == std::string::npos, "T10: the app path builds the Submit on the SESSION'S VMID (s->vmid)");
+    expect(ap.find("va, by, nIbs, vm, hasFence,") != std::string::npos && ap.find("kNativeVmid") == std::string::npos, "T10: the app path builds the Submit on the VMID HANDLE it read under gRingLock (0.0.670: it was s->vmid)");
+    expect(ap.find("const uint32_t vm = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);") != std::string::npos && ap.find("if (vm == 0u) { IOLockUnlock(gRingLock); rc = kNotReady; break; }") != std::string::npos,
+           "T10: 0.0.670: the app path checks the residency UNDER gRingLock and refuses (kNotReady, so Submit re-acquires) when a steal revoked the handle");
     {   // between the admission and the seqno / the write there is no unlock
         const size_t a = ap.find("admission(gOwners, gG5In)"), b = ap.find("emitted_now() + 1ull"), c = ap.find("ring_put_locked(");
         std::string mid = (a != std::string::npos && c != std::string::npos && a < c) ? ap.substr(a, c - a) : std::string("IOLockUnlock");
@@ -462,7 +473,7 @@ static void t10_pins(const std::string &root) {
     expect_u("T10: one IODelay and one IOSleep in the app path (the single sleep line)", count_of(ap, "IODelay(1)") * 10 + count_of(ap, "IOSleep(1)"), 11);
     expect_u("T10: no stall check, no sleep before the wait path's unlock", count_of(ap, "if (el < 5000000ull) IODelay(1); else IOSleep(1);"), 1);
     {
-        const size_t mk = ap.find("since_mark(gG5Since, s->slot, now);"), un = ap.find("IOLockUnlock(gRingLock);", mk), sl = ap.find("IODelay(1)"), hn = ap.find("hung_now()", un);
+        const size_t mk = ap.find("since_mark(gG5Since, s->cli, now);"), un = ap.find("IOLockUnlock(gRingLock);", mk), sl = ap.find("IODelay(1)"), hn = ap.find("hung_now()", un);
         expect(mk != std::string::npos && un != std::string::npos && sl != std::string::npos && hn != std::string::npos && mk < un && un < hn && hn < sl, "T10: the wait path: mark, UNLOCK, then the checks, then (only then) the sleep");
         expect(ap.substr(mk, un - mk).find("IODelay") == std::string::npos && ap.substr(mk, un - mk).find("IOSleep") == std::string::npos && ap.substr(mk, un - mk).find("stall_from_wait") == std::string::npos,
                "T10: nothing between since_mark and the unlock sleeps or runs a recovery");
@@ -470,14 +481,14 @@ static void t10_pins(const std::string &root) {
     expect(in_order(ap, { "IOLockUnlock(gRingLock);\n        if (hung_now()) { rc = hang_rc(true, false); break; }", "if (sess_poisoned(s)) { rc = n48native::g2::poison_rc(true); break; }", "const uint32_t step = wait_step(el, stallDone);",
                           "if (step == kGiveUp) { timedOut = true; rc = kTimeout; break; }", "if (step == kStallNow) { stallDone = true; (void)stall_from_wait(); continue; }", "IODelay(1)" }),
            "T10: after the unlock: HUNG -> Aborted, poisoned -> Aborted, then the bounded wait (stall path once, Timeout at 8 s)");
-    expect_u("T10: stall_from_wait runs in two places: the app's own ring Timeout and the once-only stall step", count_of(ap, "stall_from_wait()"), 2);
-    expect(in_order(ap, { "    if (waiting) {", "IOLockLock(gRingLock);", "since_clear(gG5Since, s->slot);", "if (timedOut) stat_timeout(gG5);", "IOLockUnlock(gRingLock);", "return rc;" }),
-           "T10: the single exit clears this slot's gG5Since (under gRingLock) on every path that left while waiting, counts the timeout, then returns");
+    expect_u("T10: stall_from_wait() runs ONCE in the app path - the shared wait tail's stall step (0.0.667: a transient ring-full falls through to that same tail); a second call would fail this", count_of(ap, "stall_from_wait()"), 1);
+    expect(in_order(ap, { "    if (waiting) {", "IOLockLock(gRingLock);", "since_clear(gG5Since, s->cli);", "if (timedOut) stat_timeout(gG5);", "IOLockUnlock(gRingLock);", "return rc;" }),
+           "T10: the single exit clears this client's gG5Since (under gRingLock) on every path that left while waiting, counts the timeout, then returns");
     expect_u("T10: the function has one return", count_of(ap, "return "), 1);
     expect(ap.find("gCliLock") == std::string::npos && ap.find("IOLockLock(s->lock)") == std::string::npos, "T10: the app path takes no other lock (the session lock is the caller's)");
     const std::string fill = fn_body(eng, "__attribute__((noinline)) static void g5_fill_in_locked(");
     expect(ap.find("const uint32_t K = g5_credit();") != std::string::npos && fill.find("gG5In = n48native::g5::AdmitIn{ true, false,") != std::string::npos && ap.find("g5_fill_in_locked(s, K, need);") != std::string::npos, "T10: the app path runs with G5 ON and isWs = false");
-    expect(!fill.empty() && in_order(fill, { "sysmem_rmb();", "ring_free64(rp, gWc, mask)", "gG5Since, s->slot };" }) && fill.find("IOLockLock") == std::string::npos && fill.find("IOSleep") == std::string::npos,
+    expect(!fill.empty() && in_order(fill, { "sysmem_rmb();", "ring_free64(rp, gWc, mask)", "gG5Since, s->cli };" }) && fill.find("IOLockLock") == std::string::npos && fill.find("IOSleep") == std::string::npos,
            "T10: the verdict's inputs are read in one place, under the caller's hold of gRingLock (a helper that takes no lock and never sleeps)");
     // the pure side
     expect(pure.find("constexpr uint64_t kRecoverBoundNs = 6000000000ull;") != std::string::npos && eng.find("constexpr uint64_t kRecoverWaitNs = 6000000000ull;") != std::string::npos,
@@ -500,7 +511,7 @@ static void t10_pins(const std::string &root) {
     expect(in_order(eng, { "if (s->ws) __atomic_store_n(&gSessWs, 0u, __ATOMIC_SEQ_CST);", "if (s->ws) __atomic_store_n(&gWsId, 0u, __ATOMIC_SEQ_CST);" }), "T10: n1c_close clears it");
     expect_u("T10: gWsId is written in exactly those two places", count_of(eng, "__atomic_store_n(&gWsId,"), 2);
     // the CLI
-    expect(cli.find("hangstat [0..8]|sessstat [0..5]|") != std::string::npos && cli.find("} else if (c == 0 && out[4] == 5) {") != std::string::npos && cli.find("amdgpu::n1c_g5_stat") != std::string::npos
+    expect(cli.find("hangstat [0..8]|sessstat [0..9]|") != std::string::npos && cli.find("} else if (c == 0 && out[4] == 5) {") != std::string::npos && cli.find("amdgpu::n1c_g5_stat") != std::string::npos
            && cli.find("credit-wait timeouts") != std::string::npos && cli.find("WindowServer ring reserve") != std::string::npos, "T10: navi48test: sessstat 5 is accepted and printed");
     // the lock map still stands; the stack rule
     expect(eng.find("// THE LOCK MAP (0.0.627, G2). Order: a session's own lock -> gCliLock -> gRingLock -> gHangLock; gTlbLock is a leaf") != std::string::npos, "T10: the lock map comment is intact");
@@ -508,9 +519,9 @@ static void t10_pins(const std::string &root) {
     // banned strings (the pieces are joined here so this file does not carry them; tools/pc/navi48test.c already carries two lines from before 0.0.642: not checked here), the version
     const std::string b1 = std::string("pipe+0x2") + "80", b2 = std::string("+0x2") + "82", b3 = std::string("+0x2") + "99";
     for (const std::string *f : { &eng, &pure, &hdr, &brg }) expect(f->find(b1) == std::string::npos && f->find(b2) == std::string::npos && f->find(b3) == std::string::npos, "T10: no banned pipe offsets");
-    expect(count_of(plist, "<string>0.0.664</string>") == 2 && plist.find("0.0.642") == std::string::npos, "T10: Info.plist is 0.0.664, carried twice");
-    expect(hdr.find("constexpr uint32_t kN1cKextBuild = 664;") != std::string::npos, "T10: the native client reports build 660");
-    expect(plist.find("<string>0.0.664</string>") != std::string::npos && eng.find("0.0.642\"") == std::string::npos, "T10: no stale version string in the engine");
+    expect(count_of(plist, "<string>0.0.670</string>") == 2 && plist.find("0.0.642") == std::string::npos, "T10: Info.plist is 0.0.670, carried twice");
+    expect(hdr.find("constexpr uint32_t kN1cKextBuild = 670;") != std::string::npos, "T10: the native client reports build 670");
+    expect(plist.find("<string>0.0.670</string>") != std::string::npos && eng.find("0.0.642\"") == std::string::npos, "T10: no stale version string in the engine");
 }
 
 int main(int argc, char **argv) {

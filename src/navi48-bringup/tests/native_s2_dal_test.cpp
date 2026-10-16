@@ -1292,7 +1292,7 @@ static void s_pins(const std::string &root) {
     {
         const size_t p = engh.find("kN1cKextBuild = "); const int build = p == std::string::npos ? -1 : std::atoi(engh.c_str() + p + 16);
         const size_t v = plist.find("<string>0.0."); const int ver = v == std::string::npos ? -2 : std::atoi(plist.c_str() + v + 12);
-        expect(build > 0 && build == ver, "kN1cKextBuild equals the Info.plist patch version"); expect_u("Info.plist is 0.0.664", (uint64_t)ver, 664); expect_u("the plist carries the version twice", count_of(plist, "0.0.664"), 2);
+        expect(build > 0 && build == ver, "kN1cKextBuild equals the Info.plist patch version"); expect_u("Info.plist is 0.0.670 (8 sessions)", (uint64_t)ver, 670); expect_u("the plist carries the version twice", count_of(plist, "0.0.670"), 2);
     }
     expect(mk.find("$(wildcard src/amd/*.cpp)") != std::string::npos, "the Makefile builds src/amd/*.cpp (smu_dal.cpp)");
     // the tool

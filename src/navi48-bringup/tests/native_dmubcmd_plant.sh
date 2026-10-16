@@ -124,8 +124,8 @@ plant(74, CLI, 'the CLI does not know dmubsend', '!strcmp(what, "dmubsend")) in 
 plant(75, CLI, 'the CLI sends the dmubctx arguments in the wrong order', 'return cmd_dmubctx(arg, arg2, arg3);', 'return cmd_dmubctx(arg2, arg, arg3);')
 plant(76, CLI, 'the M3 script drops the mode-block check', '    "    accel region4read 0x4c08 1                          pass ONLY if (dword & 0x00002000) == 0  (mode block byte +0x09 bit 0x20 clear); if set STOP, skip enable, roll back\\n"\n', '')
 plant(77, CLI, 'the CLI does not pre-check the allowlist', '    const uint32_t pre = n48dm_slot_check(h, d1, d2);', '    const uint32_t pre = 0u;')
-plant(78, PLIST, 'the version is not bumped', '<key>CFBundleVersion</key>\n\t<string>0.0.664</string>', '<key>CFBundleVersion</key>\n\t<string>0.0.624</string>')
-plant(79, S1C, 'the native client build number is stale', 'kN1cKextBuild = 664;', 'kN1cKextBuild = 624;')
+plant(78, PLIST, 'the version is not bumped', '<key>CFBundleVersion</key>\n\t<string>0.0.670</string>', '<key>CFBundleVersion</key>\n\t<string>0.0.624</string>')
+plant(79, S1C, 'the native client build number is stale', 'kN1cKextBuild = 670;', 'kN1cKextBuild = 624;')
 plant(80, DRH, 'the status table loses a name (two statuses share a text)', '    case N48DR_CTX_REFUSED: return "dmubctx accepts only ctx 0x7000 and 0x7800 (never 0x6800, the live DP context)";', '    case N48DR_CTX_REFUSED: return "the command header is not on the allowlist (0x04000a80 0x08000680 0x08000580 0x04000780 0x04000880): REFUSED, nothing written";')
 # ---- 0.0.626: the 0.0.625 review's F4..F8 ----
 plant(81, BRG, 'F4: the dispatcher binds the display layer before the latch is asked', 'if (action == N48DM_ACT_SEND && n48dcn::dmubCmdLatchedOn()) (void)n48dcn::bind(this);', 'if (action == N48DM_ACT_SEND) (void)n48dcn::bind(this);')

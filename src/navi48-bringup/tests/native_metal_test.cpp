@@ -5,7 +5,8 @@
 //    tools/native/navi48accel (default: the same root) - the two Navi48MetalOps.h copies must be byte-identical; tests/native_metal_plant.sh plants breaks)
 // Covers:
 //   M1  publish_verdict: every gate alone (Hello, flags, boot-arg, S1b gate / ran / positive / stopped, HUNG, state) refuses with its code, the order, the one success;
-//       withdraw_verdict: cleanup never needs the boot-arg or S1b; publish_at_boot() is false;
+//       withdraw_verdict: cleanup never needs the boot-arg or S1b; 0.0.670: publish_at_boot() (the master latch AND the kill switch) and publish_at_boot_verdict
+//       (publish_verdict with the session term removed, and NOTHING else: the two agree on every session-bearing gate combination);
 //   M2  the nub state machine over whole sequences: publish, again (Exclusive), withdraw, publish while Terminating (Busy), free -> Off, publish again, withdraw with no nub;
 //   M3  IOAccelConfig: the 12 stores equal the DISASSEMBLED bytes of AppleParavirtAccelerator::populateAccelConfig (a mini x86 decoder over the real 114 bytes) except the
 //       two intended differences (name pointer, +0x47 = 0); the family defaults (+0x4c/+0x50/+0x54 ...) survive untouched (never memset); the static check refuses each zero limit
@@ -13,8 +14,12 @@
 //   M4  stamp page, task window, factory mask (default 0), the ops table's layout (size 120, offsets) and its byte-identity with the aux kext's copy;
 //   M6  (0.0.611) config_populate never leaves our values in the caller's struct on a refusal; vhook logging is rate limited per (cls, slot); vhook output-parameter
 //       writes (VidMemory 43/61, Resource 60/61/62) only with their factory bit, pointer-checked before any write;
-//   M5  source pins: the only caller of the publish code is the native client's selector (never at boot), the verdict precedes the allocation and the registration, the
-//       selectors' shapes, the hooks are wired to the pure code, no register access in the nub, version 0.0.610, the ABI text, banned strings.
+//   M5  source pins: the TWO publishers (the native client's selector and, since 0.0.670, the kext's own boot path) share ONE implementation, the verdict precedes the
+//       allocation and the registration, the selectors' shapes, the hooks are wired to the pure code, no register access in the nub, version 0.0.670, the ABI text,
+//       banned strings;
+//   M7  (0.0.670) source pins: the boot worker publishes the nub through Navi48MetalNub::bootPublish and nothing else does; the boot hold is adjustBusy on
+//       the BRING-UP service, taken once, released by exactly one of four CAS-guarded paths, capped by a thread_call, and the arm is refused when the cap got there
+//       first (never arm behind WindowServer); every one of those decisions is the pure code above.
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -74,7 +79,79 @@ static void m1_verdicts() {
     { GateIn g = good(); g.flags = 3;     expect_u("withdraw flags != 0: BadArgument", withdraw_verdict(g, kPublished), kBadArg); }
     expect_u("withdraw with no nub: NotFound", withdraw_verdict(good(), kOff), kNotFound);
     expect_u("withdraw while terminating: Busy", withdraw_verdict(good(), kTerminating), kBusy);
-    expect(!publish_at_boot(), "the nub is never published at boot");
+    // ---- 0.0.670: the BOOT publish path. The latch is pure, and every direction of it is checked here. ----
+    expect(publish_at_boot(true, false), "0.0.670: navi48-armboot=1 and no kill switch: the KEXT publishes the nub at boot");
+    expect(!publish_at_boot(false, false), "0.0.670: without navi48-armboot the kext publishes nothing (the default is OFF)");
+    expect(!publish_at_boot(true, true), "0.0.670: navi48-nubboot=0 is the kill switch: publish on demand only");
+    expect(!publish_at_boot(false, true), "0.0.670: master off and kill switch on: nothing at boot");
+    // The boot verdict is publish_verdict with the SESSION term removed and nothing else. Three facts, all over the 128 gate combinations:
+    //   (1) the ONLY difference it makes is the session: the selector refuses every session-less combination, the boot verdict refuses all of them but
+    //       the all-open one - and that one is exactly what the boot path needs (at boot no session can exist);
+    //   (2) it publishes for exactly TWO combinations: the all-open one with a session (where the two agree) and the all-open one without it;
+    //   (3) wherever a session exists the two verdicts are identical, so the boot path can never be a WEAKER gate than the selector.
+    {
+        unsigned opened = 0, withSession = 0, selectorOpened = 0, bootOnlyOpened = 0;
+        for (unsigned m = 0; m < 128; ++m) {
+            GateIn g = good();
+            g.hello = m & 1; g.bootarg = m & 2; g.s1bGateOn = m & 4; g.s1bRan = m & 8; g.s1bPositive = m & 16;
+            g.s1bStopped = !(m & 32); g.hung = !(m & 64);
+            const uint32_t sel = publish_verdict(g, kOff), boot = publish_at_boot_verdict(g, kOff);
+            if (boot == kOk) { opened++; if (g.hello) selectorOpened++; else bootOnlyOpened++; }
+            if (g.hello) { withSession++; expect_u("with a session the boot verdict equals the selector's", boot, sel); }
+        }
+        expect_u("the boot verdict publishes for exactly two combinations", opened, 2);
+        expect_u("... one of them is the all-open combination the selector also publishes", selectorOpened, 1);
+        expect_u("... the other is that SAME combination with no session: the one the boot path exists for", bootOnlyOpened, 1);
+        expect_u("... and it agrees with the selector on all 64 session-bearing combinations", withSession, 64);
+        { GateIn s = good(); s.hello = false;                      // the all-open combination as it looks at boot: no session
+          expect_u("the all-open, session-less combination: the selector REFUSES it", publish_verdict(s, kOff), kNotReady);
+          expect_u("... and the boot path publishes it (this is the whole point of the boot verdict)", publish_at_boot_verdict(s, kOff), kOk); }
+    }
+    {   // the gate is the SAME check in the SAME order: every single term still refuses the boot path with its own code
+        GateIn g = good(); g.hello = false;
+        { GateIn b = g; b.flags = 1;          expect_u("boot: flags != 0 -> BadArgument", publish_at_boot_verdict(b, kOff), kBadArg); }
+        { GateIn b = g; b.bootarg = false;    expect_u("boot: no navi48-metal -> Unsupported", publish_at_boot_verdict(b, kOff), kUnsupported); }
+        { GateIn b = g; b.s1bGateOn = false;  expect_u("boot: S1b gate off -> NotReady", publish_at_boot_verdict(b, kOff), kNotReady); }
+        { GateIn b = g; b.s1bRan = false;     expect_u("boot: S1b did not run -> NotReady", publish_at_boot_verdict(b, kOff), kNotReady); }
+        { GateIn b = g; b.s1bPositive = false; expect_u("boot: S1b not POSITIVE -> NotReady", publish_at_boot_verdict(b, kOff), kNotReady); }
+        { GateIn b = g; b.s1bStopped = true;  expect_u("boot: S1b latched a stop -> NotReady", publish_at_boot_verdict(b, kOff), kNotReady); }
+        { GateIn b = g; b.hung = true;        expect_u("boot: GPU HUNG -> NotReady", publish_at_boot_verdict(b, kOff), kNotReady); }
+        { GateIn b = g; b.dispNub = true;     expect_u("boot: a display nub is published -> ExclusiveAccess (the 0.0.652 interlock)", publish_at_boot_verdict(b, kOff), kExclusive); }
+        { GateIn b = g; b.dispNub = true; b.m6 = true; expect_u("boot: ... unless navi48-m6 lifts it", publish_at_boot_verdict(b, kOff), kOk); }
+        expect_u("boot: already published -> ExclusiveAccess", publish_at_boot_verdict(g, kPublished), kExclusive);
+        expect_u("boot: still terminating -> Busy", publish_at_boot_verdict(g, kTerminating), kBusy);
+    }
+    // ---- 0.0.670: the BOOT HOLD's transition table. Each transition is allowed from exactly ONE state, and that is what makes "exactly one adjustBusy(-1)" and
+    //      "never arm with WindowServer up" true rather than careful. ----
+    expect(hold_take_ok(kHoldNone) && !hold_take_ok(kHoldHeld) && !hold_take_ok(kHoldClaimed), "the hold can only be TAKEN from none (one per boot)");
+    expect(hold_claim_ok(kHoldHeld) && !hold_claim_ok(kHoldNone) && !hold_claim_ok(kHoldClaimed), "the arm can only be claimed from held: a hold the cap released refuses the arm");
+    expect(hold_cap_ok(kHoldHeld) && !hold_cap_ok(kHoldNone) && !hold_cap_ok(kHoldClaimed), "the cap can only release a HELD hold (never one the worker already claimed)");
+    expect(hold_release_ok(kHoldClaimed) && !hold_release_ok(kHoldHeld) && !hold_release_ok(kHoldNone), "the worker's release is valid only after its own claim");
+    expect_u("take: none -> held", (uint64_t)hold_after_take(), (uint64_t)kHoldHeld);
+    expect_u("claim: held -> claimed", (uint64_t)hold_after_claim(), (uint64_t)kHoldClaimed);
+    expect_u("cap: held -> none", (uint64_t)hold_after_cap(), (uint64_t)kHoldNone);
+    expect_u("release: claimed -> none", (uint64_t)hold_after_release(), (uint64_t)kHoldNone);
+    {
+        const HoldState all[3] = { kHoldNone, kHoldHeld, kHoldClaimed };
+        for (int i = 0; i < 3; ++i) {
+            // `held` is the ONE state where both the cap and the worker's claim are possible - that race is what the CAS arbitrates, and only one of the
+            // two can win it (the state then refuses the other). Every OTHER state must allow neither.
+            if (all[i] != kHoldHeld) expect(!hold_cap_ok(all[i]) && !hold_claim_ok(all[i]), "only a HELD hold can be ended by the cap or by the claim");
+            expect(!(hold_take_ok(all[i]) && hold_cap_ok(all[i])), "no state can be taken and capped at once");
+            expect(!(hold_take_ok(all[i]) && hold_claim_ok(all[i])), "no state can be taken and claimed at once");
+        }
+        expect(hold_cap_ok(kHoldHeld) && hold_claim_ok(kHoldHeld), "from held the cap and the claim are BOTH possible: the CAS decides, and the loser is refused");
+        // the two ways out of `held` are mutually exclusive, and the one way out of `claimed` is the worker's: 2 releases max, 1 owner
+        expect(hold_cap_ok(kHoldHeld) && hold_claim_ok(kHoldHeld) && !hold_release_ok(kHoldHeld), "from held: cap OR claim, never a release");
+        expect(hold_release_ok(kHoldClaimed) && !hold_cap_ok(kHoldClaimed) && !hold_claim_ok(kHoldClaimed), "from claimed: the worker's release only");
+    }
+    // the cap's clamp: a typo must neither disable the guard (a cap that never expires is a boot that never finishes) nor fire before the bring-up could have finished
+    expect_u("the cap defaults to 40 s (we add no settle of our own)", hold_cap_ms(false, 0), kHoldCapMsDefault);
+    expect_u("a present but zero arg means the default too", hold_cap_ms(true, 0), kHoldCapMsDefault);
+    expect_u("below the minimum is clamped UP", hold_cap_ms(true, 1), kHoldCapMsMin);
+    expect_u("above the maximum is clamped DOWN", hold_cap_ms(true, 999999u), kHoldCapMsMax);
+    expect_u("inside the range the value is taken as given", hold_cap_ms(true, 25000u), 25000u);
+    expect_u("the minimum is below the maximum (a clamp that inverts is a clamp that does nothing)", (uint64_t)(kHoldCapMsMin < kHoldCapMsMax), 1);
 }
 
 // ---- M2 ------------------------------------------------------------------------------------------------------------------------------------------------
@@ -323,12 +400,13 @@ static void m5_pins(const std::string &root, const std::string &auxroot) {
     expect(nub.find("registerService()") != std::string::npos && count_of(nub, "->registerService()") == 1, "the nub is registered in exactly one place (selectorPublish)");
     // -- ordering in selectorPublish: gate verdict, then allocation, then attach, then state, then registration --
     {
-        const std::string b = fn_body(nub, "IOReturn Navi48MetalNub::selectorPublish(");
+        // 0.0.670: the body is publish_impl, shared by the selector and the boot path (the two entry points are one-liners below it)
+        const std::string b = fn_body(nub, "static IOReturn publish_impl(");
         const size_t v = b.find("n48metal::publish_verdict("), a = b.find("OSTypeAlloc(Navi48MetalNub)"), at = b.find("nub->attach(owner)"), st = b.find("gState = n48metal::sm_after_publish"), rg = b.find("nub->registerService()");
         expect(!b.empty() && v != std::string::npos && a != std::string::npos && at != std::string::npos && st != std::string::npos && rg != std::string::npos, "selectorPublish has all its steps");
         expect(v < a && a < at && at < st && st < rg, "order in selectorPublish: gate verdict < allocation < attach < state < registerService");
         expect(b.find("verdict != n48metal::kOk") != std::string::npos && b.find("return (IOReturn)verdict;") != std::string::npos, "a refusing verdict returns before anything is created");
-        expect(b.find("nub->retain();") != std::string::npos && b.find("nub->retain();") < b.find("IOLockUnlock(gLock);\n\tMNLOG(\"nub published") && b.find("nub->registerService()") < b.find("nub->release();  ", b.find("nub->registerService()")), "the nub is retained under the lock and released only after registerService()");
+        expect(b.find("nub->retain();") != std::string::npos && b.find("nub->retain();") < b.find("IOLockUnlock(gLock);\n\tMNLOG(\"nub published by the %s") && b.find("nub->registerService()") < b.find("nub->release();  ", b.find("nub->registerService()")), "the nub is retained under the lock and released only after registerService()");
         {   // free() takes gLock, so no path may release the nub while holding it
             const size_t f = b.find("if (rc != kIOReturnSuccess) {"); const size_t u = b.find("IOLockUnlock(gLock);", f), r = b.find("nub->release();", f);
             expect(f != std::string::npos && u != std::string::npos && r != std::string::npos && u < r, "the failed-publish path unlocks BEFORE it releases the nub (free() takes the same lock)");
@@ -363,8 +441,8 @@ static void m5_pins(const std::string &root, const std::string &auxroot) {
     expect(nub.find("n48metal::task_window(kind, size, reserve)") != std::string::npos, "task_window is the pure one");
     expect(nub.find("n48metal::factory_mask(present, v)") != std::string::npos && nub.find("\"navi48-metal-fact\"") != std::string::npos, "factory_mask is the pure one behind navi48-metal-fact");
     expect(nub.find("return (int)kIOReturnUnsupported;") != std::string::npos, "mm_hook refuses (no map entry point before #10)");
-    expect(count_of(nub, "N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 664u, n48metal::kOpsFlags, 0u,") == 2 && nub.find("op_vhook, n48metal::kOpsCaps, 0,") != std::string::npos && nub.find("N48_DISP_F_ON, 0u, op_disp_hook, op_pci_device,\n\top_native_open,\n};") != std::string::npos, "the ABI-3 ops table identity: magic, abi 3, 152 bytes, build 657, flags, the generic hook and the caps, the display flag and the two display members, native_open");
-    expect(nub.find("const N48MetalOps gOpsOff = {\n\tN48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 664u, n48metal::kOpsFlags, 0u,") != std::string::npos && nub.find("0u, 0u, nullptr, nullptr,\n\top_native_open,\n};") != std::string::npos, "the OFF table is ABI 3 / 152 bytes with no display members (flags 0, no hook, no PCI getter) and native_open");
+    expect(count_of(nub, "N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 666u, n48metal::kOpsFlags, 0u,") == 2 && nub.find("op_vhook, n48metal::kOpsCaps, 0,") != std::string::npos && nub.find("N48_DISP_F_ON, 0u, op_disp_hook, op_pci_device,\n\top_native_open,\n};") != std::string::npos, "the ABI-3 ops table identity: magic, abi 3, 152 bytes, build 657, flags, the generic hook and the caps, the display flag and the two display members, native_open");
+    expect(nub.find("const N48MetalOps gOpsOff = {\n\tN48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 666u, n48metal::kOpsFlags, 0u,") != std::string::npos && nub.find("0u, 0u, nullptr, nullptr,\n\top_native_open,\n};") != std::string::npos, "the OFF table is ABI 3 / 152 bytes with no display members (flags 0, no hook, no PCI getter) and native_open");
     expect(nub.find("functionName->isEqualTo(N48_METAL_FN_SYMBOL)") != std::string::npos && nub.find("*(const N48MetalOps **)param1 = n48disp::ops_shape(n48disp_latched_on()).dispFlags != 0u ? &gOps : &gOpsOff;") != std::string::npos, "callPlatformFunction n48.metal.ops hands out the static table the latch chooses (the display-OFF ABI-3 table unless boot-arg navi48-metal-disp=1)");
     expect(nub.find("if (!d || d != gDev || d->magic != kDevMagic) return;") != std::string::npos, "device_close is idempotent and identity-checked");
     // -- 0.0.611: the vhook and the config are the pure code --
@@ -386,10 +464,65 @@ static void m5_pins(const std::string &root, const std::string &auxroot) {
         const size_t p = engh.find("kN1cKextBuild = "); const int build = p == std::string::npos ? -1 : std::atoi(engh.c_str() + p + 16);
         const size_t v = plist.find("<string>0.0."); const int ver = v == std::string::npos ? -2 : std::atoi(plist.c_str() + v + 12);
         expect(build > 0 && build == ver, "kN1cKextBuild equals the Info.plist patch version");
-        expect_u("Info.plist is 0.0.664", (uint64_t)ver, 664); expect_u("the plist carries the version twice", count_of(plist, "0.0.664"), 2);
-        expect(nub.find("664u") != std::string::npos && nub.find("658u") == std::string::npos && nub.find("613u") == std::string::npos, "both ops tables carry the build 664");
+        expect_u("Info.plist is 0.0.670", (uint64_t)ver, 670); expect_u("the plist carries the version twice", count_of(plist, "0.0.670"), 2);
+        expect(nub.find("666u") != std::string::npos && nub.find("658u") == std::string::npos && nub.find("613u") == std::string::npos, "both ops tables carry the build 666");
     }
     expect(mk.find("src/Navi48MetalNub.cpp") != std::string::npos, "the Makefile builds Navi48MetalNub.cpp");
+    // ---- M7 (0.0.670): the boot publish and the boot hold ----
+    {
+        const std::string arm = slurp(K + "src/amd/native_armboot.cpp"), armh = slurp(K + "src/amd/native_armboot.h");
+        expect(!arm.empty() && !armh.empty(), "the boot worker's source is readable");
+        // (1) the boot publish exists, goes through the ONE publish implementation, and has exactly one caller
+        expect(nub.find("IOReturn Navi48MetalNub::bootPublish(Navi48Bringup *owner) {") != std::string::npos &&
+               nub.find("return publish_impl(owner, 0, out, /*boot=*/true);") != std::string::npos &&
+               nub.find("return publish_impl(owner, flags, out, /*boot=*/false);") != std::string::npos,
+               "0.0.670: the selector and the boot path are one-line wrappers around ONE publish_impl (the ordering and the failure path cannot drift apart)");
+        expect(count_of(arm, "Navi48MetalNub::bootPublish(") == 1 && arm.find("if (gNubLatch == kLatchOn) {") != std::string::npos &&
+               count_of(arm, "if (gNubLatch == kLatchOn) {") == 1,
+               "0.0.670: the boot worker is the ONLY caller of the boot publish, and navi48-nubboot=0 turns it off (the skip is the branch around the publish)");
+        expect(count_of(nub, "n48metal::publish_at_boot_verdict(") == 1 && nub.find("boot ? n48metal::publish_at_boot_verdict(") != std::string::npos,
+               "0.0.670: the boot path's verdict is the pure publish_at_boot_verdict, chosen by the boot flag");
+        // (2) the accelerator's property gate: written at publish, withheld by one boot-arg
+        expect(nub.find("if (accel_bind_allowed()) nub->setProperty(N48_METAL_ACCEL_GATE_KEY, kOSBooleanTrue);") != std::string::npos &&
+               nub.find("PE_parse_boot_argn(\"navi48-accelbind\"") != std::string::npos &&
+               nub.find("if (!PE_parse_boot_argn(\"navi48-accelbind\"") != std::string::npos && nub.find("return v != 0u;") != std::string::npos,
+               "0.0.670: the nub carries the accelerator's IOPropertyMatch gate, and navi48-accelbind=0 really withholds it (present-and-zero is the refusal)");
+        expect(nub.find("nub->setProperty(N48_METAL_ACCEL_GATE_KEY, kOSBooleanTrue);") < nub.find("if (nub->attach(owner))"),
+               "0.0.670: the gate is written BEFORE attach/registerService, so the aux kext's probe sees it");
+        // (3) the boot hold: adjustBusy on the BRING-UP service, taken once, released by four CAS-guarded paths, and never twice
+        // the CALLS, not the prose: the log lines and the comments name adjustBusy too, so the pins count `svc->adjustBusy(...)` exactly
+        expect_u("0.0.670: the hold raises the busy count exactly once (the call in hold_take)", count_of(arm, "svc->adjustBusy(1)"), 1);
+        expect_u("0.0.670: four release paths, each behind its own CAS (release / abandon / cap / stop)", count_of(arm, "svc->adjustBusy(-1);"), 4);
+        expect(count_of(arm, "OSCompareAndSwap") >= 6 && arm.find("&gHold") != std::string::npos, "0.0.670: every transition of the hold is a CAS on the one word");
+        expect(arm.find("n48metal::hold_after_take()") != std::string::npos && arm.find("n48metal::hold_after_claim()") != std::string::npos &&
+               arm.find("n48metal::hold_after_cap()") != std::string::npos && arm.find("n48metal::hold_after_release()") != std::string::npos,
+               "0.0.670: the four transitions come from the pure table, not from literals");
+        expect(arm.find("thread_call_allocate(&cap_call, svc)") != std::string::npos && arm.find("thread_call_enter_delayed(cap, dl)") != std::string::npos &&
+               arm.find("clock_interval_to_deadline(gCapMs, kMillisecondScale, &dl)") != std::string::npos,
+               "0.0.670: the cap is a real timer, armed from the clamped navi48-holdcap value");
+        expect(arm.find("hold_abandon(svc, \"no cap timer\")") != std::string::npos,
+               "0.0.670: a hold whose cap could not be armed is given straight back (a hold with no cap is a boot with no bound)");
+        // (4) the CAS guard, in the arm sequence and BEFORE the arm byte
+        { const size_t c = arm.find("if (gHoldUsed != 0u && !hold_claim())"), a = arm.find("n48disp::kActArm, 1ull");
+          expect(c != std::string::npos && a != std::string::npos && c < a, "0.0.670: the claim happens BEFORE pipearm, and a failed claim refuses the arm (never arm behind WindowServer)");
+          expect(arm.find("NOT arming with WindowServer up or on its way") != std::string::npos, "0.0.670: ... and says so"); }
+        // (5) fail-open: every early exit gives the hold back, and nothing here can fail the kext load
+        expect(arm.find("hold_finish(svc, false, \"the boot publish was refused\")") != std::string::npos &&
+               arm.find("hold_finish(svc, r.ok, r.why)") != std::string::npos &&
+               count_of(arm, "hold_finish(svc,") == 4,
+               "0.0.670: the worker's exits (stop / no service / refused publish / the arm verdict) all go through hold_finish");
+        expect(armh.find("void n48armboot_boot(void);") != std::string::npos && arm.find("void n48armboot_boot(void)") != std::string::npos,
+               "0.0.670: the entry point is still the void one start() calls: no return code, so no way to fail the load");
+        expect(count_of(arm, "PE_parse_boot_argn(") == 4 && arm.find("\"navi48-nohold\"") != std::string::npos && arm.find("\"navi48-nubboot\"") != std::string::npos &&
+               arm.find("\"navi48-holdcap\"") != std::string::npos && arm.find("\"navi48-armboot\"") != std::string::npos,
+               "0.0.670: four latched switches: the master, the no-hold lever, the no-boot-publish kill switch and the cap");
+        // (6) the hold is on the SAME IOService the kext is (the provider's busy state follows it), and never on the PCI device
+        expect(arm.find("const IOReturn rc = owner ? Navi48MetalNub::bootPublish(owner) : kIOReturnNotReady;") != std::string::npos,
+               "0.0.670: the owner cast is nil-checked before the boot publish (a NULL owner must never be dereferenced)");
+        expect(arm.find("IOService *svc = navi48_bringup_service();") != std::string::npos && arm.find("hold_take(svc);") != std::string::npos &&
+               arm.find("IOService *navi48_bringup_service(void);") != std::string::npos,
+               "0.0.670: the hold is taken on the BRING-UP IOService (navi48_bringup_service), the same object the bring-up kext registers, never on a PCI device");
+    }
     expect(abi.find("N48N_SEL_METAL_NUB_PUBLISH") != std::string::npos && abi.find("Never done at boot") != std::string::npos, "the ABI header documents the publish selector");
     { const std::string doc = slurp(root + "/an internal design note");
       expect(doc.find("ABI 1.8 addendum") != std::string::npos && doc.find("N48N_SEL_METAL_NUB_PUBLISH") != std::string::npos && doc.find("N48N_SEL_METAL_NUB_WITHDRAW") != std::string::npos && doc.find("navi48-metal") != std::string::npos,

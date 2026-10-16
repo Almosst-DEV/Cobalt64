@@ -77,8 +77,8 @@ plant 20 $E 'if (!multi && !OSCompareAndSwap(0, 1, &gOpenFlag)) {' 'if (false) {
 plant 21 $E ' || !va_exec_covered(s->maps, kMaxMaps, st, by[i])) { bad = true; break; }' ') { bad = true; break; }' "Submit no longer checks that the IB is EXEC-mapped"
 plant 22 $E '    if (!native_s1b_latched()) return false;' '    return false;' "the legacy refusals never fire"
 plant 23 $E '        if (hung_now()) m = kRelLeak;                                    // HUNG: drop the handle, leak the memory and the PTEs, succeed' '        if (false) m = kRelLeak;' "BoFree under HUNG frees memory the GPU may still read"
-plant 24 $E '    if (!leak && !own_wait(s)) leak = true;            // a timeout here latched the hang (switch ON: or left this slot'"'"'s work unproven)' '' "close no longer waits for idle before freeing"
-plant 25 $E '        if (program_root(s->vmid, gPark.pa) != kOk) leak = true; else parked = true;' '        parked = true;' "close frees memory without parking CONTEXT8"
+plant 24 $E '    if (!leak && !own_wait(s)) leak = true;            // a timeout here latched the hang (switch ON: or left this client'"'"'s work unproven)' '' "close no longer waits for idle before freeing"
+plant 25 $E '        else if (vmid_release_locked(s) == kOk) parked = true;' '        parked = true;' "close frees memory without parking the client's context (and without releasing its pool handle)"
 plant 26 $K/src/Navi48NativeClient.cpp '	if (args->structureInputDescriptor != nullptr || args->structureOutputDescriptor != nullptr) return kIOReturnBadArgument;' '' "out-of-line struct input is no longer refused"
 plant 27 $K/src/Navi48Bringup.cpp '	if (type == N48N_UC_TYPE) return IOAccelNavi48NativeClient::create(this, this, n48native::policy::kRouteBringup, owningTask, securityID, type, properties, handler);' '' "newUserClient no longer creates the native client"
 plant 28 $K/src/Navi48UserClient.cpp '	if (amdgpu::n1c_refuse_legacy(amdgpu::kN1cSiteWriteVRAM)) return kIOReturnNotPermitted;   // NATIVE S1c (0.0.601): refused once the native VM self-test ran
@@ -97,7 +97,7 @@ plant 39 $E '    if (!regs_allowed(off, count) || (off + count) * 4ull > gCtx->d
 plant 40 $P 'off >= kRegsAllowFirst && off <= kRegsAllowLast && off + count - 1ull <= kRegsAllowLast;' 'off >= kRegsAllowFirst && off <= kRegsAllowLast;' "the ReadRegs allowlist lets a read run past 0x2641"
 plant 41 $P 'constexpr uint32_t ring_idx(uint64_t wc, uint32_t mask) { return (uint32_t)(wc & mask); }' 'constexpr uint32_t ring_idx(uint64_t wc, uint32_t mask) { return (uint32_t)(wc % (mask + 2u)); }' "the ring index is computed wrongly across the wrap"
 plant 42 $E '    for (uint32_t i = 0; i < s->nblk; i++) gPtFree[gPtFreeN++] = s->blk[i];' '    for (uint32_t i = 0; i < s->nblk; i++) gCtx->gmc.vram_alloc.free(gPt[s->blk[i]]);' "page-table blocks go back to vram_alloc (a stale user mapping could alias a page table)"
-plant 43 $E 'static Session gSess;          // slot 0 (VMID 8): STATIC and never freed: a selector racing a close can never touch freed memory' 'static Session gSess; static void *gSessHeap = IOMallocAligned(4096, 4096);' "the session stops being a plain static (lifetime pin)"
+plant 43 $E 'static Session gSess;          // CLIENT RECORD 0: STATIC and never freed: a selector racing a close can never touch freed memory' 'static Session gSess; static void *gSessHeap = IOMallocAligned(4096, 4096);' "the client record stops being a plain static (lifetime pin)"
 plant 44 $E '    Session *s = sess_lock(ref, true);
     if (s == nullptr) return kIOReturnNotReady;   // closed while we waited for the lock
     IOReturn rc = kIOReturnSuccess;

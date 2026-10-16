@@ -19,12 +19,12 @@
 #pragma once
 #include <stdint.h>
 
-#include "native_g2_pure.h"   // OwnerLog, kOwnerN, kOwnerKernel, kMaxSessions, latch_value; (via native_s1c_pure.h) ring_has_space, kWaitCapNs, kTimeout
+#include "native_g2_pure.h"   // OwnerLog, kOwnerN, kOwnerKernel, kMaxClients, latch_value; (via native_s1c_pure.h) ring_has_space, kWaitCapNs, kTimeout
 
 namespace n48native {
 namespace g5 {
 
-using g2::kMaxSessions;
+using g2::kMaxClients;   // 0.0.669: since[] is indexed by CLIENT index (a waiter is a session, not a VMID handle)
 
 // ---- constants ---------------------------------------------------------------------------------------------------------------------------------
 constexpr uint64_t kWsWindowNs = 100000000ull;      // WindowServer counts as active for 100 ms after its last submit (it submits ~93/s even when idle: gaps of ~11 ms)
@@ -81,11 +81,12 @@ inline uint32_t ws_outstanding(const g2::OwnerLog &l, uint64_t retired, uint64_t
 }
 
 // ---- first come, first served ------------------------------------------------------------------------------------------------------------------------
-// since[slot] = the time that slot's Submit began waiting (0 = not waiting), guarded by gRingLock. True when ANOTHER slot has been waiting longer than this one
-// (a slot that is not waiting yet counts as starting now). Ties go to the lower slot. An entry older than staleNs, or in the future, is ignored.
+// since[client] = the time that client's Submit began waiting (0 = not waiting), guarded by gRingLock. True when ANOTHER client has been waiting longer than
+// this one (a client that is not waiting yet counts as starting now). Ties go to the lower client index. An entry older than staleNs, or in the future, is
+// ignored. 0.0.669: the index is the CLIENT table index (kMaxClients entries; it was the session slot, which used to BE the VMID).
 inline bool older_waiter(const uint64_t *since, uint32_t mySlot, uint64_t now, uint64_t staleNs) {
-    const uint64_t mine = (mySlot < kMaxSessions && since[mySlot] != 0ull) ? since[mySlot] : now;
-    for (uint32_t j = 0; j < kMaxSessions; j++) {
+    const uint64_t mine = (mySlot < kMaxClients && since[mySlot] != 0ull) ? since[mySlot] : now;
+    for (uint32_t j = 0; j < kMaxClients; j++) {
         if (j == mySlot) continue;
         const uint64_t t = since[j];
         if (t == 0ull || t > now || now - t > staleNs) continue;
@@ -93,8 +94,8 @@ inline bool older_waiter(const uint64_t *since, uint32_t mySlot, uint64_t now, u
     }
     return false;
 }
-inline void since_mark(uint64_t *since, uint32_t slot, uint64_t now) { if (slot < kMaxSessions && since[slot] == 0ull) since[slot] = now; }
-inline void since_clear(uint64_t *since, uint32_t slot) { if (slot < kMaxSessions) since[slot] = 0ull; }
+inline void since_mark(uint64_t *since, uint32_t slot, uint64_t now) { if (slot < kMaxClients && since[slot] == 0ull) since[slot] = now; }
+inline void since_clear(uint64_t *since, uint32_t slot) { if (slot < kMaxClients) since[slot] = 0ull; }
 
 // ---- the admission --------------------------------------------------------------------------------------------------------------------------------------
 enum Verdict : uint32_t { kAdmit = 0u, kWait = 1u };

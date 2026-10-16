@@ -6,8 +6,8 @@
 //   (run from the repo root; the argument is the repo root the source pins read from; tests/native_g4_plant.sh plants breaks in the real code and demands that this suite FAILS on each)
 // Covers:
 //   T1  the switches: navi48-apps latch; the role exists only with BOTH latches;
-//   T2  the open policy over the WHOLE input space (admin x uid x ws-arg x already-open x apps x allow-list): with the switches OFF the verdict is open_decision's, bit for bit; an
-//       administrator and uid 88 are never touched; a system uid (< 501) is never an APP; an ordinary user is an APP only on the list; every reason has its own text;
+//   T2  the open policy over the WHOLE input space (admin x uid x ws-arg x already-open x apps x allow-list): an administrator and uid 88 are never touched (uid 88 keeps the WindowServer
+//       rule alone); 0.0.665 DEFAULT-ALLOW admits EVERY other caller as an APP whatever the switches and the allow-list state, so kReasonAppNotAllowed is unreachable; every reason has its own text;
 //   T3  the selector sets: an APP reaches exactly 0, 1, 3..8 and 21 (never ReadRegs 2, never scanout 9..14, never 15..20, never an unknown number), a subset of WindowServer's set;
 //   T4  the allow-list: add / remove / list, 32 entries, duplicates, a full list, the empty list at boot, the verb's argument space, the name key (16 characters, never 0), a threaded add;
 //   T5  the budget report in QueryInfo: nothing OFF or for WindowServer, 25 % cap and the available bytes for the others, the APP flag, the lo / hi words;
@@ -68,7 +68,8 @@ static void t1_switch() {
            "T1: only navi48-apps=1 latches ON");
     expect(g4::latch_is_on(g4::kLatchOn) && !g4::latch_is_on(g4::kLatchOff) && !g4::latch_is_on(g4::kLatchUnset), "T1: Unset reads as OFF");
     expect(g4::apps_enabled(true, true) && !g4::apps_enabled(true, false) && !g4::apps_enabled(false, true) && !g4::apps_enabled(false, false), "T1: the role needs navi48-apps AND navi48-multisession");
-    expect(g4::action_admitted(true, 104) && !g4::action_admitted(false, 104) && !g4::action_admitted(true, 103) && !g4::action_admitted(true, 105) && !g4::action_admitted(true, 0), "T1: action 104 exists only with the role enabled");
+    expect(g4::action_admitted(true, 104) && !g4::action_admitted(true, 103) && !g4::action_admitted(true, 105) && !g4::action_admitted(true, 0), "T1: the verb is 104 and nothing else");
+    expect(g4::action_admitted(false, 104), "T1 (0.0.665 default-allow): verb 104 is admitted with the role OFF too - the list it maintains is not consulted for admission any more");
     expect(g4::kActAppAllow == 104u && g4::is_g4_action(104) && !g4::is_g4_action(103) && !g4::is_g4_action(105), "T1: the verb is 104");
 }
 
@@ -76,25 +77,26 @@ static void t1_switch() {
 static void t2_open_policy() {
     using namespace policy;
     static const uint32_t uids[] = { 0, 1, 88, 89, 200, 499, 500, 501, 502, 1000, 65534, 0xFFFFFFFFu };
-    uint64_t nOff = 0, nApp = 0, nNotAllowed = 0, nSame = 0;
+    uint64_t nStrictSame = 0, nApp = 0, nOffSwitchesApp = 0, nSame = 0;   // nSame: verdicts app_refine left untouched (admin, uid 88)
     for (int admin = 0; admin <= 1; admin++) for (uint32_t uid : uids) for (int ws = 0; ws <= 1; ws++) for (int open = 0; open <= 1; open++)
     for (int apps = 0; apps <= 1; apps++) for (int allow = 0; allow <= 1; allow++) {
         const OpenDecision base = open_decision(admin != 0, uid, ws != 0, open != 0);
         const OpenDecision d = app_refine(base, uid, apps != 0, allow != 0);
-        if (!apps) { nOff++; expect(d.admit == base.admit && d.reason == base.reason, "T2: with the switches OFF the verdict is open_decision's, bit for bit (every input, either allow-list state)"); }
         if (admin) expect(d.admit && d.reason == kReasonAdmin, "T2: an administrator is admitted as an administrator, whatever the switches");
-        if (!admin && uid == 88) expect(d.admit == base.admit && d.reason == base.reason, "T2: uid 88 is decided by the WindowServer rule alone");
-        if (!admin && uid < kAppMinUid) expect(d.admit == base.admit && d.reason == base.reason && d.reason != kReasonApp, "T2: a system uid (< 501) is never an APP");
-        if (!admin && uid >= kAppMinUid && apps) {
-            if (allow) { nApp++; expect(d.admit && d.reason == kReasonApp, "T2: uid >= 501, switches ON, on the allow-list: admitted as an APP"); }
-            else { nNotAllowed++; expect(!d.admit && d.reason == kReasonAppNotAllowed, "T2: uid >= 501, switches ON, NOT on the allow-list: refused with its own reason"); }
+        if (!admin && uid == 88) { nStrictSame++; expect(d.admit == base.admit && d.reason == base.reason, "T2: uid 88 is decided by the WindowServer rule alone"); }
+        // 0.0.665 (DEFAULT-ALLOW): every OTHER non-administrator caller is admitted as an APP - system uids, ordinary users,
+        // with or without the boot-args, on or off the allow-list. The narrow APP selector set is what keeps it safe.
+        if (!admin && uid != 88) {
+            nApp++;
+            expect(d.admit && d.reason == kReasonApp, "T2 (0.0.665 default-allow): non-admin, non-uid-88: admitted as an APP whatever the switches and the allow-list state");
+            if (!apps) nOffSwitchesApp++;
+            expect(d.reason != kReasonAppNotAllowed, "T2 (0.0.665): the allow-list refusal reason is unreachable - the list is not consulted");
         }
-        if (!admin && uid >= kAppMinUid && !apps) expect(!d.admit && d.reason == kReasonNotPrivileged, "T2: uid >= 501 with the switches OFF: today's NotPrivileged");
         if (d.reason == base.reason && d.admit == base.admit) nSame++;
         expect(d.reason < kReasonCount && open_reason_text(d.reason) != nullptr && std::strcmp(open_reason_text(d.reason), "?") != 0, "T2: every reason has a text");
         expect(d.admit == (d.reason == kReasonAdmin || d.reason == kReasonWindowServer || d.reason == kReasonApp), "T2: admit is true exactly for the three admitting reasons");
     }
-    expect(nOff > 0 && nApp > 0 && nNotAllowed > 0 && nSame > 0, "T2: every branch of the matrix was reached");
+    expect(nStrictSame > 0 && nApp > 0 && nOffSwitchesApp > 0 && nSame > 0, "T2: every branch of the matrix was reached");
     for (uint32_t a = 0; a < kReasonCount; a++) for (uint32_t b = a + 1; b < kReasonCount; b++)
         expect(std::strcmp(open_reason_text((OpenReason)a), open_reason_text((OpenReason)b)) != 0, "T2: reason texts are distinct");
     expect_u("T2: seven reasons", kReasonCount, 7);
@@ -138,12 +140,12 @@ static void t4_allowlist() {
     }
     // the verb's argument space
     expect(args_ok(104, n48a_arg(N48A_OP_ADD, 5)) && args_ok(104, n48a_arg(N48A_OP_REMOVE, 5)) && args_ok(104, n48a_arg(N48A_OP_LIST, 0)) && args_ok(104, n48a_arg(N48A_OP_LIST, 3)), "T4: legal arguments");
-    expect(!args_ok(104, n48a_arg(N48A_OP_LIST, 4)) && !args_ok(104, n48a_arg(N48A_OP_ADD, 0)) && !args_ok(104, n48a_arg(N48A_OP_REMOVE, 0)) && !args_ok(104, 0ull) && !args_ok(103, n48a_arg(N48A_OP_ADD, 5)), "T4: list page 4, a zero key, op 0 and a wrong action are refused");
+    expect(!args_ok(104, n48a_arg(N48A_OP_LIST, 4)) && !args_ok(104, n48a_arg(N48A_OP_ADD, 0)) && !args_ok(104, n48a_arg(N48A_OP_REMOVE, 0)) && !args_ok(104, 0ull) && !args_ok(103, n48a_arg(N48A_OP_ADD, n48native::g2::kStatGlobal + 1u)), "T4: list page 4, a zero key, op 0 and a wrong action are refused");
     for (uint32_t op = 0; op < 16; op++) {
         const bool legal = op >= 1 && op <= 3;
         expect(args_ok(104, ((uint64_t)op << 60) | 1ull) == legal, "T4: only operations 1..3 exist");
     }
-    expect(native_exempt(true, 104, n48a_arg(N48A_OP_ADD, 9)) && !native_exempt(false, 104, n48a_arg(N48A_OP_ADD, 9)) && !native_exempt(true, 104, 0ull), "T4: the verb's exemption needs the role AND a legal argument");
+    expect(native_exempt(true, 104, n48a_arg(N48A_OP_ADD, 9)) && native_exempt(false, 104, n48a_arg(N48A_OP_ADD, 9)) && !native_exempt(true, 104, 0ull), "T4 (0.0.665 default-allow): the verb's exemption needs a legal argument only - the role is no longer consulted");
     // OFF: nothing happens
     expect_u("T4: role disabled: the verb reports OFF", verb_run(false, list, n48a_arg(N48A_OP_ADD, 7), o), kAllowOff);
     expect_u("T4: ... and changed nothing", al_count(list), 0);
@@ -287,17 +289,17 @@ static void t6_close_path() {
         expect_u("T6: OFF: nothing leaked", off.leakedBytes, 0);
     }
     {   // a session page marks an APP with 0x800 and changes nothing else
-        g2::SessView sv {}; sv.state = g2::kSlotOpen; sv.hello = true; sv.ws = false;
+        g2::SessView sv {}; sv.state = g2::kCliOpen; sv.hello = true; sv.ws = false;
         uint64_t so[g2::kOutN];
         g2::sess_out(1, sv, so);
         const uint64_t plain = so[2];
         sv.app = true;
         g2::sess_out(1, sv, so);
         expect_u("T6: sessstat: an APP session page carries flag 0x800", so[2], plain | 0x800ull);
-        expect_u("T6: sessstat: without the APP role the flags are exactly the 0.0.629 value", plain, (uint64_t)g2::kSlotOpen | 0x200ull);
+        expect_u("T6: sessstat: without the APP role the flags are exactly the 0.0.629 value", plain, (uint64_t)g2::kCliOpen | 0x200ull);
     }
     // the global stat page: bits 20..35 of o[2] carry the leak count; zero changes nothing
-    g2::GlobalView gv {}; gv.open = 2; gv.dead = 1; gv.hung = true;
+    g2::GlobalView gv {}; gv.open = 2; gv.quarantined = 1; gv.hung = true;
     uint64_t o[g2::kOutN];
     g2::global_out(gv, o);
     expect_u("T6: sessstat 4: with no leak o[2] is exactly the 0.0.629 value", o[2], 2ull | (1ull << 8) | 0x10000ull);
@@ -328,8 +330,8 @@ static void t8_pins(const std::string &root) {
     const std::string cmd = slurp(root + "/tools/pc/navi48test.c"), pol = slurp(K + "src/amd/native_open_policy_pure.h"), g4p = slurp(K + "src/amd/native_g4_pure.h"), g2p = slurp(K + "src/amd/native_g2_pure.h");
     expect(!eng.empty() && !engh.empty() && !cli.empty() && !clih.empty() && !brg.empty() && !ucl.empty() && !abi.empty() && !plist.empty() && !cmd.empty() && !pol.empty() && !g4p.empty() && !g2p.empty(), "T8: every source is readable");
     // version and ABI
-    expect(count_of(plist, "<string>0.0.664</string>") == 2 && plist.find("0.0.632") == std::string::npos, "T8: Info.plist is 0.0.664, carried twice");
-    expect(engh.find("constexpr uint32_t kN1cKextBuild = 664;") != std::string::npos, "T8: the native client reports build 660");
+    expect(count_of(plist, "<string>0.0.670</string>") == 2 && plist.find("0.0.665") == std::string::npos, "T8: Info.plist is 0.0.670, carried twice (0.0.666 = 8 sessions; 0.0.665 was default-allow)");
+    expect(engh.find("constexpr uint32_t kN1cKextBuild = 670;") != std::string::npos, "T8: the native client reports build 670 (in step with Info.plist)");
     expect(abi.find("#define N48N_ABI_MINOR     12u ") != std::string::npos, "T8: ABI minor 12");
     expect(abi.find("#define N48N_BUDGET_VALID (1u << 0)") != std::string::npos && abi.find("#define N48N_BUDGET_APP   (1u << 1)") != std::string::npos, "T8: the budget flags are in the ABI header");
     // the latch: one reader, latched once, needs multi
@@ -582,67 +584,72 @@ static void t11_visible_pool(const std::string &root) {
 
 // ---- T12 (0.0.641, review MEDIUM): WindowServer always gets a slot -----------------------------------------------------------------------------------------------
 namespace {
-// open_pick as it was in 0.0.640 / 0.0.632 (the reference for "apps absent is byte-identical").
-g2::OpenPick open_pick_old(bool multi, const uint8_t *state, uint32_t openCount, bool ws, bool g1Holds) {
+// open_pick as it was in 0.0.640 / 0.0.632 (the reference for "apps absent is byte-identical"), over the first `n` records (0.0.669: open_pick takes the table
+// size, so this exhaustive matrix keeps its 4-record shape instead of enumerating 3^64 states).
+g2::CliPick open_pick_old(bool multi, const uint8_t *state, uint32_t n, uint32_t openCount, bool ws, bool g1Holds) {
     using namespace g2;
-    if (!multi) return (openCount == 0u && state[0] == kSlotFree) ? OpenPick{ kOk, 0u } : OpenPick{ kExclusive, kNoSlot };
-    if (g1Holds) return OpenPick{ kExclusive, kNoSlot };
-    if (ws && openCount != 0u) return OpenPick{ kExclusive, kNoSlot };
-    for (uint32_t i = 0; i < kMaxSessions; i++) if (state[i] == kSlotFree) return OpenPick{ kOk, i };
-    return OpenPick{ kExclusive, kNoSlot };
+    if (!multi) return (openCount == 0u && n > 0u && state[0] == kCliFree) ? CliPick{ kOk, 0u } : CliPick{ kExclusive, kNoSlot };
+    if (g1Holds) return CliPick{ kExclusive, kNoSlot };
+    if (ws && openCount != 0u) return CliPick{ kExclusive, kNoSlot };
+    for (uint32_t i = 0; i < n; i++) if (state[i] == kCliFree) return CliPick{ kOk, i };
+    return CliPick{ kExclusive, kNoSlot };
 }
 }
 static void t12_slots(const std::string &root) {
     using namespace g2;
+    // 0.0.669: the table is the CLIENT TABLE (kMaxClients records). The exhaustive matrix keeps the 4-record shape it had in 0.0.640 by passing n = 4 (open_pick
+    // takes the table size); the reserve / random-lifetime blocks below run over the REAL table size, which is what the contract is about now.
+    constexpr uint32_t kM = 4u;
     uint64_t nOld = 0, nWs = 0, nApp = 0;
     for (int multi = 0; multi <= 1; multi++) for (uint32_t code = 0; code < 81u; code++) for (int ws = 0; ws <= 1; ws++) for (int g1 = 0; g1 <= 1; g1++) for (int apps = 0; apps <= 1; apps++) for (int wsOpen = 0; wsOpen <= 1; wsOpen++) {
-        uint8_t st[kMaxSessions]; uint32_t c = code, open = 0, fr = 0;
-        for (uint32_t i = 0; i < kMaxSessions; i++) { st[i] = (uint8_t)(c % 3u); c /= 3u; if (st[i] == kSlotOpen) open++; if (st[i] == kSlotFree) fr++; }
-        const OpenPick p = open_pick(multi != 0, st, open, ws != 0, g1 != 0, apps != 0, wsOpen != 0);
+        uint8_t st[kM] = { kCliFree, kCliFree, kCliFree, kCliFree }; uint32_t c = code, open = 0, fr = 0;
+        for (uint32_t i = 0; i < kM; i++) { st[i] = (uint8_t)(c % 3u); c /= 3u; if (st[i] == kCliOpen) open++; if (st[i] == kCliFree) fr++; }
+        const CliPick p = open_pick(multi != 0, st, kM, open, ws != 0, g1 != 0, apps != 0, wsOpen != 0);
         if (!apps) {   // (iii) apps absent: identical to 0.0.640 / 0.0.632, whatever wsOpen says
-            nOld++; const OpenPick q = open_pick_old(multi != 0, st, open, ws != 0, g1 != 0);
-            expect(p.rc == q.rc && p.slot == q.slot, "T12 (iii): apps absent: open_pick is the old function, every input");
-            const OpenPick d = open_pick(multi != 0, st, open, ws != 0, g1 != 0);
-            expect(d.rc == q.rc && d.slot == q.slot, "T12 (iii): the default arguments are the old behaviour");
+            nOld++; const CliPick q = open_pick_old(multi != 0, st, kM, open, ws != 0, g1 != 0);
+            expect(p.rc == q.rc && p.cli == q.cli, "T12 (iii): apps absent: open_pick is the old function, every input");
+            const CliPick d = open_pick(multi != 0, st, kM, open, ws != 0, g1 != 0);
+            expect(d.rc == q.rc && d.cli == q.cli, "T12 (iii): the default arguments are the old behaviour");
             continue;
         }
         if (!multi) continue;
         if (g1) { expect(p.rc != kOk, "T12: a G1 test context still refuses every open"); continue; }
-        const bool wsConsistent = !wsOpen || open != 0u;   // a WindowServer session open implies some slot is open
+        const bool wsConsistent = !wsOpen || open != 0u;   // a WindowServer session open implies some record is open
         if (!wsConsistent) continue;
         if (ws) {
             nWs++;
-            expect((p.rc == kOk) == (!wsOpen && fr >= 1u), "T12 (i): a WindowServer open is admitted exactly when no WindowServer session is open and a slot is free, whatever else is open");
-            if (p.rc == kOk) expect(st[p.slot] == kSlotFree, "T12: ... into a FREE slot");
+            expect((p.rc == kOk) == (!wsOpen && fr >= 1u), "T12 (i): a WindowServer open is admitted exactly when no WindowServer session is open and a record is free, whatever else is open");
+            if (p.rc == kOk) expect(st[p.cli] == kCliFree, "T12: ... into a FREE record");
         } else {
             nApp++;
-            expect((p.rc == kOk) == (fr >= 1u && (wsOpen || fr >= 2u)), "T12 (i): a non-WindowServer open is admitted unless it would take the last free slot while no WindowServer session is open");
-            if (p.rc == kOk) { bool lowest = true; for (uint32_t i = 0; i < p.slot; i++) if (st[i] == kSlotFree) lowest = false; expect(lowest && st[p.slot] == kSlotFree, "T12: the lowest free slot"); }
+            expect((p.rc == kOk) == (fr >= 1u && (wsOpen || fr >= 2u)), "T12 (i): a non-WindowServer open is admitted unless it would take the last free record while no WindowServer session is open");
+            if (p.rc == kOk) { bool lowest = true; for (uint32_t i = 0; i < p.cli; i++) if (st[i] == kCliFree) lowest = false; expect(lowest && st[p.cli] == kCliFree, "T12: the lowest free record"); }
         }
     }
     expect(nOld > 0 && nWs > 0 && nApp > 0, "T12: every branch of the matrix was reached");
     // (i) scenario: WindowServer restarts while three non-WindowServer sessions are open
-    { uint8_t st[kMaxSessions] = { kSlotFree, kSlotOpen, kSlotOpen, kSlotOpen };   // WindowServer (slot 0) just closed; three apps remain
-      const OpenPick p = open_pick(true, st, 3u, true, false, true, false);
-      expect(p.rc == kOk && p.slot == 0u, "T12 (i): WindowServer restarts while 3 non-WindowServer sessions are open: it gets the free slot");
-      const OpenPick o = open_pick(true, st, 3u, true, false, false, false);
+    { uint8_t st[kM] = { kCliFree, kCliOpen, kCliOpen, kCliOpen };   // WindowServer (record 0) just closed; three apps remain
+      const CliPick p = open_pick(true, st, kM, 3u, true, false, true, false);
+      expect(p.rc == kOk && p.cli == 0u, "T12 (i): WindowServer restarts while 3 non-WindowServer sessions are open: it gets the free record");
+      const CliPick o = open_pick(true, st, kM, 3u, true, false, false, false);
       expect(o.rc != kOk, "T12 (iii): ... and with apps absent it is still refused, as in 0.0.640"); }
-    // the reserve keeps one slot free: every sequence of non-WindowServer opens from an empty table stops at 3 sessions while no WindowServer session is open
-    { uint8_t st[kMaxSessions] = { kSlotFree, kSlotFree, kSlotFree, kSlotFree }; uint32_t open = 0, ok = 0;
-      for (int i = 0; i < 8; i++) { const OpenPick p = open_pick(true, st, open, false, false, true, false); if (p.rc == kOk) { st[p.slot] = kSlotOpen; open++; ok++; } }
-      expect_u("T12 (i): with no WindowServer session, non-WindowServer opens stop at three: the reserve keeps one slot free", ok, 3);
-      const OpenPick w = open_pick(true, st, open, true, false, true, false);
-      expect(w.rc == kOk && w.slot == 3u, "T12 (i): ... and WindowServer then gets that slot"); }
-    // random lifetimes: the reserve holds under any open/close order (no DEAD slots)
-    { uint32_t seed = 12345u; uint8_t st[kMaxSessions] = { 0, 0, 0, 0 }; bool wsOpen = false; int wsSlot = -1; uint32_t open = 0; uint64_t wsRefusedWithFree = 0, wsTry = 0;
+    // the reserve keeps one record free: every sequence of non-WindowServer opens from an empty table stops at kMaxClients-1 sessions while no WindowServer session is open
+    { uint8_t st[kMaxClients]; for (uint32_t i = 0; i < kMaxClients; i++) st[i] = kCliFree; uint32_t open = 0, ok = 0;
+      for (uint32_t i = 0; i < kMaxClients; i++) { const CliPick p = open_pick(true, st, kMaxClients, open, false, false, true, false); if (p.rc == kOk) { st[p.cli] = kCliOpen; open++; ok++; } }
+      expect_u("T12 (i): with no WindowServer session, non-WindowServer opens stop at kMaxClients-1: the reserve keeps one record free", ok, kMaxClients - 1u);
+      const CliPick w = open_pick(true, st, kMaxClients, open, true, false, true, false);
+      expect(w.rc == kOk && w.cli == kMaxClients - 1u, "T12 (i): ... and WindowServer then gets that record"); }
+    // random lifetimes: the reserve holds under any open/close order (and a record is never permanently lost: there is no DEAD state any more)
+    { uint32_t seed = 12345u; uint8_t st[kMaxClients]; for (uint32_t i = 0; i < kMaxClients; i++) st[i] = kCliFree;
+      bool wsOpen = false; int wsCli = -1; uint32_t open = 0; uint64_t wsRefusedWithFree = 0, wsTry = 0;
       for (int step = 0; step < 20000; step++) {
           seed = seed * 1103515245u + 12345u; const uint32_t r = (seed >> 16) & 7u;
-          if (r < 3u) { const OpenPick p = open_pick(true, st, open, false, false, true, wsOpen); if (p.rc == kOk) { st[p.slot] = kSlotOpen; open++; } }
-          else if (r < 5u) { wsTry++; const OpenPick p = open_pick(true, st, open, true, false, true, wsOpen); if (p.rc == kOk) { st[p.slot] = kSlotOpen; open++; wsOpen = true; wsSlot = (int)p.slot; } else if (!wsOpen && free_slots(st) > 0u) wsRefusedWithFree++; }
-          else { uint32_t k = (seed >> 8) % kMaxSessions; if (st[k] == kSlotOpen) { st[k] = kSlotFree; open--; if (wsOpen && (int)k == wsSlot) { wsOpen = false; wsSlot = -1; } } }
-          if (!wsOpen) expect(free_slots(st) >= 1u, "T12: with no WindowServer session open, a slot is always free for it");
+          if (r < 3u) { const CliPick p = open_pick(true, st, kMaxClients, open, false, false, true, wsOpen); if (p.rc == kOk) { st[p.cli] = kCliOpen; open++; } }
+          else if (r < 5u) { wsTry++; const CliPick p = open_pick(true, st, kMaxClients, open, true, false, true, wsOpen); if (p.rc == kOk) { st[p.cli] = kCliOpen; open++; wsOpen = true; wsCli = (int)p.cli; } else if (!wsOpen && free_slots(st, kMaxClients) > 0u) wsRefusedWithFree++; }
+          else { uint32_t k = (seed >> 8) % kMaxClients; if (st[k] == kCliOpen) { st[k] = kCliFree; open--; if (wsOpen && (int)k == wsCli) { wsOpen = false; wsCli = -1; } } }
+          if (!wsOpen) expect(free_slots(st, kMaxClients) >= 1u, "T12: with no WindowServer session open, a record is always free for it");
       }
-      expect(wsTry > 0 && wsRefusedWithFree == 0, "T12: WindowServer is never refused while it has no session and a slot is free"); }
+      expect(wsTry > 0 && wsRefusedWithFree == 0, "T12: WindowServer is never refused while it has no session and a record is free"); }
     // (ii) the WindowServer identity rule is unchanged: uid 88 behind navi48-metal-ws, nobody else
     { using namespace policy;
       for (uint32_t uid : { 0u, 87u, 88u, 89u, 501u }) for (int ws = 0; ws <= 1; ws++) for (int al = 0; al <= 1; al++) {
@@ -658,11 +665,11 @@ static void t12_slots(const std::string &root) {
     const std::string K = root + "/src/navi48-bringup/";
     const std::string eng = slurp(K + "src/amd/native_s1c.cpp"), cli = slurp(K + "src/Navi48NativeClient.cpp"), g2p = slurp(K + "src/amd/native_g2_pure.h");
     expect(in_order(fn_body(eng, "IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {"), { "const bool appsNow = apps_on(), wsOpen = __atomic_load_n(&gSessWs, __ATOMIC_SEQ_CST) != 0u;",
-                          "const OpenPick pk = open_pick(multi, gSlotState, openNow, ws, g1_holds(), appsNow, wsOpen);", "if (pk.rc != kOk) {", "if (ws) __atomic_store_n(&gSessWs, 1u, __ATOMIC_SEQ_CST);" }),
-           "T12: REACHABLE: n1c_open hands open_pick the live apps flag and the live WindowServer flag (gSessWs, written with the open itself) under gCliLock");
+                          "const CliPick pk = open_pick(multi, gCliState, kMaxClients, openNow, ws, g1_holds(), appsNow, wsOpen);", "if (pk.rc != kOk) {", "if (ws) __atomic_store_n(&gSessWs, 1u, __ATOMIC_SEQ_CST);" }),
+           "T12: REACHABLE: n1c_open hands open_pick the live apps flag and the live WindowServer flag (gSessWs, written with the open itself) under gCliLock (0.0.670: the CLIENT TABLE and its size)");
     expect(in_order(fn_body(cli, "bool IOAccelNavi48NativeClient::initWithTask("), { "const bool appsOn = amdgpu::n1c_apps_enabled();", "n48native::g2::ws_already_open(appsOn, amdgpu::n1c_is_open(), amdgpu::n1c_ws_is_open())", "uid, appsOn, onAllow);" }),
            "T12: REACHABLE: the open policy's alreadyOpen input is ws_already_open(apps, any open, WindowServer open)");
-    expect(g2p.find("inline OpenPick open_pick(bool multi, const uint8_t *state, uint32_t openCount, bool ws, bool g1Holds, bool apps = false, bool wsOpen = false) {") != std::string::npos, "T12: open_pick keeps its old five arguments first, the new ones default to OFF");
+    expect(g2p.find("inline CliPick open_pick(bool multi, const uint8_t *state, uint32_t n, uint32_t openCount, bool ws, bool g1Holds, bool apps = false, bool wsOpen = false) {") != std::string::npos, "T12: open_pick keeps its old arguments in order ahead of apps / wsOpen (0.0.670 adds the table size `n` after `state`), the last two default to OFF");
 }
 
 // ---- T13 (0.0.641, review MEDIUM): the strike count --------------------------------------------------------------------------------------------------------------
@@ -682,15 +689,16 @@ static void t13_strikes(const std::string &root) {
     expect(strike_add(f, 0u) == kStrikeLimit && strike_count(f, 0u) == 0u, "T13: key 0 is never a name");
     { StrikeTab m {}; std::vector<std::thread> th; for (int i = 0; i < 4; i++) th.emplace_back([&] { for (int j = 0; j < 100; j++) (void)strike_add(m, a); }); for (auto &x : th) x.join();
       expect_u("T13: concurrent strikes for one name are all counted, in one slot", strike_count(m, a), 400); uint32_t used = 0; for (uint32_t i = 0; i < kStrikeSlots; i++) if (m.key[i]) used++; expect_u("T13: ... in exactly one slot", used, 1); }
-    // reachability through the real open decision: listed name, three recoveries blamed on it, then its open is refused with kReasonAppNotAllowed
+    // reachability through the real open decision: three recoveries blamed on a name no longer refuse its open (0.0.665: the list is not
+    // consulted for admission); the strike record stays truthful and kReasonAppNotAllowed is unreachable
     { using namespace policy; StrikeTab s {}; const OpenDecision base = open_decision(false, 501, false, false);
       auto decide = [&]() { return app_refine(base, 501, true, app_admit(true, strike_count(s, a))); };
       expect(decide().admit && decide().reason == kReasonApp, "T13: before any strike a listed name opens as an APP");
       (void)strike_add(s, a); (void)strike_add(s, a); expect(decide().admit, "T13: ... after 2 strikes still");
-      (void)strike_add(s, a); expect(!decide().admit && decide().reason == kReasonAppNotAllowed, "T13: ... after 3: refused with kReasonAppNotAllowed");
+      (void)strike_add(s, a); expect(decide().admit && decide().reason == kReasonApp, "T13 (0.0.665): ... after 3 strikes STILL admitted - strikes are a record now, not an admission gate");
       expect(g2::kMaxAutoRecoveries == kStrikeLimit, "T13: three strikes is the whole per-boot recovery budget"); }
     // the verb: strikes op
-    expect(args_ok(104, n48a_arg(N48A_OP_STRIKES, 0)) && !args_ok(104, n48a_arg(N48A_OP_STRIKES, 1)) && native_exempt(true, 104, n48a_arg(N48A_OP_STRIKES, 0)) && !native_exempt(false, 104, n48a_arg(N48A_OP_STRIKES, 0)), "T13: appallow strikes is a verb argument (payload 0), only with the role on");
+    expect(args_ok(104, n48a_arg(N48A_OP_STRIKES, 0)) && !args_ok(104, n48a_arg(N48A_OP_STRIKES, 1)) && native_exempt(true, 104, n48a_arg(N48A_OP_STRIKES, 0)) && native_exempt(false, 104, n48a_arg(N48A_OP_STRIKES, 0)), "T13 (0.0.665): appallow strikes is a verb argument (payload 0) with the role on or off");
     { uint64_t l[kMaxEntries] = { 0 }, o[kOutN]; StrikeTab s {}; (void)strike_add(s, a); (void)strike_add(s, a); (void)strike_add(s, b);
       expect(verb_run(true, l, n48a_arg(N48A_OP_STRIKES, 0), o, &s) == kAllowOk, "T13: strikes: ok");
       expect(o[2] == N48A_OP_STRIKES && o[4] == a && o[5] == 2 && o[6] == b && o[7] == 1 && o[8] == 0 && o[9] == 0 && o[12] == kStrikeLimit && o[3] == kMaxEntries, "T13: strikes: o[4 + 2i] / o[5 + 2i] = key / count of table slot i, o[12] = the limit");

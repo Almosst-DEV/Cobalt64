@@ -953,8 +953,8 @@ int main(int argc, char **argv) {
         expect(cli.find(t) != std::string::npos, (std::string("the CLI carries ") + t).c_str());
     expect(cli.find("static int cmd_dmubctx(const char *a1, const char *a2, const char *a3) {") != std::string::npos && cli.find("strcmp(a2, \"status\") != 0") != std::string::npos, "dmubctx takes `<ctx> status <value>`");
     // 6. the version, the project rules
-    expect(count_of(plist, "0.0.664") == 2 && plist.find("0.0.625") == std::string::npos, "Info.plist is 0.0.664, carried twice");
-    expect(s1c.find("kN1cKextBuild = 664;") != std::string::npos, "the native client reports build 660");
+    expect(count_of(plist, "0.0.670") == 2 && plist.find("0.0.625") == std::string::npos, "Info.plist is 0.0.670, carried twice");
+    expect(s1c.find("kN1cKextBuild = 670;") != std::string::npos, "the native client reports build 670");
     expect(drh.find("N48DR_STATUS_COUNT = 39") != std::string::npos, "the status enum ends at 39 (0.0.652: N48DR_HELD_REFUSED = 38)");
     expect(mk.find("$(wildcard src/dcn/*.cpp)") != std::string::npos, "the Makefile builds src/dcn/*.cpp");
     const std::vector<std::string> bannedStrings = { std::string("pipe") + "+0x" + "280", std::string("+0x") + "282", std::string("+0x") + "299" };   // spelled in pieces so this file itself never carries them

@@ -169,16 +169,10 @@ plant 72 $H $E "a failed import leaks the descriptor" '        md->complete(); m
 plant 73 $H $E "the import has a big local page array" '    uint64_t *pages = static_cast<uint64_t *>(IOMalloc((vm_size_t)(pre.pages * sizeof(uint64_t))));' '    uint64_t pagesLocal[16384]; uint64_t *pages = pagesLocal; (void)IOMalloc;'
 plant 74 $H $E "the import writes a register" '        const ImportChk c = import_check(hostVa, size, flags, gpuVa, s->importedBytes);' '        WREG32(*gCtx->dev, 0, 0);
         const ImportChk c = import_check(hostVa, size, flags, gpuVa, s->importedBytes);'
-plant 75 $H $E "close releases before the park" '    if (!leak) {
-        // No client owns this tree from here: park the context on the kernel'"'"'s zeroed page, then free everything.
-        if (program_root(s->vmid, gPark.pa) != kOk) leak = true; else parked = true;
-    }
-    if (!leak) {
-        for (uint32_t h = 1; h < N48N_MAX_BOS; h++) if (s->boUsed[h]) bo_release(s, h, kRelClosing);' '    if (!leak) {
-        for (uint32_t h = 1; h < N48N_MAX_BOS; h++) if (s->boUsed[h]) bo_release(s, h, kRelClosing);
-        if (program_root(s->vmid, gPark.pa) != kOk) leak = true; else parked = true;
-    }
-    if (!leak) {'
+plant 75 $H $E "close releases before the park" '        if (s->vmid == 0u) parked = true;
+        else if (vmid_release_locked(s) == kOk) parked = true;
+        else leak = true;   // the park did not acknowledge (a hang was latched): the tree may still be read, so the record is quarantined below
+    }' '    }' "close frees the memory without parking the client'"'"'s context (and without releasing its pool handle)"
 # ---- review round on 0.0.612: A device pages, B owning task, C session change, D flush failure, E selector reach ----
 BR=$SR/Navi48Bringup.cpp
 HK=$SR/apple/AppleHardwareHook.cpp
@@ -217,7 +211,7 @@ plant 113 $H $HP "C: any non-zero entry sequence counts as unchanged" 'return se
 plant 114 $H $E "C: the check runs after the record (too late)" '        if (!session_unchanged(seq0, s->id)) { rc = kIOReturnNotReady; break; }   // review item C: a different (or no) session now: these pages are the old client'"'"'s
 ' '' '        out[0] = h; out[1] = size; out[2] = mapped ? va_canonicalize(c.gpuStripped) : 0ull; out[3] = N48N_PLACED_HOST_IMPORT;' '        if (!session_unchanged(seq0, s->id)) { rc = kIOReturnNotReady; break; }
         out[0] = h; out[1] = size; out[2] = mapped ? va_canonicalize(c.gpuStripped) : 0ull; out[3] = N48N_PLACED_HOST_IMPORT;'
-plant 120 $H $E "D: a failed session-VMID TLB flush still frees / releases the memory" 'memOk = memory_may_free_after_flush(flush_vmid(s->vmid)) && memOk;' '(void)flush_vmid(s->vmid);'
+plant 120 $H $E "D: a failed pool-handle TLB flush still frees / releases the memory" 'memOk = (ownVm == 0u) || memory_may_free_after_flush(flush_vmid(ownVm));' '(void)flush_vmid(ownVm);'
 plant 121 $H $E "D: a failed flush still completes and releases the host pages" '&& memOk) { host_release(b);' ') { host_release(b);'
 plant 122 $H $E "D: a failed flush still frees the GTT pages" 'if (b.kind == kBoGtt) { if (memOk) { sysmem_free(b.sm); sys_release(b); } }' 'if (b.kind == kBoGtt) { sysmem_free(b.sm); sys_release(b); }'
 plant 123 $H $HP "D: the pure verdict always frees" 'constexpr bool memory_may_free_after_flush(uint32_t flushRc) { return flushRc == 0u; }' 'constexpr bool memory_may_free_after_flush(uint32_t flushRc) { (void)flushRc; return true; }'

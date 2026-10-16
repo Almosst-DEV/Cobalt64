@@ -109,9 +109,9 @@ plant(60, PURE, 'ddcread is exempt for any argument', '(action == kActDdcRead &&
 plant(61, UCL, 'the user client bound ignores the latch for the new verbs', 'if (action > 82 && !n48disp::action_admitted(n48disp_latched_on(), action)) return kIOReturnBadArgument;', 'if (action > 94) return kIOReturnBadArgument;')
 plant(62, CLI, 'the CLI does not know ddcread', '    else if (what && !strcmp(what, "ddcread")) in = 91;\n', '')
 plant(63, CLI, 'the CLI skips its own checksum', 'const uint32_t sum = n48dr_edid_sum(edid);', 'const uint32_t sum = 0;')
-plant(64, PLIST, 'the version is not bumped', '<key>CFBundleVersion</key>\n\t<string>0.0.664</string>', '<key>CFBundleVersion</key>\n\t<string>0.0.622</string>')
-plant(65, S1C, 'the native client build number is stale', 'kN1cKextBuild = 664;', 'kN1cKextBuild = 622;')
-plant(66, NUB, 'an ops table keeps the old build', 'const N48MetalOps gOpsOff = {\n\tN48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 664u,', 'const N48MetalOps gOpsOff = {\n\tN48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 622u,')
+plant(64, PLIST, 'the version is not bumped', '<key>CFBundleVersion</key>\n\t<string>0.0.670</string>', '<key>CFBundleVersion</key>\n\t<string>0.0.622</string>')
+plant(65, S1C, 'the native client build number is stale', 'kN1cKextBuild = 670;', 'kN1cKextBuild = 622;')
+plant(66, NUB, 'an ops table keeps the old build', 'const N48MetalOps gOpsOff = {\n\tN48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 666u,', 'const N48MetalOps gOpsOff = {\n\tN48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 622u,')
 
 # ---- region4read (0.0.624, stage M1.5): the range rule and the base (navi48_dispread.h), the flow, the glue, the dispatch, the exemption, the CLI -----------------------------------------------------------
 plant(70, H, 'the window end is exclusive of its last dword (off by one, refuses the exact fit)', 'dwords * 4u <= (uint64_t)N48DR_R4_WINDOW - off;', 'dwords * 4u < (uint64_t)N48DR_R4_WINDOW - off;')

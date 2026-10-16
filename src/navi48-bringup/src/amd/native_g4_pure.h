@@ -123,12 +123,18 @@ inline uint32_t strike_add(StrikeTab &t, uint64_t key) {
 }
 constexpr bool strike_refused(uint32_t count) { return count >= kStrikeLimit; }
 // A name is admitted as an APP only when it is on the allow-list AND not struck out.
+// 0.0.665 (DEFAULT-ALLOW): app_admit is no longer consulted for admission (app_refine in native_open_policy_pure.h admits every
+// non-root caller), so a struck-out or unlisted name still gets in. The strike accounting is kept: it is what the
+// `appallow strikes` query reports, and it stays a truthful record of auto-recovered errors blamed on a name this boot.
 constexpr bool app_admit(bool onAllowList, uint32_t strikes) { return onAllowList && !strike_refused(strikes); }
 
 // ---- the verb ---------------------------------------------------------------------------------------------------------------------------------------------
 constexpr uint32_t kActAppAllow = 104u;
 constexpr bool is_g4_action(uint32_t a) { return a == kActAppAllow; }
-constexpr bool action_admitted(bool appsEnabled, uint32_t a) { return appsEnabled && is_g4_action(a); }
+// 0.0.665 (DEFAULT-ALLOW): verb 104 stays available whatever the boot-args are. Before this it answered
+// kIOReturnBadArgument with the application role off (appsEnabled false), which the default-allow admission removes. It still validates its
+// argument and still reports Ok / Exists / NotFound; what it maintains is simply not consulted for admission any more.
+constexpr bool action_admitted(bool appsEnabled, uint32_t a) { (void)appsEnabled; return is_g4_action(a); }
 constexpr uint32_t arg_op(uint64_t arg) { return (uint32_t)(arg >> N48A_OP_SHIFT); }
 constexpr uint64_t arg_payload(uint64_t arg) { return arg & N48A_KEY_MASK; }
 constexpr bool args_ok(uint32_t a, uint64_t arg) {

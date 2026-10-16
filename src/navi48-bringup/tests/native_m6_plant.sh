@@ -169,7 +169,7 @@ plant(583, DPG, 'the AGDC list is built without the latch', '        if (ok && n
 plant(584, DNUB, 'the nub finds a framebuffer of any class', 'strcmp(cn, "Navi48Framebuffer") == 0 && svc->metaCast("IOFramebuffer")', 'svc->metaCast("IOFramebuffer")')
 plant(585, CLI, 'the CLI sends the wrong action for m6stat', 'else if (what && !strcmp(what, "m6stat")) in = 106;', 'else if (what && !strcmp(what, "m6stat")) in = 85;')
 plant(586, CLI, 'the CLI asks page 0 for every page', 'dr_call(106, page, o)', 'dr_call(106, 0, o)')
-plant(587, S1C, 'the native client still reports build 658', 'kN1cKextBuild = 664;', 'kN1cKextBuild = 658;')
+plant(587, S1C, 'the native client still reports build 658', 'kN1cKextBuild = 670;', 'kN1cKextBuild = 658;')
 plant(588, VARM6, 'the variant lacks navi48-m6=1', 'navi48-fb2=1 navi48-m6=1</string>', 'navi48-fb2=1</string>')
 plant(589, VARM6, 'the variant lacks navi48-fb2=1', 'navi48-disp2=1 navi48-fb2=1 navi48-m6=1</string>', 'navi48-disp2=1 navi48-m6=1</string>')
 plant(590, VARM6, 'the variant drops navi48-metal-ws', 'navi48-metal-ws=1 ', '')

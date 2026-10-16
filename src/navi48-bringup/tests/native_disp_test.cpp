@@ -1235,7 +1235,7 @@ int main(int argc, char **argv) {
         expect(nub.find("op_disp_hook") != std::string::npos && nub.find("op_pci_device") != std::string::npos, "the ABI-2 members are wired");
         expect(nub.find("*(const N48MetalOps **)param1 = n48disp::ops_shape(n48disp_latched_on()).dispFlags != 0u ? &gOps : &gOpsOff;") != std::string::npos, "callPlatformFunction hands out the display-OFF table (display members zero) unless the latch is ON (the table the aux kext sees decides display off)");
         expect(nub.find("OSNumber *abi = OSNumber::withNumber((uint64_t)shape.abi, 32);") != std::string::npos && nub.find("out[2] = shape.abi; out[3] = (uint64_t)shape.size;") != std::string::npos, "the published ABI / size properties follow the latch-chosen shape");
-        expect(nub.find("664u") != std::string::npos && nub.find("658u") == std::string::npos && nub.find("613u") == std::string::npos, "the ops table carries the build 664");
+        expect(nub.find("666u") != std::string::npos && nub.find("658u") == std::string::npos && nub.find("613u") == std::string::npos, "the ops table carries the build 666");
         expect(nub.find("n48disp_pci_device(ctx)") != std::string::npos, "P1: op_pci_device is the gated hook");
         expect(nub.find("n48disp::fact_mask(") != std::string::npos, "the factory mask goes through n48disp::fact_mask (OFF: the boot-arg's mask unchanged)");
         expect(nub.find("n48disp_res62(") != std::string::npos, "slot 62 is handled by the display glue");
@@ -1312,8 +1312,8 @@ int main(int argc, char **argv) {
     if (!brg.empty()) expect(brg.find("pci->setProperty(\"VRAM,totalMB\", static_cast<uint64_t>(vramMB), 32);") != std::string::npos && brg.find("pci->setProperty(\"VRAM,totalsize\", d);") != std::string::npos && brg.find("setProperty(\"VRAM,TotalMB\", static_cast<uint64_t>(vramMB), 32);") != std::string::npos &&
                               count_of(brg, "publishNativeVramOn(") == 2 && brg.find("if (amdgpu::native_s1b_latched()) publishNativeVramOn(pciDevice, vramMB);") != std::string::npos && brg.find("const uint64_t bytes = static_cast<uint64_t>(vramMB) << 20;") != std::string::npos,
                               "K5: native boots only (inside the native latch) the IOPCIDevice also gets VRAM,totalMB (32-bit) and VRAM,totalsize (8-byte OSData, bytes); the old VRAM,TotalMB stays");
-    expect(count_of(plist, "0.0.664") == 2 && plist.find("0.0.612") == std::string::npos, "Info.plist is 0.0.664, carried twice");
-    expect(s1ch.find("kN1cKextBuild = 664;") != std::string::npos, "the native client reports build 660");
+    expect(count_of(plist, "0.0.670") == 2 && plist.find("0.0.612") == std::string::npos, "Info.plist is 0.0.670, carried twice");
+    expect(s1ch.find("kN1cKextBuild = 670;") != std::string::npos, "the native client reports build 670");
     expect(ops.find("#define N48_METAL_ABI         3u") != std::string::npos && ops.find("N48_VC_DISPLAYPIPE    7u") != std::string::npos, "the ops header is ABI 3 (since 0.0.656) with the display class");
     expect(pure.find("kNeedFacts") != std::string::npos && flow.find("e.facts_add(kNeedFacts)") != std::string::npos, "adopt adds the needed facts");
     expect(count_of(flow, "e.md_prepare(") == 1 && count_of(flow, "mdc_teardown(e);") == 5 && flow.find("if (inst == n48m6::kInstDp) (void)submit_prepare(e, args[0]);") != std::string::npos && count_of(flow, "mdc_acquire(e.mdc(), md)") == 1, "0.0.616: ONE prepare in the whole flow (mdc_ensure, from submit), teardown after every disarm path, submit prepares, perform acquires");
@@ -1433,7 +1433,7 @@ int main(int argc, char **argv) {
                "M: ONE creation site (the verb), no selector, NO withdraw in M5");
         expect(dnub.find("nub->attach(pci)") != std::string::npos && dnub.find("IOService *pci = navi48_bringup_pci();") != std::string::npos && dnub.find("setProperty(N48_DISP_INDEX_KEY, idx)") != std::string::npos && dnub.find("OSNumber::withNumber((uint64_t)index, 32)") != std::string::npos,
                "M: the nub attaches to the GPU's IOPCIDevice (NOT to Navi48Bringup) with Navi48DisplayIndex = the instance's index (0.0.658: 1 = the monitor B, 2 = the monitor A)");
-        expect(dnub.find("N48_METAL_OPS_MAGIC") == std::string::npos && dnub.find("N48_DISP_OPS_MAGIC, N48_DISP_ABI, (uint32_t)sizeof(N48DispOps), 664u, 0u, 0u,\n\top_snapshot, op_power, op_trace,\n\tnullptr, nullptr, nullptr,\n};") != std::string::npos, "M: the ops table: magic, ABI 1, its size, build 660, the three hooks, the M6 members NULL");
+        expect(dnub.find("N48_METAL_OPS_MAGIC") == std::string::npos && dnub.find("N48_DISP_OPS_MAGIC, N48_DISP_ABI, (uint32_t)sizeof(N48DispOps), 666u, 0u, 0u,\n\top_snapshot, op_power, op_trace,\n\tnullptr, nullptr, nullptr,\n};") != std::string::npos, "M: the ops table: magic, ABI 1, its size, build 666, the three hooks, the M6 members NULL");
         expect(dnub.find("functionName->isEqualTo(N48_DISP_FN_SYMBOL)") != std::string::npos && dnub.find("*(const N48DispOps **)param1 = &gDispOps;") != std::string::npos, "M: callPlatformFunction(\"n48.disp.ops\") answers the table");
         expect(dnub.find("n48fb::snapshot_hook_verdict(slot >= 0, slot >= 0 && __atomic_load_n(&gHaveSnap[slot], __ATOMIC_ACQUIRE) != 0u, out != nullptr) == 0") != std::string::npos && dnub.find("*out = gSnap[slot];") != std::string::npos && dnub.find("if (nub != nullptr && nub == (void *)gNub[i]) slot = (int)i;") != std::string::npos, "M: the snapshot hook answers only for A nub of ours, with ITS OWN index's snapshot, once published");
         { const std::string mnub = slurp(K + "src/Navi48MetalNub.cpp"), dh2 = slurp(K + "src/amd/native_disp.h");

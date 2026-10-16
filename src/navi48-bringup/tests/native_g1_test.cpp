@@ -479,8 +479,8 @@ static void g9_pins(const std::string &root) {
     // 0.0.626: the register-write claim of 0.0.623 was wrong and is corrected where it was made
     expect(eng.find("No MMIO register write.") == std::string::npos && eng.find("\"No MMIO register write\", which was wrong") != std::string::npos, "the false 'No MMIO register write' comment is corrected");
     // the version
-    expect(count_of(plist, "<string>0.0.664</string>") == 2 && plist.find("0.0.625") == std::string::npos, "Info.plist is 0.0.664, carried twice");
-    expect(hdr.find("constexpr uint32_t kN1cKextBuild = 664;") != std::string::npos, "the native client reports build 660");
+    expect(count_of(plist, "<string>0.0.670</string>") == 2 && plist.find("0.0.625") == std::string::npos, "Info.plist is 0.0.670, carried twice");
+    expect(hdr.find("constexpr uint32_t kN1cKextBuild = 670;") != std::string::npos, "the native client reports build 670");
 }
 
 int main(int argc, char **argv) {

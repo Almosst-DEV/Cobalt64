@@ -322,8 +322,8 @@ static void p5_pins(const std::string &root) {
     expect(has(nbif, "writing BASE_LOW %#010x") && has(nbif, "writing BASE_HIGH %#010x") && at(nbif, "writing BASE_HIGH") < at(nbif, "kRegSelfringBaseHigh, aHigh, beforeHigh, high"), "P5 item 7: the self-ring low and high halves are logged before they are written");
     // version
     const std::string plist = slurp(root + "/src/navi48-bringup/Info.plist");
-    expect(count_of(plist, "<string>0.0.664</string>") == 2, "P5: Info.plist is 0.0.664, carried twice");
-    expect(has(s1ch, "constexpr uint32_t kN1cKextBuild = 664;"), "P5: the native client reports build 664");
+    expect(count_of(plist, "<string>0.0.670</string>") == 2, "P5: Info.plist is 0.0.670, carried twice");
+    expect(has(s1ch, "constexpr uint32_t kN1cKextBuild = 670;"), "P5: the native client reports build 670");
 }
 
 static void p6_vramstat(const std::string &root) {

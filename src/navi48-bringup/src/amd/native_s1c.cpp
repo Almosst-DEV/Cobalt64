@@ -15,8 +15,24 @@
 //  kernel GFX ring dwords outside the live range (NOPs) and, after an ACKED MES unmap, the whole ring (NOPs), the CP write-back rptr / wptr words and the MQD memory
 //  (cp_gfx_mqd_init); they send MES RESET / REMOVE_QUEUE / ADD_QUEUE frames for GFX pipe 0 queue 0 (the doorbell writes are mes_submit_pkt's and ring_emit's own); and they clear the HUNG latch after a verified probe. REGISTER WRITES (0.0.626 correction of the 0.0.623 text "No MMIO register write", which was wrong): none of their own, but the paths they call write registers, all in the graphics block, the VM/TLB block or HDP: the doorbells (MES and ring), GRBM_GFX_CNTL twice (cp_map_gfx_kgq_mes -> cp_dump_gfx_hqd), the VMID-8 TLB-invalidate registers (setup_bo -> flush_vmid), the CONTEXT8 registers (program_root at open and close) and the HDP flush (amdgpu_hdp_flush). Nothing in DCN, PSP or SMU.
 //
-//  0.0.627 (GPU-apps G2, boot-arg navi48-multisession=1, default OFF): up to four sessions, slot i on VMID 8 + i, each with its own tree, BO / map tables, fence window, caps,
-//  lock and last seqno; one shared in-order ring. With the switch ON this file ALSO writes: the CONTEXT9..11 registers (CNTL once to the S1b geometry with cntl_native,
+//  0.0.669 (POOLED VMID HANDLES: a handle on a live address space, assigned on demand and released on close or preemption - the model of the Apple
+//  driver's AMDRadeonX6000_AMDHWVMM). A client WAS a VMID: slot i ran on VMID 8 + i, so the number of clients was capped by the hardware's 8 native
+//  VMIDs, and a slot whose close could not prove its VMID idle had to be DEAD for the whole boot (its VMID was never handed out again). Both couplings are gone:
+//    * the CLIENT TABLE is kMaxClients (64) records, kernel memory, allocated on first use and RECYCLED through a free list. Each client owns its page-table
+//      root / address space (its VM context) from open to close, and that is all it needs to exist.
+//    * the VMID is a POOL of kVmidPoolSize (8) HANDLES (VMIDs 8..15, the hardware's native contexts). A handle is assigned when a client's work has to run in
+//      the GPU (a free one, else STOLEN from a client whose own work is provably retired - the SAME test 0.0.627 used to decide DEAD), released when that
+//      client closes or is preempted, and re-assigned to the same client later (its tree is untouched, so it is one CONTEXT<n> write plus one TLB flush).
+//      "8" is therefore the number of ADDRESS SPACES LIVE IN THE GPU AT ONCE, not the number of clients.
+//    * a close that cannot prove its work retired QUARANTINES the record and its handle (the GPU may still read that tree) instead of losing them: the RECLAIM
+//      pass (cli_reclaim_locked, run by open and by the residency path) gives both back the moment own_idle proves the work retired. Available resources are
+//      therefore never monotonically consumed: an unproven close no longer costs one of the 8 handles for good.
+//  What this file writes for it is the same set of registers as 0.0.627, at different times: CONTEXT<8..15> CNTL once per pool HANDLE (once per boot, not per
+//  client), then BASE / START / END when a handle is ASSIGNED (at open when one can be had, at Submit otherwise) and the park when it is RELEASED; and the TLB
+//  invalidate of whichever VMID the operation belongs to. Nothing in DCN, PSP or SMU.
+//
+//  0.0.627 (GPU-apps G2, boot-arg navi48-multisession=1, default OFF): several sessions with their own tree, BO / map tables, fence window, caps,
+//  lock and last seqno; one shared in-order ring; VMIDs 8, 9, 10 ... handed out per session (0.0.669: per pool handle, see above). With the switch ON this file ALSO writes: the CONTEXT9..11 registers (CNTL once to the S1b geometry with cntl_native,
 //  then BASE / START / END at open and the park at close, exactly as CONTEXT8), those VMIDs' TLB invalidates, their slots' fence-window GART PTEs, and - on a stall whose
 //  oldest unretired submission belongs to a non-WindowServer session - the G1 recovery on its own initiative: ring dwords outside the live range (NOPs), one MES RESET
 //  (reset_legacy_gfx) frame and one kernel probe RELEASE_MEM on the ring. Nothing in DCN, PSP or SMU. With the switch OFF the behaviour is 0.0.626's (one session, VMID 8).
@@ -99,9 +115,18 @@ struct Bo {
     uint32_t  hpageCount;
 };
 using n48native::g2::kMaxSessions;
+using n48native::g2::kMaxClients;      // 0.0.669: the client table (kernel memory, recycled); kMaxSessions is the VMID POOL size (8, the live address spaces)
+using n48native::g2::kVmidPoolSize;
+using n48native::g2::kNoClient;        // the pool entry is free
+using n48native::g2::vmid_of_handle;   // pool handle -> VMID
+using n48native::g2::kCliFree; using n48native::g2::kCliOpen; using n48native::g2::kCliQuarantined;
 constexpr uint32_t kArenaBlocks = (uint32_t)(kPtCap / 16384ull);   // 2048 blocks of 16 KiB (the pool's minimum allocation): one session's page-table cap
 constexpr uint32_t kArenaBlockBytes = 16384u;
-constexpr uint32_t kArenaReserve = kArenaBlocks * kMaxSessions;    // 0.0.627 (G2): the per-boot reserve can hold every session's cap (with the switch OFF only kArenaBlocks are ever used)
+// 0.0.669: this stays kArenaBlocks * kVmidPoolSize. It is the GLOBAL page-table block reserve: the GPU can have at most kVmidPoolSize live trees at once (the pool
+// IS that limit), so "every live tree at its cap" is the right ceiling. It is a per-boot CEILING, not a per-client guarantee: a client past the eighth allocates as
+// blocks come back, and blocks come back on every close (pt_release_blocks). Raising it with kMaxClients would reserve 2 GiB of VRAM for page tables that
+// kMaxClients clients would never use at once.
+constexpr uint32_t kArenaReserve = kArenaBlocks * kVmidPoolSize;
 static_assert(kArenaReserve <= 0xFFFFu, "page-table block indices fit the uint16_t lists");
 struct Session {
     bool      hello;
@@ -120,19 +145,36 @@ struct Session {
     uint64_t  importedBytes;   // 0.0.612: host-import bytes held (cap kImportCap, separate from the GTT cap)
     uint32_t  nBos;
     uint64_t  emitted;         // seqno of THIS session's last Submit (0.0.627: the global count is gEmitted). Written under gRingLock; atomics
-    // 0.0.627 (G2): identity. lock / slot / vmid never change once the slot exists; id / open / ws are written under gCliLock at open and close.
-    IOLock   *lock;            // THIS session's lock: its tables and counters (the old client lock's job for one session). Allocated with the slot, never freed
-    uint32_t  slot, vmid, id;  // id: unique per open (1, 2, 3 ...), the client's N1cRef carries it; 0 = never opened
+    // 0.0.669: identity. lock / cli never change once the record exists; id / open / ws are written under gCliLock at open and close. `vmid` (not `cli`) is the
+    // DYNAMIC half: it is a POOL HANDLE (the VMID 8..15 whose CONTEXT<n> currently points at this client's root), 0 = not resident right now.
+    IOLock   *lock;            // THIS client's lock: its tables and counters (the old client lock's job for one client). Allocated with the record, never freed
+    uint32_t  cli, id;         // cli: the CLIENT TABLE index (0..kMaxClients-1), carried by N1cRef::slot so the N48N ABI does not change; id: unique per open (1, 2, 3 ...)
+    volatile UInt32 vmid;      // 0.0.669: the pool handle held NOW (VMID 8..15), 0 = the client is not resident (its work cannot run in the GPU until it is)
     bool      open, ws;        // ws: admitted by the uid-88 (WindowServer) rule
     bool      app;             // 0.0.640 (G4): admitted by the allow-list rule (an ordinary user application); set once by n1c_mark_app right after the open, never ReadRegs / scanout
     uint64_t  appKey;          // 0.0.641: the executable-name key (Navi48AppKey.h) of an APP session, for the strike count; written once with `app`
     volatile UInt32 poisoned;  // 1 once an automatic recovery named this session guilty (switch ON): Submit refused, waits and GPU calls Aborted
     uint64_t  faultAtOpen;     // 0.0.629 (R5): n48native::g2::fault_word read (never cleared) at this session's open, for sessstat
 };
-static Session gSess;          // slot 0 (VMID 8): STATIC and never freed: a selector racing a close can never touch freed memory
-// 0.0.627 (G2): the session slots. Slot 0 is gSess; slots 1..3 (switch ON only) are allocated on first use and NEVER freed, for the same reason.
-static Session *gSlot[kMaxSessions] = { &gSess, nullptr, nullptr, nullptr };
-static uint8_t gSlotState[kMaxSessions];   // n48native::g2::SlotState; written under gCliLock. A DEAD slot's VMID is never handed out again this boot
+static Session gSess;          // CLIENT RECORD 0: STATIC and never freed: a selector racing a close can never touch freed memory
+// 0.0.669: the CLIENT TABLE. kMaxClients records, allocated on first use and NEVER freed (a racing selector must never touch freed memory) but RECYCLED through
+// gCliState: that is what makes the client count independent of the GPU. Record 0 is the static gSess.
+static Session *gCli[kMaxClients] = { &gSess };
+static uint8_t gCliState[kMaxClients];   // n48native::g2::CliState; written under gCliLock. A QUARANTINED record is HELD, not lost (the reclaim pass returns it)
+static uint32_t gCliAlloc;               // records ever allocated (a diagnostic; the records are never freed)
+static_assert(kMaxClients * sizeof(Session) <= n48native::g2::kClientKernelBudget, "the client table's kernel memory stays inside the pure header's budget");
+// 0.0.669: the VMID POOL. gVmidOwner[h] = the CLIENT index holding pool handle h (VMID 8 + h) or kNoClient (free). gHandleUsable: bit h set = CONTEXT<8+h>
+// carries the native geometry (probed once per handle at the first open; a handle that failed is never handed out - fail closed). All under gCliLock.
+static uint32_t gVmidOwner[kVmidPoolSize];
+static uint32_t gHandleUsable;           // bit h: CONTEXT<8+h> was proved to carry the native geometry; 0 = not probed yet (the first open probes all handles)
+// How many pool handles are held RIGHT NOW, counted from the owner array itself and never from a running total: a steal re-assigns a handle that is
+// already held, so a counter would drift; `handles free` on the stat pages is counted from this same array, and the two must never disagree. A
+// QUARANTINED record that still owns its handle is counted here. Caller holds gCliLock.
+static uint32_t vmid_held_locked(void) {
+    uint32_t n = 0;
+    for (uint32_t h = 0; h < kVmidPoolSize; h++) if (gVmidOwner[h] != kNoClient) n++;
+    return n;
+}
 // The per-boot page-table reserve: blocks taken from vram_alloc for page tables are NEVER returned to it (a user CPU mapping kept
 // after BoFree can therefore never alias a page table); a closing client returns its blocks to this list and the next client reuses them.
 static VRAMAllocation gPt[kArenaReserve];
@@ -153,8 +195,14 @@ static Hang gHang;             // boot-wide: hung survives the client
 //                  the page-table reserve (gPt / gPtFree, PtMem::alloc_page), the VRAM pools (vram_alloc / vram_alloc_hi alloc and free) and the VRAM
 //                  budget, the GART fence windows (reservation and PTE writes), CONTEXTn programming and the park root, the scanout pins and owner.
 //                  The G1 block (a kernel-owned test context, exclusive by construction) still uses it as before.
-//   gRingLock      the ring: seqno assignment (gEmitted), gSubmitBuf, the ring dwords, gWc, the owner log, a session's `emitted`, the doorbell. The space
-//                  wait (2 s) runs under it, as before. An automatic recovery holds it for its whole bounded run (emission frozen).
+//                  0.0.667: n1c_open no longer waits for the ring to go idle INSIDE it. That wait (up to kWaitCapNs) moved before the lock and what
+//                  stays under it is one non-blocking re-check, so a client opening a session cannot stall every other session's open / close / alloc.
+//   gRingLock      the ring: seqno assignment (gEmitted), gSubmitBuf, the ring dwords, gWc, the owner log, a session's `emitted`, the doorbell. 0.0.667:
+//                  NO wait runs under it any more. ring_put_locked is a single non-blocking attempt; a caller that finds the ring full drops this lock
+//                  and does its bounded waiting outside it (submit under the lock, wait outside it - the order the reference driver uses). Before
+//                  0.0.667 the 2 s space wait ran in here, so ONE session waiting for room froze every other session's submission, WindowServer's
+//                  included. An automatic recovery (g2_recover) still holds it for its whole bounded run: that path only runs AFTER a hang has been
+//                  attributed, so it delays other submitters only while the machine is already recovering.
 //   gHangLock      gHang and gRecovering.
 //   gTlbLock       gmc_flush_gpu_tlb (one invalidation engine for every VMID; 0.0.626 only ever flushed under the one client lock).
 // A GPU-dependent check that may RUN a recovery (gpu_gate, hang_poll, own_wait, stall_from_wait) is called with at most the caller's own session lock:
@@ -173,7 +221,7 @@ static bool gLegacyLogged[8];
 static uint32_t gSubmitBuf[280];   // one Submit's dwords; 0.0.627: used only under gRingLock (ring_submit)
 
 struct FenceWindow { bool reserved; uint64_t gartOff; uint64_t mc; };
-static FenceWindow gWin[kMaxSessions];   // 0.0.627 (G2): one 16-page window per slot (slot 0's is the 0.0.626 window)
+static FenceWindow gWin[kMaxClients];   // 0.0.627 (G2): one 16-page window per CLIENT RECORD (record 0's is the 0.0.626 window); 0.0.669: per record, so it is reused with the record
 struct ParkRoot { bool have; VRAMAllocation a; uint64_t pa; };
 static ParkRoot gPark;
 // 0.0.627 (G2) state.
@@ -194,7 +242,7 @@ static n48native::g4::StrikeTab gStrikes; // 0.0.641: automatic recoveries blame
 // 0.0.650 (G5 Stage 1) state. All of it is written only with navi48-g5=1 (OFF: never touched).
 static volatile UInt32 gWsId;             // the WindowServer session id (0 = none); set in n1c_open / cleared in n1c_close beside gSessWs, under gCliLock; read with atomics
 static uint64_t gWsLastNs;                // the time of WindowServer's last submit (atomics; 0 = never)
-static uint64_t gG5Since[n48native::g2::kMaxSessions];   // per slot: when that slot's app Submit began waiting for its turn (0 = not waiting); guarded by gRingLock
+static uint64_t gG5Since[n48native::g2::kMaxClients];   // per client record: when that client's app Submit began waiting for its turn (0 = not waiting); guarded by gRingLock
 static n48native::g5::Stat gG5;           // the counters of sessstat page 5; guarded by gRingLock
 static n48native::g5::AdmitIn gG5In;     // ring_submit_app_g5's verdict inputs, rebuilt on every try; guarded by gRingLock (a file-scope static keeps the Submit path's stack frame small)
 static uint64_t gLogGate;                 // 0.0.641: the "open refused" log rate limiter (n48native::g4::log_gate_step); a log-only word
@@ -233,18 +281,19 @@ static uint32_t g5_credit();   // 0.0.650: K, navi48-g5credit (1..4, default 1; 
 static bool apps_on();    // 0.0.640 (G4): navi48-apps=1 AND navi48-multisession=1 (latched once; below)
 static uint64_t appvis_cap();   // 0.0.641: the non-WindowServer visible-pool cap in bytes (boot-arg navi48-appvis, latched once; below)
 static bool g1_holds();   // a G1 test context holds the GPU (the G1 block)
-static inline Session *slot_ptr(uint32_t slot) { return slot < kMaxSessions ? __atomic_load_n(&gSlot[slot], __ATOMIC_ACQUIRE) : nullptr; }
+// 0.0.669: N1cRef::slot is the CLIENT TABLE index (the N48N ABI keeps its two uint32s; what they mean inside the kext changed).
+static inline Session *cli_ptr(uint32_t cli) { return cli < kMaxClients ? __atomic_load_n(&gCli[cli], __ATOMIC_ACQUIRE) : nullptr; }
 // The caller's session without a lock: open and still the SAME session (the id of its open). A Session is never freed, so a stale reference reads a
 // closed or re-opened record and is refused.
 static inline Session *sess_peek(const N1cRef &r) {
-    Session *s = slot_ptr(r.slot);
+    Session *s = cli_ptr(r.slot);
     if (s == nullptr || r.id == 0u || !__atomic_load_n(&s->open, __ATOMIC_ACQUIRE) || __atomic_load_n(&s->id, __ATOMIC_ACQUIRE) != r.id) return nullptr;
     return s;
 }
 static inline bool sess_hello(const N1cRef &r) { Session *g = sess_peek(r); return g != nullptr && __atomic_load_n(&g->hello, __ATOMIC_ACQUIRE); }
 // Take the caller's session lock and re-check under it. Returns the session LOCKED, or null with nothing held.
 static Session *sess_lock(const N1cRef &r, bool needHello) {
-    Session *s = slot_ptr(r.slot);
+    Session *s = cli_ptr(r.slot);
     IOLock *l = s != nullptr ? __atomic_load_n(&s->lock, __ATOMIC_ACQUIRE) : nullptr;
     if (l == nullptr) return nullptr;
     IOLockLock(l);
@@ -371,24 +420,18 @@ static bool own_wait(Session *s, bool *noBlame = nullptr) {
 
 // ---- the ring -------------------------------------------------------------------------------------------------------------------
 // Everything that goes on the ring goes through here: the space check, the write, the owner record, the emitted-seq update and the kick. Caller holds
-// gRingLock. Returns kOk, or kTimeout when the space wait reached 2 s (the CALLER decides what that means, after dropping the lock).
+// gRingLock. 0.0.667: this is a SINGLE non-blocking attempt - when the ring has no room it returns kTimeout at once and the CALLER does its bounded
+// waiting with the lock DROPPED. (The 2 s spin that used to live here ran inside the one global gRingLock, so a single session waiting for room
+// froze every other session's submission, WindowServer's included - the "random Dock/Chrome freeze, software rendering too" symptom.) Once the
+// space check passes the space is ours until the kick, so everything below it still runs without waiting.
 static uint32_t ring_put_locked(const uint32_t *dw, uint32_t n, uint64_t seq, uint8_t ownerSlot, uint32_t ownerId, Session *owner) {
     DeviceContext &dev = *gCtx->dev;
     CPContext &cp = gCtx->cp;
     const uint32_t mask = cp.ring_ptr_mask;
     if (n > cp.ring_size_dwords / 2u) return kBadArg;
-    const uint64_t t0 = now_ns();
-    for (;;) {
-        sysmem_rmb();
-        const uint32_t r = *cp.rptr_cpu & mask;
-        if (ring_has_space(ring_free64(r, gWc, mask), n)) break;
-        const uint64_t el = now_ns() - t0;
-        if (el >= kWaitCapNs) {
-            N1C_LOG("ring space: need %u dwords (+%u slack), rptr %u wptr %u, no room in 2 s", n, kRingSlack, r, (uint32_t)(gWc & mask));
-            return kTimeout;
-        }
-        if (el < 5000000ull) IODelay(1); else IOSleep(1);
-    }
+    sysmem_rmb();
+    const uint32_t r = *cp.rptr_cpu & mask;
+    if (!ring_has_space(ring_free64(r, gWc, mask), n)) return kTimeout;   // no room NOW: the caller retries outside the lock, bounded by kWaitCapNs
     auto *ring = static_cast<uint32_t *>(cp.ring_cpu);
     const uint64_t startWc = gWc;
     uint64_t wc = gWc;
@@ -415,20 +458,33 @@ static uint32_t ring_put_locked(const uint32_t *dw, uint32_t n, uint64_t seq, ui
     return kOk;
 }
 // One submission of session `s` (its VMID): the seqno is assigned, the packet built and put on the ring under ONE hold of gRingLock, so two sessions can
-// never take the same seqno. Returns kOk (*seqOut set), BadArg / InternalError for an unusable packet, or Timeout when the space wait reached 2 s (that
-// latches HUNG, or with the switch ON goes to stall_handle, AFTER the ring lock is dropped and before anything was written).
+// never take the same seqno. 0.0.667: the ring-full wait happens with that lock DROPPED - lock, try, unlock, sleep, retry - and the budget is still
+// kWaitCapNs (2 s), so the outcome is unchanged: kOk (*seqOut set), BadArg / InternalError for an unusable packet, or Timeout after 2 s (which latches
+// HUNG, or with the switch ON goes to stall_handle, exactly as before: nothing was written and no lock is held).
 static uint32_t ring_submit(Session *s, const uint64_t *va, const uint32_t *by, uint32_t nIbs, bool hasFence, uint64_t fenceAddr, uint64_t *seqOut) {
-    IOLockLock(gRingLock);
-    const uint64_t seq = emitted_now() + 1ull;
-    const uint32_t n = build_submit(gSubmitBuf, (uint32_t)(sizeof(gSubmitBuf) / sizeof(gSubmitBuf[0])), va, by, nIbs, s->vmid, hasFence,
-                                    fenceAddr, gCtx->cp.wb_bus + kWbOffsetNativeSeq, seq);
-    if (n == 0u) { IOLockUnlock(gRingLock); return (uint32_t)kIOReturnInternalError; }
-    const uint32_t er = ring_put_locked(gSubmitBuf, n, seq, (uint8_t)s->slot, s->id, s);
-    IOLockUnlock(gRingLock);
-    if (er == kTimeout) { (void)stall_from_wait(); return kTimeout; }   // 0.0.629 (R2): blames only when the hang clock expired; Timeout either way
-    if (er != kOk) return er;
-    *seqOut = seq;
-    return kOk;
+    const uint64_t t0 = now_ns();
+    for (;;) {
+        IOLockLock(gRingLock);
+        // 0.0.669: the handle is read UNDER gRingLock, because a steal takes it under gRingLock too (vmid_assign_locked). Seeing 0 here means the residency was
+        // revoked while this Submit was between calls: the packet must NOT be built with a VMID that now belongs to another client's tree. kNotReady tells the
+        // caller to re-acquire and retry (n1c_submit does, once).
+        const uint32_t vm = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);
+        if (vm == 0u) { IOLockUnlock(gRingLock); return kNotReady; }
+        const uint64_t seq = emitted_now() + 1ull;
+        const uint32_t n = build_submit(gSubmitBuf, (uint32_t)(sizeof(gSubmitBuf) / sizeof(gSubmitBuf[0])), va, by, nIbs, vm, hasFence,
+                                        fenceAddr, gCtx->cp.wb_bus + kWbOffsetNativeSeq, seq);
+        if (n == 0u) { IOLockUnlock(gRingLock); return (uint32_t)kIOReturnInternalError; }
+        const uint32_t er = ring_put_locked(gSubmitBuf, n, seq, (uint8_t)s->cli, s->id, s);
+        IOLockUnlock(gRingLock);
+        if (er != kTimeout) { if (er != kOk) return er; *seqOut = seq; return kOk; }
+        const uint64_t el = now_ns() - t0;
+        if (el >= kWaitCapNs) {   // the old 2 s cap, now measured and slept OUTSIDE gRingLock
+            N1C_LOG("ring space: Submit could not take the ring within 2 s (retried with gRingLock dropped): no room");
+            (void)stall_from_wait();   // 0.0.629 (R2): blames only when the hang clock expired; Timeout either way
+            return kTimeout;
+        }
+        if (el < 5000000ull) IODelay(1); else IOSleep(1);   // gRingLock is NOT held here
+    }
 }
 
 // 0.0.650: the verdict's inputs, read under ONE hold of gRingLock (the caller holds it): the ring space, the retired / emitted seqnos, WindowServer's id and last submit, the
@@ -440,11 +496,11 @@ __attribute__((noinline)) static void g5_fill_in_locked(const Session *s, uint32
     const uint32_t rp = *gCtx->cp.rptr_cpu & mask;
     const uint64_t em = emitted_now(), re = retired_now(em);
     const uint32_t wsId = __atomic_load_n(&gWsId, __ATOMIC_SEQ_CST);
-    gG5In = n48native::g5::AdmitIn{ true, false, wsId != 0u, __atomic_load_n(&gWsLastNs, __ATOMIC_ACQUIRE), now, K, re, em, wsId, ring_free64(rp, gWc, mask), need, gG5Since, s->slot };
+    gG5In = n48native::g5::AdmitIn{ true, false, wsId != 0u, __atomic_load_n(&gWsLastNs, __ATOMIC_ACQUIRE), now, K, re, em, wsId, ring_free64(rp, gWc, mask), need, gG5Since, s->cli };
 }
 // 0.0.650 (G5 Stage 1; navi48-g5=1 only): the Submit of a session that is NOT WindowServer. Called with ONLY the session's own lock held (the lock order of own_wait).
 // The admission verdict (n48native::g5::admission: ring reserve, the credit while WindowServer is active, first come first served) and the seqno are taken in ONE hold of
-// gRingLock; the wait for a Wait verdict runs OUTSIDE it (no sleep under the lock), bounded by kG5WaitBoundNs. Every exit clears this slot's gG5Since entry.
+// gRingLock; the wait for a Wait verdict runs OUTSIDE it (no sleep under the lock), bounded by kG5WaitBoundNs. Every exit clears this CLIENT's gG5Since entry.
 static uint32_t ring_submit_app_g5(Session *s, const uint64_t *va, const uint32_t *by, uint32_t nIbs, bool hasFence, uint64_t fenceAddr, uint64_t *seqOut) {
     using namespace n48native::g5;
     const uint32_t need = submit_dwords(nIbs, hasFence);
@@ -454,24 +510,33 @@ static uint32_t ring_submit_app_g5(Session *s, const uint64_t *va, const uint32_
     uint64_t t0 = 0;
     for (;;) {
         IOLockLock(gRingLock);
+        // 0.0.669: the residency, exactly as ring_submit checks it (a steal can revoke the handle between the acquisition and here).
+        const uint32_t vm = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);
+        if (vm == 0u) { IOLockUnlock(gRingLock); rc = kNotReady; break; }
         g5_fill_in_locked(s, K, need);
         const uint64_t now = gG5In.now;
         if (admission(gOwners, gG5In) == kAdmit) {
-            const uint64_t waitedNs = gG5Since[s->slot] != 0ull && now > gG5Since[s->slot] ? now - gG5Since[s->slot] : 0ull;
-            since_clear(gG5Since, s->slot); waiting = false;
+            const uint64_t waitedNs = gG5Since[s->cli] != 0ull && now > gG5Since[s->cli] ? now - gG5Since[s->cli] : 0ull;
             const uint64_t seq = emitted_now() + 1ull;
-            const uint32_t n = build_submit(gSubmitBuf, (uint32_t)(sizeof(gSubmitBuf) / sizeof(gSubmitBuf[0])), va, by, nIbs, s->vmid, hasFence,
+            const uint32_t n = build_submit(gSubmitBuf, (uint32_t)(sizeof(gSubmitBuf) / sizeof(gSubmitBuf[0])), va, by, nIbs, vm, hasFence,
                                             fenceAddr, gCtx->cp.wb_bus + kWbOffsetNativeSeq, seq);
             if (n == 0u) { IOLockUnlock(gRingLock); rc = (uint32_t)kIOReturnInternalError; break; }
-            const uint32_t er = ring_put_locked(gSubmitBuf, n, seq, (uint8_t)s->slot, s->id, s);
-            if (er == kOk) stat_admit(gG5, waitedNs);
-            IOLockUnlock(gRingLock);
-            if (er == kTimeout) { (void)stall_from_wait(); rc = kTimeout; break; }   // as ring_submit (R2): blames only when the hang clock expired
-            if (er != kOk) { rc = er; break; }
-            *seqOut = seq;
-            break;
+            const uint32_t er = ring_put_locked(gSubmitBuf, n, seq, (uint8_t)s->cli, s->id, s);
+            if (er == kOk) {   // admitted AND on the ring: this Submit is done
+                stat_admit(gG5, waitedNs);
+                since_clear(gG5Since, s->cli); waiting = false;
+                IOLockUnlock(gRingLock);
+                *seqOut = seq;
+                break;
+            }
+            // 0.0.667: kTimeout now means "the ring had no room at this instant", NOT "a 2 s wait expired" - the 2 s spin used to live inside
+            // ring_put_locked, under gRingLock. The verdict said Admit, so this is a transient: fall through to the ONE wait tail below, which
+            // sleeps with the lock DROPPED and keeps the same bound (wait_step / kG5WaitBoundNs). Any other code is a real failure and fails now.
+            // NOTE: with navi48-g5 OFF (the default), this path is changed conservatively (same shape as the Wait path, no behavioural redesign);
+            // the G5 host/unit tests must be re-run before navi48-g5=1 is ever set.
+            if (er != kTimeout) { IOLockUnlock(gRingLock); rc = er; break; }
         }
-        since_mark(gG5Since, s->slot, now); waiting = true; t0 = gG5Since[s->slot];
+        since_mark(gG5Since, s->cli, now); waiting = true; t0 = gG5Since[s->cli];
         IOLockUnlock(gRingLock);
         if (hung_now()) { rc = hang_rc(true, false); break; }
         if (sess_poisoned(s)) { rc = n48native::g2::poison_rc(true); break; }
@@ -483,7 +548,7 @@ static uint32_t ring_submit_app_g5(Session *s, const uint64_t *va, const uint32_
     }
     if (waiting) {   // the single exit of every path that left while still waiting
         IOLockLock(gRingLock);
-        since_clear(gG5Since, s->slot);
+        since_clear(gG5Since, s->cli);
         if (timedOut) stat_timeout(gG5);
         IOLockUnlock(gRingLock);
     }
@@ -507,7 +572,12 @@ static void g2_scrub_locked(uint64_t liveStart) {
 }
 // The G1 recovery (MES RESET reset_legacy_gfx, proven by G1 on this firmware: notes), run on the kernel's own initiative for a
 // guilty NON-WindowServer session, then proven by a kernel-only probe fence (one RELEASE_MEM of the next seqno: no IB, no VMID). gRingLock is held for the
-// whole run, so no session emits meanwhile. The guilty session is poisoned BEFORE the RESET (its seqno can retire only after it, so its waiter sees the
+// whole run, so no session emits meanwhile.
+// 0.0.667 NOTE (the one remaining "wait under a global lock", kept on purpose): this function holds gRingLock across the MES RESET *and* the probe's
+// bounded IODelay/IOSleep verify loop, so other sessions' submissions wait here for up to kVerifyNs. That is deliberate (emission must be frozen while
+// the RESET moves the read pointer) and it is NOT a source of random stalls in normal use: it only runs after a hang has already been attributed to a
+// session and the machine is recovering. The structural fix, when this area is next touched, is a per-session ring or a 64 KB+ ring with per-session
+// head/tail, which would let the recovery avoid the global lock entirely. Kept as is in 0.0.667 by decision (see the recovery notes). The guilty session is poisoned BEFORE the RESET (its seqno can retire only after it, so its waiter sees the
 // poison first). Returns recovery_ok.
 static bool g2_recover(const n48native::g2::Guilty &g, Session *gs) {
     using namespace n48native::g2;
@@ -515,10 +585,18 @@ static bool g2_recover(const n48native::g2::Guilty &g, Session *gs) {
     CPContext &cp = gCtx->cp;
     IOLockLock(gRingLock);
     const uint64_t emAt = emitted_now();
+    // 0.0.669: the guilty client must still hold a pool handle. It has an UNRETIRED submission, and a handle is only ever taken from a client whose work is
+    // retired (vmid_idle_view_locked), so this is a guard and not a path - but with no handle there is no VMID to name in the RESET, so the caller latches.
+    const uint32_t gvm = __atomic_load_n(&gs->vmid, __ATOMIC_ACQUIRE);
+    if (gvm == 0u) {
+        IOLockUnlock(gRingLock);
+        N1C_LOG("g2 recovery: the guilty client (record %u, session %u) holds NO VMID handle (it cannot: a handle is only taken from a client whose work is retired): nothing to reset, latching HUNG", gs->cli, g.sessId);
+        return false;
+    }
     g2_scrub_locked(g.startWc);
     __atomic_store_n(&gs->poisoned, 1u, __ATOMIC_SEQ_CST);
     const uint64_t t0 = now_ns();
-    const kern_return_t r = mes_reset_legacy_gfx_queue(dev, gCtx->mes, 0u, 0u, gs->vmid, cp.mqd_bus, cp.doorbell_index, cp.wptr_gpu_addr);
+    const kern_return_t r = mes_reset_legacy_gfx_queue(dev, gCtx->mes, 0u, 0u, gvm, cp.mqd_bus, cp.doorbell_index, cp.wptr_gpu_addr);
     const uint64_t actNs = now_ns() - t0;
     bool put = false, ret = false;
     uint64_t probe = 0, verifyNs = 0;
@@ -540,7 +618,7 @@ static bool g2_recover(const n48native::g2::Guilty &g, Session *gs) {
     if (ok) { gG2.recoveries++; gG2.lastGuiltySlot = g.slot; gG2.lastGuiltySeq = g.seq; gG2.collateralTotal += collateral(g.seq, emAt); }
     else gG2.failed++;
     N1C_LOG("g2 recovery: MES RESET(reset_legacy_gfx, vmid %u) %s (%#x, %llu us); probe seq %llu %s (%llu us); guilty slot %u session %u seq %llu POISONED; "
-            "%llu later submission(s) of other sessions were queued behind it (executed or dropped: not known): %s", gs->vmid, r == kIOReturnSuccess ? "ACKED" : "NOT acked", r,
+            "%llu later submission(s) of other sessions were queued behind it (executed or dropped: not known): %s", gvm, r == kIOReturnSuccess ? "ACKED" : "NOT acked", r,
             (unsigned long long)(actNs / 1000ull), (unsigned long long)probe, ret ? "RETIRED" : put ? "did NOT retire" : "not emitted", (unsigned long long)(verifyNs / 1000ull),
             g.slot, g.sessId, (unsigned long long)g.seq, (unsigned long long)collateral(g.seq, emAt), ok ? "RECOVERED, the other sessions continue" : "FAILED: latching HUNG");
     return ok;
@@ -551,7 +629,7 @@ static bool g2_recover(const n48native::g2::Guilty &g, Session *gs) {
 static bool stall_handle(uint64_t em, uint64_t re) {
     using namespace n48native::g2;
     const Guilty g = guilty_of(gOwners, re, em);
-    Session *gs = (g.known && g.slot < kMaxSessions) ? slot_ptr(g.slot) : nullptr;
+    Session *gs = (g.known && g.slot < kMaxClients) ? cli_ptr(g.slot) : nullptr;   // 0.0.669: g.slot is the CLIENT index (the owner log records it under gRingLock)
     const bool user = gs != nullptr && __atomic_load_n(&gs->open, __ATOMIC_ACQUIRE) && __atomic_load_n(&gs->id, __ATOMIC_ACQUIRE) == g.sessId &&
                       __atomic_load_n(&gs->hello, __ATOMIC_ACQUIRE);
     const bool ws = user && __atomic_load_n(&gs->ws, __ATOMIC_ACQUIRE);
@@ -666,13 +744,15 @@ static uint32_t program_root(uint32_t vmid, uint64_t rootPa) {
 // ---- open / close -------------------------------------------------------------------------------------------------------------------
 // 0.0.627 (G2): n1c_open's helpers, out of line so its frame stays within the stack rule (+0x40).
 // CONTEXT<vmid> must carry the S1b geometry (DEPTH 3 / BLOCK 0 / RETRY 0): a context that lost it must not be pointed at a tree.
-// VMIDs 9..11 (slots 1..3, switch ON only) still carry the boot geometry with RETRY 1 (hub_setup_vmid_config): their CNTL gets cntl_native exactly as
-// native_s1b.cpp set CONTEXT8, then is read back. CONTEXT8 itself is never written here (the S1b self-test owns it). Returns the CNTL read; *ok = usable.
-static __attribute__((noinline)) uint32_t ctx_prepare(uint32_t slot, uint32_t vmid, bool *ok) {
+// 0.0.669: the argument is the POOL HANDLE h (vmid = 8 + h), and the geometry is a property of the VMID, so this runs ONCE PER HANDLE PER BOOT (the same handle
+// serves different clients over time). VMIDs 9..15 (h 1..7) still carry the boot's Apple geometry (DEPTH 1 / BLOCK 7 / RETRY 0, hub_setup_vmid_config with
+// appleCtxGeometry): their CNTL gets cntl_native exactly as native_s1b.cpp set CONTEXT8, then is read back. CONTEXT8 itself (h 0) is never written here (the
+// S1b self-test owns it). Returns the CNTL read; *ok = usable.
+static __attribute__((noinline)) uint32_t ctx_prepare(uint32_t h, uint32_t vmid, bool *ok) {
     DeviceContext &dev = *gCtx->dev;
     const CtxRegs r = ctx_regs(vmid);
     uint32_t cntl = RREG32(dev, r.cntl);
-    if (slot != 0u && !ctx_geometry_ok(cntl)) {
+    if (h != 0u && !ctx_geometry_ok(cntl)) {
         const uint32_t before = cntl;
         WREG32(dev, r.cntl, cntl_native(before));
         cntl = RREG32(dev, r.cntl);
@@ -682,6 +762,129 @@ static __attribute__((noinline)) uint32_t ctx_prepare(uint32_t slot, uint32_t vm
     if (!*ok) N1C_LOG("open refused (NotReady): CONTEXT%u CNTL %#010x is not the native geometry (DEPTH 3 / BLOCK 0 / RETRY 0)", vmid, cntl);
     return cntl;
 }
+// ==== 0.0.669: THE VMID POOL (assign / steal / release) and the RECLAIM PASS ==========================================================
+// The pure half is native_g2_pure.h (vmid_pick, reclaim_pick, cli_after_close). Everything here runs under gCliLock (which also owns gVmidOwner /
+// gHandleUsable / gCliState), and the two places that must be atomic against a concurrent Submit - the steal decision and the residency read in ring_submit - take
+// gRingLock as well (gCliLock -> gRingLock is the documented order). No GPU wait ever runs under either lock.
+// Probe every pool handle once, at the first open: CONTEXT<8+h> must carry the native geometry before the handle is ever handed out. A handle that fails is kept
+// OUT of gHandleUsable for the rest of the boot (fail closed: it is never assigned), which is exactly what 0.0.627 did per session - except that a failure now
+// costs one of 8 handles for the boot, never the client's ability to open.
+static __attribute__((noinline)) void handle_probe_all(void) {
+    uint32_t usable = 0;
+    for (uint32_t h = 0; h < kVmidPoolSize; h++) {
+        bool ok = false;
+        const uint32_t cntl = ctx_prepare(h, vmid_of_handle(h), &ok);
+        if (ok) usable |= (1u << h);
+        else N1C_LOG("vmid pool: handle %u (VMID %u) is NOT usable: CONTEXT%u CNTL %#010x is not the native geometry (DEPTH 3 / BLOCK 0 / RETRY 0)", h, vmid_of_handle(h), vmid_of_handle(h), cntl);
+    }
+    gHandleUsable = usable;
+    N1C_LOG("vmid pool: %u of %u handles carry the native geometry (mask %#x); VMID 8 is the S1b self-test's own context and is read, never rewritten here",
+            (unsigned)__builtin_popcount(usable), kVmidPoolSize, usable);
+}
+// The idle[] view over the pool: for every HELD handle, whether its client's own work is proven retired. Caller holds gCliLock AND gRingLock (a handle may only be
+// taken from a client that can no longer emit a packet with it, and every emit happens under gRingLock). A QUARANTINED record is never idle: its work is unproven
+// by definition - that is why it was quarantined.
+static void vmid_idle_view_locked(bool *idle) {
+    const uint64_t re = retired_now(emitted_now());
+    for (uint32_t h = 0; h < kVmidPoolSize; h++) {
+        const uint32_t c = gVmidOwner[h];
+        Session *o = (c != kNoClient) ? gCli[c] : nullptr;
+        idle[h] = (o != nullptr) && gCliState[c] == kCliOpen && n48native::g2::own_idle(re, __atomic_load_n(&o->emitted, __ATOMIC_ACQUIRE));
+    }
+}
+// ASSIGN a handle to `s` (which must hold none) and point CONTEXT<8+h> at its tree. Caller holds gCliLock and NOT gRingLock. Returns kOk, or kNotReady when every
+// usable handle is held by a client whose work has NOT retired (the caller then decides: wait bounded, or stay non-resident).
+static uint32_t vmid_assign_locked(Session *s, uint32_t *victimOut) {
+    bool idle[kVmidPoolSize];
+    IOLockLock(gRingLock);
+    vmid_idle_view_locked(idle);
+    const n48native::g2::VmidPick p = n48native::g2::vmid_pick(gVmidOwner, idle, gHandleUsable);
+    IOLockUnlock(gRingLock);
+    if (p.rc != kOk) return kNotReady;
+    if (p.victim != kNoClient) {
+        // STEAL. That client's own work is retired, so its context may be pointed elsewhere; it keeps its tree, its BOs and its mappings and re-acquires at its
+        // next Submit. Nothing is freed and nothing but this VMID's TLB is invalidated (program_root below flushes it).
+        Session *v = gCli[p.victim];
+        if (v != nullptr) __atomic_store_n(&v->vmid, 0u, __ATOMIC_RELEASE);
+        gVmidOwner[p.handle] = kNoClient;
+        if (g5_on()) { IOLockLock(gRingLock); n48native::g5::since_clear(gG5Since, p.victim); IOLockUnlock(gRingLock); }
+    }
+    const uint32_t vmid = vmid_of_handle(p.handle);
+    const uint32_t prc = program_root(vmid, s->rootPa);   // the new root AND this VMID's TLB invalidate, in one place
+    if (prc != kOk) return prc;                           // the flush did not acknowledge (a hang was latched): the handle is not ours
+    gVmidOwner[p.handle] = s->cli;
+    if (p.victim != kNoClient) N1C_LOG("vmid pool: handle %u (VMID %u) STOLEN from client %u (its own work is retired) and given to client %u: it re-acquires at its next Submit", p.handle, vmid, p.victim, s->cli);
+    __atomic_store_n(&s->vmid, vmid, __ATOMIC_RELEASE);
+    if (victimOut != nullptr) *victimOut = p.victim;
+    return kOk;
+}
+// RELEASE `s`'s handle: program_root parks CONTEXT<8+h> on the kernel's zeroed page (the tree is about to be freed, or the handle is about to change hands) and
+// the handle goes back to the pool. Caller holds gCliLock. A non-resident client is a no-op that reports kOk.
+static uint32_t vmid_release_locked(Session *s) {
+    const uint32_t vm = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);
+    if (vm == 0u) return kOk;
+    const uint32_t h = vm - kNativeVmid;
+    if (h >= kVmidPoolSize) { __atomic_store_n(&s->vmid, 0u, __ATOMIC_RELEASE); return kBadArg; }
+    const uint32_t prc = program_root(vm, gPark.pa);
+    __atomic_store_n(&s->vmid, 0u, __ATOMIC_RELEASE);
+    gVmidOwner[h] = kNoClient;
+    if (g5_on()) { IOLockLock(gRingLock); n48native::g5::since_clear(gG5Since, s->cli); IOLockUnlock(gRingLock); }
+    return prc;
+}
+// The caller's residency, with the waitForVMID half: called with ONLY the caller's own session lock (never gCliLock / gRingLock / gCliLock), exactly like
+// own_wait. waitBounded = the caller may wait up to kWaitCapNs for a handle to come free (Submit does; QueryInfo only looks). Returns kOk, kNotReady (looked,
+// nothing free), Timeout (waited the bound out: nothing was blamed, R2's stall_from_wait judged the hang clock) or Aborted (HUNG / poisoned).
+static uint32_t vmid_need(Session *s, bool waitBounded) {
+    if (__atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE) != 0u) return kOk;
+    const uint64_t t0 = now_ns();
+    for (;;) {
+        IOLockLock(gCliLock);
+        const uint32_t rc = vmid_assign_locked(s, nullptr);
+        IOLockUnlock(gCliLock);
+        if (rc == kOk) return kOk;
+        if (rc != kNotReady) return rc;
+        if (hung_now()) return kAborted;
+        if (sess_poisoned(s)) return n48native::g2::poison_rc(true);
+        if (!waitBounded) return kNotReady;
+        const uint64_t el = now_ns() - t0;
+        if (el >= kWaitCapNs) {
+            N1C_LOG("vmid pool: client %u could not get a VMID handle within 2 s (all %u usable handles are held by clients whose work has not retired)", s->cli, kVmidPoolSize);
+            (void)stall_from_wait();   // R2: blames only when the hang clock expired; the caller gets Timeout either way
+            return kTimeout;
+        }
+        if (el < 5000000ull) IODelay(1); else IOSleep(1);
+    }
+}
+// THE RECLAIM PASS (0.0.669). Every QUARANTINED record whose own work has now retired is handed back: its handle parked and released, its record back to the
+// free list. This is what makes the available resources non-monotonic - 0.0.627's "a DEAD slot's VMID is never handed out again this boot" cost one of the 8
+// handles per unproven close, for the whole boot; a quarantine now ends the moment own_idle can prove the work retired (or after the G1-style recovery's probe
+// has proven it). Caller holds gCliLock and NOT gRingLock. Returns how many records came back.
+static uint32_t cli_reclaim_locked(void) {
+    const uint64_t re = retired_now(emitted_now());
+    bool idle[kMaxClients];
+    for (uint32_t i = 0; i < kMaxClients; i++) {
+        Session *c = gCli[i];
+        idle[i] = (c != nullptr) && gCliState[i] == kCliQuarantined && n48native::g2::own_idle(re, __atomic_load_n(&c->emitted, __ATOMIC_ACQUIRE));
+    }
+    uint32_t n = 0;
+    for (;;) {
+        const uint32_t i = n48native::g2::reclaim_pick(gCliState, idle, kMaxClients);
+        if (i == n48native::g2::kNoSlot) break;
+        Session *c = gCli[i];
+        const uint32_t prc = vmid_release_locked(c);
+        if (prc != kOk) {   // the park did not acknowledge (a hang was latched): the record stays quarantined, its handle stays held
+            N1C_LOG("vmid pool: client %u (session %u) could not be reclaimed: its park did not acknowledge, it stays QUARANTINED", i, __atomic_load_n(&c->id, __ATOMIC_SEQ_CST));
+            break;
+        }
+        const uint32_t sid = __atomic_load_n(&c->id, __ATOMIC_SEQ_CST);
+        gCliState[i] = kCliFree;
+        idle[i] = false;
+        n++;
+        N1C_LOG("vmid pool: client %u (session %u) was QUARANTINED and its own work has now retired: its handle is back in the pool and the record is reusable (quarantine over, nothing was lost)", i, sid);
+    }
+    return n;
+}
+
 // 0.0.629 (G2 review fix R5): READ the GCVM L2 protection-fault registers of the GFXHUB - STATUS_LO32 0x15d0, STATUS_HI32 0x15d1, ADDR_LO32 0x15d2, ADDR_HI32
 // 0x15d3, the four native_s1b.cpp's fault leg reads - log them, and return n48native::g2::fault_word(STATUS_LO32, ADDR_LO32). NEVER written or cleared here (the
 // S1b self-test's VMID-8 fault stays latched: a new fault is told only by a CHANGE of this word). Register reads only.
@@ -692,14 +895,19 @@ static __attribute__((noinline)) uint64_t fault_snap(const char *when, uint32_t 
     return n48native::g2::fault_word(sLo, aLo);
 }
 static __attribute__((noinline)) void open_refused_log(bool multi, bool ws, uint32_t openNow, bool apps, bool wsOpen) {
-    N1C_LOG("open refused (ExclusiveAccess): %s (%u session(s) open, switch %s)", !multi ? "the session slot is not free" : g1_holds() ? "a G1 test context holds the GPU" :
-            apps ? (ws && wsOpen) ? "a WindowServer session is already open" : (!ws && !wsOpen) ? "the last free slot is reserved for WindowServer" : "every session slot is in use or DEAD" :
-            (ws && openNow != 0u) ? "a WindowServer client opens only when no session is open" : "every session slot is in use or DEAD", openNow, multi ? "ON" : "OFF");
+    // 0.0.669: the refusal is about CLIENT RECORDS (kernel memory), never about the VMID pool: a client always opens if a record is free, even when all 8
+    // handles are held by busy clients (it is then non-resident and acquires one at its first Submit).
+    N1C_LOG("open refused (ExclusiveAccess): %s (%u client(s) open, switch %s)", !multi ? "the client record is not free" : g1_holds() ? "a G1 test context holds the GPU" :
+            apps ? (ws && wsOpen) ? "a WindowServer session is already open" : (!ws && !wsOpen) ? "the last free client record is reserved for WindowServer" : "every client record is in use or QUARANTINED" :
+            (ws && openNow != 0u) ? "a WindowServer client opens only when no session is open" : "every client record is in use or QUARANTINED", openNow, multi ? "ON" : "OFF");
 }
-static __attribute__((noinline)) void opened_log(const Session *s, uint32_t cntl, uint64_t winMc) {
+static __attribute__((noinline)) void opened_log(const Session *s, uint64_t winMc) {
     const CPContext &cp = gCtx->cp;
-    N1C_LOG("client opened: slot %u VMID %u (session %u%s), fresh root pa %#llx (visible pool), CONTEXT%u CNTL %#010x, ring %u dwords rptr %u wptr %u, fence window mc %#llx",
-            s->slot, s->vmid, s->id, s->ws ? ", WindowServer" : "", (unsigned long long)s->rootPa, s->vmid, cntl, cp.ring_size_dwords, *cp.rptr_cpu, cp.wptr, (unsigned long long)winMc);
+    const uint32_t vm = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);
+    N1C_LOG("client opened: record %u (session %u%s), %s, fresh root pa %#llx (visible pool), ring %u dwords rptr %u wptr %u, fence window mc %#llx",
+            s->cli, s->id, s->ws ? ", WindowServer" : "", vm != 0u ? "resident on pool handle" : "NOT resident (no VMID handle free: it acquires one at its first Submit)",
+            (unsigned long long)s->rootPa, cp.ring_size_dwords, *cp.rptr_cpu, cp.wptr, (unsigned long long)winMc);
+    if (vm != 0u) N1C_LOG("client opened: record %u holds pool handle %u = VMID %u, CONTEXT%u CNTL %#010x", s->cli, vm - kNativeVmid, vm, vm, RREG32(*gCtx->dev, ctx_regs(vm).cntl));
 }
 IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {
     using namespace n48native::g2;
@@ -729,7 +937,8 @@ IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {
         N1C_LOG("open refused (NotReady): the GPU was declared HUNG earlier this boot; reboot");
         return kIOReturnNotReady;
     }
-    // (4) exclusivity. Switch OFF: exactly one client, by this compare-and-swap (0.0.626). Switch ON (0.0.627, G2): open_pick under the client lock below.
+    // (4) exclusivity. Switch OFF: exactly one client, by this compare-and-swap (0.0.626). Switch ON (0.0.627, G2): open_pick over the CLIENT TABLE under the
+    // client lock below (0.0.669: the table, not the VMID pool - a free record always opens, see open_refused_log).
     const bool multi = multi_on();
     if (!multi && !OSCompareAndSwap(0, 1, &gOpenFlag)) {
         N1C_LOG("open refused (ExclusiveAccess): a native client is already open");
@@ -739,34 +948,68 @@ IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {
     if (!gCliLock || !gRingLock || !gHangLock || !gTlbLock) { if (!multi) OSCompareAndSwap(1, 0, &gOpenFlag); return kIOReturnNoMemory; }
     gCtx = &ctx;
 
-    // The whole open runs under the client lock so a racing close cannot see a half-built session.
+    // 0.0.667 (discipline 1: no wait under a shared lock). The "the ring must be idle for the FIRST session" wait belongs OUTSIDE the client lock:
+    // it used to run INSIDE it, so while any new client waited for the ring to drain, every other session's open / close / allocation queued behind
+    // gCliLock - "opening a device stalls the whole machine". The wait below is bounded (kWaitCapNs) and the re-check under the lock is NON-BLOCKING
+    // (see the do-block). That is safe rather than merely convenient: it is only reached when the effective open count is 0, so no session exists
+    // that could put work on the ring, and retirement only ever moves the ring towards idle - the wait can be shorter than needed, never wrong.
+    // (With the multi switch ON and a session already open the wait is skipped entirely, exactly as before.)
+    if ((multi ? __atomic_load_n(&gOpenFlag, __ATOMIC_SEQ_CST) : 0u) == 0u) {
+        const uint64_t t0 = now_ns();
+        for (;;) {
+            sysmem_rmb();
+            if ((*ctx.cp.rptr_cpu & ctx.cp.ring_ptr_mask) == ctx.cp.wptr) break;
+            if (now_ns() - t0 >= kWaitCapNs) {
+                N1C_LOG("open refused (NotReady): the kernel ring is not idle (rptr %u wptr %u) after 2 s, waited with gCliLock DROPPED",
+                        *ctx.cp.rptr_cpu, ctx.cp.wptr);
+                if (!multi) OSCompareAndSwap(1, 0, &gOpenFlag);
+                return kIOReturnNotReady;
+            }
+            IOSleep(1);
+        }
+    }
+
+    // The whole open runs under the client lock so a racing close cannot see a half-built record. 0.0.669: the reclaim pass, the record pick, the record's
+    // wipe and the pool handle's assignment are all inside this one hold, so two opens can never pick the same record or the same handle.
     IOLockLock(gCliLock);
     IOReturn rc = kIOReturnSuccess;
     Session *s = nullptr;
     do {
         CPContext &cp = ctx.cp;
         const uint32_t openNow = multi ? __atomic_load_n(&gOpenFlag, __ATOMIC_SEQ_CST) : 0u;
-        const bool appsNow = apps_on(), wsOpen = __atomic_load_n(&gSessWs, __ATOMIC_SEQ_CST) != 0u;   // 0.0.641: apps ON = a WindowServer slot is always available and the last free slot is its
-        const OpenPick pk = open_pick(multi, gSlotState, openNow, ws, g1_holds(), appsNow, wsOpen);
+        const bool appsNow = apps_on(), wsOpen = __atomic_load_n(&gSessWs, __ATOMIC_SEQ_CST) != 0u;   // 0.0.641: apps ON = a WindowServer record is always available and the last free record is its
+        // 0.0.669: BEFORE the table is judged, give back every QUARANTINED record whose own work has now retired (its handle and its record). This is the pass
+        // that makes an unproven close a temporary hold instead of a permanent loss, so a long-running boot never runs out of records or handles.
+        const uint32_t reclaimed = cli_reclaim_locked();
+        if (reclaimed != 0u) N1C_LOG("open: the reclaim pass returned %u quarantined client record(s) to the table before this open", reclaimed);
+        const CliPick pk = open_pick(multi, gCliState, kMaxClients, openNow, ws, g1_holds(), appsNow, wsOpen);
         if (pk.rc != kOk) { open_refused_log(multi, ws, openNow, appsNow, wsOpen); rc = kIOReturnExclusiveAccess; break; }
-        const uint32_t slot = pk.slot, vmid = vmid_of_slot(slot);
+        const uint32_t cli = pk.cli;
         // The ring must be idle for the FIRST session: S1b's (or the last session's) work has retired and the seqno restarts. 0.0.627: a later session
-        // (switch ON) opens next to the running ones.
+        // (switch ON) opens next to the running ones. 0.0.667: the BOUNDED wait for this runs outside gCliLock (above, before the lock is taken); what
+        // stays here is a single NON-BLOCKING re-check, so no other session is ever blocked behind this one's wait. It cannot actually fail when
+        // openNow == 0 (no session exists that could put work on the ring) - it is checked rather than assumed, and failing is the safe outcome.
         if (openNow == 0u) {
-            const uint64_t t0 = now_ns();
-            for (;;) {
-                sysmem_rmb();
-                if ((*cp.rptr_cpu & cp.ring_ptr_mask) == cp.wptr) break;
-                if (now_ns() - t0 >= kWaitCapNs) { N1C_LOG("open refused (NotReady): the kernel ring is not idle (rptr %u wptr %u)", *cp.rptr_cpu, cp.wptr); rc = kIOReturnNotReady; break; }
-                IOSleep(1);
+            sysmem_rmb();
+            if ((*cp.rptr_cpu & cp.ring_ptr_mask) != cp.wptr) {
+                N1C_LOG("open refused (NotReady): the kernel ring went busy between the outside wait and the client lock (rptr %u wptr %u)", *cp.rptr_cpu, cp.wptr);
+                rc = kIOReturnNotReady;
+                break;
             }
         }
         if (rc != kIOReturnSuccess) break;
-        bool ctxOk = false;
-        const uint32_t cntl = ctx_prepare(slot, vmid, &ctxOk);   // CONTEXT<vmid>: the S1b geometry, set once for VMIDs 9..11, read back
-        if (!ctxOk) { rc = kIOReturnNotReady; break; }
-        // The slot's fence window: 16 GART pages reserved once per boot from the same bump allocator the ring, MQD and write-back page came from.
-        FenceWindow &win = gWin[slot];
+        // 0.0.669: the CONTEXT geometry belongs to the POOL HANDLE, not to the client (the same handle serves different clients over time), so every handle is
+        // probed once per boot here and a handle that fails the probe is taken out of the pool for good. No handle at all -> the client opens NON-RESIDENT and
+        // its first Submit fails NotReady; that is a boot whose GPU cannot run native trees, and it is reported as such.
+        if (gHandleUsable == 0u) handle_probe_all();
+        if (gHandleUsable == 0u) {
+            N1C_LOG("open refused (NotReady): not one of the %u pool handles carries the native context geometry (DEPTH 3 / BLOCK 0 / RETRY 0)", kVmidPoolSize);
+            rc = kIOReturnNotReady;
+            break;
+        }
+        // The client record's fence window: 16 GART pages reserved ONCE per record (0.0.669: per record, so it is reused with the record) from the same bump
+        // allocator the ring, MQD and write-back page came from.
+        FenceWindow &win = gWin[cli];
         if (!win.reserved) {
             GMCContext &gmc = ctx.gmc;
             const uint64_t bytes = (uint64_t)N48N_FENCE_SLOTS * kPage;
@@ -795,24 +1038,28 @@ IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {
             gPark.have = true;
         }
         if (!gWcInit) { gWc = cp.wptr; gWcInit = true; }   // the ring is idle: the counter starts at the hardware wptr and never restarts
-        // The session record. Slot 0 is the static gSess; slots 1..3 are allocated once (switch ON) and never freed. Its lock is kept across opens.
-        if (gSlot[slot] == nullptr) {
+        // The client record. Record 0 is the static gSess; the others are allocated ONCE (0.0.669: on the first use of that table entry, up to kMaxClients)
+        // and never freed - they are RECYCLED through gCliState instead, so a racing selector can never touch freed memory and the client count does not
+        // consume anything the GPU owns. Its lock is kept across opens.
+        if (gCli[cli] == nullptr) {
             Session *ns = static_cast<Session *>(IOMalloc(sizeof(Session)));
             if (ns == nullptr) { rc = kIOReturnNoMemory; break; }
             bzero(ns, sizeof(Session));
-            __atomic_store_n(&gSlot[slot], ns, __ATOMIC_RELEASE);
+            __atomic_store_n(&gCli[cli], ns, __ATOMIC_RELEASE);
+            gCliAlloc++;
         }
-        s = gSlot[slot];
+        s = gCli[cli];
         // 0.0.629 (G2 review fix R1): the record is wiped WITHOUT its lock field. A closing thread may still hold (and is about to release) that lock: it
-        // was never NULL once created, and it is created exactly once per slot, here, before the slot's first open publishes the session.
+        // was never NULL once created, and it is created exactly once per RECORD, here, before that record's first open publishes the session.
         if (s->lock == nullptr) {
             IOLock *nl = IOLockAlloc();
             if (nl == nullptr) { s = nullptr; rc = kIOReturnNoMemory; break; }
             __atomic_store_n(&s->lock, nl, __ATOMIC_RELEASE);
         }
         n48native::g2::sess_wipe_keep_lock(s);
-        s->slot = slot; s->vmid = vmid; s->ws = ws;
-        s->faultAtOpen = fault_snap("open", slot);   // R5: read only
+        s->cli = cli; s->ws = ws;   // 0.0.669: the VMID is NOT set here - it is a pool handle, assigned just below (or not at all)
+        __atomic_store_n(&s->vmid, 0u, __ATOMIC_RELEASE);
+        s->faultAtOpen = fault_snap("open", cli);   // R5: read only
         s->pagesInBlk = 4u;   // forces the first block
         PtMem mem{ s };
         s->rootPa = mem.alloc_page();
@@ -825,18 +1072,27 @@ IOReturn n1c_open(BringupContext &ctx, bool ws, N1cRef *out) {
             __atomic_store_n(&gEmitted, 0ull, __ATOMIC_RELEASE);
             gHang.lastRetired = 0; gHang.tProgress = now_ns();
         }
-        if (program_root(vmid, s->rootPa) != kOk) { rc = kIOReturnNotReady; break; }
+        // 0.0.669: the VMID POOL. A free handle (or one whose client's work is retired) is taken and CONTEXT<8+h> is pointed at this client's fresh root. If
+        // every usable handle is held by a client that has NOT retired its work, the open STILL SUCCEEDS: the client is simply not resident yet and acquires a
+        // handle at its first Submit (or at QueryInfo). That single change is what takes the client count off the hardware's 8 native VMIDs.
+        const uint32_t arc = vmid_assign_locked(s, nullptr);
+        if (arc != kOk && arc != kNotReady) { rc = (IOReturn)arc; break; }
+        if (arc == kNotReady) N1C_LOG("client opened NON-RESIDENT: all %u usable pool handles are held by clients whose own work has not retired; record %u acquires one at its first Submit", kVmidPoolSize, cli);
         __atomic_store_n(&s->id, ++gSessSeqCounter, __ATOMIC_SEQ_CST);   // 0.0.609
         __atomic_store_n(&s->open, true, __ATOMIC_RELEASE);
-        gSlotState[slot] = kSlotOpen;
+        gCliState[cli] = kCliOpen;
         if (multi) __atomic_add_fetch(&gOpenFlag, 1u, __ATOMIC_SEQ_CST);
         if (ws) __atomic_store_n(&gSessWs, 1u, __ATOMIC_SEQ_CST);   // 0.0.623 (G1) note, 0.0.627: set with the open itself
         if (ws) __atomic_store_n(&gWsId, s->id, __ATOMIC_SEQ_CST);   // 0.0.650 (G5): WindowServer is found by its session id, never by its slot
-        if (out != nullptr) { out->slot = slot; out->id = s->id; }
-        opened_log(s, cntl, win.mc);
+        if (out != nullptr) { out->slot = cli; out->id = s->id; }   // N48N ABI unchanged: the client carries these two words back on every call
+        opened_log(s, win.mc);
     } while (false);
     if (rc != kIOReturnSuccess) {
-        if (s != nullptr) pt_release_blocks(s);
+        if (s != nullptr) {
+            pt_release_blocks(s);
+            (void)vmid_release_locked(s);   // 0.0.669: give a handle that was already assigned back to the pool (the park page exists by now)
+            __atomic_store_n(&s->open, false, __ATOMIC_RELEASE);
+        }
         if (!multi) OSCompareAndSwap(1, 0, &gOpenFlag);
     }
     IOLockUnlock(gCliLock);
@@ -915,8 +1171,9 @@ void n1c_close(const N1cRef &ref, const char *how) {
     if (!multi || __atomic_load_n(&gScanOwner, __ATOMIC_ACQUIRE) == s->id) { uint64_t tr[2]; scan_teardown(s, how, tr); if (multi) __atomic_store_n(&gScanOwner, 0u, __ATOMIC_RELEASE); }
     n48dcn::modeHoldSessionClosed(s->id);   // 0.0.609: a row-120 hold owned by this session ends (or, HANDOFF, passes on) - AFTER the plane is back; atomic words only
     IOLockUnlock(gCliLock);
+    const uint32_t vmidAtClose = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);   // 0.0.669: for the log only; a steal may take the handle while we wait
     bool leak = hung_now();
-    if (!leak && !own_wait(s)) leak = true;            // a timeout here latched the hang (switch ON: or left this slot's work unproven)
+    if (!leak && !own_wait(s)) leak = true;            // a timeout here latched the hang (switch ON: or left this client's work unproven)
     const bool ownIdle = !leak;
     uint32_t nBos = 0, nHost = 0; uint64_t vramB = 0, gttB = 0, hostB = 0;
     for (uint32_t h = 1; h < N48N_MAX_BOS; h++) {
@@ -931,13 +1188,17 @@ void n1c_close(const N1cRef &ref, const char *how) {
     IOLockLock(gCliLock);
     bool parked = false;
     if (!leak) {
-        // No client owns this tree from here: park the context on the kernel's zeroed page, then free everything.
-        if (program_root(s->vmid, gPark.pa) != kOk) leak = true; else parked = true;
+        // No client owns this tree from here: park the context on the kernel's zeroed page AND hand the pool handle back, then free everything.
+        // 0.0.669: a client that is NOT resident (it never submitted, or an idle steal took its handle) has nothing to park - its handle is already back in
+        // the pool and no CONTEXT<n> points at this tree, so the park is trivially done and it must NOT be reported as a leak.
+        if (s->vmid == 0u) parked = true;
+        else if (vmid_release_locked(s) == kOk) parked = true;
+        else leak = true;   // the park did not acknowledge (a hang was latched): the tree may still be read, so the record is quarantined below
     }
     if (!leak) {
         for (uint32_t h = 1; h < N48N_MAX_BOS; h++) if (s->boUsed[h]) bo_release(s, h, kRelClosing);
         bool slots = false;
-        const FenceWindow &win = gWin[s->slot];
+        const FenceWindow &win = gWin[s->cli];
         for (uint32_t i = 0; i < N48N_FENCE_SLOTS; i++) {
             if (!s->fslot[i].used) continue;
             const uint64_t zero = 0;
@@ -946,18 +1207,25 @@ void n1c_close(const N1cRef &ref, const char *how) {
         }
         if (slots) { amdgpu_hdp_flush(dev); (void)flush_vmid(0); }
         pt_release_blocks(s);   // into the reserve, not vram_alloc
-        N1C_LOG("client closed (%s): slot %u VMID %u: %u BOs (%llu MiB VRAM, %llu MiB GTT), %u PT pages, %llu seqs, freed", how, s->slot, s->vmid, nBos,
+        N1C_LOG("client closed (%s): record %u (session %u), VMID %u (pool handle %s): %u BOs (%llu MiB VRAM, %llu MiB GTT), %u PT pages, %llu seqs, freed",
+                how, s->cli, s->id, vmidAtClose, vmidAtClose != 0u ? "released back to the pool" : "was not resident", nBos,
                 (unsigned long long)(vramB >> 20), (unsigned long long)(gttB >> 20), ptPages, (unsigned long long)seqs);
         if (nHost != 0u) N1C_LOG("client closed (%s): %u host imports (%llu KiB) unmapped, then completed and released", how, nHost, (unsigned long long)(hostB >> 10));   // 0.0.612
     } else {
-        // HUNG (or this slot's own work not proven retired): nothing the GPU might still read is freed; the context stays as it is, and the slot is DEAD.
-        N1C_LOG("client closed (%s): slot %u VMID %u: %u BOs (%llu MiB VRAM, %llu MiB GTT), %u PT pages, %llu seqs, LEAKED (HUNG)", how, s->slot, s->vmid, nBos,
+        // HUNG, or this client's own work was not proven retired: nothing the GPU might still read is freed and the context stays as it is. The record is
+        // QUARANTINED below (0.0.669): its handle is held, and the reclaim pass gives both back once own_idle can prove the work retired.
+        N1C_LOG("client closed (%s): record %u (session %u), VMID %u: %u BOs (%llu MiB VRAM, %llu MiB GTT), %u PT pages, %llu seqs, LEAKED (HUNG or the work was not proven retired)",
+                how, s->cli, s->id, vmidAtClose, nBos,
                 (unsigned long long)(vramB >> 20), (unsigned long long)(gttB >> 20), ptPages, (unsigned long long)seqs);
         if (nHost != 0u) N1C_LOG("client closed (%s): %u host imports (%llu KiB) LEAKED (HUNG): pages stay wired, never completed or released", how, nHost, (unsigned long long)(hostB >> 10));   // 0.0.612
     }
     __atomic_store_n(&s->hello, false, __ATOMIC_RELEASE);
-    __atomic_store_n(&s->open, false, __ATOMIC_RELEASE);          // the Session itself is static (slot 0) or never freed (slots 1..3)
-    gSlotState[s->slot] = slot_after_close(parked, ownIdle);       // 0.0.627 (G2): a VMID that may still be in use is never handed out again
+    __atomic_store_n(&s->open, false, __ATOMIC_RELEASE);          // the Session itself is static (record 0) or never freed (records 1..kMaxClients-1)
+    // 0.0.669: FREE only when the context was parked AND this client's own work was proven retired. Otherwise QUARANTINED: the record AND its pool handle are
+    // HELD (the GPU may still read that tree) and the reclaim pass hands them back as soon as own_idle proves the work retired. 0.0.627 made this permanent.
+    const uint8_t nst = n48native::g2::cli_after_close(parked, ownIdle);
+    gCliState[s->cli] = nst;
+    if (nst == kCliQuarantined) N1C_LOG("client closed (%s): record %u (session %u) is QUARANTINED (parked %d, own work proven retired %d): its pool handle stays HELD until the reclaim pass can prove the work retired - it is NOT lost (0.0.627 would have made it DEAD for the boot)", how, s->cli, s->id, (int)parked, (int)ownIdle);
     if (s->ws) __atomic_store_n(&gSessWs, 0u, __ATOMIC_SEQ_CST);   // 0.0.623 (G1): no WindowServer session any more
     if (s->ws) __atomic_store_n(&gWsId, 0u, __ATOMIC_SEQ_CST);     // 0.0.650 (G5)
     if (!multi) OSCompareAndSwap(1, 0, &gOpenFlag);
@@ -988,7 +1256,7 @@ static void bo_release(Session *s, uint32_t h, RelMode mode) {
     if (b.pinMask1 != 0u && scan_unpin1(h, b, mode)) b.pinLeak = 1u; // 0.0.662: and the monitor A's (instance 1) A before ITS slots' memory
     if (b.pinMask2 != 0u && scan_unpin2(h, b, mode)) b.pinLeak = 1u; // 0.0.661: and instance 2's A before ITS slots' memory
     if (b.pinLeak != 0u) mode = kRelLeak;             // a restore that did not verify: keep the memory and the PTEs, like HUNG
-    const FenceWindow &win = gWin[s->slot];
+    const FenceWindow &win = gWin[s->cli];
     if (mode == kRelClosing) {
         // The whole tree is being discarded (the context is parked, the arena is freed by the caller) and the fence-window PTEs are cleared
         // by the caller in one pass: only the memory goes.
@@ -1002,7 +1270,7 @@ static void bo_release(Session *s, uint32_t h, RelMode mode) {
         else if (b.kind == kBoVis && !vramReturnOk) {
             // LEAKED until reboot, and still COUNTED: gVramOthers keeps these bytes (they are never taken off the budget), so the 25 % cap reflects what the pool really lost.
             gMappedLeakBytes += b.size; gMappedLeakBos++;
-            N1C_LOG("close: slot %u BO %u (visible VRAM, %llu KiB at mc %#llx) is still CPU-mapped: its range is LEAKED until reboot (%u BO(s), %llu KiB leaked so far), not returned to the pool", s->slot, h,
+            N1C_LOG("close: record %u BO %u (visible VRAM, %llu KiB at mc %#llx) is still CPU-mapped: its range is LEAKED until reboot (%u BO(s), %llu KiB leaked so far), not returned to the pool", s->cli, h,
                     (unsigned long long)(b.size >> 10), (unsigned long long)b.mc, gMappedLeakBos, (unsigned long long)(gMappedLeakBytes >> 10));
         }
         else if (b.kind == kBoVis) { gCtx->gmc.vram_alloc.free(b.a); budget_release(b); }
@@ -1015,7 +1283,10 @@ static void bo_release(Session *s, uint32_t h, RelMode mode) {
             if (va_ent_used(e) && e.handle == h) { pt_unmap(s->rootPa, e.start, e.size / kPage, mem); touched = true; }
         }
         bool memOk = true;   // review item D: false once a TLB flush did not acknowledge (HUNG): the memory of this BO is then leaked, like the HUNG leak
-        if (touched) { amdgpu_hdp_flush(*gCtx->dev); memOk = memory_may_free_after_flush(flush_vmid(s->vmid)) && memOk; }
+        // 0.0.669: a client's own TLB only has entries while it is RESIDENT. Its handle was parked and flushed when it was released (close, or an idle
+        // steal) and nothing was submitted since, so a non-resident client has nothing to invalidate: the unmap needs no flush.
+        const uint32_t ownVm = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);
+        if (touched) { amdgpu_hdp_flush(*gCtx->dev); memOk = (ownVm == 0u) || memory_may_free_after_flush(flush_vmid(ownVm)); }
         bool slotCleared = false;
         for (uint32_t i = 0; i < N48N_FENCE_SLOTS; i++) {
             if (s->fslot[i].used && s->fslot[i].handle == h) {
@@ -1046,7 +1317,7 @@ static void bo_release(Session *s, uint32_t h, RelMode mode) {
 
 // 0.0.610 (ABI 1.8): read-only views for the Metal nub gate (that source file is the only user). 0.0.627: Hello done on ANY open session (one with the switch OFF).
 bool n1c_hello_done() {
-    for (uint32_t i = 0; i < kMaxSessions; i++) { Session *g = slot_ptr(i); if (g != nullptr && __atomic_load_n(&g->open, __ATOMIC_ACQUIRE) && __atomic_load_n(&g->hello, __ATOMIC_ACQUIRE)) return true; }
+    for (uint32_t i = 0; i < kMaxClients; i++) { Session *g = cli_ptr(i); if (g != nullptr && __atomic_load_n(&g->open, __ATOMIC_ACQUIRE) && __atomic_load_n(&g->hello, __ATOMIC_ACQUIRE)) return true; }
     return false;
 }
 bool n1c_hung() { return hung_now(); }
@@ -1061,7 +1332,9 @@ IOReturn n1c_hello(const N1cRef &ref, uint64_t clientAbi, uint64_t flags, uint64
         __atomic_store_n(&s->hello, true, __ATOMIC_RELEASE);
         // ABI 1.1: the minor is reported only when the client asks for it; without the flag out[0] is exactly the major, as in 1.0.
         out[0] = ((flags & N48N_HELLO_F_MINOR) != 0ull) ? (uint64_t)N48N_ABI_VERSION | ((uint64_t)N48N_ABI_MINOR << 16) : (uint64_t)N48N_ABI_VERSION;
-        out[1] = kN1cKextBuild; out[2] = N48N_MAX_IBS; out[3] = s->vmid;   // 0.0.627: the session's own VMID (8 with the switch OFF)
+        // 0.0.669: the VMID the client holds RIGHT NOW, i.e. the pool handle assigned to it, or 0 when it is not resident (an open that found every
+        // usable handle held by a busy client, before its first Submit). It is a HANDLE, not an identity: it can change between calls, and 0 is legal.
+        out[1] = kN1cKextBuild; out[2] = N48N_MAX_IBS; out[3] = (uint64_t)__atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);
     }
     sess_unlock(s);
     return rc;
@@ -1069,8 +1342,11 @@ IOReturn n1c_hello(const N1cRef &ref, uint64_t clientAbi, uint64_t flags, uint64
 
 IOReturn n1c_query_info(const N1cRef &ref, n48n_info *o) {
     if (!sess_hello(ref)) return kIOReturnNotReady;
-    Session *s = sess_peek(ref);
+    Session *s = sess_lock(ref, true);
     if (s == nullptr) return kIOReturnNotReady;
+    // 0.0.669: QueryInfo is a diagnostic that also reports the pool handle. A non-blocking attempt first, so the handle is the client's whenever one can be
+    // had at this instant (a free one, or one whose client is idle); it NEVER waits here.
+    if (__atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE) == 0u) (void)vmid_need(s, false);
     BringupContext &c = *gCtx;
     memset(o, 0, sizeof(*o));
     const IPVersion v = c.dev->ip.getVersion(IPBlock::GC);
@@ -1078,7 +1354,7 @@ IOReturn n1c_query_info(const N1cRef &ref, n48n_info *o) {
     o->abi_version = N48N_ABI_VERSION; o->kext_build = kN1cKextBuild;
     o->flags = (hung_now() ? N48N_INFO_HUNG : 0u) | (native_s1b_state().positivePass ? N48N_INFO_S1B_POSITIVE : 0u) |
                (native_s1b_state().gate == kGateOn ? N48N_INFO_NATIVE_BOOT : 0u);
-    o->vmid = s->vmid;
+    o->vmid = (uint32_t)__atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);   // 0.0.669: the pool handle held now, 0 = not resident
     o->gb_addr_config = RREG32(*c.dev, SOC15_REG_OFFSET_BIDX(*c.dev, IPBlock::GC, GFXRegBaseIdx::GB_ADDR_CONFIG, GFXRegs::GB_ADDR_CONFIG));
     o->gc_version = ((uint32_t)v.major << 16) | ((uint32_t)v.minor << 8) | v.rev;
     o->ring_size_dw = c.cp.ring_size_dwords; o->max_ibs = N48N_MAX_IBS;
@@ -1097,6 +1373,7 @@ IOReturn n1c_query_info(const N1cRef &ref, n48n_info *o) {
     o->va_low_first = kVaFirst; o->va_low_last = 0x00007FFFFFFFFFFFull;
     o->va_high_first = 0xFFFF800000000000ull; o->va_high_last = 0xFFFFFFFFFFFFFFFFull;
     o->max_bos = N48N_MAX_BOS; o->fence_slots = N48N_FENCE_SLOTS;
+    sess_unlock(s);
     return kIOReturnSuccess;
 }
 
@@ -1129,7 +1406,7 @@ IOReturn n1c_bo_create(const N1cRef &ref, const n48n_gem_create_in *in, uint64_t
         if (p.kind == kPlaceVis) {
             // 0.0.627 (G2): non-WindowServer sessions together stay within the global VRAM budget (switch ON; always true with it OFF).
             if (!n48native::g2::vram_budget_ok(multi, s->ws, gVramOthers, p.size, vram_total())) {
-                N1C_LOG("BoCreate refused (NoMemory): slot %u is over the shared VRAM budget for non-WindowServer sessions (%llu MiB held of %llu MiB, %llu KiB asked)", s->slot,
+                N1C_LOG("BoCreate refused (NoMemory): record %u is over the shared VRAM budget for non-WindowServer sessions (%llu MiB held of %llu MiB, %llu KiB asked)", s->cli,
                         (unsigned long long)(gVramOthers >> 20), (unsigned long long)(n48native::g2::others_vram_cap(vram_total()) >> 20), (unsigned long long)(p.size >> 10));
                 rc = kIOReturnNoMemory; break;
             }
@@ -1141,7 +1418,7 @@ IOReturn n1c_bo_create(const N1cRef &ref, const n48n_gem_create_in *in, uint64_t
             bool hiDone = n48native::g4::hi_first(appsNow, s->ws, p.hiOk) && gCtx->gmc.vram_alloc_hi.is_inited() && gCtx->gmc.vram_alloc_hi.alloc(p.size, p.align, &a);
             if (!hiDone) {
                 if (!n48native::g4::appvis_ok(appsNow, s->ws, gVisOthers, p.size, appsNow ? appvis_cap() : 0ull)) {
-                    N1C_LOG("BoCreate refused (NoMemory): slot %u is over the visible-VRAM cap for non-WindowServer sessions (%llu KiB held of %llu MiB, %llu KiB asked)", s->slot,
+                    N1C_LOG("BoCreate refused (NoMemory): record %u is over the visible-VRAM cap for non-WindowServer sessions (%llu KiB held of %llu MiB, %llu KiB asked)", s->cli,
                             (unsigned long long)(gVisOthers >> 10), (unsigned long long)(appvis_cap() >> 20), (unsigned long long)(p.size >> 10));
                     rc = kIOReturnNoMemory; break;
                 }
@@ -1165,7 +1442,7 @@ IOReturn n1c_bo_create(const N1cRef &ref, const n48n_gem_create_in *in, uint64_t
         } else {
             if (p.size > kGttMaxBo || would_exceed(s->gttUsed, p.size, kGttCap)) { rc = kIOReturnNoMemory; break; }
             if (!n48native::g2::sys_budget_ok(multi, s->ws, gSysHeld, p.size)) {   // 0.0.629 (R4): GTT + imports of all sessions <= 6 GiB (WindowServer: per-session caps only)
-                N1C_LOG("BoCreate refused (NoMemory): slot %u: GTT + host imports of all sessions would pass the global %llu MiB (%llu MiB held, %llu KiB asked)", s->slot,
+                N1C_LOG("BoCreate refused (NoMemory): record %u: GTT + host imports of all sessions would pass the global %llu MiB (%llu MiB held, %llu KiB asked)", s->cli,
                         (unsigned long long)(n48native::g2::kSysGlobalCap >> 20), (unsigned long long)(gSysHeld >> 20), (unsigned long long)(p.size >> 10));
                 rc = kIOReturnNoMemory; break;
             }
@@ -1265,7 +1542,7 @@ IOReturn n1c_bo_free(const N1cRef &ref, uint64_t handle) {
         // Busy, nothing touched, the handle stays valid (unmap, then free again). Under HUNG the memory is leaked anyway, so the check is not needed there.
         const uint32_t mrc = hung_now() ? kOk : n48native::g2::bofree_mapping_rc(multi_on(), b0.kind == kBoVis, b0.vmd != nullptr, b0.vmd != nullptr ? (uint32_t)b0.vmd->getRetainCount() : 0u);
         if (mrc != kOk) {
-            N1C_LOG("BoFree refused (Busy): slot %u BO %u (visible VRAM, %llu KiB) is still CPU-mapped (%d descriptor references): unmap it first", s->slot, h,
+            N1C_LOG("BoFree refused (Busy): record %u BO %u (visible VRAM, %llu KiB) is still CPU-mapped (%d descriptor references): unmap it first", s->cli, h,
                     (unsigned long long)(b0.size >> 10), b0.vmd->getRetainCount());
             rc = (IOReturn)mrc;
         } else {
@@ -1274,7 +1551,7 @@ IOReturn n1c_bo_free(const N1cRef &ref, uint64_t handle) {
             if (noBlame) {
                 // 0.0.629 (R2), switch ON: the 2 s ran out while the GPU was still making progress. Nobody was blamed; the BO is KEPT (handle valid, memory and PTEs
                 // as they were) and the caller gets Timeout. Its close frees it after its own work retired.
-                N1C_LOG("BoFree: slot %u BO %u: own work not retired within 2 s while the GPU is progressing: Timeout, the BO is kept (no blame)", s->slot, h);
+                N1C_LOG("BoFree: record %u BO %u: own work not retired within 2 s while the GPU is progressing: Timeout, the BO is kept (no blame)", s->cli, h);
             } else {
                 IOLockLock(gCliLock);
                 bo_release(s, h, m);
@@ -1364,7 +1641,7 @@ IOReturn n1c_bo_import_host(const N1cRef &ref, task_t task, uint64_t hostVa, uin
         if (c.rc == kNoMemory) N1C_LOG("import refused: per-client cap of %llu MiB reached under the lock (%llu MiB held, %llu KiB asked)", (unsigned long long)(kImportCap >> 20), (unsigned long long)(s->importedBytes >> 20), (unsigned long long)(size >> 10));   // 0.0.620
         if (c.rc != kOk) { rc = (IOReturn)c.rc; break; }
         if (!n48native::g2::sys_budget_ok(multi_on(), s->ws, gSysHeld, size)) {   // 0.0.629 (R4): under gCliLock, before anything is mapped
-            N1C_LOG("import refused (NoMemory): slot %u: GTT + host imports of all sessions would pass the global %llu MiB (%llu MiB held, %llu KiB asked)", s->slot,
+            N1C_LOG("import refused (NoMemory): record %u: GTT + host imports of all sessions would pass the global %llu MiB (%llu MiB held, %llu KiB asked)", s->cli,
                     (unsigned long long)(n48native::g2::kSysGlobalCap >> 20), (unsigned long long)(gSysHeld >> 20), (unsigned long long)(size >> 10));
             rc = kIOReturnNoMemory; break;
         }
@@ -1390,7 +1667,9 @@ IOReturn n1c_bo_import_host(const N1cRef &ref, task_t task, uint64_t hostVa, uin
         if (mapped) {
             s->maps[slot] = VaEnt{ c.gpuStripped, size, 0, h, (uint32_t)flags };
             amdgpu_hdp_flush(*gCtx->dev);
-            const uint32_t f = flush_vmid(s->vmid);               // synchronous: the mapping is complete on return
+            // 0.0.669: only a resident client has a TLB to flush (see bo_release); non-resident, the mapping becomes visible at the next assign's flush.
+            const uint32_t ownVm = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);
+            const uint32_t f = ownVm == 0u ? kOk : flush_vmid(ownVm);   // synchronous: the mapping is complete on return
             if (f != kOk) rc = (IOReturn)f;                        // a hang was latched: the BO stays recorded (leaked at close)
         }
         out[0] = h; out[1] = size; out[2] = mapped ? va_canonicalize(c.gpuStripped) : 0ull; out[3] = N48N_PLACED_HOST_IMPORT;
@@ -1439,7 +1718,9 @@ IOReturn n1c_gem_va(const N1cRef &ref, const n48n_gem_va *in) {
             if (r != kOk) { rc = (IOReturn)r; break; }
             s->maps[slot] = VaEnt{ q.stripped, in->map_size, in->offset_in_bo, in->handle, in->flags };
             amdgpu_hdp_flush(*gCtx->dev);
-            const uint32_t f = flush_vmid(s->vmid);      // synchronous: the mapping is complete on return
+            // 0.0.669: as above - a non-resident client has no TLB entries to invalidate.
+            const uint32_t ownVm = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);
+            const uint32_t f = ownVm == 0u ? kOk : flush_vmid(ownVm);   // synchronous: the mapping is complete on return
             if (f != kOk) rc = (IOReturn)f;
         } else {
             const int hit = va_find_exact(s->maps, kMaxMaps, in->handle, q.stripped, in->map_size);
@@ -1452,7 +1733,8 @@ IOReturn n1c_gem_va(const N1cRef &ref, const n48n_gem_va *in) {
             pt_unmap(s->rootPa, q.stripped, in->map_size / kPage, mem);
             s->maps[hit] = VaEnt{ 0, 0, 0, 0, 0 };
             amdgpu_hdp_flush(*gCtx->dev);
-            const uint32_t f = flush_vmid(s->vmid);
+            const uint32_t ownVm = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);
+            const uint32_t f = ownVm == 0u ? kOk : flush_vmid(ownVm);
             if (f != kOk) rc = (IOReturn)f;
         }
     } while (false);
@@ -1491,11 +1773,11 @@ IOReturn n1c_ctx(const N1cRef &ref, const n48n_ctx *in, n48n_ctx *out) {
     return rc;
 }
 
-// The VMID-0 address of a user-fence target (contract 4.3): a VRAM BO by its MC address, a GTT BO through the slot's fence window. Caller holds the
+// The VMID-0 address of a user-fence target (contract 4.3): a VRAM BO by its MC address, a GTT BO through the client record's fence window. Caller holds the
 // session's lock and gCliLock (the GART table and the VMID-0 TLB are shared).
 static uint32_t resolve_fence(Session *s, uint32_t handle, uint32_t off, uint64_t *addr) {
     const Bo &b = s->bo[handle];
-    const FenceWindow &win = gWin[s->slot];
+    const FenceWindow &win = gWin[s->cli];
     if (b.kind == kBoHost) return kNotPermitted;   // 0.0.612: an imported range of the caller's memory is never a kernel-written fence target
     if (b.kind != kBoGtt) { *addr = fence_addr_vram(b.mc, off); return kOk; }
     const uint32_t page = off / (uint32_t)kPage;
@@ -1503,7 +1785,7 @@ static uint32_t resolve_fence(Session *s, uint32_t handle, uint32_t off, uint64_
     const int slot = fence_slot_pick(s->fslot, N48N_FENCE_SLOTS, handle, page, &isNew);
     if (slot < 0) return kNoResources;
     if (isNew) {
-        // U3: gmc_bind_existing only bumps, gart_bind_existing runs a different allocator; so the slot's PTE is written directly with the
+        // U3: gmc_bind_existing only bumps, gart_bind_existing runs a different allocator; so the window slot's PTE is written directly with the
         // encoding gmc_bind_existing uses (PTEFlags::SYSMEM_RW on the page's bus address), inside the window reserved at first open.
         const uint64_t pte = ((b.sm.bus + (uint64_t)page * kPage) & ~0xFFFull) | PTEFlags::SYSMEM_RW;
         bar0_memcpy_to_vram(*gCtx->dev, gCtx->gmc.gart_pt_vram_offset + (win.gartOff / kPage + (uint64_t)slot) * 8ull, &pte, sizeof(pte));
@@ -1549,10 +1831,25 @@ IOReturn n1c_submit(const N1cRef &ref, const uint8_t *in, uint32_t size, uint64_
             IOLockUnlock(gCliLock);
             if (fr != kOk) { rc = (IOReturn)fr; break; }
         }
-        uint32_t er;
-        if (!g5_on()) er = ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut);   // G5 OFF: exactly 0.0.642
-        else if (s->ws) { __atomic_store_n(&gWsLastNs, now_ns(), __ATOMIC_RELEASE); er = ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut); }   // 0.0.650 (G5): WindowServer is stamped, never gated
-        else er = ring_submit_app_g5(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut);   // 0.0.650 (G5): every other session passes the admission
+        // 0.0.669: the client must be RESIDENT to put an IB on the ring (the packet carries its VMID). This is where a client that opened non-resident, or
+        // whose handle an idle steal took, gets one: a free handle at once; else a bounded wait (kWaitCapNs) for one of the busy clients to retire its work,
+        // which is the waitForVMID half of the Apple driver's split. Timeout here means the bound ran out - nobody is blamed for that alone (R2).
+        {
+            const uint32_t vrc = vmid_need(s, true);
+            if (vrc != kOk) { rc = (IOReturn)vrc; break; }
+        }
+        uint32_t er = kOk;
+        for (uint32_t attempt = 0; attempt < 2u; attempt++) {
+            if (!g5_on()) er = ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut);   // G5 OFF: exactly 0.0.642
+            else if (s->ws) { __atomic_store_n(&gWsLastNs, now_ns(), __ATOMIC_RELEASE); er = ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut); }   // 0.0.650 (G5): WindowServer is stamped, never gated
+            else er = ring_submit_app_g5(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut);   // 0.0.650 (G5): every other session passes the admission
+            if (er != kNotReady) break;
+            // 0.0.669: kNotReady means a steal revoked this client's handle between the acquisition above and the ring. A steal is only possible while this
+            // client's OWN work is retired, so the retry is safe; it is done ONCE (a second revocation is a real failure, not a race we keep losing to).
+            N1C_LOG("Submit: record %u (session %u) lost its VMID handle to an idle steal between the acquisition and the ring: re-acquiring and retrying once", s->cli, s->id);
+            const uint32_t vrc2 = vmid_need(s, true);
+            if (vrc2 != kOk) { er = vrc2; break; }
+        }
         if (er != kOk) { rc = (IOReturn)er; break; }
     } while (false);
     sess_unlock(s);
@@ -1849,7 +2146,7 @@ static bool multi_on() {
         const bool present = PE_parse_boot_argn("navi48-multisession", &v, sizeof(v));
         if (OSCompareAndSwap(n48native::g2::kLatchUnset, n48native::g2::latch_value(present, v), &gMultiLatch))
             N1C_LOG("boot-arg navi48-multisession %s: native sessions are %s for this boot", present ? (v == 1u ? "=1" : "present but not 1") : "absent",
-                    n48native::g2::latch_is_on(gMultiLatch) ? "MULTIPLE (up to 4: VMID 8 for the first, 9..11 for the others)" : "SINGLE (VMID 8, one open at a time)");
+                    n48native::g2::latch_is_on(gMultiLatch) ? "MULTIPLE (0.0.669: up to kMaxClients = 64 client records, sharing a POOL of 8 VMID handles = 8 live address spaces at once)" : "SINGLE (VMID 8, one open at a time)");
         l = gMultiLatch;
     }
     return n48native::g2::latch_is_on(l);
@@ -1981,7 +2278,7 @@ void n1c_unmap_for_close(const N1cRef &ref, IOUserClient *uc) {
         }
         vmd->release();
     }
-    if (removed != 0u) N1C_LOG("close: slot %u: %u CPU mapping(s) of visible-VRAM BOs removed before the session's BOs are released", ref.slot, removed);
+    if (removed != 0u) N1C_LOG("close: record %u: %u CPU mapping(s) of visible-VRAM BOs removed before the session's BOs are released", ref.slot, removed);
 }
 // 0.0.641: the "open refused" log gate (n48native::g4::log_gate_step). true = log this line; *suppressed = lines dropped in the previous window (report them once). Log-only.
 bool n1c_log_gate(uint32_t *suppressed) {
@@ -2001,18 +2298,36 @@ IOReturn n1c_app_verb(uint64_t arg, uint64_t *o) {
     if (rc == kAllowOk && o[2] != N48A_OP_LIST) N1C_LOG("appallow: %s key %#llx -> %u entr%s on the allow-list", o[2] == N48A_OP_ADD ? "ADDED" : "REMOVED", (unsigned long long)o[4], (unsigned)o[1], o[1] == 1ull ? "y" : "ies");
     return rc == kAllowOk || rc == kAllowExists || rc == kAllowNotFound ? kIOReturnSuccess : rc == kAllowFull ? kIOReturnNoSpace : rc == kAllowOff ? kIOReturnNotPermitted : kIOReturnBadArgument;
 }
-// accel 103 `sessstat <page>`: page 0..3 one session slot, page 4 the global page. Read-only. The caller (accelExperiment) checked the latch and the argument.
+// accel 103 `sessstat <page>`: 0..kVmidPoolSize-1 = ONE POOL HANDLE each; kVmidPoolSize = the global page; kVmidPoolSize+1 = the CLIENT TABLE (0.0.669).
+// Read-only; the caller (accelExperiment) checked the latch and the argument.
 IOReturn n1c_g2_stat(uint64_t page, uint64_t *o) {
     using namespace n48native::g2;
     for (uint32_t i = 0; i < kOutN; i++) o[i] = 0;
     if (!multi_on()) { o[0] = kStatOff; return kIOReturnSuccess; }
-    if (page > (uint64_t)kStatGlobal) { o[0] = kStatBadArg; return kIOReturnBadArgument; }
+    if (page > (uint64_t)kStatClients) { o[0] = kStatBadArg; return kIOReturnBadArgument; }
     if (gCliLock == nullptr || gCtx == nullptr) { o[0] = kStatOk; o[1] = page; return kIOReturnSuccess; }   // nothing ever opened this boot
+    if (page == (uint64_t)kStatClients) {
+        // 0.0.669: the CLIENT TABLE page. It is what tells the user whether the pool or the table is the limit: `quarantined` > 0 with `handles free` > 0
+        // means the table is holding records back (the reclaim pass will return them), while `handles free` = 0 means all 8 live address spaces are busy.
+        GlobalView g {};
+        IOLockLock(gCliLock);
+        g.open = __atomic_load_n(&gOpenFlag, __ATOMIC_SEQ_CST);
+        for (uint32_t i = 0; i < kMaxClients; i++) if (gCliState[i] == kCliQuarantined) g.quarantined++;
+        for (uint32_t i = 0; i < kMaxClients; i++) if (gCliState[i] == kCliFree) g.freeList++;
+        for (uint32_t h = 0; h < kVmidPoolSize; h++) if (gVmidOwner[h] == kNoClient) g.handlesFree++;
+        g.records = gCliAlloc;
+        g.handlesHeld = vmid_held_locked();
+        IOLockUnlock(gCliLock);
+        cli_out(g, o);
+        return kIOReturnSuccess;
+    }
     if (page == (uint64_t)kStatGlobal) {
         GlobalView g {};
         IOLockLock(gCliLock);
         g.open = __atomic_load_n(&gOpenFlag, __ATOMIC_SEQ_CST);
-        for (uint32_t i = 0; i < kMaxSessions; i++) if (gSlotState[i] == kSlotDead) g.dead++;
+        for (uint32_t i = 0; i < kMaxClients; i++) if (gCliState[i] == kCliQuarantined) g.quarantined++;
+        for (uint32_t h = 0; h < kVmidPoolSize; h++) if (gVmidOwner[h] == kNoClient) g.handlesFree++;
+        g.handlesHeld = vmid_held_locked();
         g.othersVram = gVramOthers; g.othersCap = others_vram_cap(vram_total());
         if (apps_on()) { g.appVisBytes = gVisOthers; g.appVisCapMiB = (uint32_t)(appvis_cap() >> 20); }   // 0.0.641: the visible-pool use of non-WindowServer sessions and its cap
         IOLockUnlock(gCliLock);
@@ -2027,20 +2342,27 @@ IOReturn n1c_g2_stat(uint64_t page, uint64_t *o) {
         global_out(g, o);
         return kIOReturnSuccess;
     }
-    const uint32_t slot = (uint32_t)page;
+    // page 0..kVmidPoolSize-1: ONE POOL HANDLE. o[3] = the VMID (8 + page), o[12] = the client index holding it (or 0xFFFFFFFF = free), and o[2]'s 0x1000 bit
+    // says the handle is FREE. 0.0.669: this page describes the HANDLE, so a free one is now a normal answer instead of a "free slot".
+    const uint32_t handle = (uint32_t)page;
     SessView v {};
-    v.vmid = vmid_of_slot(slot);
+    v.vmid = vmid_of_handle(handle);
     IOLockLock(gCliLock);
-    v.state = gSlotState[slot];
-    Session *s = slot_ptr(slot);
-    if (s != nullptr && __atomic_load_n(&s->open, __ATOMIC_ACQUIRE)) {   // the counters are read under gCliLock (a racing selector may be mid-update: a diagnostic)
-        v.ws = s->ws; v.app = s->app; v.hello = s->hello; v.poisoned = sess_poisoned(s); v.id = s->id;   // 0.0.640 (G4): app
-        v.vram = s->vramBytes; v.gtt = s->gttUsed; v.imported = s->importedBytes; v.ptBytes = (uint64_t)s->nblk * kArenaBlockBytes;
-        v.lastSeq = __atomic_load_n(&s->emitted, __ATOMIC_ACQUIRE); v.nBos = s->nBos;
-        v.faultAtOpen = s->faultAtOpen;   // 0.0.629 (R5)
+    const uint32_t c = (handle < kVmidPoolSize) ? gVmidOwner[handle] : kNoClient;
+    v.free = (c == kNoClient);
+    v.cli = c;
+    Session *s = (c != kNoClient) ? gCli[c] : nullptr;
+    if (s != nullptr) {
+        v.state = gCliState[c];
+        if (__atomic_load_n(&s->open, __ATOMIC_ACQUIRE)) {   // the counters are read under gCliLock (a racing selector may be mid-update: a diagnostic)
+            v.ws = s->ws; v.app = s->app; v.hello = s->hello; v.poisoned = sess_poisoned(s); v.id = s->id;   // 0.0.640 (G4): app
+            v.vram = s->vramBytes; v.gtt = s->gttUsed; v.imported = s->importedBytes; v.ptBytes = (uint64_t)s->nblk * kArenaBlockBytes;
+            v.lastSeq = __atomic_load_n(&s->emitted, __ATOMIC_ACQUIRE); v.nBos = s->nBos;
+            v.faultAtOpen = s->faultAtOpen;   // 0.0.629 (R5)
+        }
     }
     IOLockUnlock(gCliLock);
-    sess_out(slot, v, o);
+    sess_out(handle, v, o);
     return kIOReturnSuccess;
 }
 

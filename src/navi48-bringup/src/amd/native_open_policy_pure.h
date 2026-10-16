@@ -44,8 +44,8 @@ inline const char *open_reason_text(OpenReason r) {
     case kReasonNotPrivileged: return "not root (euid != 0)";
     case kReasonWsArgOff:      return "uid 88 but boot-arg navi48-metal-ws is not 1";
     case kReasonWsAlreadyOpen: return "uid 88 but a native client is already open";
-    case kReasonApp:           return "allow-listed user application (navi48-apps=1)";
-    case kReasonAppNotAllowed: return "user application not on the navi48-apps allow-list";
+    case kReasonApp:           return "ordinary caller admitted with the APP role (default-allow since 0.0.665)";
+    case kReasonAppNotAllowed: return "user application not on the navi48-apps allow-list (unreachable since 0.0.665: the list is not consulted)";
     default:                   return "?";
     }
 }
@@ -55,10 +55,16 @@ inline const char *open_reason_text(OpenReason r) {
 // user's (>= kAppMinUid) while BOTH boot-args are set (appsOn = navi48-apps=1 AND navi48-multisession=1), turns the refusal into kReasonApp (the process is on the kernel allow-list) or
 // kReasonAppNotAllowed (it is not). Everything else - an administrator, uid 88, a system uid below 501, and EVERY caller when appsOn is false - passes through untouched, so with the
 // switches off the decision is bit for bit today's.
+// 0.0.665 (DEFAULT-ALLOW) changes the paragraph above: EVERY non-root caller that is not uid 88 is now admitted with the APP role, with or without the
+// boot-args and with or without the name being on the allow-list. `appsOn`/`onAllowList` are accepted and IGNORED here; kReasonAppNotAllowed can no longer be produced (the allow-list is
+// no longer consulted for admission - the appallow verb stays as a validated no-op, native_g4_pure.h). What keeps this from being a free-for-all: uid 88 keeps its own rule (boot-arg,
+// one client), an administrator keeps every selector, and an APP client still reaches ONLY selector_allowed_for_app (0, 1, 3..8, 21) - so an unprivileged process still never reads
+// registers (2), never touches the scanout plane (9..14) and never calls 15..20.
 constexpr uint32_t kAppMinUid = 501u;   // the first ordinary macOS user; below it are root, daemons and _windowserver
 constexpr OpenDecision app_refine(OpenDecision d, uint32_t uid, bool appsOn, bool onAllowList) {
-    if (d.admit || d.reason != kReasonNotPrivileged || !appsOn || uid < kAppMinUid) return d;
-    return onAllowList ? OpenDecision{ true, kReasonApp } : OpenDecision{ false, kReasonAppNotAllowed };
+    if (d.admit || d.reason != kReasonNotPrivileged || uid == kWindowServerUid) return d;
+    (void)appsOn; (void)onAllowList;
+    return OpenDecision{ true, kReasonApp };
 }
 // An APP client reaches the application set only: Hello, QueryInfo, BoCreate, BoFree, GemVa, Ctx, Submit, WaitSeq (0, 1, 3..8) and BoImportHost (21). Never ReadRegs (2: raw register reads),
 // never the scanout set (9..14: the display plane belongs to WindowServer), never 15..20 (DAL step, mode trial / hold / release, Metal nub publish / withdraw), nor an unknown number.

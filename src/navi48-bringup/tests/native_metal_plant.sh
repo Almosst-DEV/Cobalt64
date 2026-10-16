@@ -83,7 +83,30 @@ plant 8 $P "a nub may be published while the old one is still terminating" '    
 // Withdraw' '    return kOk;
 }
 // Withdraw'
-plant 9 $P "NUB AT BOOT: publish_at_boot() says yes" 'inline bool publish_at_boot() { return false; }' 'inline bool publish_at_boot() { return true; }'
+plant 9 $P "NUB AT BOOT: the boot publish ignores both switches" 'inline bool publish_at_boot(bool masterLatch, bool killSwitch) { return masterLatch && !killSwitch; }' 'inline bool publish_at_boot(bool masterLatch, bool killSwitch) { (void)masterLatch; (void)killSwitch; return true; }'
+plant 9  $P "NUB AT BOOT: the kill switch is ignored (navi48-nubboot=0 no longer stops the boot publish)" 'return masterLatch && !killSwitch;' 'return masterLatch;'
+plant 93 $P "NUB AT BOOT: the master latch is ignored (the nub is published on every boot)" 'return masterLatch && !killSwitch;' 'return !killSwitch;'
+plant 94 $P "NUB AT BOOT: the boot verdict is no longer the selector's verdict minus the session (a weaker gate is possible)" '    GateIn boot = g;
+    boot.hello = true;                       // the boot IS the session: the only difference from publish_verdict, and it is this one line
+    return publish_verdict(boot, st);' '    return publish_verdict(g, st);'
+plant 95 $P "NUB AT BOOT: the boot verdict forces MORE than the session (it would publish a HUNG GPU)" '    GateIn boot = g;
+    boot.hello = true;' '    GateIn boot = g;
+    boot.hello = true; boot.hung = false;'
+# ---- the boot hold (0.0.670): each transition is allowed from exactly one state, and the cap can only take a held hold ----
+plant 96 $P "BOOT HOLD: the cap may release a claimed hold (the worker's release would then run twice)" 'inline bool hold_cap_ok(HoldState s)     { return s == kHoldHeld; }' 'inline bool hold_cap_ok(HoldState s)     { return s != kHoldNone; }'
+plant 97 $P "BOOT HOLD: the arm may be claimed after the cap released the hold (never arm behind WindowServer)" 'inline bool hold_claim_ok(HoldState s)   { return s == kHoldHeld; }' 'inline bool hold_claim_ok(HoldState s)   { return true; }'
+plant 98 $P "BOOT HOLD: a second hold may be taken (two adjustBusy(1) for one release)" 'inline bool hold_take_ok(HoldState s)    { return s == kHoldNone; }' 'inline bool hold_take_ok(HoldState s)    { return true; }'
+plant 99 $P "BOOT HOLD: the worker's release is valid without its claim (adjustBusy(-1) without the raise)" 'inline bool hold_release_ok(HoldState s) { return s == kHoldClaimed; }' 'inline bool hold_release_ok(HoldState s) { return true; }'
+plant 100 $P "BOOT HOLD: the cap's minimum clamp is gone (a 1 ms cap lets WindowServer in mid-bring-up)" '    if (argValue < kHoldCapMsMin) return kHoldCapMsMin;' '    if (argValue < kHoldCapMsMin) return argValue;'
+plant 101 $P "BOOT HOLD: the cap's maximum clamp is gone (a boot-arg can hold the boot for a day)" '    if (argValue > kHoldCapMsMax) return kHoldCapMsMax;' '    if (argValue > kHoldCapMsMax) return argValue;'
+plant 102 $P "BOOT HOLD: a cap of 0 disables the cap instead of meaning the default" '    if (!argPresent || argValue == 0u) return kHoldCapMsDefault;' '    if (!argPresent) return kHoldCapMsDefault;
+    if (argValue == 0u) return 0xFFFFFFFFu;'
+# ---- the accelerator's property gate ----
+plant 103 $N "GATE: the nub does not carry the accelerator's IOPropertyMatch gate (the accelerator can never match)" 'if (accel_bind_allowed()) nub->setProperty(N48_METAL_ACCEL_GATE_KEY, kOSBooleanTrue);' '(void)0;'
+plant 111 $N "GATE: the accelerator gate ignores navi48-accelbind=0 (the kill switch would do nothing)" '	return v != 0u;' '	return true;'
+plant 104 $N "GATE: the gate is written AFTER attach/registerService (the aux kext's probe would not see it)" 'if (accel_bind_allowed()) nub->setProperty(N48_METAL_ACCEL_GATE_KEY, kOSBooleanTrue);
+			if (nub->attach(owner)) {' 'if (nub->attach(owner)) {
+				if (accel_bind_allowed()) nub->setProperty(N48_METAL_ACCEL_GATE_KEY, kOSBooleanTrue);'
 plant 10 $P "withdraw needs the boot-arg (cleanup becomes impossible)" '    if (g.flags != 0) return kBadArg;
     if (st == kPublished) return kOk;' '    if (g.flags != 0) return kBadArg;
     if (!g.bootarg) return kUnsupported;
@@ -127,7 +150,7 @@ plant 31 $N "the gate ignores HUNG" 'g.hung = amdgpu::n1c_hung();' 'g.hung = fal
 plant 32 $N "the gate does not read the Hello state" 'g.hello = amdgpu::n1c_hello_done();' 'g.hello = true;'
 plant 33 $N "the populate hook is not the pure config_populate" 'n48metal::config_populate(cfg, bytes, (uint64_t)(uintptr_t)kAccelName)' '0'
 plant 34 $N "the ops table carries the wrong build" 'const N48MetalOps gOps = {
-	N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 664u,' 'const N48MetalOps gOps = {
+	N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 666u,' 'const N48MetalOps gOps = {
 	N48_METAL_OPS_MAGIC, N48_METAL_ABI, (uint32_t)sizeof(N48MetalOps), 610u,'
 plant 35 $N "the memory-map hook claims success" 'return (int)kIOReturnUnsupported;' 'return 0;'
 plant 36 $N "the nub source touches a register" '	MNLOG("device_close");' '	MNLOG("device_close"); (void)"WREG32";'
@@ -136,9 +159,9 @@ plant 38 $C "the publish selector accepts the wrong shape" 'if (!shape(1, 4, 0, 
 		return Navi48MetalNub::selectorPublish' 'if (!shape(1, 3, 0, 0)) return kIOReturnBadArgument;
 		return Navi48MetalNub::selectorPublish'
 plant 39 $C "the withdraw selector is not dispatched" 'case N48N_SEL_METAL_NUB_WITHDRAW:' 'case 20 + 100:'
-plant 40 $SR/amd/native_s1c.h "the kext build is not bumped" 'kN1cKextBuild = 664;' 'kN1cKextBuild = 610;'
+plant 40 $SR/amd/native_s1c.h "the kext build is not bumped" 'kN1cKextBuild = 670;' 'kN1cKextBuild = 610;'
 plant 41 $K/Info.plist "the plist is not bumped (one occurrence)" '<key>CFBundleShortVersionString</key>
-	<string>0.0.664</string>' '<key>CFBundleShortVersionString</key>
+	<string>0.0.670</string>' '<key>CFBundleShortVersionString</key>
 	<string>0.0.610</string>'
 plant 42 $SR/Navi48NativeABI.h "the ABI minor is not bumped" '#define N48N_ABI_MINOR     12u ' '#define N48N_ABI_MINOR     7u '
 plant 43 $SR/Navi48NativeABI.h "the withdraw selector moves" 'N48N_SEL_METAL_NUB_WITHDRAW = 20,' 'N48N_SEL_METAL_NUB_WITHDRAW = 21,'
@@ -185,6 +208,14 @@ plant 71 $N "op_vhook logs unconditionally (an extra MNLOG outside the rate limi
 plant 72 $N "op_vhook reads the boot-arg on every call (the hot path)" '	if (cls == N48_VC_VIDMEMORY || cls == N48_VC_RESOURCE) mask = op_factory_mask(nullptr);' '	mask = op_factory_mask(nullptr);'
 plant 73 $N "op_vhook ignores the pure handler" 'n48metal::vhook_handle(mask, cls, slot, args, nargs, ret, n48metal::kKernelMin)' '0'
 plant 74 $N "op_vhook passes a zero kernel base (a user pointer is written)" 'n48metal::vhook_handle(mask, cls, slot, args, nargs, ret, n48metal::kKernelMin)' 'n48metal::vhook_handle(mask, cls, slot, args, nargs, ret, 0)'
+
+# ---- 0.0.670: the boot worker's hold. Every one of these breaks a decision the pure header makes; the worker's own pins are source scans. ----
+plant 105 $SR/amd/native_armboot.cpp "BOOT HOLD: the hold is taken on a DIFFERENT service than the kext's (the busy state would not reach the provider chain)" 'IOService *svc = navi48_bringup_service();' 'IOService *svc = nullptr;'
+plant 106 $SR/amd/native_armboot.cpp "BOOT HOLD: no cap timer is armed (a stuck bring-up becomes a stuck boot)" 'thread_call_enter_delayed(cap, dl);' '(void)dl;'
+plant 107 $SR/amd/native_armboot.cpp "BOOT HOLD: the arm no longer checks the claim (it arms behind WindowServer)" 'if (gHoldUsed != 0u && !hold_claim()) {' 'if (false) {'
+plant 108 $SR/amd/native_armboot.cpp "BOOT HOLD: a refusal after the claim leaks the hold (WindowServer never starts)" 'hold_finish(svc, r.ok, r.why);' '(void)r;'
+plant 109 $SR/amd/native_armboot.cpp "BOOT PUBLISH: the kext publishes the nub even with navi48-nubboot=0" 'if (gNubLatch == kLatchOn) {' 'if (false) {'
+plant 110 $SR/amd/native_armboot.cpp "BOOT PUBLISH: the boot path stops using the pure verdict" 'Navi48MetalNub::bootPublish(owner)' 'Navi48MetalNub::selectorPublish(owner, 0, out)'
 
 # ---- review round: the total count of Navi48MetalNub references in native_s1c.cpp is pinned at 2 (include + hungLatched) ----
 plant 90 $SR/amd/native_s1c.cpp "native_s1c.cpp gains a third reference to the nub (a new use)" '    Navi48MetalNub::hungLatched();' '    Navi48MetalNub::hungLatched(); (void)sizeof(Navi48MetalNub);'

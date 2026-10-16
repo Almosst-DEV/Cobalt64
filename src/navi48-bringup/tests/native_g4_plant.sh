@@ -146,9 +146,9 @@ plant 57 $E '        g.mappedLeakBos = gMappedLeakBos;   // 0.0.640 (G4): BOs le
 plant 58 $E '        const uint32_t mrc = hung_now() ? kOk : n48native::g2::bofree_mapping_rc(' '        const uint32_t mrc = kOk; (void)n48native::g2::bofree_mapping_rc(' "R6 58: BoFree of a mapped BO is no longer refused (0.0.629's rule lost)"
 # ---- version ----
 plant 59 $K/Info.plist '<key>CFBundleVersion</key>
-	<string>0.0.664</string>' '<key>CFBundleVersion</key>
+	<string>0.0.670</string>' '<key>CFBundleVersion</key>
 	<string>0.0.632</string>' "the version is not bumped"
-plant 60 $K/src/amd/native_s1c.h 'kN1cKextBuild = 664;' 'kN1cKextBuild = 632;' "the native client build number is stale"
+plant 60 $K/src/amd/native_s1c.h 'kN1cKextBuild = 670;' 'kN1cKextBuild = 632;' "the native client build number is stale"
 
 plant 61 $N '		if (gAppSelRefusedLogged < 16u && OSIncrementAtomic((volatile SInt32 *)&gAppSelRefusedLogged) < 16) NCLOG("selector %u refused: not permitted for an APP (user application) client", selector);
 		return kIOReturnNotPrivileged;' '		if (gAppSelRefusedLogged < 16u && OSIncrementAtomic((volatile SInt32 *)&gAppSelRefusedLogged) < 16) NCLOG("selector %u refused: not permitted for an APP (user application) client", selector);
@@ -185,12 +185,12 @@ plant 86 $E '        if (apps_on()) { g.appVisBytes = gVisOthers; g.appVisCapMiB
 plant 87 $G2 'constexpr uint64_t appvis_bits(uint64_t visBytes, uint32_t capMiB) { return (((visBytes >> 10) & 0xFFFFFull) << 36) | ((uint64_t)(capMiB & 0xFFu) << 56); }' 'constexpr uint64_t appvis_bits(uint64_t visBytes, uint32_t capMiB) { return (((visBytes >> 10) & 0xFFFFFull) << 36) | ((uint64_t)(capMiB & 0xFFu) << 57); }' "VIS 87 (pure): the cap rides in the wrong bits of the stat word"
 plant 88 $C '(out[5] >> 36) & 0xfffff, (out[5] >> 56));' '(out[5] >> 36) & 0xfffff, (out[5] >> 57));' "VIS 88 (CLI): navi48test decodes the cap from the wrong bits"
 # item 5: WindowServer always gets a slot
-plant 89 $G2 '        if (ws ? wsOpen : (!wsOpen && free_slots(state) <= 1u)) return OpenPick{ kExclusive, kNoSlot };' '        if (ws ? wsOpen : (!wsOpen && free_slots(state) <= 0u)) return OpenPick{ kExclusive, kNoSlot };' "SLOT 89 (pure): no slot is reserved for WindowServer"
-plant 90 $G2 '        if (ws ? wsOpen : (!wsOpen && free_slots(state) <= 1u)) return OpenPick{ kExclusive, kNoSlot };' '        if (ws ? (openCount != 0u) : (!wsOpen && free_slots(state) <= 1u)) return OpenPick{ kExclusive, kNoSlot };' "SLOT 90 (pure): WindowServer is still refused whenever anything is open"
-plant 91 $G2 '        if (ws ? wsOpen : (!wsOpen && free_slots(state) <= 1u)) return OpenPick{ kExclusive, kNoSlot };' '        if (ws ? wsOpen : (free_slots(state) <= 1u)) return OpenPick{ kExclusive, kNoSlot };' "SLOT 91 (pure): the reserve also binds when WindowServer already has its session"
+plant 89 $G2 '        if (ws ? wsOpen : (!wsOpen && free_slots(state, n) <= 1u)) return CliPick{ kExclusive, kNoSlot };' '        if (ws ? wsOpen : (!wsOpen && free_slots(state) <= 0u)) return OpenPick{ kExclusive, kNoSlot };' "SLOT 89 (pure): no slot is reserved for WindowServer"
+plant 90 $G2 '        if (ws ? wsOpen : (!wsOpen && free_slots(state, n) <= 1u)) return CliPick{ kExclusive, kNoSlot };' '        if (ws ? (openCount != 0u) : (!wsOpen && free_slots(state, n) <= 1u)) return CliPick{ kExclusive, kNoSlot };' "SLOT 90 (pure): WindowServer is still refused whenever anything is open"
+plant 91 $G2 '        if (ws ? wsOpen : (!wsOpen && free_slots(state, n) <= 1u)) return CliPick{ kExclusive, kNoSlot };' '        if (ws ? wsOpen : (free_slots(state, n) <= 1u)) return CliPick{ kExclusive, kNoSlot };' "SLOT 91 (pure): the reserve also binds when WindowServer already has its session"
 plant 92 $G2 'constexpr bool ws_already_open(bool apps, bool anyOpen, bool wsOpen) { return apps ? wsOpen : anyOpen; }' 'constexpr bool ws_already_open(bool apps, bool anyOpen, bool wsOpen) { (void)apps; (void)wsOpen; return anyOpen; }' "SLOT 92 (pure): the open policy still refuses WindowServer whenever any client is open"
 plant 93 $G2 'ws, bool g1Holds, bool apps = false, bool wsOpen = false) {' 'ws, bool g1Holds, bool apps = true, bool wsOpen = false) {' "SLOT 93 (pure): the new rules are ON by default (apps absent no longer identical)"
-plant 94 $E 'const OpenPick pk = open_pick(multi, gSlotState, openNow, ws, g1_holds(), appsNow, wsOpen);' 'const OpenPick pk = open_pick(multi, gSlotState, openNow, ws, g1_holds(), false, wsOpen);' "SLOT 94 (kernel): n1c_open never passes the apps flag to open_pick"
+plant 94 $E 'const CliPick pk = open_pick(multi, gCliState, kMaxClients, openNow, ws, g1_holds(), appsNow, wsOpen);' 'const CliPick pk = open_pick(multi, gCliState, kMaxClients, openNow, ws, g1_holds(), false, wsOpen);' "SLOT 94 (kernel): n1c_open never passes the apps flag to open_pick"
 plant 95 $E 'const bool appsNow = apps_on(), wsOpen = __atomic_load_n(&gSessWs, __ATOMIC_SEQ_CST) != 0u;' 'const bool appsNow = apps_on(), wsOpen = false;' "SLOT 95 (kernel): n1c_open never tells open_pick that WindowServer is open"
 plant 96 $N 'n48native::g2::ws_already_open(appsOn, amdgpu::n1c_is_open(), amdgpu::n1c_ws_is_open())' 'amdgpu::n1c_is_open()' "SLOT 96 (kernel): the client class asks the open policy 'is anything open' with apps ON too"
 plant 97 $O 'constexpr uint32_t kWindowServerUid = 88u;' 'constexpr uint32_t kWindowServerUid = 89u;' "SLOT 97: the WindowServer identity rule changed"

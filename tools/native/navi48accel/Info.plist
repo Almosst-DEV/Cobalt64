@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>KEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.0.7</string>
+	<string>0.0.8</string>
 	<key>CFBundleVersion</key>
-	<string>0.0.7</string>
+	<string>0.0.8</string>
 	<key>IOKitPersonalities</key>
 	<dict>
 		<key>Navi48Framebuffer</key>
@@ -64,6 +64,11 @@
 			<integer>1000</integer>
 			<key>IOProviderClass</key>
 			<string>Navi48MetalNub</string>
+			<key>IOPropertyMatch</key>
+			<dict>
+				<key>Navi48LoadAccelerator</key>
+				<true/>
+			</dict>
 			<key>MetalPluginClassName</key>
 			<string>Navi48Device</string>
 			<key>MetalPluginName</key>

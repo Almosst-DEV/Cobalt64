@@ -23,6 +23,7 @@
 #include "dcn/navi48_scanout_pure.h"   // 0.0.603 (native S2a): n48scan::accel_exempt
 #include "amd/native_disp.h"            // 0.0.613 (#11 11h.2): the display pipe glue (boot-arg navi48-metal-disp=1)
 #include "amd/native_disp_pure.h"
+#include "amd/native_armboot.h"        // 0.0.668: the kext adopts and arms the display pipe at boot (boot-arg navi48-armboot=1, default OFF)
 #include "amd/native_agdc_pure.h"      // 0.0.614 (#11 11h.3): the native AGDC service (verb 88)
 #include "amd/native_g1_pure.h"        // 0.0.623 (GPU-apps G1): hangtest / hangrecover / hangstat (verbs 100..102, boot-arg navi48-g1=1)
 #include "amd/native_g5_pure.h"        // 0.0.650 (GPU-apps G5 Stage 1): sessstat page 5 (boot-arg navi48-g5=1)
@@ -7480,6 +7481,11 @@ bool Navi48Bringup::start(IOService *provider) {
 
 	N48LOG("start: done (VRAM %u MiB, %u IPs)", vramMB, ipDiscovery.isValid() ? ipDiscovery.ipCount() : 0);
 	if (!getProperty("PSP,Stage")) setProperty("Navi48,Stage", "survey-readonly");
+	// 0.0.668: the boot-time display adoption. LAST in start(), so the PCI device, the BAR mappings, the scanout locks and the nub registry are all in
+	// place before the worker can use them. It is a no-op (one log line) unless boot-arg navi48-armboot=1, and it can never fail this method: see
+	// amd/native_armboot.h for why the four verbs cannot run HERE (the accelerator does not exist yet: it matches the Metal nub a userspace daemon
+	// publishes after this returns) and why the wait is a separate, bounded, non-blocking thread.
+	n48armboot_boot();
 	registerService();
 	return true;
 }
@@ -7524,10 +7530,12 @@ IOReturn Navi48Bringup::accelExperiment(uint32_t action, uint64_t *outInstalled,
 			for (unsigned i = 0; i < n48native::g1::kOutN && i < kAccelExtraScalars; i++) outExtra[i] = v[i];
 		return kr;
 	}
-	// action 103 (0.0.627, GPU-apps G2; boot-arg navi48-multisession=1 only): `sessstat <0..4>`, READ-ONLY: page 0..3 one native session slot (VMID 8..11), page 4 the
-	// global page (open sessions, DEAD slots, seqnos, the shared VRAM budget, automatic recoveries). Like G1, dispatched before the native-boot refusal as its own
-	// exemption (n48native::g2::native_exempt); with the latch OFF (the default) 103 is BadArgument here and in the user client, as before 0.0.627.
+	// action 103 (0.0.627, GPU-apps G2; boot-arg navi48-multisession=1 only): `sessstat <0..9>`, READ-ONLY. 0.0.669: page 0..7 is ONE VMID POOL HANDLE each
+	// (VMID 8 + the page, its owner or FREE), page 8 the global page (open clients, QUARANTINED records, seqnos, the shared VRAM budget, automatic recoveries), page 9
+	// the CLIENT TABLE (records allocated / on the free list, quarantined records, the pool's free and held handles). Like G1, dispatched before the native-boot
+	// refusal as its own exemption (n48native::g2::native_exempt); with the latch OFF (the default) 103 is BadArgument here and in the user client.
 	// 0.0.650 (G5 Stage 1): page 5 is the application-credit page; it exists only with boot-arg navi48-g5=1 (and multisession) latched, else BadArgument as before.
+	// (g5::args_ok reserves page 5 BEFORE g2's range, so 5 stays the credit page and 6..7 are pool handles that no G5 query reaches.)
 	if (n48native::g2::is_g2_action(action)) {
 		const bool g5page = n48native::g5::args_ok(amdgpu::n1c_g5_latched_on(), action, argScalar);
 		if (!g5page && !n48native::g2::native_exempt(amdgpu::n1c_multi_latched_on(), action, argScalar)) return kIOReturnBadArgument;
@@ -8947,6 +8955,9 @@ IOReturn Navi48Bringup::accelExperiment(uint32_t action, uint64_t *outInstalled,
 }
 
 void Navi48Bringup::stop(IOService *provider) {
+	// 0.0.668: the boot-time armboot worker's stop request, FIRST: it holds a reference to this service, so a stop can only reach here once that worker
+	// has already ended its wait - this is the belt to that braces, and it is a single atomic store.
+	n48armboot_stop();
 	// : never leave a patched className behind in a kext that is going away.
 	n48fbname::restore_on_unload();
 	// 0.0.603 (native S2a): the console plane back and every scanout watchdog thread finished BEFORE anything is unmapped (both need the registers).

@@ -89,8 +89,8 @@ plant 16 $P '            if (e.slot == g2::kOwnerKernel) continue;
 plant 17 $P '        if (t < mine || (t == mine && j < mySlot)) return true;' '        if (t < mine || (t == mine && j > mySlot)) return true;' "PURE 17: older_waiter tie goes to the higher slot"
 plant 18 $P '        if (t == 0ull || t > now || now - t > staleNs) continue;' '        (void)staleNs; if (t == 0ull || t > now) continue;' "PURE 18: a leaked since[] entry never heals (stale entries are not ignored)"
 plant 19 $P '        if (t == 0ull || t > now || now - t > staleNs) continue;' '        if (t == 0ull || (t <= now && now - t > staleNs)) continue;' "PURE 19: a since[] entry in the future is honoured"
-plant 20 $P '    const uint64_t mine = (mySlot < kMaxSessions && since[mySlot] != 0ull) ? since[mySlot] : now;' '    const uint64_t mine = 0ull;' "PURE 20: a slot not waiting yet counts as the oldest"
-plant 21 $P 'inline void since_mark(uint64_t *since, uint32_t slot, uint64_t now) { if (slot < kMaxSessions && since[slot] == 0ull) since[slot] = now; }' 'inline void since_mark(uint64_t *since, uint32_t slot, uint64_t now) { if (slot < kMaxSessions) since[slot] = now; }' "PURE 21: since_mark restarts the clock on every try (a waiter never gets older)"
+plant 20 $P '    const uint64_t mine = (mySlot < kMaxClients && since[mySlot] != 0ull) ? since[mySlot] : now;' '    const uint64_t mine = 0ull;' "PURE 20: a slot not waiting yet counts as the oldest"
+plant 21 $P 'inline void since_mark(uint64_t *since, uint32_t slot, uint64_t now) { if (slot < kMaxClients && since[slot] == 0ull) since[slot] = now; }' 'inline void since_mark(uint64_t *since, uint32_t slot, uint64_t now) { if (slot < kMaxClients) since[slot] = now; }' "PURE 21: since_mark restarts the clock on every try (a waiter never gets older)"
 plant 22 $P '    const uint32_t inUse = (a.on && !a.isWs && act) ? app_in_flight(log, a.retired, a.emitted, a.wsId, a.K) : 0u;' '    const uint32_t inUse = 0u; (void)log;' "PURE 22: the composite never counts the jobs in flight"
 plant 23 $P '    const bool act = ws_active(a.wsOpen, a.lastWsNs, a.now, kWsWindowNs);' '    const bool act = false;' "PURE 23: the composite thinks WindowServer is never active"
 plant 24 $P '    const bool older = (a.on && !a.isWs) ? older_waiter(a.since, a.slot, a.now, kSinceStaleNs) : false;' '    const bool older = false;' "PURE 24: the composite never looks for an older waiter"
@@ -104,17 +104,17 @@ plant 31 $P 'o[4] = v.appInFlight; o[5] = v.wsOutstanding;' 'o[4] = v.wsOutstand
 plant 32 $P 'constexpr uint64_t kSinceStaleNs = kG5WaitBoundNs + 1000000000ull;' 'constexpr uint64_t kSinceStaleNs = 1000000000ull;' "PURE 32: since[] entries go stale after 1 s (a legitimate 6 s wait would be forgotten)"
 # ---- the kernel ----
 plant 40 $E '        if (admission(gOwners, gG5In) == kAdmit) {' '        if (true) {' "KERNEL 40: ring_submit_app_g5 never asks the admission"
-plant 41 $E '            since_clear(gG5Since, s->slot); waiting = false;
-' '            since_clear(gG5Since, s->slot); waiting = false;
+plant 41 $E '            since_clear(gG5Since, s->cli); waiting = false;
+' '            since_clear(gG5Since, s->cli); waiting = false;
             IOLockUnlock(gRingLock); IOLockLock(gRingLock);
 ' "KERNEL 41: the admission verdict and the seqno are taken in two holds of gRingLock"
-plant 42 $E '        since_mark(gG5Since, s->slot, now); waiting = true; t0 = gG5Since[s->slot];
-        IOLockUnlock(gRingLock);' '        since_mark(gG5Since, s->slot, now); waiting = true; t0 = gG5Since[s->slot];
+plant 42 $E '        since_mark(gG5Since, s->cli, now); waiting = true; t0 = gG5Since[s->cli];
+        IOLockUnlock(gRingLock);' '        since_mark(gG5Since, s->cli, now); waiting = true; t0 = gG5Since[s->cli];
         IOSleep(1);
         IOLockUnlock(gRingLock);' "KERNEL 42 (= spec 5): the sleep runs inside the lock"
-plant 43 $E '        since_clear(gG5Since, s->slot);
+plant 43 $E '        since_clear(gG5Since, s->cli);
         if (timedOut) stat_timeout(gG5);' '        if (timedOut) stat_timeout(gG5);' "KERNEL 43 (= spec 6): the exit does not clear gG5Since (a timed-out waiter leaks its entry)"
-plant 44 $E '        else if (s->ws) { __atomic_store_n(&gWsLastNs,' '        else if (s->slot == 0u) { __atomic_store_n(&gWsLastNs,' "KERNEL 44 (= spec 7): n1c_submit identifies WindowServer by slot 0"
+plant 44 $E '        else if (s->ws) { __atomic_store_n(&gWsLastNs,' '        else if (s->cli == 0u) { __atomic_store_n(&gWsLastNs,' "KERNEL 44: n1c_submit identifies WindowServer by slot 0"
 plant 45 $E '        if (!g5_on()) er = ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut);   // G5 OFF: exactly 0.0.642' '        if (false) er = ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut);   // G5 OFF: exactly 0.0.642' "KERNEL 45: with G5 OFF the app path is still taken"
 plant 46 $E '        else er = ring_submit_app_g5(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut);' '        else er = ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut);' "KERNEL 46: apps never reach the admission (n1c_submit calls ring_submit for them)"
 plant 47 $E '        else if (s->ws) { __atomic_store_n(&gWsLastNs, now_ns(), __ATOMIC_RELEASE); er = ring_submit(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut); }' '        else if (s->ws) { er = ring_submit_app_g5(s, va, by, v.nIbs, hasFence, fenceAddr, seqOut); }' "KERNEL 47: WindowServer goes through the app admission (and is never stamped)"
@@ -141,20 +141,29 @@ plant 57 $E '        v.appInFlight = app_in_flight(gOwners, re, em, wsId, n48nat
 plant 59 $E 'constexpr uint64_t kRecoverWaitNs = 6000000000ull;' 'constexpr uint64_t kRecoverWaitNs = 1000000000ull;' "KERNEL 59: the kernel's recovery bound no longer matches the 8 s app bound"
 plant 61 $B '		const bool g5page = n48native::g5::args_ok(amdgpu::n1c_g5_latched_on(), action, argScalar);' '		const bool g5page = n48native::g5::args_ok(true, action, argScalar);' "KERNEL 61: sessstat 5 is served with G5 OFF"
 plant 62 $B '		if (!g5page && !n48native::g2::native_exempt(amdgpu::n1c_multi_latched_on(), action, argScalar)) return kIOReturnBadArgument;' '		if (false) return kIOReturnBadArgument;' "KERNEL 62: sessstat accepts any page"
-plant 64 $E '            const uint32_t n = build_submit(gSubmitBuf, (uint32_t)(sizeof(gSubmitBuf) / sizeof(gSubmitBuf[0])), va, by, nIbs, s->vmid, hasFence,' '            const uint32_t n = build_submit(gSubmitBuf, (uint32_t)(sizeof(gSubmitBuf) / sizeof(gSubmitBuf[0])), va, by, nIbs, kNativeVmid, hasFence,' "KERNEL 64: the app path builds every IB on VMID 8"
+plant 64 $E '            const uint32_t n = build_submit(gSubmitBuf, (uint32_t)(sizeof(gSubmitBuf) / sizeof(gSubmitBuf[0])), va, by, nIbs, vm, hasFence,' '            const uint32_t n = build_submit(gSubmitBuf, (uint32_t)(sizeof(gSubmitBuf) / sizeof(gSubmitBuf[0])), va, by, nIbs, kNativeVmid, hasFence,' "KERNEL 64: the app path builds every IB on VMID 8"
 plant 65 $E '        IOLockLock(gRingLock);
+        // 0.0.669: the residency, exactly as ring_submit checks it (a steal can revoke the handle between the acquisition and here).
+        const uint32_t vm = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);
+        if (vm == 0u) { IOLockUnlock(gRingLock); rc = kNotReady; break; }
         g5_fill_in_locked(s, K, need);' '        g5_fill_in_locked(s, K, need);
-        IOLockLock(gRingLock);' "KERNEL 65: the admission inputs are read before gRingLock is taken (a stale snapshot)"
+        IOLockLock(gRingLock);
+        // 0.0.669: the residency, exactly as ring_submit checks it (a steal can revoke the handle between the acquisition and here).
+        const uint32_t vm = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);
+        if (vm == 0u) { IOLockUnlock(gRingLock); rc = kNotReady; break; }' "KERNEL 65: the admission inputs are read before gRingLock is taken (a stale snapshot)"
 plant 63 $E '        if (el < 5000000ull) IODelay(1); else IOSleep(1);
     }
     if (waiting) {' '    }
     if (waiting) {' "KERNEL 63: the wait loop spins without sleeping"
 # ---- the CLI, the version ----
-plant 70 $C 'hangstat [0..8]|sessstat [0..5]|' 'hangstat [0..8]|sessstat [0..4]|' "CLI 70: the usage does not offer page 5"
+plant 66 $E '        const uint32_t vm = __atomic_load_n(&s->vmid, __ATOMIC_ACQUIRE);
+        if (vm == 0u) { IOLockUnlock(gRingLock); rc = kNotReady; break; }
+        g5_fill_in_locked(s, K, need);' '        g5_fill_in_locked(s, K, need);' "KERNEL 66 (0.0.670): the app path never checks the client's VMID-handle residency (a packet could name a VMID another client now owns)"
+plant 70 $C 'hangstat [0..8]|sessstat [0..9]|' 'hangstat [0..8]|sessstat [0..4]|' "CLI 70: the usage does not offer page 5"
 plant 71 $C '        } else if (c == 0 && out[4] == 5) {' '        } else if (c == 0 && out[4] == 55) {' "CLI 71: page 5 is not printed"
 plant 72 $PL '<key>CFBundleVersion</key>
-	<string>0.0.664</string>' '<key>CFBundleVersion</key>
+	<string>0.0.670</string>' '<key>CFBundleVersion</key>
 	<string>0.0.642</string>' "VERSION 72: Info.plist is not bumped"
-plant 73 $H 'kN1cKextBuild = 664;' 'kN1cKextBuild = 642;' "VERSION 73: the native client build number is stale"
+plant 73 $H 'kN1cKextBuild = 670;' 'kN1cKextBuild = 642;' "VERSION 73: the native client build number is stale"
 echo "native_g5_plant: $((total - 1)) plants (+ the baseline), $escaped escaped or did not apply"
 [ $escaped -eq 0 ]

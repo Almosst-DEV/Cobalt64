@@ -608,9 +608,20 @@ static void u12_pins(const std::string &root) {
     { const size_t g1b = eng.find("// ==== 0.0.623: GPU-apps stage G1"), sc = eng.find("static void g2_scrub_locked("), n1 = eng.find("ring[i] = cp_p3_nop1();"), n2 = eng.find("ring[i] = cp_p3_nop1();", n1 + 1);
       expect(sc != std::string::npos && n1 > sc && n1 < eng.find("\n}\n", sc) && n2 > g1b, "the NOP fills: one in g2_scrub_locked (the recovery), the other two inside the G1 block"); }
     expect_u("the doorbell is rung in exactly one place", count_of(eng, "WDOORBELL64("), 1);
+    // 0.0.667: the 2 s space wait left ring_put_locked AND gRingLock. The lock still covers the seqno, the build and the put; the wait and its
+    // sleep now happen with the lock DROPPED (lock -> try -> unlock -> sleep -> retry). Three separate assertions, so putting the wait back
+    // inside the lock - or the spin back inside ring_put_locked - fails this test instead of passing it.
     { const std::string rs = fn_body(eng, "static uint32_t ring_submit(");
-      expect(!rs.empty() && in_order(rs, { "IOLockLock(gRingLock);", "const uint64_t seq = emitted_now() + 1ull;", "build_submit(gSubmitBuf,", "ring_put_locked(gSubmitBuf, n, seq,", "IOLockUnlock(gRingLock);", "if (er == kTimeout) { (void)stall_from_wait(); return kTimeout; }" }),
-             "ring_submit: the ring lock is held over the seqno, the build and the put (incl. the space check); a 2 s space wait goes to the stall path AFTER the lock is dropped"); }
+      expect(!rs.empty() && in_order(rs, { "IOLockLock(gRingLock);", "const uint64_t seq = emitted_now() + 1ull;", "build_submit(gSubmitBuf,", "ring_put_locked(gSubmitBuf, n, seq,", "IOLockUnlock(gRingLock);", "if (el >= kWaitCapNs)", "stall_from_wait()", "return kTimeout;" }),
+             "ring_submit: the lock is still held over the seqno, the build and the put, and the 2 s verdict (stall_from_wait, return kTimeout) is reached AFTER the unlock"); }
+    { const std::string put = fn_body(eng, "static uint32_t ring_put_locked(");
+      expect(!put.empty() && put.find("IOSleep") == std::string::npos && put.find("IODelay") == std::string::npos && put.find("for (;;)") == std::string::npos &&
+             put.find("if (!ring_has_space(ring_free64(r, gWc, mask), n)) return kTimeout;") != std::string::npos,
+             "ring_put_locked is ONE non-blocking attempt: no spin, no sleep, the space check returns kTimeout at once (0.0.667)"); }
+    { const std::string rs = fn_body(eng, "static uint32_t ring_submit(");
+      const size_t lk = rs.find("IOLockLock(gRingLock)"), ul = rs.find("IOLockUnlock(gRingLock)"), sl = rs.find("IOSleep(1)");
+      expect(lk != std::string::npos && ul != std::string::npos && sl != std::string::npos && lk < ul && ul < sl,
+             "ring_submit: no sleep can run while gRingLock is held (the space wait is outside it)"); }
     expect(eng.find("return kTimeout;", sp) < wr, "a space wait that reaches 2 s returns before anything is written");
     expect_u("ring_put_locked is called by ring_submit, the recovery probe and (0.0.650, G5, ON only) ring_submit_app_g5 only", count_of(eng, "ring_put_locked("), 4);
     expect_u("ONE builder call and ONE put of a built Submit in each of the two submit paths: ring_submit and (0.0.650, G5) ring_submit_app_g5 (0.0.627: G1's hang IB and probe IB go through ring_submit too)", count_of(eng, "build_submit(gSubmitBuf") + count_of(eng, "ring_put_locked(gSubmitBuf, n, seq,"), 4);
@@ -634,7 +645,11 @@ static void u12_pins(const std::string &root) {
     expect_u("every locked selector re-checks the session under the lock (6 + ScanoutAcquire / Register / Release, 0.0.603 + BoImportHost, 0.0.612)", count_of(eng, "closed while we waited for the lock"), 10);
     expect(eng.find("static Session gSess;") != std::string::npos && eng.find("IOFree(ns") == std::string::npos && count_of(eng, "IOMalloc(sizeof(Session))") == 1 && eng.find("IOMallocAligned") == std::string::npos && eng.find("IOFreeAligned") == std::string::npos,
            "SESSION LIFETIME: slot 0 is a static, slots 1..3 (0.0.627) are allocated once and never freed");
-    { const size_t a = eng.find("IOReturn n1c_query_info("), b = eng.find("\n}\n", a); expect(eng.substr(a, b - a).find("sess_lock(") == std::string::npos && eng.substr(a, b - a).find("Session *s = sess_peek(ref);") != std::string::npos, "the lock-free QueryInfo reads the caller's never-freed session record without a lock"); }
+    // 0.0.669: QueryInfo is no longer lock-free. It reports the VMID POOL HANDLE the client holds and, when it holds none, makes ONE NON-BLOCKING attempt to
+    // take one (vmid_need(s, false), which must touch gCliLock and s->vmid): that is a write to the record, so the record is taken UNDER its own lock now.
+    { const size_t a = eng.find("IOReturn n1c_query_info("), b = eng.find("\n}\n", a); const std::string qi = eng.substr(a, b - a);
+      expect(qi.find("Session *s = sess_lock(ref, true);") != std::string::npos && qi.find("(void)vmid_need(s, false);") != std::string::npos && qi.find("sess_unlock(s);") != std::string::npos,
+             "0.0.670: QueryInfo takes the caller's session lock, takes a pool handle if it has none (non-blocking) and reports it; it is no longer lock-free"); }
     expect(eng.find("vram_alloc.free(s->blk") == std::string::npos && eng.find("gPtFree[gPtFreeN++] = s->blk[i]") != std::string::npos &&
            count_of(eng, "vram_alloc.alloc(kArenaBlockBytes") == 2, "PAGE TABLES: blocks return to the per-boot reserve, never to vram_alloc (the two allocs are the reserve's growth and the park root)");
     expect(eng.find("if (!regs_allowed(off, count)") != std::string::npos, "ReadRegs is allowlisted");
@@ -642,10 +657,12 @@ static void u12_pins(const std::string &root) {
            count_of(eng, "cp.wptr = ring_idx(wc, mask)") == 1, "the doorbell / wptr shadow carry the full 64-bit counter, initialised once from cp.wptr");
     expect_u("the native path never calls native_s1b_refuse", count_of(eng, "native_s1b_refuse("), 0);
     expect_u("... and does not touch CP_DEBUG", count_of(eng, "0x1e1f"), 0);
-    expect_u("close is idempotent and single-owner: the session's open flag is cleared once, under its lock (0.0.627)", count_of(eng, "    __atomic_store_n(&s->open, false, __ATOMIC_RELEASE);          // the Session itself is static (slot 0) or never freed (slots 1..3)\n"), 1);
+    expect_u("close is idempotent and single-owner: the session's open flag is cleared once, under its lock (0.0.627)", count_of(eng, "    __atomic_store_n(&s->open, false, __ATOMIC_RELEASE);          // the Session itself is static (record 0) or never freed (records 1..kMaxClients-1)\n"), 1);
     expect(eng.find("LEAKED (HUNG)") != std::string::npos && eng.find("seqs, freed\"") != std::string::npos, "both close log lines exist");
     expect(eng.find("if (!leak && !own_wait(s)) leak = true;") != std::string::npos, "close waits for ITS OWN work (0.0.627) and leaks when it cannot");
-    expect(eng.find("program_root(s->vmid, gPark.pa)") != std::string::npos && eng.find("program_root(s->vmid, gPark.pa)") < eng.find("bo_release(s, h, kRelClosing)"), "the session's context is parked BEFORE any memory is freed");
+    { const std::string cl = fn_body(eng, "void n1c_close(const N1cRef &ref, const char *how) {");
+      expect(cl.find("vmid_release_locked(s)") != std::string::npos && cl.find("vmid_release_locked(s)") < cl.find("bo_release(s, h, kRelClosing)"),
+             "0.0.670: close parks the client's context (and releases its pool handle) BEFORE any memory is freed - pinned INSIDE the close body, so the same call in open's failure path cannot satisfy it"); }
     expect(eng.find("if (hung_now()) m = kRelLeak;") != std::string::npos && fn_body(eng, "IOReturn n1c_bo_free(").find("bo_release(s, h, m);") != std::string::npos, "BoFree under HUNG leaks and succeeds");
     // client: exact shapes, nothing inline-refusable slips through
     expect(cli.find("args->structureInputDescriptor != nullptr || args->structureOutputDescriptor != nullptr") != std::string::npos, "out-of-line structs are refused");
@@ -683,7 +700,7 @@ static void u12_pins(const std::string &root) {
     }
     // build plumbing
     expect(mk.find("src/Navi48NativeClient.cpp") != std::string::npos, "the Makefile builds the client");
-    expect(plist.find("<string>0.0.664</string>") != std::string::npos && count_of(plist, "0.0.664") == 2 && plist.find("0.0.605") == std::string::npos, "Info.plist is 0.0.664");
+    expect(plist.find("<string>0.0.670</string>") != std::string::npos && count_of(plist, "0.0.670") == 2 && plist.find("0.0.605") == std::string::npos, "Info.plist is 0.0.670");
     expect(pure.find("kWbOffsetNativeSeq = 0x0C0u") != std::string::npos, "the native seqno slot offset");
     // banned strings in the new files
     const std::string bad1 = std::string("pipe+0x2") + "80", bad2 = std::string("+0x2") + "82", bad3 = std::string("+0x2") + "99";   // built at run time: this file must not contain the tokens

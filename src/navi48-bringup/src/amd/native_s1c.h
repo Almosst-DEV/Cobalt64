@@ -3,8 +3,10 @@
 //  (Navi48NativeClient, type 'N48N'). Contract: an internal design note. Default OFF: nothing here runs unless a client opens,
 //  and a client opens only on a native boot (navi48-native=1 accepted) whose S1b self-test reported POSITIVE PASS.
 //
-//  One client at a time, on VMID 8 (0.0.627: up to four with boot-arg navi48-multisession=1, VMIDs 8..11), with a fresh empty 4-level tree per client. All GPU work goes through the kernel GFX ring (the
-//  KGQ) with the ring-safety rules of the contract section 6: a free-space check against the write-back rptr, one client lock, a
+//  One client at a time (0.0.627: several with boot-arg navi48-multisession=1), each with a fresh empty 4-level tree per client. 0.0.669: the CLIENT and the VMID are
+//  no longer the same thing - a client is a record in a table of kMaxClients (64, kernel memory, recycled) and the VMID is a handle from a POOL of 8 (VMIDs 8..15, the
+//  hardware's native contexts), assigned when the client's work has to run in the GPU and released when it closes or is preempted. See native_g2_pure.h. All GPU work
+//  goes through the kernel GFX ring (the KGQ) with the ring-safety rules of the contract section 6: a free-space check against the write-back rptr, one client lock, a
 //  kext-global ring lock, and a HUNG latch after which memory is leaked instead of freed.
 //
 #pragma once
@@ -23,7 +25,7 @@ class IOUserClient;       // 0.0.641: n1c_unmap_for_close
 
 namespace amdgpu {
 
-constexpr uint32_t kN1cKextBuild = 664;   // the REAL build (0.0.659): Hello / QueryInfo report it; tests/native_s2a_test.cpp, native_s2_dal_test.cpp and native_s2d_test.cpp pin it to Info.plist so it cannot go stale again
+constexpr uint32_t kN1cKextBuild = 670;   // the REAL build (0.0.670: THE KEXT PUBLISHES THE METAL NUB ITSELF AT BOOT AND HOLDS THE BOOT UNTIL THE DISPLAY PIPE IS ARMED - Navi48MetalNub::bootPublish (amd/native_metal_pure.h's publish_at_boot_verdict: the selector's verdict minus the session term) plus adjustBusy(1) on the bring-up service released when the arm is done, with a cap (navi48-holdcap, 40 s default) that releases the count AND refuses the arm; WindowServer's IOKitWaitQuiet therefore returns only after the arm, so its FIRST start finds the pipe armed and no WindowServer restart is needed - amd/native_armboot.cpp, boot-args navi48-armboot=1 (master, DEFAULT OFF), navi48-nubboot=0 (publish on demand only) and navi48-nohold=1 (no hold); 0.0.669: the pooled VMID handles - a client is no longer a VMID (see native_g2_pure.h); 0.0.668: the kext adopts and arms the display pipe at boot - amd/native_armboot.{h,cpp}, boot-arg navi48-armboot=1, DEFAULT OFF: ONE bounded kernel-thread wait for the aux accelerator, then pipeadopt -> pipeagdc -> fbname -> pipearm in that order, with NO WindowServer restart; 0.0.667 was no wait under gRingLock - ring_put_locked is one non-blocking attempt and the bounded space wait happens with the lock dropped; 0.0.666 was kMaxSessions 4 -> 8); Hello / QueryInfo report it. NOTE 1: the ops tables (Navi48MetalNub.cpp / Navi48DisplayNub.cpp) keep 666u on purpose - that field is the kext <-> aux-kext handshake, so it moves only together with a rebuilt aux kext. NOTE 2: the host test suites' pinning assertions are swept in the same pass as this constant (0.0.669: 29 test files pin the version string and 21 pin this build number; the 666 pins of NOTE 1 are deliberately left alone). The literal text of the constant must stay unique in this file: the version plants of those suites replace it exact-once.
 
 // Legacy-client sites refused once the native VM self-test has touched the GPU (contract 6.2). The legacy ring writers and the pool
 // users that share vram_alloc without a lock.
@@ -32,11 +34,14 @@ enum N1cLegacySite : uint32_t { kN1cSiteSelfTest = 2, kN1cSiteAllocVRAM = 3, kN1
 bool n1c_refuse_legacy(uint32_t site);
 
 // 0.0.627 (GPU-apps G2): the caller's session. The client keeps the reference n1c_open filled in and passes it to every call; a stale reference (its
-// session closed, or the slot re-opened by another client: a different id) is refused with NotReady. slot 0..3 = VMID 8..11; id 0 = none.
+// session closed, or the record reused by another client: a different id) is refused with NotReady. 0.0.669: `slot` is the CLIENT TABLE index (0..kMaxClients-1), NOT a
+// VMID - the two words, their widths and their meaning on the wire are unchanged (the N48N ABI does not move); which VMID the session runs on is decided per call by
+// the pool. id 0 = none.
 struct N1cRef { uint32_t slot; uint32_t id; };
 // Open: gate checks, exclusivity, and the fresh tree. Returns kIOReturnSuccess, NotReady (gate / S1b / HUNG / device not ready),
-// ExclusiveAccess (a client is open; 0.0.627 with boot-arg navi48-multisession=1: no free slot, a G1 test holds the GPU, or a WindowServer open while
-// any session is open) or NoMemory. Logs one line per refusal. ws: the caller was admitted by the uid-88 (WindowServer) rule. *out: the session.
+// ExclusiveAccess (a client is open; 0.0.627 with boot-arg navi48-multisession=1: no free CLIENT RECORD - the 0.0.669 pool is not consulted, a client with no VMID
+// handle opens NON-RESIDENT -, a G1 test holds the GPU, or a WindowServer open while any session is open) or NoMemory. Logs one line per refusal. ws: the caller was
+// admitted by the uid-88 (WindowServer) rule. *out: the session.
 IOReturn n1c_open(BringupContext &ctx, bool ws = false, N1cRef *out = nullptr);
 // Close (clientClose / clientDied / stop): idempotent. `how` names the caller in the log line.
 void n1c_close(const N1cRef &ref, const char *how);

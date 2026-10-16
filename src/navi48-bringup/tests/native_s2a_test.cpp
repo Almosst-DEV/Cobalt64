@@ -620,8 +620,8 @@ static void s11_pins(const std::string &root) {
         const size_t v = plist.find("<string>0.0.");
         const int ver = v == std::string::npos ? -2 : std::atoi(plist.c_str() + v + 12);
         expect(build > 0 && build == ver, "kN1cKextBuild equals the Info.plist patch version (Hello can no longer print a stale build)");
-        expect_u("Info.plist is 0.0.664", (uint64_t)ver, 664);
-        expect_u("the plist carries the version twice", count_of(plist, "0.0.664"), 2);
+        expect_u("Info.plist is 0.0.670 (8 sessions)", (uint64_t)ver, 670);
+        expect_u("the plist carries the version twice", count_of(plist, "0.0.670"), 2);
     }
     expect(mk.find("$(wildcard src/dcn/*.cpp)") != std::string::npos, "the Makefile builds src/dcn/*.cpp");
     // -- the tool --

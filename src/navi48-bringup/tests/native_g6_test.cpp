@@ -173,13 +173,13 @@ static void r4_pins(const std::string &root) {
     // both tables
     expect_u("both tables end with op_native_open", count_of(nub, "\top_native_open,\n};"), 2u);
     expect(nub.find("const N48MetalOps gOps = {") != std::string::npos && nub.find("const N48MetalOps gOpsOff = {") != std::string::npos && nub.find("gOpsV1") == std::string::npos, "the tables are gOps (display on) and gOpsOff (display off): both ABI 3");
-    expect_u("both tables are built at 664", count_of(nub, "(uint32_t)sizeof(N48MetalOps), 664u,"), 2u);
+    expect_u("both tables are built at 666", count_of(nub, "(uint32_t)sizeof(N48MetalOps), 666u,"), 2u);
     expect(nub.find("n48disp::ops_shape(n48disp_latched_on()).dispFlags != 0u ? &gOps : &gOpsOff;") != std::string::npos, "callPlatformFunction hands out gOps only with the display latch ON");
     expect(nub.find("static_assert(N48_METAL_UC_N48N == N48N_UC_TYPE,") != std::string::npos, "the type constants are tied at compile time");
     // the Info.plist version
     const std::string plist = slurp(root + "/src/navi48-bringup/Info.plist");
-    expect(plist.find("<string>0.0.664</string>") != std::string::npos && plist.find("0.0.654") == std::string::npos, "Info.plist says 0.0.664");
-    expect(slurp(K + "amd/native_s1c.h").find("kN1cKextBuild = 664;") != std::string::npos, "Hello / QueryInfo report build 664");
+    expect(plist.find("<string>0.0.670</string>") != std::string::npos && plist.find("0.0.654") == std::string::npos, "Info.plist says 0.0.670");
+    expect(slurp(K + "amd/native_s1c.h").find("kN1cKextBuild = 670;") != std::string::npos, "Hello / QueryInfo report build 670");
 }
 
 int main(int argc, char **argv) {

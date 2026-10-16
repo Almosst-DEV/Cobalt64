@@ -159,7 +159,7 @@ plant 51 $SR/Navi48NativeClient.cpp "the selector shape is wrong (2 scalars)" 's
 plant 52 $SR/amd/native_s1c.cpp "the selector body ignores non-zero flags" '    if ((flags & ~(uint64_t)N48N_MODE_TF_MASK) != 0ull || out == nullptr) return kIOReturnBadArgument;   // 0.0.606: the flags word carries N48N_MODE_TF_* (0.0.605 required 0)
     return (IOReturn)n48dcn::modeTrial(row, dwellMs, flags, out);' '    if (out == nullptr) return kIOReturnBadArgument;
     return (IOReturn)n48dcn::modeTrial(row, dwellMs, flags, out);'
-plant 53 $SR/amd/native_s1c.h "the kext build number is stale" 'kN1cKextBuild = 664;' 'kN1cKextBuild = 606;'
+plant 53 $SR/amd/native_s1c.h "the kext build number is stale" 'kN1cKextBuild = 670;' 'kN1cKextBuild = 606;'
 plant 54 $SR/Navi48NativeABI.h "the ABI minor is not bumped" '#define N48N_ABI_MINOR     12u' '#define N48N_ABI_MINOR     4u'
 plant 55 $SR/amd/smu_dal_pure.h "the DID table: divider of DID 0x40..0x5F is 4-stepped" 'did < 0x60u ? 64u + 2u * (did - 0x40u)' 'did < 0x60u ? 64u + 4u * (did - 0x40u)'
 plant 56 tools/native/n48mode.c "the tool does not print the watch warning" '; WATCH THE MONITOR)' ')'

@@ -140,8 +140,8 @@ plant(74, HPP, 'the hpp drops the latch accessor', 'bool disp2LatchedOn();     /
 plant(80, CLI, 'the CLI sends action 99', 'else if (what && !strcmp(what, "disp2")) in = 98;', 'else if (what && !strcmp(what, "disp2")) in = 99;')
 plant(81, CLI, 'the CLI post-check never runs off', '            if (dr_call(N48D2_ACT, d2_arg(N48D2_OP_OFF), o2) == 0)', '            if (0)')
 plant(82, CLI, 'the CLI script lights before the PHY (timing listed before pclk)', '    "  1     accel dmubsend pclk otg1-on ', '    "  1     accel disp2 timing (early) ; accel dmubsend pclk otg1-on ')
-plant(83, PLIST, 'the version is not bumped', '<key>CFBundleVersion</key>\n\t<string>0.0.664</string>', '<key>CFBundleVersion</key>\n\t<string>0.0.630</string>')
-plant(84, S1C, 'the native client build number is stale', 'kN1cKextBuild = 664;', 'kN1cKextBuild = 630;')
+plant(83, PLIST, 'the version is not bumped', '<key>CFBundleVersion</key>\n\t<string>0.0.670</string>', '<key>CFBundleVersion</key>\n\t<string>0.0.630</string>')
+plant(84, S1C, 'the native client build number is stale', 'kN1cKextBuild = 670;', 'kN1cKextBuild = 630;')
 plant(85, H, 'a banned pipe-offset spelling is introduced in the pure header', '#define N48D2_ACT 98u', '#define N48D2_ACT 98u   /* pipe+' + '0x280 */')
 # ---- 0.0.632: the second status page and the FIFO-reset (symbol clock) report ---------------------------------------------------------------------------------------------------------------------------------------
 plant(86, F, 'status2 drops its last register read', 'for (uint32_t i = 0; i < N48D2_STAT2_COUNT; i++) v[1 + i / 2u] |= (uint64_t)e.rd(tbl[i].abs)', 'for (uint32_t i = 0; i + 1u < N48D2_STAT2_COUNT; i++) v[1 + i / 2u] |= (uint64_t)e.rd(tbl[i].abs)')

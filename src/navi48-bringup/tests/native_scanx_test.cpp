@@ -898,7 +898,7 @@ static void suite_pins(const std::string &root) {
     EXPECT(has(disp, "KernelEnv ke; (void)n48m6::pub_rate_flush(gD.m6Rate, now_ns(), [&ke]() { ke.m6_publish_now(); });") && has(glue, "if (n48m6_latched_on() && n48m6flip_latched_on()) n48disp_m6_flush();"), "R5: Status flushes a deferred table publish");
     EXPECT(has(pure, "if (!__atomic_compare_exchange_n(&r.lastNs, &last, nowNs, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return false;") && has(pure, "struct PubRate { volatile uint64_t lastNs; volatile uint32_t dirty; };"), "M1: the flush wins its slot by compare-and-swap and PubRate is atomic");
     // version / CLI
-    EXPECT(count_of(plist, "<string>0.0.664</string>") == 2 && !has(plist, "<string>0.0.661</string>"), "X11: the kext is 0.0.664");
+    EXPECT(count_of(plist, "<string>0.0.670</string>") == 2 && !has(plist, "<string>0.0.661</string>"), "X11: the kext is 0.0.670");
     EXPECT(has(clic, "in = 107;") && has(clic, "cmd_m6xstat(arg, arg2)") && has(clic, "dr_call(107, inst == 1u ?"), "X11: the CLI verb m6xstat (action 107) takes the instance");
     EXPECT(has(clic, "static int cmd_m6xstat(const char *a1, const char *a2) {") && has(clic, "accel m6xstat <1|2> <0|1|2|all>") && has(clic, "m6xstat inst1 page %u: navi48-m6 %s, navi48-m6flip %s, navi48-m6flip1 %s"), "X11 (item 11): m6xstat <1|2> [page]; one argument stays a page of the monitor B");
     EXPECT(has(clic, "page == 4") && has(clic, "AGDC 0x921 answered") && has(clic, "for (unsigned p = 0; p < 5; p++) rc |= m6stat_page(p);"), "X11 (item 11): m6stat prints the AGDC per-instance fields (page 4)");

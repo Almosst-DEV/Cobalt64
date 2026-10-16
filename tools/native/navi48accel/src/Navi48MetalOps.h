@@ -22,6 +22,11 @@
 
 #define N48_METAL_FN_SYMBOL   "n48.metal.ops"
 #define N48_METAL_NUB_CLASS   "Navi48MetalNub"
+/* 0.0.670: the property the nub carries while the bring-up kext ALLOWS an accelerator on this boot, and the key the aux kext's
+ * personality requires (IOPropertyMatch, tools/native/navi48accel/Info.plist). This is Apple's shape, one step instead of its three
+ * (LoadHWServices -> LoadController -> LoadAccelerator): the stage that owns the device decides whether the next one may match. The literal
+ * text is repeated in the plist because a plist cannot use a macro; the aux kext's host test pins the two together. */
+#define N48_METAL_ACCEL_GATE_KEY "Navi48LoadAccelerator"
 #define N48_METAL_ABI         3u                   /* 3 since bring-up 0.0.656 / aux 0.0.5 (native_open appended at 144); 2 since 0.0.613 / aux 0.0.3: the display-pipe members appended at 120 (below) */
 #define N48_METAL_UC_N48N     0x4E34384Eu          /* the user-client type 'N48N' (= N48N_UC_TYPE of Navi48NativeABI.h; the bring-up kext static_asserts the equality) */
 #define N48_METAL_ABI_MIN     1u                   /* the oldest table a consumer accepts: an ABI-1 table (120 bytes) is valid and means "display off" */
