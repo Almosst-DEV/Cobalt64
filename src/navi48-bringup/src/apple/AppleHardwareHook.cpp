@@ -34290,7 +34290,7 @@ uint32_t hw_hook_gfx_neuter(uint64_t arg, uint64_t *out, unsigned count) {
               (unsigned long long)gXdRes.readFail, gXdRes.lastStage, (unsigned long long)gXdRes.lastVa,
               gXdRes.lastId >= 0 ? xlat12_shader_id_name(gXdRes.lastId) : "no identity");
     if (gXdRes.asked)
-        HWLOG("gfx-xlat:   descriptor rung: of the matched programs %llu read NO client descriptor and %llu DO (image "
+        HWLOG("gfx-xlat:   descriptor rung %s: of the matched programs %llu read NO client descriptor and %llu DO (image "
               "or non-ring buffer, or unproven) - nothing on this path translates one, so a frame binding one refuses at "
               "`descriptor` (detail 0x1CIII: class C, identity III)", gXdDescRung ? "ON" : "OFF",
               (unsigned long long)gXdRes.descFree, (unsigned long long)gXdRes.descBad);
